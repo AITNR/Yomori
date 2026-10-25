@@ -143,10 +143,6 @@ public sealed partial class ChannelsPage : Page
         ChannelReadinessBar.Severity = VM.ChannelReadinessText.Contains("就绪")
             ? InfoBarSeverity.Success
             : InfoBarSeverity.Warning;
-
-        CurrentChannelHint.Text = VM.ActiveSession is null
-            ? "本轮尚未开始"
-            : $"最靠前的通道：{VM.ActiveSession.DisplayName}";
     }
 
     /// <summary>
@@ -308,43 +304,6 @@ public sealed partial class ChannelsPage : Page
     {
         VM.RemoveAgentCommand.Execute(null);
         SyncChannelChrome();
-    }
-
-    /// <summary>跳到多画面页（左侧菜单「会话通道」父项）—— 全部通道的网格。</summary>
-    private void OnOpenMultiView(object sender, RoutedEventArgs e) => VM.Navigate("channels");
-
-    /// <summary>
-    /// 「打开当前通道画面」：跳到某一条通道的子页。
-    /// 优先跳"当前有内嵌画面的那条"，否则跳本轮第一条会话通道，再否则跳配置里启用的第一条。
-    /// </summary>
-    private void OnOpenActiveChannelPage(object sender, RoutedEventArgs e)
-    {
-        var channelId = VM.ActiveEmbedChannelId;
-        if (string.IsNullOrEmpty(channelId))
-        {
-            foreach (var session in VM.Sessions)
-            {
-                if (session.IsRemote)
-                {
-                    channelId = session.ChannelId;
-                    break;
-                }
-            }
-        }
-
-        if (string.IsNullOrEmpty(channelId))
-        {
-            channelId = VM.Config.Rdp.Channels.FirstOrDefault(c => c.Enabled)?.Id ?? string.Empty;
-        }
-
-        if (string.IsNullOrEmpty(channelId))
-        {
-            _ = DialogHelper.ShowMessageAsync("还没有会话通道",
-                "点上面的「新建通道」加一条，填上目标主机与账户 —— 之后它就会出现在左侧菜单「会话通道」下面。");
-            return;
-        }
-
-        VM.Navigate("ch:" + channelId);
     }
 
     /// <summary>跳到任务执行页 —— 那边才是"哪条通道跑哪些任务"的地方（本页只管配通道）。</summary>
