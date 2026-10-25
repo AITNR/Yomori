@@ -4840,13 +4840,6 @@ public sealed class MainViewModel : ObservableObject
             return false;
         }
 
-        if (isLocal && !readiness.LikelySupported)
-        {
-            _ = DialogHelper.ShowMessageAsync("当前系统不支持",
-                readiness.EditionNote + "\n\nWindows 家庭版不能作为远程桌面服务端，无法登录其它账户。");
-            return false;
-        }
-
         if (!isLocal && channel.BridgePath.Trim().Length == 0)
         {
             _ = DialogHelper.ShowMessageAsync("还需要配置共享目录",

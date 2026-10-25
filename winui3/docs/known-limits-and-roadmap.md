@@ -5,12 +5,12 @@
 
 ## 已知限制
 
-- **家庭版检测是硬阻断，与设计意图不符**：`RdpSessionService.DescribeEdition()` 把「检测到家庭版」写进 `Readiness.Problems`，
-  而 `CanConnect` 要求 `Problems.Count == 0` → 预检直接判不可连，连「连接」按钮都过不去。
-  方法上方的注释写的是「给出提示而不是硬阻断」，两者矛盾。
-  影响：已经用 RDP Wrapper 一类工具给家庭版开好多会话的用户，也会被这一条拦住（2026-10-21 发现）。
-  建议修法：家庭版降级为独立的 `Warnings` 集合（不参与 `CanConnect`），真正的判据改成**探测 3389 是否在监听**
-  （`GetExtendedTcpTable` 或连一次 `127.0.0.1:3389`）—— 装了 Wrapper 的家庭版会监听，没开远程桌面的专业版不会，比读 SKU 可靠。
+- ~~**家庭版检测是硬阻断**~~（2026-10-25 已修）：原来 `RdpSessionService.DescribeEdition()`
+  把「检测到家庭版」写进 `Readiness.Problems`，`CanConnect` 要求 `Problems.Count == 0`，
+  于是用 RDP Wrapper 一类方案把家庭版开成服务端的用户也被拦住。
+  现在版本判断整条移除，`EditionNote` 只用于展示系统版本名；「远程桌面是否开启」改成
+  注册表开关不成立时再探测 3389 是否在监听（`IPGlobalProperties.GetActiveTcpListeners`），
+  端口在听即判就绪 —— 比读 SKU 可靠，家庭版与专业版走同一条判据。
 
 - **真机 GUI 验证尚未全覆盖**：构建环境在沙箱中无法启动 GUI，自动化部分靠 `dotnet build` + `_smoke` 源码级冒烟（770+ 项断言）；
   多通道并行、内嵌画面、多画面同屏等交互需要在真机上逐项验收（清单见计划书 §10）。

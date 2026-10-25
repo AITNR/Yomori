@@ -76,7 +76,8 @@ public sealed class RdpReadiness
     public bool AgentOnline { get; set; }
 
     public bool CredentialSaved { get; set; }
-    public bool LikelySupported { get; set; } = true;
+
+    /// <summary>系统版本名，仅用于展示（不参与任何判断）。</summary>
     public string EditionNote { get; set; } = string.Empty;
 
     /// <summary>目标是否本机。为 false 时账户 / 会话 / Agent 无法在本机查验。</summary>
@@ -305,6 +306,13 @@ public static class RdpSessionService
 
     // ---------------- 远程桌面开关 ----------------
 
+    /// <summary>
+    /// 本机是否能接受 RDP 连接。
+    ///
+    /// 先读注册表开关；读不到「已开启」时再退回端口探测。家庭版的服务端默认被关掉
+    /// （<c>fDenyTSConnections=1</c>），但用 RDP Wrapper 一类方案打开后 3389 会真的在监听，
+    /// 此时按版本判会误报「尚未开启远程桌面」—— 所以以「端口有没有在听」为兜底判据。
+    /// </summary>
     public static bool IsRemoteDesktopEnabled()
     {
         try
@@ -312,12 +320,40 @@ public static class RdpSessionService
             using var key = Registry.LocalMachine.OpenSubKey(
                 @"System\CurrentControlSet\Control\Terminal Server");
             var value = key?.GetValue("fDenyTSConnections");
-            return value is int number && number == 0;
+            if (value is int number && number == 0)
+            {
+                return true;
+            }
         }
         catch
         {
-            return false;
+            // 注册表读不到就退到端口探测
         }
+
+        return IsRdpPortListening();
+    }
+
+    /// <summary>本机 3389 是否有监听（只查监听表，不向外连接）。</summary>
+    public static bool IsRdpPortListening()
+    {
+        const int RdpPort = 3389;
+        try
+        {
+            foreach (var endpoint in System.Net.NetworkInformation.IPGlobalProperties
+                         .GetIPGlobalProperties().GetActiveTcpListeners())
+            {
+                if (endpoint.Port == RdpPort)
+                {
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            // 拿不到监听表就当作没监听
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -355,30 +391,23 @@ public static class RdpSessionService
         return true;
     }
 
-    /// <summary>Windows 家庭版不能作为 RDP 服务端，这里给出提示而不是硬阻断。</summary>
+    /// <summary>
+    /// 记录系统版本名，只用于界面展示，不参与任何判断。
+    ///
+    /// 2026-10-25 起不再按版本（家庭版 / 专业版）做任何限制：家庭版经 RDP Wrapper
+    /// 一类方案同样能当远程桌面服务端，判据改为 3389 是否在监听
+    /// （见 <see cref="IsRemoteDesktopEnabled"/>），比读 SKU 可靠。
+    /// </summary>
     public static void DescribeEdition(RdpReadiness readiness)
     {
         try
         {
             using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
-            var product = key?.GetValue("ProductName")?.ToString() ?? string.Empty;
-            var edition = key?.GetValue("EditionID")?.ToString() ?? string.Empty;
-
-            readiness.EditionNote = product;
-
-            var home = product.Contains("Home", StringComparison.OrdinalIgnoreCase)
-                       || product.Contains("家庭", StringComparison.Ordinal)
-                       || edition.Contains("Core", StringComparison.OrdinalIgnoreCase);
-
-            if (home)
-            {
-                readiness.LikelySupported = false;
-                readiness.Problems.Add("检测到 Windows 家庭版，该版本不能作为远程桌面服务端，无法用 RDP 登录其它账户");
-            }
+            readiness.EditionNote = key?.GetValue("ProductName")?.ToString() ?? string.Empty;
         }
         catch
         {
-            // 读不到版本就不做限制
+            // 读不到版本就不显示，不影响连接
         }
     }
 
@@ -2062,7 +2091,7 @@ public static class RdpSessionService
         // 与目标会话里代理自己算出来的目录一致（见 RdpChannelPaths）
         var bridge = RdpBridge.For(RdpChannelPaths.Resolve(bridgePath, targetUser));
 
-        // 本机只是客户端时才受"家庭版不能当服务端"限制；连别人不受影响
+        // 本机当服务端才需要检查账户 / 远程桌面开关 / 代理；连远程主机这些都得在对方机器上确认
         if (isLocal)
         {
             DescribeEdition(readiness);
