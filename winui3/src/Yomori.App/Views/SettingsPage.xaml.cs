@@ -25,11 +25,20 @@ public sealed partial class SettingsPage : Page
     /// <summary>最近一次 RDP 解锁只读检测的结果；「查看诊断」按它出文本，不再重新跑一遍检测。</summary>
     private RdpUnlockSnapshot? _rdpSnapshot;
 
+    /// <summary>上一次修改操作的完整报告（含逐步现场）。「查看诊断」优先把它带出来。</summary>
+    private string _rdpLastReport = "";
+
     /// <summary>
     /// 只读检测是否正在进行。互斥有两层意义：按钮连点不会叠起两次检测；
     /// 以及「移动中」的结果不乱序盖掉上一份（检测本身是毫秒级，但服务状态的读取是 Win32 调用）。
     /// </summary>
     private bool _rdpDetecting;
+
+    /// <summary>
+    /// 是否正在跑修改操作（解锁 / 还原）。与 <see cref="_rdpDetecting"/> 分开记，
+    /// 因为两者不能互相覆盖：检测可以单独跑，修改期间检测只在流程内部做。
+    /// </summary>
+    private bool _rdpBusy;
 
     /// <summary>页面是否已经卸载。卸载之后不能再往控件上写（会摸到失效元素）。</summary>
     private bool _unloaded;
@@ -761,7 +770,7 @@ public sealed partial class SettingsPage : Page
     /// </remarks>
     private async Task RefreshRdpSectionAsync(bool announce)
     {
-        if (_rdpDetecting)
+        if (_rdpDetecting || _rdpBusy)
         {
             return;
         }
@@ -769,6 +778,7 @@ public sealed partial class SettingsPage : Page
         _rdpDetecting = true;
         var queue = DispatcherQueue;
 
+        RdpProbeSummaryText.Text = "正在检测…";
         SetRdpBusy(true);
 
         try
@@ -782,6 +792,10 @@ public sealed partial class SettingsPage : Page
                 }
 
                 _rdpSnapshot = snapshot;
+
+                // 先放开 detecting 再刷按钮：UpdateRdpButtonStates 会读这个标志，
+                // 顺序反了的话按钮会停在禁用态（这一处踩过：检测完成后「重新检测」点不动）
+                _rdpDetecting = false;
                 RenderRdpSnapshot(snapshot);
                 SetRdpBusy(false);
 
@@ -803,6 +817,7 @@ public sealed partial class SettingsPage : Page
                     return;
                 }
 
+                _rdpDetecting = false;
                 SetRdpBusy(false);
                 RdpProbeSummaryText.Text = $"检测失败：{detail}";
                 VM.AppendLog($"[RDP 解锁] 检测异常：{detail}");
@@ -817,18 +832,43 @@ public sealed partial class SettingsPage : Page
 
     private void SetRdpBusy(bool busy)
     {
-        RdpRedetectButton.IsEnabled = !busy;
-
-        // 诊断按钮只在有一份结果之后可用：没有快照时点它只能弹「还没有结果」，不如直接灰着
-        RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
-
         RdpProbeProgress.IsActive = busy;
         RdpProbeProgress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
 
-        if (busy)
+        UpdateRdpButtonStates();
+    }
+
+    /// <summary>
+    /// 三个修改按钮 + 两个只读入口的可用性。
+    /// </summary>
+    /// <remarks>
+    /// 「还原注册表」没有备份时必须禁用并说明原因（计划书 5.3 第 2 条：无有效备份时
+    /// 禁用按钮，不猜 Windows 默认值）。所以这里每次都要问一次账本 ——
+    /// 磁盘上的一目录扫描，比在内存里维护一份可能过期的"有没有备份"可靠。
+    /// </remarks>
+    private void UpdateRdpButtonStates()
+    {
+        var busy = _rdpBusy || _rdpDetecting;
+
+        RdpRedetectButton.IsEnabled = !busy;
+        RdpUnlockButton.IsEnabled = !busy;
+        RdpUninstallButton.IsEnabled = false;   // 卸载在 M5 接入
+
+        var hasBaseline = false;
+        var hasAnyTransaction = false;
+        try
         {
-            RdpProbeSummaryText.Text = "正在检测…";
+            hasBaseline = RdpTransactionStore.FindFirstBaseline() is not null;
+            hasAnyTransaction = RdpTransactionStore.List().Count > 0;
         }
+        catch
+        {
+            // 账本目录不可读：两个按钮都保持禁用
+        }
+
+        RdpRestoreRegistryButton.IsEnabled = !busy && hasBaseline;
+        RdpBackupButton.IsEnabled = !busy && hasAnyTransaction;
+        RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
     }
 
     /// <summary>
@@ -938,7 +978,11 @@ public sealed partial class SettingsPage : Page
             return;
         }
 
-        var text = RdpUnlockDiagnostics.FormatDetail(snapshot);
+        var text = _rdpLastReport.Length > 0
+            ? _rdpLastReport + Environment.NewLine + Environment.NewLine
+              + "--- 当前状态 ---" + Environment.NewLine
+              + RdpUnlockDiagnostics.FormatDetail(snapshot)
+            : RdpUnlockDiagnostics.FormatDetail(snapshot);
 
         var box = new TextBox
         {
@@ -1017,4 +1061,438 @@ public sealed partial class SettingsPage : Page
     }
 
     private static string Dash(string text) => string.IsNullOrWhiteSpace(text) ? "—" : text;
+
+    // ---------------- 远程桌面解锁：修改动作（M2–M4） ----------------
+
+    /// <summary>
+    /// 解锁：先弹系统修改风险，再（缺组件时）弹杀软人工确认，最后才进流程。
+    /// </summary>
+    /// <remarks>
+    /// 三个对话框的**顺序**是计划书定的，不能合并：
+    /// ① 系统修改风险（3.2 第一层）→ ② 下载前的人肉确认（3.2 第二层，只在需要下载时）。
+    /// 合并成一个对话框的话，用户点"确定"到底同意了哪一件事就说不清了。
+    /// </remarks>
+    private async void OnRdpUnlock(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        await EnsureRdpSnapshotAsync();
+
+        var needDownload = _rdpSnapshot?.WrapperState != RdpWrapperState.Installed;
+
+        if (!await ConfirmUnlockRiskAsync(needDownload))
+        {
+            return;
+        }
+
+        var antivirusConfirmed = false;
+        if (needDownload)
+        {
+            if (!await ConfirmAntivirusAsync())
+            {
+                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
+                return;
+            }
+
+            antivirusConfirmed = true;
+        }
+
+        var request = new RdpUnlockRequest { AntivirusConfirmed = antivirusConfirmed };
+        var network = UpdateNetworkSettings.FromConfig(VM.Config);
+
+        await RunRdpOperationAsync("解锁 RDP",
+            (progress, token) => RdpUnlockService.UnlockAsync(request, network, progress, token));
+    }
+
+    /// <summary>还原注册表：默认用最早那份基线，用户也可以从「历史备份」里挑。</summary>
+    private async void OnRdpRestoreRegistry(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        RdpTransactionInfo? baseline;
+        try
+        {
+            baseline = RdpTransactionStore.FindFirstBaseline();
+        }
+        catch (Exception ex)
+        {
+            SetRdpAction($"读不到备份账本：{ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        if (baseline is null)
+        {
+            SetRdpAction("没有可用的注册表备份，已跳过。");
+            return;
+        }
+
+        var confirmed = await DialogHelper.ShowMessageAsync(
+            "还原注册表",
+            $"将把本功能改过的注册表值恢复成解锁前的状态。{Environment.NewLine}{Environment.NewLine}"
+            + $"使用备份：{baseline.SummaryText}{Environment.NewLine}"
+            + "变更范围：仅 fDenyTSConnections 等白名单键值。"
+            + Environment.NewLine + Environment.NewLine
+            + "注意：这**不会**卸载解锁组件，也不会删除 Windows 用户、Yomori 通道或凭据。"
+            + "恢复可能需要重启远程桌面服务，正在连接的远程会话会断开。",
+            closeText: "取消",
+            primaryText: "确认还原");
+
+        if (confirmed != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        var id = baseline.Id;
+        await RunRdpOperationAsync("还原注册表",
+            (progress, token) => RdpUnlockService.RestoreRegistryAsync(id, progress, token));
+    }
+
+    /// <summary>历史备份：列出所有事务，允许挑一份还原。</summary>
+    private async void OnRdpBackups(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        var list = new List<RdpTransactionInfo>();
+        try
+        {
+            foreach (var item in RdpTransactionStore.List())
+            {
+                list.Add(item);
+            }
+        }
+        catch (Exception ex)
+        {
+            SetRdpAction($"读不到备份账本：{ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        if (list.Count == 0)
+        {
+            SetRdpAction("还没有任何事务记录。");
+            return;
+        }
+
+        var picker = new ComboBox
+        {
+            ItemsSource = list,
+            SelectedIndex = 0,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            MinWidth = 460,
+        };
+
+        var panel = new StackPanel { Spacing = 10 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"备份目录：{RdpTransactionStore.RootDir}",
+            FontSize = 12,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+            IsTextSelectionEnabled = true,
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = "「未完成」的事务是崩溃或强杀留下的半截记录；它本身也能还原，"
+                   + "但删除前请先看诊断确认它做到哪一步。",
+            FontSize = 12,
+            Opacity = 0.7,
+            TextWrapping = TextWrapping.Wrap,
+        });
+        panel.Children.Add(picker);
+
+        var dialog = new ContentDialog
+        {
+            Title = "历史备份",
+            Content = panel,
+            PrimaryButtonText = "还原这一份",
+            CloseButtonText = "关闭",
+            DefaultButton = ContentDialogButton.Close,
+        };
+
+        if (await DialogHelper.ShowAsync(dialog) != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        if (picker.SelectedItem is not RdpTransactionInfo selected)
+        {
+            return;
+        }
+
+        var confirmed = await DialogHelper.ShowMessageAsync(
+            "还原注册表",
+            $"将按 {selected.SummaryText} 恢复注册表。"
+            + Environment.NewLine + Environment.NewLine
+            + "这不会卸载解锁组件，也不会动 Windows 用户与通道凭据。",
+            closeText: "取消",
+            primaryText: "确认还原");
+
+        if (confirmed != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        var id = selected.Id;
+        await RunRdpOperationAsync("还原注册表",
+            (progress, token) => RdpUnlockService.RestoreRegistryAsync(id, progress, token));
+    }
+
+    /// <summary>没有检测结果时先补一次，避免"按 Wrapper 状态分岔"的判断基于 null。</summary>
+    private async Task EnsureRdpSnapshotAsync()
+    {
+        if (_rdpSnapshot is not null || _rdpDetecting)
+        {
+            return;
+        }
+
+        await RefreshRdpSectionAsync(announce: false);
+    }
+
+    private async Task<bool> ConfirmUnlockRiskAsync(bool needDownload)
+    {
+        var scope = new System.Text.StringBuilder();
+        scope.AppendLine("这个操作会修改本机系统：");
+        scope.AppendLine("1. " + (needDownload ? "下载并安装第三方 RDP Wrapper 解锁组件" : "复用本机已有的解锁组件（不重装）"));
+        scope.AppendLine("2. 修改注册表：HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server 的 fDenyTSConnections 改为 0");
+        scope.AppendLine("3. 更新本机 rdpwrap.ini");
+        scope.AppendLine("4. 重启 Remote Desktop Services（TermService）");
+        scope.AppendLine();
+        scope.AppendLine("风险：");
+        scope.AppendLine("· 精简版系统上可能无效；");
+        scope.AppendLine("· 重启服务会断开当前所有远程会话，正在跑的任务无法通过注册表备份恢复；");
+        scope.AppendLine("· 卸载不保证能还原成安装前的全部状态。");
+        scope.AppendLine();
+        scope.AppendLine("备份位置：");
+        scope.AppendLine("· " + RdpTransactionStore.RootDir + "\\<事务ID>\\");
+        scope.AppendLine("  内含注册表快照、INI 备份与逐步日志。");
+
+        var dialog = new ContentDialog
+        {
+            Title = needDownload ? "解锁 RDP：将下载组件并修改系统" : "解锁 RDP：将修改系统",
+            Content = new ScrollViewer
+            {
+                Content = new TextBlock
+                {
+                    Text = scope.ToString(),
+                    TextWrapping = TextWrapping.Wrap,
+                    FontSize = 13,
+                },
+                MaxHeight = 420,
+            },
+            PrimaryButtonText = "继续",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+        };
+
+        return await DialogHelper.ShowAsync(dialog) == ContentDialogResult.Primary;
+    }
+
+    /// <summary>
+    /// 下载前的人肉确认（计划书 3.2）。文案是计划书给定的，不要"优化"掉任何一句 ——
+    /// 其中「不检测、不验证也不修改」「取消后不会开始下载」「请及时重新开启防护」都是承诺。
+    /// </summary>
+    private async Task<bool> ConfirmAntivirusAsync()
+    {
+        var check = new CheckBox
+        {
+            Content = "我已确认关闭所有杀毒软件",
+            Margin = new Thickness(0, 8, 0, 0),
+        };
+
+        var panel = new StackPanel { Spacing = 10 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "此操作将从 RDP Wrapper 官方 Releases 下载最新正式版。"
+                   + "请确认已关闭所有杀毒软件（包括系统自带防护及第三方安全软件）后再点击「确定并开始下载」。"
+                   + "Yomori 不检测、不验证也不修改杀毒软件状态。取消后不会开始下载。"
+                   + "操作完成、失败或取消后，请及时重新开启安全防护。",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 13,
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = "下载源：" + RdpReleaseResolver.LatestApiUrl,
+            FontSize = 12,
+            Opacity = 0.65,
+            TextWrapping = TextWrapping.Wrap,
+            IsTextSelectionEnabled = true,
+        });
+        panel.Children.Add(check);
+
+        var dialog = new ContentDialog
+        {
+            Title = "下载前确认",
+            Content = panel,
+            PrimaryButtonText = "确定并开始下载",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+            IsPrimaryButtonEnabled = false,
+        };
+
+        check.Checked += (_, __) => dialog.IsPrimaryButtonEnabled = true;
+        check.Unchecked += (_, __) => dialog.IsPrimaryButtonEnabled = false;
+
+        return await DialogHelper.ShowAsync(dialog) == ContentDialogResult.Primary;
+    }
+
+    /// <summary>
+    /// 跑一次修改操作并渲染结果。
+    /// </summary>
+    /// <remarks>
+    /// 进度对象在 UI 线程上构造，所以 <see cref="Progress{T}"/> 的回调会回到 UI 线程 ——
+    /// 但结果渲染仍然走 <see cref="RunOnUi"/>：这个工程里"await 之后还在 UI 线程"
+    /// 已经被证明不能靠假设（见 OnCheckUpdate 的注释）。
+    /// </remarks>
+    private async Task RunRdpOperationAsync(
+        string title,
+        Func<IProgress<RdpProgressInfo>, CancellationToken, Task<RdpOperationResult>> operation)
+    {
+        if (_rdpBusy)
+        {
+            return;
+        }
+
+        var queue = DispatcherQueue;
+        _rdpBusy = true;
+        SetRdpBusy(true);
+        RdpResultBar.IsOpen = false;
+
+        var progress = new Progress<RdpProgressInfo>(info =>
+        {
+            if (_unloaded)
+            {
+                return;
+            }
+
+            RdpProbeSummaryText.Text = $"{title}：第 {info.Step}/{info.Total} 步 —— {info.Text}";
+        });
+
+        try
+        {
+            // 必须在后台线程起步：解锁流程里有注册表写入与 SCM 停启（最长两轮 45 秒等待），
+            // 而"不需要下载"这条分支在第一个 await 之前就会走到它们 —— 直接在 UI 线程调用等于界面卡死。
+            var result = await Task.Run(() => operation(progress, CancellationToken.None));
+            RunOnUi(queue, () =>
+            {
+                if (_unloaded)
+                {
+                    return;
+                }
+
+                _rdpBusy = false;
+                SetRdpBusy(false);
+                RenderRdpOperationResult(title, result);
+            });
+        }
+        catch (Exception ex)
+        {
+            // 服务层设计上不抛异常；真抛出来也要把按钮恢复可点，并把异常本身说清楚
+            var detail = $"{ex.GetType().Name}: {ex.Message}";
+            RunOnUi(queue, () =>
+            {
+                if (_unloaded)
+                {
+                    return;
+                }
+
+                _rdpBusy = false;
+                SetRdpBusy(false);
+                RdpResultBar.Severity = InfoBarSeverity.Error;
+                RdpResultBar.Title = title + "：出现未预期错误";
+                RdpResultBar.Message = detail;
+                RdpResultBar.IsOpen = true;
+                SetRdpAction($"{title} 失败：{detail}");
+            });
+            VM.AppendLog($"[RDP 解锁] {title} 异常：{detail}");
+        }
+    }
+
+    /// <summary>把一次操作的结果画出来：结果条 + 步骤列表 + 用流程内的最终检测刷新四项。</summary>
+    private void RenderRdpOperationResult(string title, RdpOperationResult result)
+    {
+        RdpResultBar.Severity = result.Success
+            ? InfoBarSeverity.Success
+            : HasWarningStep(result.Steps)
+                ? InfoBarSeverity.Warning
+                : InfoBarSeverity.Error;
+        RdpResultBar.Title = result.Success ? title + "：完成" : title + "：没有全部成功";
+        RdpResultBar.Message = result.Summary;
+        RdpResultBar.IsOpen = true;
+
+        // 步骤
+        RdpStepsLines.Children.Clear();
+        foreach (var step in result.Steps)
+        {
+            RdpStepsLines.Children.Add(BuildStepLine(step));
+        }
+
+        RdpStepsTitle.Text = $"执行步骤（{result.Steps.Count} 步）";
+        RdpStepsPanel.Visibility = result.Steps.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+
+        // 用流程内部的最终检测刷新四项，不重跑一次检测（重跑可能读到中间态）
+        if (result.Final is not null)
+        {
+            _rdpSnapshot = result.Final;
+            RenderRdpSnapshot(result.Final);
+        }
+
+        if (result.NeedsProtectionReminder)
+        {
+            SetRdpAction($"提示：本轮下载前您确认关闭过安全软件，请现在重新开启 —— {DateTime.Now:HH:mm:ss}");
+        }
+        else
+        {
+            SetRdpAction($"{title} 结束：{(result.Success ? "成功" : "未全部成功")} —— {DateTime.Now:HH:mm:ss}");
+        }
+
+        VM.AppendLog($"[RDP 解锁] {title}：{result.Summary}");
+
+        // 失败时把完整报告留一份，用户点「查看诊断」就能拿到逐步现场
+        _rdpLastReport = result.FormatReport();
+    }
+
+    private static FrameworkElement BuildStepLine(RdpStepRecord step)
+    {
+        var panel = new StackPanel { Spacing = 1 };
+
+        panel.Children.Add(new TextBlock
+        {
+            Text = step.ToLine(),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Foreground = StepBrush(step.Outcome),
+        });
+
+        return panel;
+    }
+
+    /// <summary>结果条用 Warning 还是 Error：有「注意」级步骤时说明不是硬失败，别一律报红。</summary>
+    private static bool HasWarningStep(IReadOnlyList<RdpStepRecord> steps)
+    {
+        foreach (var step in steps)
+        {
+            if (step.Outcome == RdpStepOutcome.Warn)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static SolidColorBrush StepBrush(RdpStepOutcome outcome) => outcome switch    {
+        RdpStepOutcome.Ok => new SolidColorBrush(Color.FromArgb(0xFF, 0x2F, 0xAE, 0x5B)),
+        RdpStepOutcome.Warn => new SolidColorBrush(Color.FromArgb(0xFF, 0xC9, 0x9A, 0x00)),
+        RdpStepOutcome.Fail => new SolidColorBrush(Color.FromArgb(0xFF, 0xC4, 0x2B, 0x1C)),
+        RdpStepOutcome.Skipped => new SolidColorBrush(Color.FromArgb(0xFF, 0x8A, 0x8A, 0x8A)),
+        _ => new SolidColorBrush(Color.FromArgb(0xFF, 0x8A, 0x8A, 0x8A)),
+    };
 }

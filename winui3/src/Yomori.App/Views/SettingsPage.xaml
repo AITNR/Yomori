@@ -92,19 +92,31 @@
                                Text="用于让本机支持多账户同时远程连接。本区当前只做只读检测：读取 TermService 的 ServiceDll、服务状态、会话枚举、termsrv.dll 版本与本机 rdpwrap.ini。检测不修改任何系统设置，也不下载任何文件。" />
 
                     <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button x:Name="RdpUnlockButton" Content="解锁 RDP" IsEnabled="False" />
+                        <Button x:Name="RdpUnlockButton" Content="解锁 RDP" Click="OnRdpUnlock" />
                         <Button x:Name="RdpUninstallButton" Content="卸载 RDP 解锁" IsEnabled="False" />
-                        <Button x:Name="RdpRestoreRegistryButton" Content="还原注册表" IsEnabled="False" />
+                        <Button x:Name="RdpRestoreRegistryButton" Content="还原注册表" Click="OnRdpRestoreRegistry" IsEnabled="False" />
                     </StackPanel>
 
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                               Text="解锁、卸载与还原注册表尚未接入本版本，按钮暂不可用。它们分别对应：安装官方解锁组件、调用官方卸载器、按快照恢复注册表 —— 三者不是同一个「回滚」，因此不会做成一个按钮。" />
+                               Text="三件事互不相同，因此是三个按钮：解锁 = 安装官方组件并改配置；还原注册表 = 只按快照恢复本功能改过的键值，不卸载组件；卸载 = 调用官方卸载器（本版本尚未接入）。三者共享同一把锁，同时只能跑一个。" />
+
+                    <InfoBar x:Name="RdpResultBar" IsOpen="False" IsClosable="True" />
+
+                    <!-- 执行步骤：跑完点开看，每一行对应计划书 3.3 的一步 -->
+                    <StackPanel x:Name="RdpStepsPanel" Spacing="4" Visibility="Collapsed">
+                        <TextBlock x:Name="RdpStepsTitle" FontSize="12" FontWeight="SemiBold" />
+                        <ScrollViewer MaxHeight="220"
+                                      VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel x:Name="RdpStepsLines" Spacing="2" />
+                        </ScrollViewer>
+                    </StackPanel>
 
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button x:Name="RdpRedetectButton" Content="重新检测" Click="OnRdpRedetect" />
                         <Button x:Name="RdpDiagnoseButton" Content="查看诊断" Click="OnRdpDiagnose" IsEnabled="False" />
                         <Button Content="打开排查教程" Click="OnRdpTutorial" />
-                        <Button x:Name="RdpBackupButton" Content="历史备份" IsEnabled="False" />
+                        <Button x:Name="RdpBackupButton" Content="历史备份" Click="OnRdpBackups" />
                     </StackPanel>
 
                     <!-- 四行检测结果由 SettingsPage.xaml.cs 直接填入 StackPanel：

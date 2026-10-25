@@ -973,6 +973,13 @@ public static class UpdateService
     /// <param name="targetPath">落盘路径（目录不存在会建）。</param>
     /// <param name="network">代理设置。</param>
     /// <param name="progress">进度 0~1（服务器不给 Content-Length 时不会回调）。</param>
+    /// <summary>
+    /// 按代理设置取一个共享的 <see cref="HttpClient"/>。
+    /// 对外开放是为了让别的模块查 GitHub 时复用同一套代理语义（RDP 解锁要查上游工具发布），
+    /// 而不是各自 new 一个 client、各自漏一个连接池。
+    /// </summary>
+    public static HttpClient NetworkClient(UpdateNetworkSettings network) => GetClient(network);
+
     public static async Task<(bool Ok, string Message)> DownloadAsync(
         string url,
         string targetPath,

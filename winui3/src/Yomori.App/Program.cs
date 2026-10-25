@@ -223,6 +223,14 @@ public static class Program
             Environment.Exit(AgentAutoDeploy.Run());
         }
 
+        // RDP 解锁的无界面诊断（计划书 M4）：只读检测 + 事务账本，退出码即结论。
+        // 和 --deploy-agent 一样在单实例之前分流：它是查询任务，不该因为
+        // 「用户正开着主控端」就被交接逻辑叫回去，也不需要窗口。
+        if (RdpDiagnoseCli.IsInvocation(args))
+        {
+            Environment.Exit(RdpDiagnoseCli.Run());
+        }
+
         // 任务栏身份要在第一个窗口创建之前定下来，代理模式不涉及窗口、跳过。
         if (!isAgent)
         {
