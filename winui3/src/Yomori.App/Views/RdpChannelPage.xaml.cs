@@ -87,7 +87,19 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     /// </summary>
     private RdpFullScreenCoordinator? _fullScreen;
 
-    /// <summary>事件卡是否收起（收起后画面能多占 140px）。</summary>
+    /// <summary>运行信息栏展开时的宽度上限（px）。实际宽度按页面宽度比例算，见 ApplyEventsColumnWidth。</summary>
+    private const double ExpandedEventsColumnWidthMax = 420;
+
+    /// <summary>展开时的宽度下限：再窄 TabView 里的日志行就没法看了。</summary>
+    private const double ExpandedEventsColumnWidthMin = 260;
+
+    /// <summary>
+    /// 收起后的宽度：只放得下「展开」按钮。
+    /// ⚠️ 不能收成 0 —— 那个按钮就在栏里，栏宽归零按钮跟着消失，就再也展不开了。
+    /// </summary>
+    private const double CollapsedEventsColumnWidth = 96;
+
+    /// <summary>运行信息栏是否收起（收起后整栏收窄，画面多占约 264px）。</summary>
     private bool _eventsCollapsed;
 
     /// <summary>
@@ -102,6 +114,11 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     public RdpChannelPage()
     {
         InitializeComponent();
+
+        // 运行信息栏的宽度跟着页面宽度走（见 ApplyEventsColumnWidth）：
+        // 固定值在最小窗口（960）下会把画面挤没，在大屏上又白占地方。
+        SizeChanged += (_, _) => ApplyEventsColumnWidth();
+
         ExternalLogList.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler(OnLogPointerWheel), true);
 
@@ -344,12 +361,42 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
         VM.AppendLog($"[通道：{VM.ChannelDisplayName(channelId)}] 画面已弹出到独立窗口。");
     }
 
-    /// <summary>事件卡折叠/展开 —— 收起后画面能多吃 140px。</summary>
+    /// <summary>
+    /// 运行信息栏的收起 / 展开。
+    ///
+    /// 收起时**整栏一起收窄**（不只是隐藏列表）：这个栏在画面右边，留着 360px 的空白
+    /// 等于白占画面宽度。窄栏里只留「展开」按钮 —— 所以宽度不能收成 0，
+    /// 否则那个按钮跟着消失，就再也点不回来了。
+    /// </summary>
     private void OnToggleEventsClicked(object sender, RoutedEventArgs e)
     {
         _eventsCollapsed = !_eventsCollapsed;
+
         EventsTabs.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
+        EventsTitle.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
+        FollowExternalLogsToggle.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
         ToggleEventsButton.Content = _eventsCollapsed ? "展开" : "收起";
+
+        ApplyEventsColumnWidth();
+    }
+
+    /// <summary>
+    /// 按页面宽度定右栏宽度：固定值在两种极端上都难看 ——
+    /// 窗口只有 960（最小宽度）时 360px 会把画面挤没，而大屏上又白白浪费宽度。
+    /// 所以取约三分之一并夹在 [260, 420] 之间；收起时固定窄条。
+    /// </summary>
+    private void ApplyEventsColumnWidth()
+    {
+        var width = _eventsCollapsed
+            ? CollapsedEventsColumnWidth
+            : Math.Clamp(ActualWidth * 0.34, ExpandedEventsColumnWidthMin, ExpandedEventsColumnWidthMax);
+
+        if (EventsColumn is null || Math.Abs(EventsColumn.Width.Value - width) < 0.5)
+        {
+            return;
+        }
+
+        EventsColumn.Width = new GridLength(width);
     }
 
     private void OnClearExternalLogsClicked(object sender, RoutedEventArgs e)
