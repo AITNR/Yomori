@@ -218,6 +218,9 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     /// 日志文件路径，或**日志文件所在的目录**。支持环境变量（如 <c>%LOCALAPPDATA%</c>）。
     /// 填目录时按 <see cref="ExternalLogPattern"/> 匹配，并自动挑最近修改的那一份 ——
     /// 这样 BetterGI 按天滚动、MaaEnd 一份固定名 + 多份日期文件，都不用改配置。
+    ///
+    /// <para>相对路径以**脚本所在目录**为基准（如 MAA_bbb 填 <c>debug</c>，
+    /// 即 <c>&lt;安装目录&gt;\debug</c>）。这样多账户各自装在不同盘时不必为每台机器改配置。</para>
     /// </summary>
     [JsonPropertyName("external_log_path")]
     public string ExternalLogPath

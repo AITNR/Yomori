@@ -350,8 +350,12 @@
                                                       OnContent="开启" OffContent="关闭" />
 
                                         <TextBox Header="日志文件或目录"
-                                                 PlaceholderText="例如：C:\Program Files\BetterGI\log"
-                                                 Text="{Binding ExternalLogPath, Mode=TwoWay}" />
+                                                 PlaceholderText="例如：C:\Program Files\BetterGI\log，或相对脚本目录的 debug"
+                                                 Text="{Binding ExternalLogPath, Mode=TwoWay}">
+                                            <ToolTipService.ToolTip>
+                                                <ToolTip Content="填目录时按右侧匹配模式取该目录下全部日志（如 MAA_bbb 的 debug 目录下 maafw.log / gui.log / agent.log 会一起采集）；相对路径以脚本所在目录为基准。" />
+                                            </ToolTipService.ToolTip>
+                                        </TextBox>
 
                                         <Grid ColumnSpacing="12">
                                             <Grid.ColumnDefinitions>

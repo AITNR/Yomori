@@ -99,20 +99,18 @@ public static class ExternalLogFilter
     };
 
     /// <summary>
-    /// 级别字段的提取器 —— 只在**真正的级别字段**里认级别。
+    /// python logging 的默认格式：<c>时间 - [logger 名] - 级别 - 正文</c>。
     ///
-    /// 为什么必须先剥离：三种日志的时间戳含 - : , 等字符，
-    /// 直接全行搜 "error" 会把正文里的普通词误判成错误
-    /// （比如「正在处理 error 模块」被标成 [错误]，界面全是红的）。
+    /// 出现在 MAA_bbb 的 <c>debug\agent.log</c>（它自己的 <c>Logger.py</c> 用
+    /// <c>"%(asctime)s - [%(name)s] - %(levelname)s - %(message)s"</c> 建的 formatter）。
+    /// 这条不认，整份 agent.log 就全是 Unknown —— 行会照常显示，
+    /// 但 WARNING/ERROR 不被标红，排障时最该跳出来的那几行反而最不显眼。
     ///
-    /// 三种写法：
-    ///   [INF] / [ERROR]       —— BetterGI、MaaEnd
-    ///   | INFO |              —— March7thAssistant
-    ///   时间戳后紧跟大写级别    —— MaaEnd 的 "2026-10-16 12:26:08 INFO"
+    /// 锚死在行首的时间戳与两个连字符上：正文里出现的 <c>- ERROR -</c> 不算级别。
     /// </summary>
-    private static readonly Regex LevelField = new(
-        @"^\s*(?:\[?\d{4}-\d{2}-\d{2}\]?[ T]\[?\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\]?\s*)?" +
-        @"(?:\[(?<b>[A-Z]{3,11})\]|\|\s*(?<v>[A-Z]{3,11})\s*\||(?<t>\b[A-Z]{3,11}\b))",
+    private static readonly Regex PythonLoggingLevel = new(
+        @"^\s*\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d{1,6})?\s*-\s*" +
+        @"(?:\[[^\]]*\]\s*-\s*)?(?<v>[A-Za-z]{3,11})\s*-",
         RegexOptions.Compiled);
 
     /// <summary>
@@ -143,6 +141,14 @@ public static class ExternalLogFilter
     /// 识别行级别，仅用于界面标注。
     ///
     /// 只在**级别字段**里比对，正文里的 "error" / "超时" 不会被误判。
+    ///
+    /// <para>四种写法（顺序即优先级）：</para>
+    /// <list type="number">
+    ///   <item><c>[INF]</c> / <c>[ERROR]</c> —— BetterGI、MaaEnd、MaaFramework（maafw.log）</item>
+    ///   <item><c>| INFO |</c> —— March7thAssistant</item>
+    ///   <item>时间戳后紧跟大写级别 —— MaaEnd 的 <c>2026-10-16 12:26:08 INFO</c></item>
+    ///   <item><c>- INFO -</c> —— python logging 默认格式（MAA_bbb 的 agent.log）</item>
+    /// </list>
     /// </summary>
     public static ExternalLogLevel Classify(string? raw)
     {
@@ -176,6 +182,16 @@ public static class ExternalLogFilter
         if (bare.Success)
         {
             return MatchLevel(bare.Groups["v"].Value);
+        }
+
+        // ④ python logging 默认格式（MAA_bbb 的 agent.log）。
+        //    组件名可能很长（"custom.往世乐土周常流程"），60 字符的 head 会截掉级别，
+        //    所以这一条单独取更宽的前缀，且用带时间戳锚定的正则。
+        var wide = text.Length > 200 ? text.Substring(0, 200) : text;
+        var python = PythonLoggingLevel.Match(wide);
+        if (python.Success)
+        {
+            return MatchLevel(python.Groups["v"].Value);
         }
 
         return ExternalLogLevel.Unknown;
