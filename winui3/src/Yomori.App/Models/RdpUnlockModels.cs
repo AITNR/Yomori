@@ -99,6 +99,15 @@ public sealed class RdpIniAnalysis
     public int SectionCount { get; init; }
     public RdpSupportState State { get; init; } = RdpSupportState.Unknown;
     public string Detail { get; init; } = "";
+
+    /// <summary>
+    /// 实际命中的那个候选版本号（<see cref="State"/> 为已覆盖时才有值）。
+    ///
+    /// <para>为什么需要它：termsrv.dll 的「固定文件信息」与「版本字符串」可能不一致
+    /// （Windows 的 QS 更新只改前者），两段都要拿去比对。命中哪个必须记下来，
+    /// 否则界面无法解释「为什么显示的版本号与文件属性里的不一样」。</para>
+    /// </summary>
+    public string MatchedVersion { get; init; } = "";
 }
 
 /// <summary>
@@ -160,11 +169,25 @@ public sealed class RdpUnlockSnapshot
 
     // ---- Support ----
     public RdpSupportState SupportState { get; init; } = RdpSupportState.Unknown;
+
+    /// <summary>比对用的版本号：取 DLL 的**固定文件信息**（与 RDPWrap 一致）。</summary>
     public string TermsrvVersion { get; init; } = "";
+
+    /// <summary><c>FileVersion</c> 的原始文本，含 <c> (WinBuild.160101.0800)</c> 这类后缀。</summary>
     public string TermsrvVersionRaw { get; init; } = "";
+
+    /// <summary>
+    /// 版本字符串里的四段数字。<see cref="TermsrvVersion"/> 与它不同时才有值 ——
+    /// Windows 的 QS 更新只改固定文件信息，字符串会滞后，两者不一致是正常现象。
+    /// </summary>
+    public string TermsrvVersionText { get; init; } = "";
+
     public string IniUpdated { get; init; } = "";
     public bool IniLabelMatch { get; init; }
     public bool IniStrictSectionMatch { get; init; }
+
+    /// <summary>INI 里实际命中的版本段（多候选比对时才知道是哪一个）。</summary>
+    public string IniMatchedVersion { get; init; } = "";
 
     // ---- 汇总 ----
     public IReadOnlyList<RdpProbeItem> Items { get; init; } = Array.Empty<RdpProbeItem>();
@@ -343,10 +366,20 @@ public static class RdpUnlockDiagnostics
         sb.AppendLine($"安装目录：{Blank(snapshot.InstallDirectory)}");
         sb.AppendLine($"INI 路径：{Blank(snapshot.IniPath)}");
         sb.AppendLine($"INI Updated：{Blank(snapshot.IniUpdated)}");
-        sb.AppendLine($"termsrv.dll 版本：{Blank(snapshot.TermsrvVersion)}");
+        sb.AppendLine($"termsrv.dll 版本：{Blank(snapshot.TermsrvVersion)}（取自固定文件信息，与 RDPWrap 同源）");
+        if (snapshot.TermsrvVersionText.Length > 0)
+        {
+            sb.AppendLine($"版本字符串：{snapshot.TermsrvVersionText}（StringFileInfo 里的 FileVersion，QS 更新后可能滞后）");
+        }
+
         if (snapshot.TermsrvVersionRaw.Length > 0)
         {
             sb.AppendLine($"版本原始文本：{snapshot.TermsrvVersionRaw}");
+        }
+
+        if (snapshot.IniMatchedVersion.Length > 0)
+        {
+            sb.AppendLine($"INI 命中的段：[{snapshot.IniMatchedVersion}]");
         }
 
         sb.AppendLine($"INI 标签匹配：{YesNo(snapshot.IniLabelMatch)}　严格 section 匹配：{YesNo(snapshot.IniStrictSectionMatch)}");

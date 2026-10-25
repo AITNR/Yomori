@@ -54,6 +54,9 @@ public static class RdpReadOnlyDetector
         "CloseServiceHandle",
         "WinStationEnumerateW",
         "WinStationFreeMemory",
+        "GetFileVersionInfoSizeW",
+        "GetFileVersionInfoW",
+        "VerQueryValueW",
     };
 
     /// <summary>
@@ -127,8 +130,9 @@ public static class RdpReadOnlyDetector
         };
 
         // ---- 4. Support：termsrv.dll 版本 × 本机 INI ----
-        var version = ReadTermsrvVersion(errors, out var versionRaw);
-        var ini = ReadAndAnalyzeIni(iniPath, version, errors);
+        var versions = ReadTermsrvVersion(errors);
+        var version = versions.Primary;
+        var ini = ReadAndAnalyzeIni(iniPath, versions.Candidates, errors);
         var supportLevel = SupportLevel(ini.State);
         var supportItem = new RdpProbeItem
         {
@@ -136,7 +140,7 @@ public static class RdpReadOnlyDetector
             Title = "Support",
             Level = supportLevel,
             StateText = RdpProbeText.SupportLabel(ini.State),
-            ValueText = DescribeSupportValue(version, ini),
+            ValueText = DescribeSupportValue(version, versions, ini),
             ExpectedText = "本机 rdpwrap.ini 中存在与该 termsrv.dll 版本一致的补丁段",
             ErrorCode = ini.Found ? "" : "未找到 rdpwrap.ini",
             Advice = SupportAdvice(ini.State),
@@ -164,10 +168,14 @@ public static class RdpReadOnlyDetector
             TcpDetail = tcp.Detail,
             SupportState = ini.State,
             TermsrvVersion = version,
-            TermsrvVersionRaw = versionRaw,
+            TermsrvVersionRaw = versions.Raw,
+            TermsrvVersionText = string.Equals(versions.Text, version, StringComparison.OrdinalIgnoreCase)
+                ? ""
+                : versions.Text,
             IniUpdated = ini.Updated,
             IniLabelMatch = ini.LabelMatch,
             IniStrictSectionMatch = ini.StrictSectionMatch,
+            IniMatchedVersion = ini.MatchedVersion,
             Items = new[] { wrapperItem, serviceItem, listenerItem, supportItem },
             Errors = errors,
         };
@@ -298,6 +306,22 @@ public static class RdpReadOnlyDetector
     /// 只写了 <c>LocalOnlyTransports=1</c> 的空壳段当成已支持。</para>
     /// </remarks>
     public static RdpIniAnalysis AnalyzeIni(string? iniText, string fourPartVersion, bool is64BitProcess = true)
+        => AnalyzeIni(iniText, new[] { fourPartVersion }, is64BitProcess);
+
+    /// <summary>
+    /// 同一份 INI 按**多个候选版本**比对，任一命中即算覆盖。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么要多候选：termsrv.dll 有两套版本号，<c>VS_FIXEDFILEINFO</c> 的数值字段与
+    /// StringFileInfo 的 <c>FileVersion</c> 字符串。Windows 的 QS 更新只刷新前者，
+    /// 于是会出现「固定信息 10.0.26100.9549 / 字符串 10.0.26100.8875」这种情况。
+    /// RDPWrap 自己（以及社区 INI 的段名）用的是固定信息，本机 INI 里也只写了前者；
+    /// 但历史上确有按字符串写的 INI，两段都比才不会被某一种起源的 INI 判死。</para>
+    /// <para>顺序即优先级：前面的候选先命中，命中哪个记在
+    /// <see cref="RdpIniAnalysis.MatchedVersion"/> 里。</para>
+    /// </remarks>
+    public static RdpIniAnalysis AnalyzeIni(string? iniText, IReadOnlyList<string> candidates,
+        bool is64BitProcess = true)
     {
         var archSuffix = is64BitProcess ? ".x64" : ".x86";
 
@@ -356,8 +380,18 @@ public static class RdpReadOnlyDetector
             }
         }
 
-        var version = (fourPartVersion ?? string.Empty).Trim();
-        if (version.Length == 0)
+        // 候选去空去重，保持传入顺序（顺序即优先级）
+        var versions = new List<string>();
+        foreach (var candidate in candidates ?? Array.Empty<string>())
+        {
+            var version = (candidate ?? string.Empty).Trim();
+            if (version.Length > 0 && !versions.Contains(version, StringComparer.OrdinalIgnoreCase))
+            {
+                versions.Add(version);
+            }
+        }
+
+        if (versions.Count == 0)
         {
             return new RdpIniAnalysis
             {
@@ -369,12 +403,15 @@ public static class RdpReadOnlyDetector
             };
         }
 
-        var labelMatch = iniText.IndexOf(version, StringComparison.OrdinalIgnoreCase) >= 0;
-
-        var strictMatch = false;
-        var patchKeyCount = 0;
-        if (sections.TryGetValue(version, out var keys))
+        // 严格命中：逐个候选找同名 section，且该 section 里有本架构的补丁键
+        foreach (var version in versions)
         {
+            if (!sections.TryGetValue(version, out var keys))
+            {
+                continue;
+            }
+
+            var patchKeyCount = 0;
             foreach (var key in keys)
             {
                 if (key.EndsWith(archSuffix, StringComparison.OrdinalIgnoreCase))
@@ -383,38 +420,58 @@ public static class RdpReadOnlyDetector
                 }
             }
 
-            strictMatch = patchKeyCount > 0;
+            if (patchKeyCount > 0)
+            {
+                return new RdpIniAnalysis
+                {
+                    Found = true,
+                    Updated = updated,
+                    LabelMatch = true,
+                    StrictSectionMatch = true,
+                    SectionCount = sections.Count,
+                    State = RdpSupportState.FullySupported,
+                    MatchedVersion = version,
+                    Detail = $"[{version}] 段存在，含 {patchKeyCount} 个 {archSuffix} 补丁键",
+                };
+            }
         }
 
-        string detail;
-        RdpSupportState state;
+        // 宽松命中：整份文本里出现过某个候选，但没有可用的补丁段（多半只是注释）
+        var labelHit = "";
+        foreach (var version in versions)
+        {
+            if (iniText.IndexOf(version, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                labelHit = version;
+                break;
+            }
+        }
 
-        if (strictMatch)
+        if (labelHit.Length > 0)
         {
-            state = RdpSupportState.FullySupported;
-            detail = $"[{version}] 段存在，含 {patchKeyCount} 个 {archSuffix} 补丁键";
-        }
-        else if (labelMatch)
-        {
-            state = RdpSupportState.Ambiguous;
-            detail = $"INI 文本里出现过 {version}，但没有带 {archSuffix} 补丁键的同名段"
-                     + "（常见于注释或说明文字里提到该版本）";
-        }
-        else
-        {
-            state = RdpSupportState.NotSupported;
-            detail = $"INI 里没有 {version} 这个构建号（共 {sections.Count} 个段）";
+            return new RdpIniAnalysis
+            {
+                Found = true,
+                Updated = updated,
+                LabelMatch = true,
+                StrictSectionMatch = false,
+                SectionCount = sections.Count,
+                State = RdpSupportState.Ambiguous,
+                MatchedVersion = labelHit,
+                Detail = $"INI 文本里出现过 {labelHit}，但没有带 {archSuffix} 补丁键的同名段"
+                         + "（常见于注释或说明文字里提到该版本）",
+            };
         }
 
         return new RdpIniAnalysis
         {
             Found = true,
             Updated = updated,
-            LabelMatch = labelMatch,
-            StrictSectionMatch = strictMatch,
+            LabelMatch = false,
+            StrictSectionMatch = false,
             SectionCount = sections.Count,
-            State = state,
-            Detail = detail,
+            State = RdpSupportState.NotSupported,
+            Detail = $"INI 里没有 {string.Join(" 或 ", versions)} 这个构建号（共 {sections.Count} 个段）",
         };
     }
 
@@ -581,9 +638,68 @@ public static class RdpReadOnlyDetector
         }
     }
 
-    private static string ReadTermsrvVersion(List<string> errors, out string raw)
+    /// <summary>
+    /// termsrv.dll 的两套版本号。
+    /// </summary>
+    /// <remarks>
+    /// <para>同一份 DLL 里有**两个来源**，Windows 的 QS 更新只刷新数值、不刷新字符串：</para>
+    /// <list type="bullet">
+    /// <item><see cref="File"/> / <see cref="Product"/>：<c>VS_FIXEDFILEINFO</c> 里的数值字段，
+    /// 直接从文件字节读出。RDPWrap CnC 显示、社区 INI 的段名用的都是这一套。</item>
+    /// <item><see cref="Text"/>：StringFileInfo 里的 <c>FileVersion</c> 字符串。
+    /// 可能长期滞后 —— 本机实测数值是 10.0.26100.9549，字符串仍写 10.0.26100.8875。</item>
+    /// </list>
+    /// <para>2026-10-25 连栽两次，两次的结论相反、都记在这里：</para>
+    /// <list type="number">
+    /// <item>按字符串比对 → INI 里只有 <c>[10.0.26100.9549]</c> 段，「已覆盖」被报成「未覆盖（特例）」；</item>
+    /// <item>改读 .NET 的 <c>FileMajorPart</c> → 得到 <c>6.2.26100.9549</c>；
+    /// 直接 <c>VerQueryValue</c> 同样是 6.2，而磁盘上写的是 10.0 ——
+    /// 兼容层把 file version 字段改写成模拟系统版本，product 字段不动。</item>
+    /// </list>
+    /// <para>所以现在**不信 API、只信文件字节**：file 优先，product 次之，字符串兜底。</para>
+    /// </remarks>
+    private readonly record struct TermsrvVersions(string File, string Product, string Text, string Raw)
     {
-        raw = "";
+        /// <summary>界面与比对用的主版本号。</summary>
+        public string Primary
+        {
+            get
+            {
+                if (File.Length > 0)
+                {
+                    return File;
+                }
+
+                if (Product.Length > 0)
+                {
+                    return Product;
+                }
+
+                return Text;
+            }
+        }
+
+        /// <summary>比对用的候选，主版本在前（顺序即优先级）。</summary>
+        public IReadOnlyList<string> Candidates
+        {
+            get
+            {
+                var list = new List<string>(3);
+                foreach (var candidate in new[] { Primary, Product, Text })
+                {
+                    if (candidate.Length > 0 && !list.Contains(candidate, StringComparer.OrdinalIgnoreCase))
+                    {
+                        list.Add(candidate);
+                    }
+                }
+
+                return list;
+            }
+        }
+    }
+
+    private static TermsrvVersions ReadTermsrvVersion(List<string> errors)
+    {
         try
         {
             // 永远读原版 termsrv.dll：Wrapper 装了之后 ServiceDll 指向 rdpwrap.dll，
@@ -592,31 +708,165 @@ public static class RdpReadOnlyDetector
             if (!File.Exists(path))
             {
                 errors.Add($"找不到 {path}");
-                return "";
+                return default;
             }
 
             var info = FileVersionInfo.GetVersionInfo(path);
-            raw = info.FileVersion ?? "";
+            var raw = info.FileVersion ?? "";
+            var textVersion = TryParseFourPartVersion(raw, out var parsed) ? parsed : "";
 
-            // ⚠️ 必须用 FileVersion **字符串**的前四段，不能用 FileMajorPart 那组固定信息。
-            // 本机实测：termsrv.dll 的固定文件信息是 10.0.26100.9549，字符串版本是
-            // 10.0.26100.8875 —— 而 rdpwrap.ini 的 section 名用的是后者
-            // （社区 INI 里写的是 [10.0.26100.8875]）。取错那一组，比对永远不命中，
-            // 界面会把「已覆盖」报成「未覆盖」。
-            if (TryParseFourPartVersion(raw, out var fourPart))
+            // ① 以**磁盘上的** VS_FIXEDFILEINFO 为准。
+            //    本机实测踩过：同一份文件，.NET 进程里 version.dll 的 VerQueryValue 给出
+            //    dwFileVersionMS = 0x00060002（6.2），而文件字节里是 0x000A0000（10.0）；
+            //    dwProductVersion 没被改写。同一份文件用 python 进程读却是 10.0。
+            //    成因未定位（疑与宿主进程的兼容层有关），结论很明确：
+            //    不能拿 API 的 file version 字段当判据，否则「已覆盖」会被报成「未覆盖」。
+            if (TryReadFixedInfoFromDisk(path, out var diskFile, out var diskProduct))
             {
-                return fourPart;
+                if (TryReadFixedFileInfo(path, out var api) &&
+                    api.FileVersionMs != 0 && diskFile.Length > 0)
+                {
+                    var apiFile = FourPart(api.FileVersionMs, api.FileVersionLs);
+                    if (!string.Equals(apiFile, diskFile, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // 不打断检测，只留证：将来别人再看到版本号对不上时，这里能直接指向根因
+                        errors.Add($"[环境提示] 版本 API 与文件内容不一致：API 报 {apiFile}，"
+                                   + $"文件里写的是 {diskFile}；比对以文件内容为准。"
+                                   + "（同一份文件在不同宿主进程里读出的 file version 可能不同，成因未定位，"
+                                   + "因此这里不采用该字段。）");
+                    }
+                }
+
+                return new TermsrvVersions(diskFile, diskProduct, textVersion, raw);
             }
 
-            // 字符串版本缺失或格式陌生时才退回固定信息，并在 raw 里保留原文供诊断
-            return $"{info.FileMajorPart}.{info.FileMinorPart}.{info.FileBuildPart}.{info.FilePrivatePart}";
+            // ② 读不出磁盘结构时才退回 version.dll（正常环境两者一致）
+            if (TryReadFixedFileInfo(path, out var fixedInfo))
+            {
+                return new TermsrvVersions(
+                    FourPart(fixedInfo.FileVersionMs, fixedInfo.FileVersionLs),
+                    FourPart(fixedInfo.ProductVersionMs, fixedInfo.ProductVersionLs),
+                    textVersion,
+                    raw);
+            }
+
+            // ③ 最后才用框架的数值字段 —— 它在某些文件上等于资源里的值，但不能当主判据
+            var product =
+                $"{info.ProductMajorPart}.{info.ProductMinorPart}.{info.ProductBuildPart}.{info.ProductPrivatePart}";
+            return new TermsrvVersions("", product, textVersion, raw);
         }
         catch (Exception ex)
         {
             errors.Add($"读取 termsrv.dll 版本失败：{ex.GetType().Name}: {ex.Message}");
-            return "";
+            return default;
         }
     }
+
+    /// <summary>
+    /// 直接在文件字节里找出 <c>VS_FIXEDFILEINFO</c> 并读它的两套版本号。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么不走 <c>version.dll</c>：本机实测同一份文件，<c>VerQueryValue</c> 返回的
+    /// <c>dwFileVersionMS</c> 是 0x00060002（6.2），而文件字节里写的是 0x000A0000（10.0）。
+    /// 自己读字节绕开这一层。</para>
+    /// <para>匹配条件两个都要满足：签名 0xFEEF04BD、紧跟的 <c>dwStrucVersion</c> 为 0x00010000。
+    /// 只认签名会在二进制里撞上偶然相同的四字节，而撞上之后得到的「版本号」看起来完全正常 ——
+    /// 那是最坏的一种错。</para>
+    /// </remarks>
+    private static bool TryReadFixedInfoFromDisk(string path, out string fileVersion, out string productVersion)
+    {
+        fileVersion = "";
+        productVersion = "";
+
+        byte[] bytes;
+        try
+        {
+            bytes = File.ReadAllBytes(path);
+        }
+        catch
+        {
+            return false;
+        }
+
+        const uint signature = 0xFEEF04BD;
+        const uint expectedStruc = 0x00010000;
+
+        for (var i = 0; i + 24 <= bytes.Length; i++)
+        {
+            if (BitConverter.ToUInt32(bytes, i) != signature)
+            {
+                continue;
+            }
+
+            if (BitConverter.ToUInt32(bytes, i + 4) != expectedStruc)
+            {
+                continue;
+            }
+
+            fileVersion = FourPart(BitConverter.ToUInt32(bytes, i + 8), BitConverter.ToUInt32(bytes, i + 12));
+            productVersion = FourPart(BitConverter.ToUInt32(bytes, i + 16), BitConverter.ToUInt32(bytes, i + 20));
+            return fileVersion.Length > 0;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 读 <c>VS_FIXEDFILEINFO</c>（RT_VERSION 里的数值块）。
+    /// </summary>
+    /// <remarks>
+    /// <para><c>dwSignature</c> 不等于 0xFEEF04BD 一律视为失败 —— 这种块的其余字段全是垃圾，
+    /// 但会被格式化成一个「看起来很正常」的版本号，是最坏的一种错。</para>
+    /// <para>⚠️ 缓冲区必须自己 pin 住再把地址交给 <c>VerQueryValueW</c>。把
+    /// <c>lpBlock</c> 声明成 <c>byte[]</c> 时封送会复制一份、返回的指针指向那块临时内存，
+    /// 取结构时可能已经失效 —— 实测读出 <c>6.2.26100.9549</c>（资源里是 10.0.26100.9549），
+    /// 一个不报错、还能通过 signature 校验的假版本号。</para>
+    /// </remarks>
+    private static bool TryReadFixedFileInfo(string path, out Native.VS_FIXEDFILEINFO info)
+    {
+        info = default;
+        try
+        {
+            var size = Native.GetFileVersionInfoSizeW(path, out _);
+            if (size <= 0)
+            {
+                return false;
+            }
+
+            var data = new byte[size];
+            if (!Native.GetFileVersionInfoW(path, 0, size, data))
+            {
+                return false;
+            }
+
+            var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+            try
+            {
+                var block = handle.AddrOfPinnedObject();
+                if (!Native.VerQueryValueW(block, @"\", out var buffer, out var length)
+                    || buffer == IntPtr.Zero
+                    || length < (uint)Marshal.SizeOf<Native.VS_FIXEDFILEINFO>())
+                {
+                    return false;
+                }
+
+                info = Marshal.PtrToStructure<Native.VS_FIXEDFILEINFO>(buffer);
+            }
+            finally
+            {
+                handle.Free();
+            }
+
+            return info.Signature == 0xFEEF04BD;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string FourPart(uint versionMs, uint versionLs) =>
+        $"{(versionMs >> 16) & 0xFFFF}.{versionMs & 0xFFFF}.{(versionLs >> 16) & 0xFFFF}.{versionLs & 0xFFFF}";
 
     /// <summary>
     /// 从 <c>FileVersion</c> 原文里取四段数字版本（丢掉 " (WinBuild.160101.0800)" 这类后缀）。
@@ -666,7 +916,7 @@ public static class RdpReadOnlyDetector
         return true;
     }
 
-    private static RdpIniAnalysis ReadAndAnalyzeIni(string path, string version, List<string> errors)
+    private static RdpIniAnalysis ReadAndAnalyzeIni(string path, IReadOnlyList<string> versions, List<string> errors)
     {
         try
         {
@@ -677,7 +927,7 @@ public static class RdpReadOnlyDetector
 
             // 社区版 rdpwrap.ini 常见 UTF-8（含或不含 BOM）；ASCII 兼容的 ANSI 也读得动。
             var text = File.ReadAllText(path, Encoding.UTF8);
-            return AnalyzeIni(text, version, Environment.Is64BitProcess);
+            return AnalyzeIni(text, versions, Environment.Is64BitProcess);
         }
         catch (Exception ex)
         {
@@ -812,7 +1062,7 @@ public static class RdpReadOnlyDetector
         _ => "",
     };
 
-    private static string DescribeSupportValue(string version, RdpIniAnalysis ini)
+    private static string DescribeSupportValue(string version, TermsrvVersions versions, RdpIniAnalysis ini)
     {
         if (version.Length == 0)
         {
@@ -820,7 +1070,18 @@ public static class RdpReadOnlyDetector
         }
 
         var updated = ini.Updated.Length > 0 ? $"，INI Updated={ini.Updated}" : "";
-        return $"termsrv.dll {version}{updated}；{ini.Detail}";
+        var text = $"termsrv.dll {version}{updated}；{ini.Detail}";
+
+        // 两套版本号不一致时必须解释一句：否则用户看到界面写 9549、文件属性里写 8875，
+        // 第一反应是「读错了」，然后就不再信这一项的结论。
+        if (versions.Text.Length > 0 &&
+            !string.Equals(versions.Text, version, StringComparison.OrdinalIgnoreCase))
+        {
+            text += $"（文件属性里的版本字符串仍写作 {versions.Text} —— Windows 的 QS 更新"
+                    + "只刷新固定文件信息，比对以固定信息为准，与 RDPWrap 一致）";
+        }
+
+        return text;
     }
 
     private static string DescribeListenerValue(SessionProbe probe, TcpProbe tcp)
@@ -937,6 +1198,38 @@ public static class RdpReadOnlyDetector
             public int State;
         }
 
+        /// <summary>
+        /// <c>VS_FIXEDFILEINFO</c>：版本资源里的数值块，紧跟在 RT_VERSION 的头部之后。
+        /// </summary>
+        /// <remarks>
+        /// <para>13 个 DWORD，<c>dwSignature</c> 必须是 0xFEEF04BD。四个版本段的位置是
+        /// 8/12（file）与 16/20（product），偏移错一位读出来的就是「看起来像版本号」的垃圾。</para>
+        /// <para>⚠️ 本机 termsrv.dll 的 file version = product version = 10.0.26100.9549，
+        /// 而 StringFileInfo 里的 <c>FileVersion</c> 字符串仍写 10.0.26100.8875 ——
+        /// 字符串与数值可以差一个 QS 更新，比对只能认数值。</para>
+        /// </remarks>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct VS_FIXEDFILEINFO
+        {
+            public uint Signature;
+            public uint StrucVersion;
+
+            /// <summary>高 16 位主版本、低 16 位次版本。</summary>
+            public uint FileVersionMs;
+
+            /// <summary>高 16 位构建号、低 16 位修订号。</summary>
+            public uint FileVersionLs;
+            public uint ProductVersionMs;
+            public uint ProductVersionLs;
+            public uint FileFlagsMask;
+            public uint FileFlags;
+            public uint FileOs;
+            public uint FileType;
+            public uint FileSubtype;
+            public uint FileDateMs;
+            public uint FileDateLs;
+        }
+
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr OpenSCManagerW(string? machineName, string? databaseName, uint access);
 
@@ -965,6 +1258,23 @@ public static class RdpReadOnlyDetector
         [DllImport("winsta.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.U1)]
         public static extern bool WinStationFreeMemory(IntPtr buffer);
+
+        // ---- 版本资源（version.dll）----
+        // 只读：读 VS_FIXEDFILEINFO 的数值字段。为什么不直接用 .NET 的 FileVersionInfo：
+        // 本机 termsrv.dll 上它的 FileMajorPart/MinorPart 给出 6.2（而不是资源里写的 10.0），
+        // Product* 才给出 10.0.26100.9549 —— 与 RDPWrap CnC 显示的一致。数值取自原始结构
+        // 才不依赖框架内部对 File/Product 两套字段的取舍，也能同时把两套都留作诊断。
+
+        [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int GetFileVersionInfoSizeW(string fileName, out int handle);
+
+        [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetFileVersionInfoW(string fileName, int handle, int length, byte[] data);
+
+        [DllImport("version.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool VerQueryValueW(IntPtr block, string subBlock, out IntPtr buffer, out uint length);
     }
 
     /// <summary>
