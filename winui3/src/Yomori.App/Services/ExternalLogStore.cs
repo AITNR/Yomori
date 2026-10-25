@@ -18,6 +18,15 @@ public sealed class ExternalLogFileInfo
     /// <summary>通道标识（本地执行组为 <c>local</c>）。</summary>
     public string ChannelTag { get; init; } = string.Empty;
 
+    /// <summary>
+    /// 这份日志是哪一处写出来的（见 <see cref="ExternalLogRoot.Label"/>）。
+    ///
+    /// 必须有：同一个通道标识可能在两个位置各有一份 —— 目标账户会话里跑的那份由代理写在
+    /// <c>%ProgramData%\Yomori\agent\external_logs</c>，关掉远程执行时由主控端写在
+    /// 程序目录的 <c>external_logs</c>。只显示通道名会让两行长得一模一样。
+    /// </summary>
+    public string SourceLabel { get; init; } = string.Empty;
+
     public long Bytes { get; init; }
 
     public DateTime LastWriteTime { get; init; }
@@ -38,6 +47,19 @@ public sealed class ExternalLogUsage
     public List<ExternalLogFileInfo> Files { get; init; } = new();
 }
 
+/// <summary>一处外部日志落盘位置（主控端查看 / 清理时要覆盖的那些）。</summary>
+public sealed class ExternalLogRoot
+{
+    /// <summary>根目录绝对路径（<c>...\external_logs</c>）。</summary>
+    public string Path { get; init; } = string.Empty;
+
+    /// <summary>这处日志是谁写的 —— 界面上必须标出来。</summary>
+    public string Label { get; init; } = string.Empty;
+
+    /// <summary>是不是「目标账户会话里的代理」写的。</summary>
+    public bool IsAgent { get; init; }
+}
+
 /// <summary>
 /// 外部脚本日志的**独立**落盘 —— 与Yomori自己的会话日志（<c>logs/YYYY-MM-DD.log</c>）完全分开。
 ///
@@ -49,6 +71,18 @@ public sealed class ExternalLogUsage
 ///
 /// <para>为什么按通道分目录：多通道并行时不同通道可能在跑**同一个**脚本
 /// （比如两条通道都跑 BetterGI），共用一个文件就会互相穿插、看不出哪行属于哪条通道。</para>
+///
+/// <para>【两个落盘位置 —— 这是查"日志哪去了"时最容易搞错的一点】</para>
+/// <list type="bullet">
+///   <item><b>目标账户会话里</b>（远程执行，绝大多数场景）：日志是**代理**写的，
+///         而代理的程序目录是 <c>%ProgramData%\Yomori\agent</c>，所以落在
+///         <c>%ProgramData%\Yomori\agent\external_logs\</c>（副本被占用过则可能是 <c>agent_b</c>）。</item>
+///   <item><b>当前进程本地执行</b>（关掉「在目标账户会话中执行任务」）：日志是主控端写的，
+///         落在主控端程序目录的 <c>external_logs\local\</c>。</item>
+/// </list>
+/// <para>所以 <see cref="RootDir"/> 是"**本进程**的根"，而主控端要看全部日志时用
+/// <see cref="ViewRoots"/>（本机 + 代理副本）。之前只看本进程那一个根，
+/// 结果目标账户跑出来的日志在界面上永远是"暂无文件"、也永远清不掉。</para>
 /// </summary>
 public static class ExternalLogStore
 {
@@ -58,8 +92,141 @@ public static class ExternalLogStore
     /// <summary>本地执行组的通道标识。</summary>
     public const string LocalChannelTag = "local";
 
-    /// <summary>外部日志根目录：<c>&lt;BaseDir&gt;\external_logs</c>。</summary>
+    /// <summary>
+    /// 本进程的外部日志根目录：<c>&lt;BaseDir&gt;\external_logs</c>。
+    ///
+    /// <para>注意语义是"**写日志的那个进程**自己的根"：主控端进程里它是安装目录，
+    /// 代理进程里它就是 <c>%ProgramData%\Yomori\agent</c>。写入侧（<see cref="TodayFilePath"/>）
+    /// 依赖这个语义，别改成"主控端视角"。</para>
+    /// </summary>
     public static string RootDir => Path.Combine(AppPaths.BaseDir, RootDirName);
+
+    /// <summary>
+    /// 主控端视角下的所有外部日志根目录 —— 查看占用、清理、打开目录都要覆盖这些。
+    ///
+    /// 代理副本目录不存在时不列出来（还没部署代理），免得占用明细里凭空多一处空来源；
+    /// 但 <see cref="PreferredRoot"/> 在"已部署但还没产生日志"时仍然会指向它。
+    /// </summary>
+    public static IReadOnlyList<ExternalLogRoot> ViewRoots()
+    {
+        var roots = new List<ExternalLogRoot>
+        {
+            new() { Path = RootDir, Label = "本机执行", IsAgent = false },
+        };
+
+        foreach (var dir in AgentRootDirs())
+        {
+            roots.Add(new ExternalLogRoot { Path = dir, Label = "目标账户", IsAgent = true });
+        }
+
+        return roots;
+    }
+
+    /// <summary>
+    /// 「打开日志目录」该打开哪一处。
+    ///
+    /// 判断顺序按"用户最可能想看什么"来：
+    ///   ① 已经有文件的那一处（同一个位置可能有多份日志、代理副本还可能有 agent_b 两份，
+    ///      取文件最多的一处）；
+    ///   ② 有代理副本目录但还没产生日志 → 打开代理那一处 —— 任务绝大多数跑在目标账户里，
+    ///      这才是"接下来会写文件"的正确位置（以前这里打开的是主控端安装目录下的同名空目录，
+    ///      用户看到的是个永远不长的空文件夹）；
+    ///   ③ 代理都没部署过（本地执行）→ 本机那份。
+    /// </summary>
+    public static ExternalLogRoot PreferredRoot()
+    {
+        var roots = ViewRoots();
+
+        var withFiles = roots
+            .Select(root => (Root: root, Count: EnumerateLogFiles(root.Path).Count()))
+            .Where(item => item.Count > 0)
+            .OrderByDescending(item => item.Count)
+            .ToList();
+
+        if (withFiles.Count > 0)
+        {
+            return withFiles[0].Root;
+        }
+
+        foreach (var slot in PayloadSlotDirs())
+        {
+            if (!Directory.Exists(slot))
+            {
+                continue;
+            }
+
+            return new ExternalLogRoot
+            {
+                Path = Path.Combine(slot, RootDirName),
+                Label = "目标账户",
+                IsAgent = true,
+            };
+        }
+
+        return roots[0];
+    }
+
+    /// <summary>代理副本可能存在的几个目录（首选 + 备用），顺序即优先级。</summary>
+    private static IEnumerable<string> PayloadSlotDirs()
+    {
+        yield return RdpSessionService.AgentProgramDir;
+        yield return RdpSessionService.AgentProgramDirSpare;
+    }
+
+    /// <summary>代理那几处日志根（只返回目录确实存在的）。</summary>
+    private static IEnumerable<string> AgentRootDirs()
+    {
+        foreach (var slot in PayloadSlotDirs())
+        {
+            var dir = Path.Combine(slot, RootDirName);
+            if (Directory.Exists(dir))
+            {
+                yield return dir;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 枚举一个根目录下所有通道的日志文件（连通道目录名一起返回）。
+    ///
+    /// 全程 try/catch：<c>%ProgramData%\Yomori\agent</c> 是多个账户共用的，
+    /// 别的账户建的通道目录当前账户可能读不进去 —— 那不该让整份统计变成"暂无"。
+    /// </summary>
+    private static List<(FileInfo File, string Tag)> EnumerateLogFiles(string rootDir)
+    {
+        var files = new List<(FileInfo File, string Tag)>();
+
+        try
+        {
+            var root = new DirectoryInfo(rootDir);
+            if (!root.Exists)
+            {
+                return files;
+            }
+
+            // 先物化成列表：懒枚举的异常会在 foreach 里抛，那样连一层 catch 都套不住
+            foreach (var dir in root.EnumerateDirectories().ToList())
+            {
+                try
+                {
+                    foreach (var file in dir.EnumerateFiles("*.log"))
+                    {
+                        files.Add((file, dir.Name));
+                    }
+                }
+                catch
+                {
+                    // 单个通道目录读不进去，继续下一个
+                }
+            }
+        }
+        catch
+        {
+            // 整个根目录访问不了，当空处理
+        }
+
+        return files;
+    }
 
     /// <summary>某通道的目录：<c>&lt;RootDir&gt;\&lt;通道标识&gt;</c>。</summary>
     public static string ChannelDir(string channelTag) =>
@@ -108,30 +275,23 @@ public static class ExternalLogStore
     {
         var result = new List<ExternalLogFileInfo>();
 
-        try
+        // ⚠️ 必须遍历 ViewRoots，不能只看本进程的 RootDir ——
+        //    目标账户会话里跑出来的日志躺在 %ProgramData%\Yomori\agent\external_logs，
+        //    之前只看本进程根目录，界面永远显示"暂无文件"。
+        foreach (var root in ViewRoots())
         {
-            var root = new DirectoryInfo(RootDir);
-            if (root.Exists)
+            foreach (var (file, tag) in EnumerateLogFiles(root.Path))
             {
-                foreach (var dir in root.EnumerateDirectories())
+                result.Add(new ExternalLogFileInfo
                 {
-                    foreach (var file in dir.EnumerateFiles("*.log"))
-                    {
-                        result.Add(new ExternalLogFileInfo
-                        {
-                            FilePath = file.FullName,
-                            FileName = file.Name,
-                            ChannelTag = dir.Name,
-                            Bytes = file.Length,
-                            LastWriteTime = file.LastWriteTime,
-                        });
-                    }
-                }
+                    FilePath = file.FullName,
+                    FileName = file.Name,
+                    ChannelTag = tag,
+                    SourceLabel = root.Label,
+                    Bytes = file.Length,
+                    LastWriteTime = file.LastWriteTime,
+                });
             }
-        }
-        catch
-        {
-            // 读不到就当 0 条，界面显示"暂无"即可
         }
 
         result = result.OrderByDescending(f => f.LastWriteTime).ToList();
@@ -158,34 +318,22 @@ public static class ExternalLogStore
         var deleted = 0;
         var freed = 0L;
 
-        try
+        // 两处落盘都要清。只清本机那份的话，目标账户里代理写的那份会一直涨
+        // （脚本一天几千行），而且用户在界面上根本看不见它有多大 —— 报"占用 0"却占着几个 G。
+        foreach (var root in ViewRoots())
         {
-            var root = new DirectoryInfo(RootDir);
-            if (!root.Exists)
+            foreach (var group in EnumerateLogFiles(root.Path).GroupBy(item => item.Tag))
             {
-                return (0, 0);
-            }
-
-            foreach (var dir in root.EnumerateDirectories())
-            {
-                var sessions = new List<FileInfo>();
-                foreach (var file in dir.EnumerateFiles("*.log"))
-                {
-                    sessions.Add(file);
-                }
-
+                var sessions = group.Select(item => item.File).ToList();
                 if (sessions.Count <= keep)
                 {
                     continue;
                 }
 
                 // 按最后写入时间排序，而不是按文件名：字典序与真实新旧不总是一致
-                var stale = sessions
-                    .OrderByDescending(f => f.LastWriteTimeUtc)
-                    .Skip(keep)
-                    .ToList();
-
-                foreach (var file in stale)
+                foreach (var file in sessions
+                             .OrderByDescending(f => f.LastWriteTimeUtc)
+                             .Skip(keep))
                 {
                     try
                     {
@@ -201,10 +349,6 @@ public static class ExternalLogStore
                 }
             }
         }
-        catch
-        {
-            // 整轮清理失败也不影响主流程
-        }
 
         return (deleted, freed);
     }
@@ -215,41 +359,30 @@ public static class ExternalLogStore
     {
         var deleted = 0;
         var freed = 0L;
+        var filter = string.IsNullOrWhiteSpace(channelTag) ? null : SanitizeTag(channelTag);
 
-        try
+        // 同样要覆盖两处落盘，否则"清空"之后代理那份还在，用户会以为按钮没生效
+        foreach (var root in ViewRoots())
         {
-            var root = new DirectoryInfo(RootDir);
-            if (!root.Exists)
+            foreach (var (file, tag) in EnumerateLogFiles(root.Path))
             {
-                return (0, 0);
-            }
-
-            var dirs = string.IsNullOrWhiteSpace(channelTag)
-                ? root.EnumerateDirectories().ToList()
-                : root.EnumerateDirectories().Where(d =>
-                    string.Equals(d.Name, SanitizeTag(channelTag), StringComparison.OrdinalIgnoreCase)).ToList();
-
-            foreach (var dir in dirs)
-            {
-                foreach (var file in dir.EnumerateFiles("*.log").ToList())
+                if (filter is not null && !string.Equals(tag, filter, StringComparison.OrdinalIgnoreCase))
                 {
-                    try
-                    {
-                        var size = file.Length;
-                        file.Delete();
-                        deleted++;
-                        freed += size;
-                    }
-                    catch
-                    {
-                        // 忽略
-                    }
+                    continue;
+                }
+
+                try
+                {
+                    var size = file.Length;
+                    file.Delete();
+                    deleted++;
+                    freed += size;
+                }
+                catch
+                {
+                    // 忽略
                 }
             }
-        }
-        catch
-        {
-            // 忽略
         }
 
         return (deleted, freed);

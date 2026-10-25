@@ -119,7 +119,7 @@
             <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
                 <StackPanel Spacing="12">
                     <TextBlock Text="外部脚本日志" FontWeight="SemiBold" />
-                    <TextBlock Text="脚本自己写出来的实时日志（BetterGI / March7thAssistant / MaaEnd 等），按通道分目录、每天一份文件保存。"
+                    <TextBlock Text="脚本自己写出来的实时日志（BetterGI / March7thAssistant / MaaEnd 等），按通道分目录、每天一份文件保存。目标账户会话里的那份由代理写在 %ProgramData%\Yomori\agent\external_logs，本地执行的那份写在程序目录的 external_logs。"
                                TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
 
                     <Grid ColumnSpacing="12">

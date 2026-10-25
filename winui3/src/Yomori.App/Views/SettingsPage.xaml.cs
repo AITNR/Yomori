@@ -232,6 +232,7 @@ public sealed partial class SettingsPage : Page
         var usage = ExternalLogStore.GetUsage();
         ExternalLogInfoText.Text = usage.FileCount == 0
             ? "还没有外部日志文件。任务跑起来、并且任务上配了外部日志路径之后，这里会显示占用。"
+              + "（占用统计与清理同时覆盖两处：本机执行的那份，以及目标账户会话里代理写的那份。）"
             : $"共 {usage.FileCount} 份，占用 {usage.TotalText}。每通道每天一份，超出 {VM.Config.ExternalLogKeepFiles} 份的会在启动时自动清理。";
     }
 
@@ -312,7 +313,7 @@ public sealed partial class SettingsPage : Page
             {
                 var line = new TextBlock
                 {
-                    Text = $"{file.ChannelTag}  ·  {file.FileName}  ·  {file.SizeText}  ·  {file.LastWriteTime:yyyy-MM-dd HH:mm}",
+                    Text = $"{file.SourceLabel} · {file.ChannelTag}  ·  {file.FileName}  ·  {file.SizeText}  ·  {file.LastWriteTime:yyyy-MM-dd HH:mm}",
                     FontSize = 12,
                     TextWrapping = TextWrapping.NoWrap,
                     TextTrimming = TextTrimming.CharacterEllipsis,
@@ -347,8 +348,12 @@ public sealed partial class SettingsPage : Page
 
     private void OnOpenExternalLogFolder(object sender, RoutedEventArgs e)
     {
-        VM.OpenDirectory(ExternalLogStore.RootDir);
-        SetExternalLogAction($"已请求打开：{ExternalLogStore.RootDir}");
+        // 打开"真正在写日志的那一处"，不是本进程的安装目录。
+        // 目标账户会话里的日志是**代理**写的，落在 %ProgramData%\Yomori\agent\external_logs；
+        // 以前这里打开 <程序目录>\external_logs，对绝大多数用户来说是个永远不长的空文件夹。
+        var root = ExternalLogStore.PreferredRoot();
+        VM.OpenDirectory(root.Path);
+        SetExternalLogAction($"已请求打开：{root.Path}（{root.Label}）");
     }
 
     // ---------------- 关于：版本号 + 检查更新 ----------------
