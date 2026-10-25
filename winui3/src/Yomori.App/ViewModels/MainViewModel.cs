@@ -93,6 +93,222 @@ public sealed class MainViewModel : ObservableObject
 
         LogLines = new ObservableCollection<string>();
         StatRows = new ObservableCollection<StatRow>();
+
+        // 通知中心：先把上次的通知读回来（已读状态一起），再挂变更回调 ——
+        // 铃铛上的红点与"未读就摇"都由这里驱动。
+        Notifications = new NotificationCenter();
+        Notifications.Load();
+        Notifications.Changed += (_, _) =>
+        {
+            OnPropertyChanged(nameof(NotifyDotVisibility));
+            OnPropertyChanged(nameof(HasUnreadNotifications));
+        };
+    }
+
+    // ---------------- 通知中心（铃铛） ----------------
+
+    /// <summary>通知中心。消息落盘在程序目录的 <c>notifications.json</c>。</summary>
+    public NotificationCenter Notifications { get; }
+
+    /// <summary>铃铛上那个红点：有未读时才显示。</summary>
+    public Visibility NotifyDotVisibility =>
+        Notifications.HasUnread ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>有没有未读（摇铃铛动画看这个）。</summary>
+    public bool HasUnreadNotifications => Notifications.HasUnread;
+
+    /// <summary>把一条通知标为已读，并按它的动作类型打开链接/目录。</summary>
+    public void OpenNotification(AppNotification? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        Notifications.MarkRead(item);
+
+        try
+        {
+            switch (item.ActionKind)
+            {
+                case AppNotificationActions.OpenUrl when item.ActionTarget.Length > 0:
+                    UpdateService.OpenUrl(item.ActionTarget);
+                    break;
+
+                case AppNotificationActions.OpenPath when item.ActionTarget.Length > 0:
+                    OpenDirectory(item.ActionTarget);
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[通知] 打开动作失败：{ex.Message}");
+        }
+    }
+
+    /// <summary>铃铛里点「全部已读」。</summary>
+    public void MarkAllNotificationsRead() => Notifications.MarkAllRead();
+
+    // ---------------- 启动时检查更新 ----------------
+
+    /// <summary>
+    /// 启动后延迟几秒再查：启动瞬间要抢磁盘和网络的东西已经够多了
+    /// （配置、日志、画面、代理预检），错开这几秒用户完全感觉不到。
+    /// </summary>
+    private const int StartupUpdateCheckDelaySeconds = 6;
+
+    /// <summary>安装包下载到哪：程序目录下的 <c>updates</c>（管理员可写，用户也好找）。</summary>
+    public static string UpdateDownloadDir => Path.Combine(AppPaths.BaseDir, "updates");
+
+    /// <summary>
+    /// 启动时按设置检查一次更新（取值见 <see cref="UpdateCheckModes"/>）。
+    ///
+    /// <para>整段在后台跑，**不阻塞启动**，结论通过通知中心（铃铛）呈现。
+    /// 没更新 / 查不到 / 本机比远端新，一律不打扰 —— 启动时弹"检查更新失败"只会变成噪声，
+    /// 那些情况只写运行日志。</para>
+    /// </summary>
+    public void BeginStartupUpdateCheck()
+    {
+        var mode = UpdateCheckModes.Normalize(Config.UpdateCheckMode);
+        if (mode == UpdateCheckModes.Off)
+        {
+            AppendLog("[更新检查] 启动检查已在设置里关闭，跳过。");
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(StartupUpdateCheckDelaySeconds)).ConfigureAwait(false);
+            await RunStartupUpdateCheckAsync(mode).ConfigureAwait(false);
+        });
+    }
+
+    private async Task RunStartupUpdateCheckAsync(string mode)
+    {
+        var channel = UpdateChannels.Normalize(Config.UpdateChannel);
+        var network = UpdateNetworkSettings.FromConfig(Config);
+
+        var result = await UpdateService.CheckAsync(channel, network).ConfigureAwait(false);
+        AppendLog(result.LogLine);
+
+        if (result.Status != UpdateCheckStatus.UpdateAvailable || result.Latest is null)
+        {
+            return;
+        }
+
+        var release = result.Latest;
+
+        if (mode == UpdateCheckModes.Download)
+        {
+            await DownloadUpdateAsync(release, network).ConfigureAwait(false);
+            return;
+        }
+
+        // AddIfNew：每次启动都会查到同一个新版本，不去重的话铃铛里会攒一串复读
+        Post(() => Notifications.AddIfNew(
+            $"发现新版本 {release.Version}",
+            result.Message + "\n点这条去发布页下载。",
+            AppNotificationKinds.Update,
+            AppNotificationActions.OpenUrl,
+            release.PageUrl));
+    }
+
+    private async Task DownloadUpdateAsync(GitHubRelease release, UpdateNetworkSettings network)
+    {
+        var pick = UpdateService.PickDownload(release);
+        if (pick is null)
+        {
+            Post(() => Notifications.Add(
+                $"发现新版本 {release.Version}",
+                "这份发布里没有可下载的安装包，点这条去发布页看看。",
+                AppNotificationKinds.Warning,
+                AppNotificationActions.OpenUrl,
+                release.PageUrl));
+            return;
+        }
+
+        var (url, fileName) = pick.Value;
+        var target = Path.Combine(UpdateDownloadDir, fileName);
+
+        AppendLog($"[更新检查] 开始下载 {fileName}（代理：{UpdateProxyModes.Label(Config.UpdateProxyMode)}）。");
+
+        var (ok, message) = await UpdateService
+            .DownloadAsync(url, target, network)
+            .ConfigureAwait(false);
+
+        AppendLog($"[更新检查] {message}");
+
+        if (!ok)
+        {
+            Post(() => Notifications.Add("更新下载失败", message, AppNotificationKinds.Warning));
+            return;
+        }
+
+        Post(() =>
+        {
+            Notifications.Add(
+                $"已下载 {release.Version} 安装包",
+                $"{Path.GetFileName(target)}\n点这条打开所在文件夹。",
+                AppNotificationKinds.Download,
+                AppNotificationActions.OpenPath,
+                UpdateDownloadDir);
+
+            _ = AskInstallUpdateAsync(target, release.Version);
+        });
+    }
+
+    /// <summary>
+    /// 下载完问一句要不要现在装。
+    ///
+    /// <para>⚠️ 必须问：安装程序会先关掉正在运行的 Yomori，跑了一半的任务会当场断掉。
+    /// 这种后果不能由程序替用户决定 —— 尤其本程序的常见用法就是挂机跑长任务。</para>
+    /// </summary>
+    private async Task AskInstallUpdateAsync(string setupPath, string version)
+    {
+        ContentDialogResult result;
+        try
+        {
+            result = await DialogHelper.ShowMessageAsync(
+                "更新已下载",
+                $"新版本 {version} 的安装包已经下载好：\n{setupPath}\n\n"
+                + "现在安装吗？安装程序会先关闭 Yomori —— 正在执行的任务会被中断，"
+                + "建议等这一轮跑完再装。",
+                closeText: "稍后",
+                primaryText: "现在安装");
+        }
+        catch
+        {
+            return;
+        }
+
+        if (result != ContentDialogResult.Primary)
+        {
+            AppendLog("[更新检查] 用户选择稍后安装（安装包留在 updates 目录）。");
+            return;
+        }
+
+        StartInstallerAndExit(setupPath);
+    }
+
+    private void StartInstallerAndExit(string setupPath)
+    {
+        try
+        {
+            // 主程序是 requireAdministrator，子进程继承同一个令牌 → 不会再弹一次 UAC
+            Process.Start(new ProcessStartInfo(setupPath) { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[更新检查] 启动安装程序失败：{ex.Message}");
+            _ = DialogHelper.ShowMessageAsync("无法启动安装程序", ex.Message);
+            return;
+        }
+
+        AppendLog("[更新检查] 安装程序已启动，本程序退出以便覆盖文件。");
+
+        // ⚠️ 必须走 RequestExit：直接 Close() 会被关闭拦截变成"收进托盘"，
+        //    进程留着就会锁住 Yomori.exe，安装程序随即覆盖失败。
+        App.MainWindow?.RequestExit();
     }
 
     private void LogMemorySample()
@@ -147,6 +363,12 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>「设置 → 关于」里更新渠道下拉框的选项（正式版 / 测试版）。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> UpdateChannelItems => UpdateChannels.Items;
+
+    /// <summary>启动时检查更新的三种方式（不检查 / 通知 / 自动下载）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> UpdateCheckModeItems => UpdateCheckModes.Items;
+
+    /// <summary>检查更新与下载时走的代理（系统 / 自定义 / 不使用）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> UpdateProxyModeItems => UpdateProxyModes.Items;
 
     // ---------------- 运行状态 ----------------
 

@@ -1,0 +1,125 @@
+// -*- coding: utf-8 -*-
+using System;
+using System.Text.Json.Serialization;
+using Yomori.Helpers;
+
+namespace Yomori.Models;
+
+/// <summary>通知的种类（只影响铃铛里的图标/强调色与排障归类）。</summary>
+public static class AppNotificationKinds
+{
+    public const string Info = "info";
+
+    /// <summary>有可用更新。</summary>
+    public const string Update = "update";
+
+    /// <summary>安装包已下载完。</summary>
+    public const string Download = "download";
+
+    /// <summary>失败（检查更新失败、下载中断…）。</summary>
+    public const string Warning = "warning";
+}
+
+/// <summary>点开一条通知后要做什么。</summary>
+public static class AppNotificationActions
+{
+    public const string None = "none";
+
+    /// <summary>用浏览器打开 <c>ActionTarget</c>（URL）。</summary>
+    public const string OpenUrl = "open_url";
+
+    /// <summary>在资源管理器里打开 <c>ActionTarget</c>（文件或目录路径）。</summary>
+    public const string OpenPath = "open_path";
+}
+
+/// <summary>
+/// 通知中心里的一条消息。
+///
+/// <para>⚠️ 这个类会被序列化进 <c>notifications.json</c>，字段改名等于改存储格式。
+/// 已读状态一起存 —— 用户关掉程序再打开，不应该被同一条更新提醒再摇一次。</para>
+///
+/// <para>⚠️ 不引用任何 <c>Microsoft.UI.Xaml</c> 类型（连 <c>Visibility</c> 都不行）：
+/// 冒烟工程把 Models 直接编译进纯 .NET 目标，见 MEMORY 的「Models 层纪律」。</para>
+/// </summary>
+public sealed class AppNotification : ObservableObject
+{
+    private bool _isRead;
+
+    [JsonPropertyName("id")]
+    public string Id { get; set; } = Guid.NewGuid().ToString("N")[..12];
+
+    [JsonPropertyName("title")]
+    public string Title { get; set; } = string.Empty;
+
+    [JsonPropertyName("body")]
+    public string Body { get; set; } = string.Empty;
+
+    /// <summary>取值见 <see cref="AppNotificationKinds"/>。</summary>
+    [JsonPropertyName("kind")]
+    public string Kind { get; set; } = AppNotificationKinds.Info;
+
+    [JsonPropertyName("created_at")]
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.Now;
+
+    [JsonPropertyName("is_read")]
+    public bool IsRead
+    {
+        get => _isRead;
+        set
+        {
+            if (SetProperty(ref _isRead, value))
+            {
+                OnPropertyChanged(nameof(IsUnread));
+                OnPropertyChanged(nameof(UnreadMark));
+            }
+        }
+    }
+
+    /// <summary>取值见 <see cref="AppNotificationActions"/>。</summary>
+    [JsonPropertyName("action_kind")]
+    public string ActionKind { get; set; } = AppNotificationActions.None;
+
+    /// <summary>动作参数（URL 或路径）。</summary>
+    [JsonPropertyName("action_target")]
+    public string ActionTarget { get; set; } = string.Empty;
+
+    /// <summary>未读（绑定用，省得 XAML 写取反）。</summary>
+    [JsonIgnore]
+    public bool IsUnread => !IsRead;
+
+    /// <summary>
+    /// 列表里那个"未读"标记的文字。已读时是空串 —— 空 TextBlock 不占宽，
+    /// 比再用一个 bool→Visibility 的转换器省事（项目里没有转换器，也不打算加）。
+    /// </summary>
+    [JsonIgnore]
+    public string UnreadMark => IsRead ? string.Empty : "未读";
+
+    /// <summary>这条有没有可点的动作。</summary>
+    [JsonIgnore]
+    public bool HasAction =>
+        ActionTarget.Length > 0
+        && ActionKind is AppNotificationActions.OpenUrl or AppNotificationActions.OpenPath;
+
+    /// <summary>动作按钮上的字（没有动作时为空串）。</summary>
+    [JsonIgnore]
+    public string ActionText => ActionKind switch
+    {
+        AppNotificationActions.OpenUrl => "前往下载",
+        AppNotificationActions.OpenPath => "打开所在文件夹",
+        _ => string.Empty,
+    };
+
+    /// <summary>界面上显示的相对时间（今天只给时分，更早给日期）。</summary>
+    [JsonIgnore]
+    public string TimeText
+    {
+        get
+        {
+            var local = CreatedAt.ToLocalTime();
+            var today = DateTimeOffset.Now.Date;
+            return local.Date == today
+                ? local.ToString("HH:mm")
+                : local.ToString("MM-dd HH:mm");
+        }
+    }
+}

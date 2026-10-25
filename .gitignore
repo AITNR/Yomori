@@ -78,3 +78,8 @@ native-out/
 .native-build/
 .vcpkg/
 .nuget/
+
+# 运行期数据（落在程序根目录）
+# notifications.json = 铃铛里的通知与已读状态；updates/ = 自动下载的安装包（几十 MB）
+notifications.json
+updates/

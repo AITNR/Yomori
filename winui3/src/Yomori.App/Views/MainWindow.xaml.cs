@@ -163,6 +163,12 @@ public sealed partial class MainWindow : Window
         // 右侧执行状态栏：建行对象、恢复上次的展开/收起、起 1Hz 刷新
         InitializeSideStatus();
 
+        // 通知铃铛：未读时每 2 秒轻摇一次（读完全部立刻停）
+        InitializeNotificationBell();
+
+        // 启动时按设置检查一次更新（后台跑，6 秒后开始；结论进铃铛）
+        VM.BeginStartupUpdateCheck();
+
 
         // M5/M6 自检通道：自动导航到「通道管理」页（页面 Loaded 里自动连接、画面挂在本页）
         if (Program.EmbedVmArgs is not null)
@@ -725,6 +731,147 @@ public sealed partial class MainWindow : Window
 
     /// <summary>展开/收起的宽度过渡时长。</summary>
     private const int SideStatusSlideMs = 200;
+
+    // ---------------- 通知铃铛 ----------------
+
+    /// <summary>未读期间的摇动间隔（用户要求：每 2 秒轻摇一次，读完全部立刻停）。</summary>
+    private static readonly TimeSpan BellShakeInterval = TimeSpan.FromSeconds(2);
+
+    /// <summary>铃铛的 2 秒计时器。<b>必须是字段</b>，局部变量会被 GC 回收且不报错。</summary>
+    private DispatcherQueueTimer? _bellTimer;
+
+    /// <summary>摇动动画。<b>必须是字段</b>：Storyboard 只存局部变量时可能播到一半被回收。</summary>
+    private Storyboard? _bellShake;
+
+    /// <summary>
+    /// 铃铛初始化：列表数据源、摇动动画、2 秒心跳。
+    ///
+    /// ⚠️ ItemsSource 用代码赋值而不是 x:Bind —— Window 上的 x:Bind 求值早于
+    /// 这边的集合准备，绑了会拿到空列表（右侧状态栏的 SideRowList 也是同样的原因手赋值）。
+    /// </summary>
+    private void InitializeNotificationBell()
+    {
+        NotifyList.ItemsSource = VM.Notifications.Items;
+
+        _bellShake = BuildBellShake();
+
+        _bellTimer = DispatcherQueue.CreateTimer();
+        _bellTimer.Interval = BellShakeInterval;
+        _bellTimer.IsRepeating = true;
+        _bellTimer.Tick += (_, _) =>
+        {
+            if (VM.HasUnreadNotifications)
+            {
+                PlayBellShake();
+            }
+        };
+        _bellTimer.Start();
+
+        VM.Notifications.Changed += (_, _) => UpdateNotifyChrome();
+        UpdateNotifyChrome();
+    }
+
+    /// <summary>
+    /// 一记轻摇：0 → +9° → -9° → +6° → -4° → 0，共 0.5 秒。
+    /// 动的是 <see cref="RotateTransform"/>（渲染变换），属独立动画 ——
+    /// **不需要** <c>EnableDependentAnimation</c>（只有 Width/Height 那类布局属性才需要）。
+    /// </summary>
+    private Storyboard BuildBellShake()
+    {
+        var animate = new DoubleAnimationUsingKeyFrames();
+
+        animate.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.Zero), Value = 0 });
+        animate.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(90)), Value = 9 });
+        animate.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(200)), Value = -9 });
+        animate.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(310)), Value = 6 });
+        animate.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(420)), Value = -4 });
+        animate.KeyFrames.Add(new EasingDoubleKeyFrame { KeyTime = KeyTime.FromTimeSpan(TimeSpan.FromMilliseconds(500)), Value = 0 });
+
+        Storyboard.SetTarget(animate, NotifyRotate);
+        Storyboard.SetTargetProperty(animate, "Angle");
+
+        var storyboard = new Storyboard();
+        storyboard.Children.Add(animate);
+        return storyboard;
+    }
+
+    private void PlayBellShake()
+    {
+        if (_bellShake is null)
+        {
+            return;
+        }
+
+        // HoldEnd 会让动画结束后继续压住 Angle：先 Stop 再显式归零，
+        // 否则下一轮会从上一轮的终点起算，越摇越歪。
+        _bellShake.Stop();
+        NotifyRotate.Angle = 0;
+
+        try
+        {
+            _bellShake.Begin();
+        }
+        catch
+        {
+            // 元素还没进可视树等边界情况：摇不动就算了，不值得因此崩掉主窗口
+        }
+    }
+
+    /// <summary>刷新红点、空列表提示与 tooltip；未读清零时立刻停止摇动并归零。</summary>
+    private void UpdateNotifyChrome()
+    {
+        var unread = VM.HasUnreadNotifications;
+
+        NotifyDot.Visibility = unread ? Visibility.Visible : Visibility.Collapsed;
+        NotifyEmptyHint.Visibility = VM.Notifications.Items.Count == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+
+        ToolTipService.SetToolTip(NotifyButton, unread
+            ? $"通知（{VM.Notifications.UnreadCount} 条未读）"
+            : "通知");
+
+        if (!unread)
+        {
+            _bellShake?.Stop();
+            NotifyRotate.Angle = 0;
+        }
+    }
+
+    private void OnNotificationClicked(object sender, ItemClickEventArgs e)
+    {
+        if (e.ClickedItem is AppNotification item)
+        {
+            VM.OpenNotification(item);
+            UpdateNotifyChrome();
+        }
+    }
+
+    private void OnMarkAllNotificationsRead(object sender, RoutedEventArgs e)
+    {
+        VM.MarkAllNotificationsRead();
+        UpdateNotifyChrome();
+    }
+
+    private async void OnClearNotifications(object sender, RoutedEventArgs e)
+    {
+        if (VM.Notifications.Items.Count == 0)
+        {
+            return;
+        }
+
+        var confirm = await Helpers.DialogHelper.ShowMessageAsync(
+            "清空通知",
+            "确定清空全部通知吗？这条操作不可撤销。",
+            closeText: "取消",
+            primaryText: "清空");
+
+        if (confirm == ContentDialogResult.Primary)
+        {
+            VM.Notifications.Clear();
+            UpdateNotifyChrome();
+        }
+    }
 
     /// <summary>切换过程中"旧内容淡出"的时长（短于宽度过渡，先看不见再变窄，避免文字被挤成一团）。</summary>
     private const int SideStatusFadeOutMs = 90;

@@ -6,6 +6,7 @@
     xmlns:local="using:Yomori"
     xmlns:vm="using:Yomori.ViewModels"
     xmlns:views="using:Yomori.Views"
+    xmlns:models="using:Yomori.Models"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
 
     <Grid>
@@ -100,28 +101,128 @@
                                 Padding="12,8"
                                 BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}"
                                 BorderThickness="0,0,0,1">
-                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                <Button Content="开始执行"
-                                        Style="{StaticResource AccentButtonStyle}"
-                                        IsEnabled="{x:Bind VM.CanStart, Mode=OneWay}"
-                                        Click="OnStartClicked" />
-                                <Button Content="暂停执行"
-                                        IsEnabled="{x:Bind VM.CanPause, Mode=OneWay}"
-                                        Click="OnPauseClicked" />
-                                <Button Content="继续执行"
-                                        IsEnabled="{x:Bind VM.IsRunning, Mode=OneWay}"
-                                        Click="OnResumeClicked" />
-                                <Button Content="停止执行  F8"
-                                        IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
-                                        Click="OnStopClicked"
-                                        Background="{StaticResource YomoriDangerBrush}" />
-                                <Button Content="紧急停止全部  Ctrl+Alt+F8"
-                                        IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
-                                        Click="OnEmergencyStopClicked"
-                                        Background="{StaticResource YomoriDangerDeepBrush}" />
-                                <Button Content="保存配置" Click="OnSaveClicked" />
-                                <Button Content="取消关机" Click="OnCancelShutdownClicked" />
-                            </StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8">
+                                    <Button Content="开始执行"
+                                            Style="{StaticResource AccentButtonStyle}"
+                                            IsEnabled="{x:Bind VM.CanStart, Mode=OneWay}"
+                                            Click="OnStartClicked" />
+                                    <Button Content="暂停执行"
+                                            IsEnabled="{x:Bind VM.CanPause, Mode=OneWay}"
+                                            Click="OnPauseClicked" />
+                                    <Button Content="继续执行"
+                                            IsEnabled="{x:Bind VM.IsRunning, Mode=OneWay}"
+                                            Click="OnResumeClicked" />
+                                    <Button Content="停止执行  F8"
+                                            IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
+                                            Click="OnStopClicked"
+                                            Background="{StaticResource YomoriDangerBrush}" />
+                                    <Button Content="紧急停止全部  Ctrl+Alt+F8"
+                                            IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
+                                            Click="OnEmergencyStopClicked"
+                                            Background="{StaticResource YomoriDangerDeepBrush}" />
+                                    <Button Content="保存配置" Click="OnSaveClicked" />
+                                    <Button Content="取消关机" Click="OnCancelShutdownClicked" />
+                                </StackPanel>
+
+                                <!-- 通知铃铛：有未读时点红点 + 每 2 秒轻摇一次（见 InitializeNotificationBell）。
+                                     摇动动的是 RotateTransform（渲染变换），属独立动画 —— 不需要
+                                     EnableDependentAnimation；只有 Width/Height 这类布局属性才需要。 -->
+                                <Button x:Name="NotifyButton" Grid.Column="1"
+                                        Width="34" Height="30" Padding="0"
+                                        ToolTipService.ToolTip="通知">
+                                    <Button.Flyout>
+                                        <Flyout x:Name="NotifyFlyout" Placement="BottomEdgeAlignedRight">
+                                            <Grid Width="380" RowSpacing="8">
+                                                <Grid.RowDefinitions>
+                                                    <RowDefinition Height="Auto" />
+                                                    <RowDefinition Height="*" />
+                                                </Grid.RowDefinitions>
+
+                                                <Grid Grid.Row="0" ColumnSpacing="4">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="通知"
+                                                               FontWeight="SemiBold" VerticalAlignment="Center" />
+                                                    <HyperlinkButton Grid.Column="1" Content="全部已读"
+                                                                     Click="OnMarkAllNotificationsRead" />
+                                                    <HyperlinkButton Grid.Column="2" Content="清空"
+                                                                     Click="OnClearNotifications" />
+                                                </Grid>
+
+                                                <!-- ⚠️ ItemsSource 由代码赋值（InitializeNotificationBell）：
+                                                     Window 上的 x:Bind 求值早于这边的集合准备，绑了会拿到空列表。 -->
+                                                <ListView x:Name="NotifyList" Grid.Row="1"
+                                                          SelectionMode="None"
+                                                          IsItemClickEnabled="True"
+                                                          MaxHeight="360" MinHeight="72"
+                                                          ItemClick="OnNotificationClicked">
+                                                    <ListView.ItemTemplate>
+                                                        <DataTemplate x:DataType="models:AppNotification">
+                                                            <Grid ColumnSpacing="8" Padding="0,4">
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="*" />
+                                                                    <ColumnDefinition Width="Auto" />
+                                                                </Grid.ColumnDefinitions>
+
+                                                                <!-- 未读标记：已读时是空串，不占宽 -->
+                                                                <TextBlock Grid.Column="0"
+                                                                           Text="{x:Bind UnreadMark}"
+                                                                           FontSize="11"
+                                                                           Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
+                                                                           VerticalAlignment="Center" />
+
+                                                                <StackPanel Grid.Column="1" Spacing="2">
+                                                                    <TextBlock Text="{x:Bind Title}" TextWrapping="Wrap" />
+                                                                    <TextBlock Text="{x:Bind Body}" TextWrapping="Wrap"
+                                                                               FontSize="12" Opacity="0.7" />
+                                                                </StackPanel>
+
+                                                                <TextBlock Grid.Column="2" Text="{x:Bind TimeText}"
+                                                                           FontSize="11" Opacity="0.55"
+                                                                           VerticalAlignment="Top" />
+                                                            </Grid>
+                                                        </DataTemplate>
+                                                    </ListView.ItemTemplate>
+                                                </ListView>
+
+                                                <TextBlock x:Name="NotifyEmptyHint" Grid.Row="1"
+                                                           Text="还没有通知。"
+                                                           Opacity="0.6" FontSize="12"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center" />
+                                            </Grid>
+                                        </Flyout>
+                                    </Button.Flyout>
+
+                                    <Grid>
+                                        <FontIcon x:Name="NotifyIcon" Glyph="&#xEA8F;" FontSize="16"
+                                                  HorizontalAlignment="Center" VerticalAlignment="Center"
+                                                  RenderTransformOrigin="0.5,0.5">
+                                            <FontIcon.RenderTransform>
+                                                <RotateTransform x:Name="NotifyRotate" Angle="0" />
+                                            </FontIcon.RenderTransform>
+                                        </FontIcon>
+
+                                        <!-- 未读红点 -->
+                                        <Border x:Name="NotifyDot"
+                                                Width="8" Height="8" CornerRadius="4"
+                                                Background="#E81123"
+                                                HorizontalAlignment="Right" VerticalAlignment="Top"
+                                                Margin="0,2,3,0"
+                                                Visibility="Collapsed" />
+                                    </Grid>
+                                </Button>
+                            </Grid>
                         </Border>
 
                         <!-- 页面容器 -->

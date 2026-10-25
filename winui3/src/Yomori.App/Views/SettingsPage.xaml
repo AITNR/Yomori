@@ -209,6 +209,37 @@
                     <TextBlock x:Name="VersionDetailText"
                                FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
 
+                    <!-- 启动时的更新行为 + 下载代理。
+                         两个下拉都不绑 SelectedValue（由代码在 RefreshUpdateOptions 里摆好）——
+                         这一页已经踩过两次「SelectedValue 先于 ItemsSource 求值 → 永远空白」。 -->
+                    <StackPanel Orientation="Horizontal" Spacing="12">
+                        <ComboBox x:Name="UpdateCheckModeBox"
+                                  Header="启动时检查更新" MinWidth="186"
+                                  ItemsSource="{x:Bind VM.UpdateCheckModeItems, Mode=OneWay}"
+                                  DisplayMemberPath="Value" SelectedValuePath="Key"
+                                  SelectionChanged="OnUpdateCheckModeChanged">
+                            <ToolTipService.ToolTip>
+                                <ToolTip Content="每次启动在后台查一次。选「有更新时自动下载」会在下载完后问你要不要现在安装。" />
+                            </ToolTipService.ToolTip>
+                        </ComboBox>
+
+                        <ComboBox x:Name="UpdateProxyModeBox"
+                                  Header="下载代理" MinWidth="150"
+                                  ItemsSource="{x:Bind VM.UpdateProxyModeItems, Mode=OneWay}"
+                                  DisplayMemberPath="Value" SelectedValuePath="Key"
+                                  SelectionChanged="OnUpdateProxyModeChanged">
+                            <ToolTipService.ToolTip>
+                                <ToolTip Content="检查更新与下载安装包都走这里。系统代理配错时选「不使用代理」。" />
+                            </ToolTipService.ToolTip>
+                        </ComboBox>
+                    </StackPanel>
+
+                    <TextBox x:Name="UpdateProxyUrlBox"
+                             Header="自定义代理地址"
+                             PlaceholderText="http://127.0.0.1:7890"
+                             Visibility="Collapsed"
+                             LostFocus="OnUpdateProxyUrlLostFocus" />
+
                     <Grid ColumnSpacing="8" RowSpacing="8">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />

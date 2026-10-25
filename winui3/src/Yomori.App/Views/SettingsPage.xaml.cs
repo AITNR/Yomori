@@ -49,6 +49,17 @@ public sealed partial class SettingsPage : Page
             ThemeBox.SelectedIndex = found;
             UpdateChannelBox.SelectedIndex = IndexOfUpdateChannel(VM.Config.UpdateChannel);
             CloseActionBox.SelectedIndex = IndexOfCloseAction(VM.Config.Window.CloseAction);
+
+            // 启动检查方式 / 下载代理：同样在 _syncing 里摆初值，别让 SelectionChanged 把
+            // "读配置"当成"用户改设置"而反复写盘。
+            UpdateCheckModeBox.SelectedIndex = IndexOfItem(
+                UpdateCheckModes.Items, UpdateCheckModes.Normalize(VM.Config.UpdateCheckMode));
+            UpdateProxyModeBox.SelectedIndex = IndexOfItem(
+                UpdateProxyModes.Items, UpdateProxyModes.Normalize(VM.Config.UpdateProxyMode));
+            UpdateProxyUrlBox.Text = VM.Config.UpdateProxyUrl;
+            UpdateProxyUrlBox.Visibility = VM.Config.UpdateProxyMode == UpdateProxyModes.Custom
+                ? Visibility.Visible
+                : Visibility.Collapsed;
         }
         finally
         {
@@ -453,6 +464,84 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
+    /// 在一组 (Key, Value) 选项里找 Key 对应的下标；找不到回落到 0。
+    /// 用 SelectedIndex 而不是 SelectedValue —— 后者在列表还没填好的时候赋值会被丢弃
+    /// （本页两次踩过：渲染后端下拉框、通道页的会话处理下拉框）。
+    /// </summary>
+    private static int IndexOfItem(IReadOnlyList<KeyValuePair<string, string>> items, string key)
+    {
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (items[i].Key == key)
+            {
+                return i;
+            }
+        }
+
+        return 0;
+    }
+
+    // ---------------- 启动检查更新 / 下载代理 ----------------
+
+    private void OnUpdateCheckModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncing || UpdateCheckModeBox.SelectedItem is not KeyValuePair<string, string> item)
+        {
+            return;
+        }
+
+        var mode = UpdateCheckModes.Normalize(item.Key);
+        if (VM.Config.UpdateCheckMode == mode)
+        {
+            return;
+        }
+
+        VM.Config.UpdateCheckMode = mode;
+        VM.SaveConfig();
+        VM.AppendLog($"启动时检查更新已设为「{UpdateCheckModes.Label(mode)}」。");
+    }
+
+    private void OnUpdateProxyModeChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncing || UpdateProxyModeBox.SelectedItem is not KeyValuePair<string, string> item)
+        {
+            return;
+        }
+
+        var mode = UpdateProxyModes.Normalize(item.Key);
+        if (VM.Config.UpdateProxyMode != mode)
+        {
+            VM.Config.UpdateProxyMode = mode;
+            VM.SaveConfig();
+            VM.AppendLog($"更新下载代理已切换为「{UpdateProxyModes.Label(mode)}」。");
+        }
+
+        // 只有"自定义"才需要地址框；切走时保留已填内容，不主动清空
+        UpdateProxyUrlBox.Visibility = mode == UpdateProxyModes.Custom
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+    }
+
+    private void OnUpdateProxyUrlLostFocus(object sender, RoutedEventArgs e)
+    {
+        var text = (UpdateProxyUrlBox.Text ?? string.Empty).Trim();
+        if (VM.Config.UpdateProxyUrl == text)
+        {
+            return;
+        }
+
+        VM.Config.UpdateProxyUrl = text;
+        VM.SaveConfig();
+
+        // 顺手说一句地址能不能解析，省得用户到"下载失败"才发现填错
+        var usable = string.IsNullOrEmpty(text) || Uri.TryCreate(text, UriKind.Absolute, out _);
+        VM.AppendLog(usable
+            ? $"更新下载代理地址已保存：{(text.Length == 0 ? "（空 → 回退系统代理）" : text)}"
+            : $"更新下载代理地址格式可疑（{text}）—— 需要带协议，例如 http://127.0.0.1:7890；" +
+              "解析不出来时会退回系统代理。");
+    }
+
+    /// <summary>
     /// 查一次更新。查询是网络 IO，所以丢到线程池；结果用 <see cref="RunOnUi"/> 搬回 UI 线程再画 ——
     /// 控件只能在 UI 线程上碰，而 await 之后的续体落在哪个线程**不能靠假设**
     /// （工程里已经栽过一次：Windows App SDK 的选择器 await 之后就不在 UI 线程了）。
@@ -470,7 +559,10 @@ public sealed partial class SettingsPage : Page
 
         try
         {
-            var result = await Task.Run(() => UpdateService.CheckAsync(channel));
+            // 带上网代理设置：用户在这里配的代理同样作用于手动检查（否则"自定义代理"
+            // 只在启动自动检查时生效，手动点一下反而连不上，像是代理没配好）。
+            var network = UpdateNetworkSettings.FromConfig(VM.Config);
+            var result = await Task.Run(() => UpdateService.CheckAsync(channel, network));
             RunOnUi(queue, () =>
             {
                 SetUpdateBusy(false);

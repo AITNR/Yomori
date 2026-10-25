@@ -35,6 +35,9 @@ public sealed class AppConfig : ObservableObject
     private int _externalLogKeepFiles = ExternalLogDefaults.KeepFiles;
     private int _eventLineLimit = ExternalLogDefaults.EventLineLimit;
     private string _updateChannel = UpdateChannels.Stable;
+    private string _updateCheckMode = UpdateCheckModes.Notify;
+    private string _updateProxyMode = UpdateProxyModes.System;
+    private string _updateProxyUrl = string.Empty;
 
     public AppConfig()
     {
@@ -142,6 +145,38 @@ public sealed class AppConfig : ObservableObject
         set => SetProperty(ref _updateChannel, value);
     }
 
+    /// <summary>
+    /// 启动时自动检查更新的方式，取值见 <see cref="UpdateCheckModes"/>。
+    ///
+    /// 老配置里没有这个键 → 归一成 <c>notify</c>（"每次启动检测、有更新就通知"），
+    /// 这正是引入这个功能时要的行为。
+    /// </summary>
+    [JsonPropertyName("update_check_mode")]
+    public string UpdateCheckMode
+    {
+        get => _updateCheckMode;
+        set => SetProperty(ref _updateCheckMode, UpdateCheckModes.Normalize(value));
+    }
+
+    /// <summary>检查更新 / 下载安装包走哪种代理，取值见 <see cref="UpdateProxyModes"/>。</summary>
+    [JsonPropertyName("update_proxy_mode")]
+    public string UpdateProxyMode
+    {
+        get => _updateProxyMode;
+        set => SetProperty(ref _updateProxyMode, UpdateProxyModes.Normalize(value));
+    }
+
+    /// <summary>
+    /// 自定义代理地址，形如 <c>http://127.0.0.1:7890</c>。只有
+    /// <see cref="UpdateProxyMode"/> 为 <c>custom</c> 时用得上；留空等同于"系统代理"。
+    /// </summary>
+    [JsonPropertyName("update_proxy_url")]
+    public string UpdateProxyUrl
+    {
+        get => _updateProxyUrl;
+        set => SetProperty(ref _updateProxyUrl, (value ?? string.Empty).Trim());
+    }
+
     [JsonPropertyName("tasks")]
     public List<TaskConfig> Tasks { get; set; } = new();
 
@@ -201,6 +236,11 @@ public sealed class AppConfig : ObservableObject
         // 不能在这里清空 —— 临时拔一次 U 盘就把用户的选择抹掉太粗暴。
         HomeBannerPath = (HomeBannerPath ?? string.Empty).Trim();
         UpdateChannel = UpdateChannels.Normalize(UpdateChannel);
+        UpdateCheckMode = UpdateCheckModes.Normalize(UpdateCheckMode);
+        UpdateProxyMode = UpdateProxyModes.Normalize(UpdateProxyMode);
+        // 只去空白：地址合法性交给使用处判断（写错了要让用户看到"代理连不上"，
+        // 而不是被这里静默改写成一个看起来正常、其实不是他填的值）。
+        UpdateProxyUrl = (UpdateProxyUrl ?? string.Empty).Trim();
         ExternalLogKeepFiles = Math.Max(1, ExternalLogKeepFiles);
         EventLineLimit = ExternalLogDefaults.NormalizeEventLineLimit(EventLineLimit);
 
@@ -272,6 +312,9 @@ public sealed class AppConfig : ObservableObject
         EnableTimeoutScreenshot = EnableTimeoutScreenshot,
         DeveloperMode = DeveloperMode,
         UpdateChannel = UpdateChannel,
+        UpdateCheckMode = UpdateCheckMode,
+        UpdateProxyMode = UpdateProxyMode,
+        UpdateProxyUrl = UpdateProxyUrl,
         ExternalLogKeepFiles = ExternalLogKeepFiles,
         EventLineLimit = EventLineLimit,
         Rdp = (RdpConfig)Rdp.Clone(),

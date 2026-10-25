@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -121,11 +122,72 @@ public static class UpdateService
     /// <summary>本机自编译标记（与 csproj 里 Version 的兜底值一致）。</summary>
     public const string LocalBuildMarker = "-dev.local";
 
-    private static readonly HttpClient Http = CreateClient();
+    /// <summary>默认网络设置（跟随系统代理）。界面上的「检查更新」按钮没传设置时用它。</summary>
+    public static readonly UpdateNetworkSettings DefaultNetwork =
+        new(UpdateProxyModes.System, string.Empty);
 
-    private static HttpClient CreateClient()
+    /// <summary>
+    /// 按「代理模式 + 地址」缓存 HttpClient。
+    ///
+    /// 为什么缓存而不是每次新建：HttpClient 每次 new 都会带走一个连接池，检查更新虽然不频繁，
+    /// 但下载完再检查一次就会漏一个；而且代理设置一变（用户在设置里改地址）只该换 client，
+    /// 不该影响正在跑的那次请求。
+    /// </summary>
+    private static readonly Dictionary<string, HttpClient> Clients = new(StringComparer.OrdinalIgnoreCase);
+
+    private static HttpClient GetClient(UpdateNetworkSettings network)
     {
-        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        var mode = UpdateProxyModes.Normalize(network.ProxyMode);
+        var proxyUrl = (network.ProxyUrl ?? string.Empty).Trim();
+        var key = mode + "|" + proxyUrl;
+
+        lock (Clients)
+        {
+            if (Clients.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+
+            var created = CreateClient(mode, proxyUrl);
+            Clients[key] = created;
+            return created;
+        }
+    }
+
+    private static HttpClient CreateClient(string proxyMode, string proxyUrl)
+    {
+        var handler = new HttpClientHandler();
+
+        switch (proxyMode)
+        {
+            case UpdateProxyModes.None:
+                // 直连：系统代理配错（或走了不通的梯子）时用它绕开
+                handler.UseProxy = false;
+                break;
+
+            case UpdateProxyModes.Custom:
+                if (Uri.TryCreate(proxyUrl, UriKind.Absolute, out var proxyUri))
+                {
+                    handler.Proxy = new WebProxy(proxyUri);
+                    handler.UseProxy = true;
+                }
+                else
+                {
+                    // 地址填错或留空 → 退回系统代理，而不是"静默不用代理"。
+                    // 检查更新照常能走；用户会从结果里看到是网络问题还是没更新。
+                    handler.UseProxy = true;
+                    handler.Proxy = HttpClient.DefaultProxy;
+                }
+
+                break;
+
+            default:
+                handler.UseProxy = true;
+                handler.Proxy = HttpClient.DefaultProxy;
+                break;
+        }
+
+        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
 
         // GitHub 接口要求带 User-Agent，缺了直接 403；Accept 用官方推荐的那个
         client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Yomori", "1.0"));
@@ -203,16 +265,28 @@ public static class UpdateService
     /// 按给定通道查一次更新。**不抛异常** —— 失败也会变成一条 <see cref="UpdateCheckStatus.Failed"/> 结果，
     /// 让调用方（界面）只有一个分支要写。
     /// </summary>
-    public static async Task<UpdateCheckResult> CheckAsync(string channel, CancellationToken cancellationToken = default)
+    public static Task<UpdateCheckResult> CheckAsync(string channel, CancellationToken cancellationToken = default)
+        => CheckAsync(channel, DefaultNetwork, cancellationToken);
+
+    /// <summary>
+    /// 带网络设置的重载：启动时自动检查与手动「检查更新」都走这里，
+    /// 代理模式由设置页决定（系统 / 自定义 / 不使用）。
+    /// </summary>
+    public static async Task<UpdateCheckResult> CheckAsync(
+        string channel,
+        UpdateNetworkSettings network,
+        CancellationToken cancellationToken = default)
     {
         var normalized = UpdateChannels.Normalize(channel);
         var channelLabel = UpdateChannels.Label(normalized);
 
         try
         {
+            var client = GetClient(network);
+
             var release = normalized == UpdateChannels.Beta
-                ? await FetchNewestPrereleaseAsync(cancellationToken).ConfigureAwait(false)
-                : await FetchLatestStableAsync(cancellationToken).ConfigureAwait(false);
+                ? await FetchNewestPrereleaseAsync(client, cancellationToken).ConfigureAwait(false)
+                : await FetchLatestStableAsync(client, cancellationToken).ConfigureAwait(false);
 
             if (release is null)
             {
@@ -332,11 +406,11 @@ public static class UpdateService
         };
 
     /// <summary>正式版通道：GitHub 定义的「最新正式版」。</summary>
-    private static async Task<GitHubRelease?> FetchLatestStableAsync(CancellationToken cancellationToken)
+    private static async Task<GitHubRelease?> FetchLatestStableAsync(HttpClient client, CancellationToken cancellationToken)
     {
         var url = $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest";
 
-        using var response = await Http.GetAsync(url, cancellationToken).ConfigureAwait(false);
+        using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
@@ -362,11 +436,11 @@ public static class UpdateService
     /// <para>为什么不用「列表第一个」：列表按创建时间排，而 CI 每推一次 main 就发一份，
     /// 时间顺序不等于版本大小（重跑、回退、手改 tag 都会打乱）。按版本号挑才是稳的。</para>
     /// </summary>
-    private static async Task<GitHubRelease?> FetchNewestPrereleaseAsync(CancellationToken cancellationToken)
+    private static async Task<GitHubRelease?> FetchNewestPrereleaseAsync(HttpClient client, CancellationToken cancellationToken)
     {
         var url = $"https://api.github.com/repos/{Owner}/{Repo}/releases?per_page=50";
 
-        using var response = await Http.GetAsync(url, cancellationToken).ConfigureAwait(false);
+        using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
         await ThrowIfNotSuccessAsync(response, cancellationToken).ConfigureAwait(false);
 
         var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
@@ -835,4 +909,153 @@ public static class UpdateService
 
         public string ResetHint { get; }
     }
+
+    // ---------------- 下载安装包 ----------------
+
+    /// <summary>
+    /// 这份发布里该下载哪个文件：优先安装包（<c>*-setup.exe</c>），其次是绿色包。
+    ///
+    /// 优先安装包是因为"自动下载"的下一步是"要不要现在装" —— 绿色包解压到哪、
+    /// 要不要覆盖当前目录，那些问题没有安装包替我们回答。
+    /// </summary>
+    /// <returns>URL 与建议的文件名；这份发布没有可下载资产时为 null。</returns>
+    public static (string Url, string FileName)? PickDownload(GitHubRelease? release)
+    {
+        if (release is null)
+        {
+            return null;
+        }
+
+        var url = !string.IsNullOrWhiteSpace(release.SetupUrl) ? release.SetupUrl : release.ZipUrl;
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return null;
+        }
+
+        string name;
+        try
+        {
+            name = Path.GetFileName(new Uri(url).AbsolutePath);
+        }
+        catch
+        {
+            name = string.Empty;
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = "Yomori-update.bin";
+        }
+
+        return (url, name);
+    }
+
+    /// <summary>
+    /// 把发布资产下载到指定路径，返回（是否成功，给用户看的一句话）。
+    ///
+    /// <para>先写 <c>*.part</c> 再改名：中途断网会留下半个 exe，双击报"安装数据损坏"——
+    /// 那比干脆没下载更糟。失败时把临时的半成品删掉。</para>
+    ///
+    /// <para>⚠️ 不抛异常：调用方在后台线程，失败要变成通知里的一句话，而不是一个未捕获异常。</para>
+    /// </summary>
+    /// <param name="url">资产直链。</param>
+    /// <param name="targetPath">落盘路径（目录不存在会建）。</param>
+    /// <param name="network">代理设置。</param>
+    /// <param name="progress">进度 0~1（服务器不给 Content-Length 时不会回调）。</param>
+    public static async Task<(bool Ok, string Message)> DownloadAsync(
+        string url,
+        string targetPath,
+        UpdateNetworkSettings network,
+        IProgress<double>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        var partPath = targetPath + ".part";
+
+        try
+        {
+            var client = GetClient(network);
+
+            using var response = await client
+                .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+
+            await ThrowIfNotSuccessAsync(response, cancellationToken).ConfigureAwait(false);
+
+            var total = response.Content.Headers.ContentLength ?? 0;
+
+            var directory = Path.GetDirectoryName(targetPath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            await using (var source = await response.Content
+                             .ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+            await using (var sink = new FileStream(
+                             partPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                             81920, useAsync: true))
+            {
+                var buffer = new byte[81920];
+                long received = 0;
+                int read;
+
+                while ((read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                {
+                    await sink.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                    received += read;
+
+                    if (total > 0)
+                    {
+                        progress?.Report((double)received / total);
+                    }
+                }
+            }
+
+            if (File.Exists(targetPath))
+            {
+                File.Delete(targetPath);
+            }
+
+            File.Move(partPath, targetPath);
+            return (true, $"已下载 {Path.GetFileName(targetPath)}");
+        }
+        catch (OperationCanceledException)
+        {
+            TryDelete(partPath);
+            return (false, "下载被取消或超时（安装包没有下完）。");
+        }
+        catch (Exception ex)
+        {
+            TryDelete(partPath);
+            return (false, $"下载失败：{ex.Message}");
+        }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // 删不掉就留着，反正 .part 不会被当成安装包
+        }
+    }
+}
+
+/// <summary>
+/// 检查更新 / 下载安装包时用的网络设置。值来自 <see cref="AppConfig"/>，
+/// 语义见 <see cref="UpdateProxyModes"/>。
+/// </summary>
+/// <param name="ProxyMode">system / custom / none。</param>
+/// <param name="ProxyUrl">自定义代理地址（仅 custom 用），形如 http://127.0.0.1:7890。</param>
+public readonly record struct UpdateNetworkSettings(string ProxyMode, string ProxyUrl)
+{
+    /// <summary>从配置里取一份快照。传值而不是传 AppConfig，避免后台线程长时间持有可变对象。</summary>
+    public static UpdateNetworkSettings FromConfig(AppConfig config) =>
+        new(config.UpdateProxyMode, config.UpdateProxyUrl);
 }

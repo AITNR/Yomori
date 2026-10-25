@@ -115,8 +115,9 @@ public static class MonitorKinds
 /// <list type="bullet">
 /// <item><see cref="Stable"/>（正式版）—— <c>release.yml</c> 手动发布的 <c>vX.Y.Z</c>；
 /// 接口取 <c>/releases/latest</c>，也就是「最新的非预发布版」。</item>
-/// <item><see cref="Beta"/>（测试版）—— <c>ci.yml</c> 每次 main 提交自动发的滚动预发布；
-/// 接口取发布列表里版本号最大的那一份（含预发布），所以正式版发出来之后也能立刻拿到。</item>
+/// <item><see cref="Beta"/>（测试版）—— <c>ci.yml</c> 每次 main 提交自动发的滚动预发布。
+/// 接口只在**预发布**里挑版本号最大的一份（正式版与 dev 构建编号不同源，混着比会让
+/// 正式版永远赢 —— 2026-10-25 修过这个：「选了测试版却拿到正式版」）。</item>
 /// </list>
 /// 值会写进 config.json，改名字等于改配置格式，别随手改。
 /// </summary>
@@ -134,4 +135,93 @@ public static class UpdateChannels
     public static string Normalize(string? value) => value == Beta ? Beta : Stable;
 
     public static string Label(string? value) => value == Beta ? "测试版" : "正式版";
+}
+
+/// <summary>
+/// 启动时自动检查更新的方式（写进 config.json 的 <c>update_check_mode</c>）。
+///
+/// <para>为什么默认是 <see cref="Notify"/>：用户要的是"每次启动自动检测、有就告诉我"，
+/// 但**未经同意自动下载**属于会占带宽、会落盘的副作用，不该是默认行为 ——
+/// 想省这一步的人在设置里选 <see cref="Download"/> 即可。</para>
+/// </summary>
+public static class UpdateCheckModes
+{
+    /// <summary>不检查（连网络请求都不发）。</summary>
+    public const string Off = "off";
+
+    /// <summary>检查，有更新时进通知中心。</summary>
+    public const string Notify = "notify";
+
+    /// <summary>检查，有更新时后台下载，下载完问要不要现在装。</summary>
+    public const string Download = "download";
+
+    public static readonly IReadOnlyList<KeyValuePair<string, string>> Items = new List<KeyValuePair<string, string>>
+    {
+        new(Off, "不检查更新"),
+        new(Notify, "有更新时通知我"),
+        new(Download, "有更新时自动下载"),
+    };
+
+    /// <summary>未知 / 空值一律回落"启动时通知"（用户提这个需求时要的就是它）。</summary>
+    public static string Normalize(string? value)
+    {
+        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return text switch
+        {
+            Off => Off,
+            Download => Download,
+            _ => Notify,
+        };
+    }
+
+    public static string Label(string? value) => Normalize(value) switch
+    {
+        Off => "不检查更新",
+        Download => "有更新时自动下载",
+        _ => "有更新时通知我",
+    };
+}
+
+/// <summary>
+/// 检查更新 / 下载安装包时走哪种代理（写进 config.json 的 <c>update_proxy_mode</c>）。
+///
+/// <para>为什么单独给下载配一个开关：用户可能只给浏览器挂了代理（或者反过来），
+/// 而 GitHub 的 release 资产在部分网络下直连会超时。默认跟随系统代理 —— 那是不做任何
+/// 额外配置时最不意外的行为。</para>
+/// </summary>
+public static class UpdateProxyModes
+{
+    /// <summary>跟随系统代理（WinINET / 环境变量，<c>HttpClient.DefaultProxy</c>）。</summary>
+    public const string System = "system";
+
+    /// <summary>自定义代理地址，形如 <c>http://127.0.0.1:7890</c>。</summary>
+    public const string Custom = "custom";
+
+    /// <summary>不走代理（直连）。系统代理配错时用它绕开。</summary>
+    public const string None = "none";
+
+    public static readonly IReadOnlyList<KeyValuePair<string, string>> Items = new List<KeyValuePair<string, string>>
+    {
+        new(System, "系统代理"),
+        new(Custom, "自定义代理"),
+        new(None, "不使用代理"),
+    };
+
+    public static string Normalize(string? value)
+    {
+        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return text switch
+        {
+            Custom => Custom,
+            None => None,
+            _ => System,
+        };
+    }
+
+    public static string Label(string? value) => Normalize(value) switch
+    {
+        Custom => "自定义代理",
+        None => "不使用代理",
+        _ => "系统代理",
+    };
 }
