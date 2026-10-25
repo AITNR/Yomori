@@ -160,6 +160,14 @@ public static class Program
             // 这一轮要 MarkHandoff：它是"没跑起来"的一轮，不该把 last_run.state 写成 clean-exit，
             // 否则下次启动的"上次退出"判据会把提权被拒误判成正常退出。
             Services.CrashLog.MarkHandoff();
+
+            // 安装时自动部署是无人值守的：被拒时只留日志与退出码，绝不弹这个对话框
+            // （调用方在安装向导后面，静默安装时连向导都没有，弹出来只会把安装卡住）。
+            if (AgentAutoDeploy.IsInvocation(args))
+            {
+                Environment.Exit(AgentAutoDeploy.Run());
+            }
+
             ReportElevationRefused(isAgent: false);
             return;
         }
@@ -200,6 +208,19 @@ public static class Program
             }
 
             return;
+        }
+
+        // 安装时自动部署（安装程序在文件铺完后调 `Yomori.exe --deploy-agent`）。
+        //
+        // 三条约束都跟"无人值守"有关：
+        //   ① 弹窗一律不要：调用方是安装向导，静默安装时连向导都没有，弹出来只会把安装卡住；
+        //   ② 不参与单实例、不打 AUMID：它是个一次性任务，退出码才是结论，
+        //      更不能因为"用户正开着主控端"就被交接逻辑叫回去；
+        //   ③ 自己判管理员权限（见 AgentAutoDeploy.RunCore）—— 走不到下面那段
+        //      ReportElevationRefused，否则被拒时会弹一个没人看得见的消息框。
+        if (AgentAutoDeploy.IsInvocation(args))
+        {
+            Environment.Exit(AgentAutoDeploy.Run());
         }
 
         // 任务栏身份要在第一个窗口创建之前定下来，代理模式不涉及窗口、跳过。

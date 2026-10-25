@@ -163,7 +163,7 @@ CI 的每次构建都会建一个自己的预发布 tag，资产不会被下一�
 
 | 产物 | 用法 |
 |---|---|
-| `Yomori-<版本>-setup.exe` | **安装版**。默认装到 `%ProgramFiles%\Yomori\`，带开始菜单快捷方式与卸载入口；**双击即弹 UAC**（清单里就是 `requireAdministrator`） |
+| `Yomori-<版本>-setup.exe` | **安装版**。默认装到 `%ProgramFiles%\Yomori\`，带开始菜单快捷方式与卸载入口；**双击即弹 UAC**（清单里就是 `requireAdministrator`）。安装结束时会自动部署会话代理（调 `Yomori.exe --deploy-agent`），装完即可连目标账户 |
 | `Yomori-winui3-<版本>-x64.zip` | **绿色版**。解压到**固定目录**（别放临时目录，日志会写在它旁边），双击 `Yomori.exe` 即用 |
 
 安装脚本是 `winui3/tools/installer.iss`（Inno Setup 6；CI 里**钉死 6.7.3**，本机复现要先装 Inno Setup 6）。

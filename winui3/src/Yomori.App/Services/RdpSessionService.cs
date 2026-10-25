@@ -1381,6 +1381,49 @@ public static class RdpSessionService
             });
         }
 
+        if (!CreateStartupShortcut(exe, arguments, out var shortcutError))
+        {
+            message = shortcutError;
+            return false;
+        }
+
+        var notes = new StringBuilder();
+        notes.Append($"已部署到所有用户共享启动目录：{AgentShortcutPath}（程序副本：{Path.GetDirectoryName(exe)}）");
+
+        if (manifestNote.Length > 0)
+        {
+            notes.Append("；").Append(manifestNote);
+        }
+
+        if (payloadNote.Length > 0)
+        {
+            notes.Append("；").Append(payloadNote);
+        }
+
+        if (IsOtherInstanceRunning())
+        {
+            notes.Append("；检测到还有其他Yomori进程在跑（多半是目标账户里那个常驻代理），"
+                + "要让它换成新程序，需注销目标账户后重新连接");
+        }
+
+        message = notes.ToString();
+        return true;
+    }
+
+    /// <summary>
+    /// 在公共启动目录写下代理自启项（所有账户登录时由 Explorer 拉起它）。
+    ///
+    /// 抽成独立方法是因为现在有两个调用方：手动部署（<see cref="DeployAgent"/>）与
+    /// 安装时自动部署（<see cref="AutoDeployForInstall"/>）。两处的差别只在"要不要重写已有项"，
+    /// 写快捷方式本身的手法必须完全一致 —— 分开写两份迟早会漂移（比如只在一处补了参数）。
+    /// </summary>
+    /// <param name="exe">代理主程序（已在公共副本目录里）。</param>
+    /// <param name="arguments">启动参数，通常是 <c>--rdp-agent [--bridge:...]</c>。</param>
+    /// <param name="error">失败原因（成功时为空串）。</param>
+    private static bool CreateStartupShortcut(string exe, string arguments, out string error)
+    {
+        error = string.Empty;
+
         var shortcut = AgentShortcutPath;
         var directory = Path.GetDirectoryName(shortcut);
         if (!string.IsNullOrEmpty(directory))
@@ -1393,7 +1436,7 @@ public static class RdpSessionService
             }
             catch (Exception ex)
             {
-                message = $"无法写入公共启动目录：{directory}\n{ex.Message}";
+                error = $"无法写入公共启动目录：{directory}\n{ex.Message}";
                 return false;
             }
         }
@@ -1422,32 +1465,175 @@ public static class RdpSessionService
                 ? "当前进程已经是管理员，因此这不是权限问题，请对照上面的具体报错。"
                 : "当前进程不是管理员：写公共启动目录需要管理员权限。";
 
-            message = $"创建启动项失败：{(shellError.Length > 0 ? shellError : "PowerShell 未给出错误信息")}\n"
+            error = $"创建启动项失败：{(shellError.Length > 0 ? shellError : "PowerShell 未给出错误信息")}\n"
                 + $"启动项路径：{shortcut}\n{hint}";
             return false;
         }
 
-        var notes = new StringBuilder();
-        notes.Append($"已部署到所有用户共享启动目录：{shortcut}（程序副本：{workDir}）");
-
-        if (manifestNote.Length > 0)
-        {
-            notes.Append("；").Append(manifestNote);
-        }
-
-        if (payloadNote.Length > 0)
-        {
-            notes.Append("；").Append(payloadNote);
-        }
-
-        if (IsOtherInstanceRunning())
-        {
-            notes.Append("；检测到还有其他Yomori进程在跑（多半是目标账户里那个常驻代理），"
-                + "要让它换成新程序，需注销目标账户后重新连接");
-        }
-
-        message = notes.ToString();
         return true;
+    }
+
+    /// <summary>
+    /// 已部署的副本是不是就是随包分发的这一份（<see cref="ShippedAgentDir"/> 里的载荷）。
+    ///
+    /// 只用于"安装时自动部署"的幂等判断：内容一致就跳过整套搬运与快捷方式重建。
+    /// 比对走 <see cref="AgentPayloadIdentity"/>，不看时间戳 —— 全量副本时代那个 exe
+    /// 会被 mt.exe 就地改写，时间戳说明不了版本。
+    /// </summary>
+    public static bool IsAgentPayloadCurrent()
+    {
+        var shippedExe = Path.Combine(ShippedAgentDir, AgentExeName);
+        if (!File.Exists(shippedExe))
+        {
+            return false;
+        }
+
+        foreach (var slot in PayloadSlotDirs())
+        {
+            if (AgentPayloadIdentity.Matches(shippedExe, Path.Combine(slot, AgentExeName)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 安装程序在文件铺完后调用（<c>Yomori.exe --deploy-agent</c>）：把随包的代理载荷
+    /// 部署到公共目录，让目标账户登录后立刻就能跑代理，不必等用户进程序点一次「部署会话代理」。
+    ///
+    /// 与 <see cref="DeployAgent"/> 刻意的两点不同：
+    ///
+    /// <para>① <b>已有自启项一律不动。</b>自启项的参数里带着 <c>--bridge:</c>，那是用户在
+    /// 「通道管理」里配的（远程主机共享目录）。安装器不知道通道配置，重写它等于把桥目录
+    /// 改回默认值 —— 远程通道当场失效，而且现象是"装了个新版本就再也不执行任务了"。
+    /// 只有压根没有自启项时（全新安装，或"卸载后重装"）才新建，参数从 config.json 里
+    /// 能唯一确定的 bridge_path 取，取不到就用默认（与手动部署在干净配置下完全一致）。</para>
+    ///
+    /// <para>② <b>不杀正在执行任务的代理。</b>安装是无人值守的，用户可能只是在装新版本；
+    /// 这时把别人跑了一半的活打断不可接受。是否安全由调用方（<c>AgentAutoDeploy</c>）
+    /// 先用桥状态确认，这里只负责搬运（<see cref="EnsureAgentPayload"/> 对"文件被占用"
+    /// 本来就有退到备用目录的降级，不会硬来）。</para>
+    /// </summary>
+    /// <param name="message">结果说明（成功也可能带过程说明）。</param>
+    public static bool AutoDeployForInstall(out string message)
+    {
+        message = string.Empty;
+
+        var shippedExe = Path.Combine(ShippedAgentDir, AgentExeName);
+        if (!File.Exists(shippedExe))
+        {
+            message = $"安装目录下缺少代理载荷：{shippedExe}\n"
+                + "安装包不完整（应当随包带上 agent\\ 子目录），请重新安装。";
+            return false;
+        }
+
+        // targetUser 传 null：安装时不知道（也不该猜）目标账户。
+        // 它的作用只是"部署前看看那一路桥上的代理是不是正忙着" —— 那件事由调用方
+        // 扫全部桥统一做，比按一个猜出来的账户名查更准。
+        if (!EnsureAgentPayload(shippedExe, null, out var exe, out var copyError, out var payloadNote))
+        {
+            message = copyError;
+            return false;
+        }
+
+        // 部署完如果还有代理进程活着，说明旧程序仍在内存里跑（部署换了磁盘上的文件，
+        // 但进程不会自己换成新版）。这句话在安装日志里很关键：用户升级完发现"版本号变了、
+        // 代理行为没变"时，能从这里知道要先注销目标账户。
+        var runningNote = IsOtherInstanceRunning()
+            ? "；检测到还有Yomori进程在跑（多半是目标账户里那个常驻代理），"
+              + "要让它换成新程序，需注销目标账户后重新连接"
+            : string.Empty;
+
+        if (File.Exists(AgentShortcutPath))
+        {
+            message = payloadNote.Length > 0
+                ? $"代理程序副本已更新（{payloadNote}）；自启项已存在，保留原有参数未改动{runningNote}"
+                : $"代理程序副本已是最新；自启项已存在，保留原有参数未改动{runningNote}";
+            return true;
+        }
+
+        var bridgePath = ResolveConfiguredBridgePath();
+        if (!CreateStartupShortcut(exe, RdpTargets.BuildAgentArguments(bridgePath), out var createError))
+        {
+            message = createError;
+            return false;
+        }
+
+        var note = bridgePath is null
+            ? "已写入登录自启项（目标账户登录后自动启动代理）。"
+            : $"已写入登录自启项，桥目录取自已保存的通道配置：{bridgePath}";
+
+        message = payloadNote.Length > 0
+            ? $"{note}（{payloadNote}）{runningNote}"
+            : $"{note}{runningNote}";
+        return true;
+    }
+
+    /// <summary>
+    /// 从已保存的 config.json 里找出"能唯一确定"的指令桥目录，供安装时重建自启项用。
+    ///
+    /// 为什么要读配置：自启项的参数带着 <c>--bridge:</c>，而安装器重装/升级时会把旧的
+    /// 自启项清掉（卸载器只认安装时登记过的文件，自启项不在其中，但本产品自己的
+    /// 卸载清理会删）。这时若一律按"无 --bridge"重建，配了共享目录的通道就静默失效。
+    ///
+    /// 规则保守到只做"不会猜错"的事：把所有通道的 bridge_path 收集起来，
+    ///   · 一个非空都没有 → 返回 null（本机环回场景，默认就够）；
+    ///   · 只有一个不同取值 → 用它；
+    ///   · 有多个不同取值 → 返回 null 并在日志里说明（公共自启项本来就只有一个快捷方式，
+    ///     多通道不同桥这种配置，任何自动选择都是在替用户瞎决定）。
+    /// 任何异常（文件损坏、字段缺失）都退回 null —— 安装过程绝不能因读配置而中断。
+    /// </summary>
+    /// <returns>bridge_path；无法唯一确定时为 null。</returns>
+    private static string? ResolveConfiguredBridgePath()
+    {
+        try
+        {
+            var path = AppPaths.ConfigPath;
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            var json = File.ReadAllText(path, Encoding.UTF8);
+            var config = System.Text.Json.JsonSerializer.Deserialize<AppConfig>(
+                json,
+                new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true,
+                    ReadCommentHandling = System.Text.Json.JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true,
+                });
+
+            if (config?.Rdp is null)
+            {
+                return null;
+            }
+
+            var candidates = new List<string>();
+            void Consider(string? value)
+            {
+                var text = (value ?? string.Empty).Trim();
+                if (text.Length > 0
+                    && !candidates.Exists(c => string.Equals(c, text, StringComparison.OrdinalIgnoreCase)))
+                {
+                    candidates.Add(text);
+                }
+            }
+
+            Consider(config.Rdp.BridgePath);
+            foreach (var channel in config.Rdp.Channels)
+            {
+                Consider(channel.BridgePath);
+            }
+
+            return candidates.Count == 1 ? candidates[0] : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>

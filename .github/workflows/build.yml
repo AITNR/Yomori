@@ -426,6 +426,17 @@ jobs:
           }
           Write-Host '✅ 安装目录：{pf}\Yomori（且不让旧安装目录覆盖）'
 
+          # 安装时自动部署会话代理的唯一落地点就是这个脚本里的 Exec。只在 C# 里加了
+          # --deploy-agent 分支、忘了改 iss，功能等于不存在 —— 而且两边都不会报错，
+          # 要等用户装完发现「代理未部署」才知道。宁可在编译前判红。
+          if (-not ($issLines -match '--deploy-agent')) {
+            throw 'installer.iss 里找不到 --deploy-agent：装完不会自动部署会话代理'
+          }
+          if (-not ($issLines -match 'ewWaitUntilTerminated')) {
+            throw 'installer.iss 的部署调用没有等待结束 —— 会与后面的启动/卸载抢文件'
+          }
+          Write-Host '✅ 安装时自动部署会话代理：已接线'
+
           # Inno 的官方包不带 Unofficial 语言文件，中文要另外取；
           # 取不到就用默认英文向导（不给 LangFile 参数），别因此判红
           $langDir = Join-Path $env:GITHUB_WORKSPACE 'isl'

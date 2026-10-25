@@ -12,6 +12,11 @@
 ;   · 升级安装 = 覆盖程序文件、保留配置；
 ;   · 卸载后配置和日志也会留在安装目录，需要清掉自己删。
 ;
+; 装完文件后还会调 `Yomori.exe --deploy-agent` 自动部署会话代理（见 [Code] 的
+; DeploySessionAgent）：把随包的 agent\ 载荷铺到 %ProgramData%\Yomori\agent，
+; 并登记「所有用户」的登录自启项 —— 装完即可连目标账户，不必先手动点一次部署。
+; 该步骤失败不阻断安装（用户仍可在「通道管理」里手动部署）。
+;
 ; ── 为什么还要「改编译器模板」这一步（见 build.yml 的「让安装包强制要求管理员」）──
 ;   Inno 的引导器（SetupLdr.e32/e64）清单里写死 asInvoker，PrivilegesRequired=admin
 ;   只是让它在**自己启动之后**再 runas 提权一次 —— 于是双击后先出向导、过一会儿才弹
@@ -139,6 +144,17 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; IconFilename:
 [Run]
 Filename: "{app}\{#MyAppExe}"; Description: "安装完成后启动 {#MyAppName}"; Flags: nowait postinstall runascurrentuser skipifsilent
 
+[UninstallDelete]
+; 代理副本与自启项是「安装时自动部署」的产物（不归 [Files] 管），卸载要自己收尾：
+; 否则程序文件删干净了，ProgramData 里还留着 73MB 副本，外加一个永远指向不存在程序的
+; 启动项 —— 那东西会让每个账户登录时都白试一次。
+;
+; ⚠️ 只删 agent 子目录，**不要**删整个 {commonappdata}\Yomori：那里还有指令桥 rdp\，
+;    里面是任务状态、耗时统计与日志，属于用户数据，卸载程序不该替用户清。
+Type: files; Name: "{commonstartup}\Yomori RDP 会话代理.lnk"
+Type: filesandordirs; Name: "{commonappdata}\Yomori\agent"
+Type: filesandordirs; Name: "{commonappdata}\Yomori\agent_b"
+
 [Code]
 // 兜底：万一谁用「没打补丁的编译器模板」编出这个安装包（外层清单还是 asInvoker），
 // 至少别让它静默地以普通用户身份往 Program Files 里写 —— 那样会装一半失败，报错还看不懂。
@@ -152,6 +168,38 @@ begin
            '请右键点击安装包，选择「以管理员身份运行」。', mbError, MB_OK);
     Result := False;
   end;
+end;
+
+// ── 安装时自动部署会话代理 ───────────────────────────────────────────────
+// 文件铺完后调主程序自己的部署入口（--deploy-agent）：把随包的 agent\ 载荷铺到
+// {commonappdata}\Yomori\agent，并在「所有用户」的启动目录写下代理自启项。
+// 目标是「装完就能直接连目标账户」，不必先想起来去点界面上的「部署会话代理」按钮。
+//
+// 为什么不在这里用 [Files] / [Icons] 直接铺：
+//   · 代理运行期要往副本目录写 logs / runtime_stats，得给 BUILTIN\Users 放开权限；
+//     主程序那份部署逻辑已经连同「旧代理正占着文件 → 改铺备用目录 agent_b」一起做完了，
+//     在这里重写一遍 = 两套规则迟早漂移。
+//   · 幂等：载荷内容一致就跳过整套搬运，升级安装不会白搬 73MB。
+//   · 已有自启项时**不重写** —— 它的参数里带着用户配的 --bridge:，安装器不该替用户决定。
+//
+// 失败绝不中断安装（用户还能在程序里手动部署一次），只写安装日志。
+// 退出码：0 已部署 / 已是最新；1 失败；2 代理正在执行任务（跳过）；3 缺管理员权限。
+procedure DeploySessionAgent();
+var
+  ResultCode: Integer;
+begin
+  if not Exec(ExpandConstant('{app}\{#MyAppExe}'), '--deploy-agent',
+              ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    // Exec 自己失败时 ResultCode 是 GetLastError
+    Log('会话代理自动部署没能启动（Exec 失败）：' + SysErrorMessage(ResultCode));
+    Exit;
+  end;
+
+  Log('会话代理自动部署结束，退出码 ' + IntToStr(ResultCode));
+  if ResultCode <> 0 then
+    Log('  未部署成功。详情见 ' + ExpandConstant('{app}') + '\logs\agent_deploy.log；'
+        + '安装完成后可在「通道管理」里点「部署会话代理」重试。');
 end;
 
 // 从旧版（装在 {pf}\YukinoChan）升级上来时，同 AppId 会让 Inno 先静默跑一遍旧卸载器，
@@ -171,5 +219,9 @@ begin
       else
         Log('旧安装目录非空，予以保留：' + LegacyDir);
     end;
+
+    // 放在 ssPostInstall：此时文件已全部落地，而 [Run] 里那条「安装完成后启动」还没跑 ——
+    // 主程序起来时代理已经就位，首次连接的预检就能直接看到"已部署"。
+    DeploySessionAgent();
   end;
 end;
