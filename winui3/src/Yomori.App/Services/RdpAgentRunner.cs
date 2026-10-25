@@ -63,6 +63,15 @@ public sealed class RdpAgentRunner
     private Timer? _liveLogTimer;
     private bool _liveLogWriteFailureReported;
 
+    /// <summary>
+    /// 累计被省略的 TRACE/DEBUG 行数（见 <see cref="ExternalLogFilter.ShouldArchive"/>）。
+    /// 每满 <see cref="OmittedLogReportBatch"/> 行往归档里补一条摘要，
+    /// 让人知道「日志变少是因为筛掉了冗长行」，而不是脚本没输出。
+    /// </summary>
+    private int _omittedLogLines;
+
+    private const int OmittedLogReportBatch = 500;
+
     public RdpAgentRunner(RdpCommand command)
     {
         _command = command;
@@ -330,6 +339,10 @@ public sealed class RdpAgentRunner
     /// <summary>
     /// 处理外部脚本日志：写入独立归档文件，并排队写入主控实时日志流。
     /// 不触碰 status.json.Events，避免高频日志影响任务状态事件。
+    ///
+    /// <para>TRACE/DEBUG 级（MaaFramework 的函数进出、Pipeline 解析、GPU 探测）**不归档也不上屏**，
+    /// 理由见 <see cref="ExternalLogFilter.ShouldArchive"/> —— 这两级占实测日志体积七成以上。
+    /// 被省略的行按批补一条摘要，避免让人误以为脚本没输出。</para>
     /// </summary>
     private void OnExternalLogLine(TaskExternalLogLine item)
     {
@@ -341,10 +354,25 @@ public sealed class RdpAgentRunner
 
         try
         {
+            var archivePath = ExternalLogStore.TodayFilePath(_bridge.ChannelTag, DateTime.Now);
+
+            if (!ExternalLogFilter.ShouldArchive(line.Level))
+            {
+                var omitted = Interlocked.Increment(ref _omittedLogLines);
+                if (omitted % OmittedLogReportBatch == 0)
+                {
+                    ExternalLogStore.Append(
+                        archivePath,
+                        $"[{FormatHelper.NowTimeText()}] [已省略累计 {omitted} 行 TRACE/DEBUG 日志" +
+                        "（外部日志只保留 INFO 及以上；需要明细请设 " +
+                        ExternalLogFilter.VerboseEnvironmentVariable + "=1 后重启）]");
+                }
+
+                return;
+            }
+
             var text = ExternalLogText(line);
-            ExternalLogStore.Append(
-                ExternalLogStore.TodayFilePath(_bridge.ChannelTag, DateTime.Now),
-                $"[{FormatHelper.NowTimeText()}] {text}");
+            ExternalLogStore.Append(archivePath, $"[{FormatHelper.NowTimeText()}] {text}");
 
             lock (_liveLogGate)
             {

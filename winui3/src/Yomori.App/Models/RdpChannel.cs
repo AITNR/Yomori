@@ -27,8 +27,8 @@ public sealed class RdpChannel : ObservableObject, ICloneable
     private string _bridgePath = string.Empty;
     private bool _credentialSaved;
     private string _sessionFinish = SessionFinishModes.Keep;
-    private int _desktopWidth;
-    private int _desktopHeight;
+    private int _desktopWidth = RdpResolutions.DefaultWidth;
+    private int _desktopHeight = RdpResolutions.DefaultHeight;
     private bool _enabled = true;
     private bool _localMuted;
     private bool _inputLocked;

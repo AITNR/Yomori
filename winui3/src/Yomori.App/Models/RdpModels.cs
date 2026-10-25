@@ -108,6 +108,16 @@ public static class RdpResolutions
     public const int MinHeight = 480;
     public const int MaxHeight = 4096;
 
+    /// <summary>
+    /// 新建通道的默认窗口尺寸（1920 × 1080）。
+    /// 不用「自适应」当默认：自适应会跟着画面区域变，同一套任务在不同显示器上
+    /// 分辨率不同，脚本按坐标点击就会错位；固定 1080p 让每条通道的桌面尺寸可预期。
+    /// </summary>
+    public const int DefaultWidth = 1920;
+
+    /// <inheritdoc cref="DefaultWidth"/>
+    public const int DefaultHeight = 1080;
+
     public static readonly IReadOnlyList<KeyValuePair<string, string>> Items =
         new List<KeyValuePair<string, string>>
         {
@@ -496,16 +506,16 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private bool _notifyOnTaskDone = true;
     private bool _notifyOnChannelDone = true;
     private bool _notifyOnAllDone = true;
-    private bool _notifyLocalTaskDone;
+    private bool _notifyLocalTaskDone = true;
     private int _connectTimeoutSeconds = 120;
     private bool _credentialSaved;
     private bool _embedRemoteDesktop;
-    private string _clientMode = ClientModes.Mstsc;
+    private string _clientMode = ClientModes.Embedded;
     private bool _audioEnabled = true;
-    private bool _gfxEnabled;
+    private bool _gfxEnabled = true;
     private string _renderBackend = RenderBackends.Auto;
-    private int _desktopWidth;
-    private int _desktopHeight;
+    private int _desktopWidth = RdpResolutions.DefaultWidth;
+    private int _desktopHeight = RdpResolutions.DefaultHeight;
     private List<RdpChannel> _channels = new();
 
     /// <summary>是否在 RDP 会话中执行任务（关闭则仍在当前会话本地执行）。</summary>
@@ -619,7 +629,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
         set => SetProperty(ref _embedRemoteDesktop, value);
     }
 
-    /// <summary>连接方式：mstsc 独立窗口（默认）或 FreeRDP 内嵌画面（client_mode，计划书 §5.6）。</summary>
+    /// <summary>连接方式：内嵌 FreeRDP 画面（默认）或 mstsc 独立窗口（client_mode，计划书 §5.6）。</summary>
     [JsonPropertyName("client_mode")]
     public string ClientMode
     {
@@ -635,7 +645,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
         set => SetProperty(ref _audioEnabled, value);
     }
 
-    /// <summary>内嵌 GFX 全帧管线（gfx_enabled；撕裂根治，自动协商 progressive）。</summary>
+    /// <summary>内嵌 GFX 全帧管线（gfx_enabled；撕裂根治，自动协商 progressive）。默认开启。</summary>
     [JsonPropertyName("gfx_enabled")]
     public bool GfxEnabled
     {

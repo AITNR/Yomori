@@ -301,7 +301,7 @@
                               ToolTipService.ToolTip="D3D 在某些显卡 / 虚拟显示驱动组合下可能把整个窗口卡死（进程还活着但点不动）。碰到就切到软渲染，不用等新版本。改完下次连接生效。" />
                     <CheckBox Content="GFX 全帧管线（撕裂根治，需重连生效）"
                               IsChecked="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
-                              ToolTipService.ToolTip="走 RDP 图形管道协商 progressive 全帧，远端快速变化时不再撕裂；默认关闭" />
+                              ToolTipService.ToolTip="走 RDP 图形管道协商 progressive 全帧，远端快速变化时不再撕裂；默认开启，个别显卡驱动下画面异常时再关掉" />
 
                     <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
                                Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />
@@ -324,16 +324,6 @@
                     <ToggleSwitch Header="本地（非远程会话）执行时也发通知"
                                   IsOn="{x:Bind VM.RdpSettings.NotifyLocalTaskDone, Mode=TwoWay}" />
 
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="通知只从主控端发出：系统 Toast 只能在发出它的那个用户会话里显示，目标会话里弹的你根本看不到，所以代理侧已不再发任何通知。主控端轮询到事件后自己弹；主控端会话锁定时先落暂存，回前台补发。" />
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="连接并执行（当前设置那一组）"
-                                Command="{x:Bind VM.ConnectAndRunCommand}"
-                                ToolTipService.ToolTip="不按通道分组，直接用上面这块的全局设置连一次并跑全部启用任务" />
-                        <Button Content="断开目标会话" Command="{x:Bind VM.DisconnectSessionCommand}" />
-                        <Button Content="注销目标账户" Command="{x:Bind VM.LogoffSessionCommand}" />
-                    </StackPanel>
                 </StackPanel>
             </Border>
 

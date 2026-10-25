@@ -2685,12 +2685,18 @@ public sealed class MainViewModel : ObservableObject
         {
             Id = RdpChannel.NewId(),
             Name = $"通道 {Config.Rdp.Channels.Count + 1}",
-            // 新通道继承全局的默认值（约定见计划书 §4.1：旧字段是"新建通道时的默认值"）
+            // 新通道继承全局的默认值（约定见计划书 §4.1：旧字段是"新建通道时的默认值"）。
+            // 分辨率例外：全局字段还是「自适应」(0) 时不要继承 —— 那会让新通道的桌面尺寸
+            // 跟着画面区域变，同一套任务换台显示器就全错位，所以回落到固定的 1920 × 1080。
             Host = RdpSettings.TargetHost,
             BridgePath = RdpSettings.BridgePath,
             SessionFinish = RdpSettings.SessionFinish,
-            DesktopWidth = RdpSettings.DesktopWidth,
-            DesktopHeight = RdpSettings.DesktopHeight,
+            DesktopWidth = RdpSettings.DesktopWidth > 0
+                ? RdpSettings.DesktopWidth
+                : RdpResolutions.DefaultWidth,
+            DesktopHeight = RdpSettings.DesktopHeight > 0
+                ? RdpSettings.DesktopHeight
+                : RdpResolutions.DefaultHeight,
         };
         channel.Sanitize(Config.Rdp.Channels.Count + 1);
 
@@ -5188,21 +5194,44 @@ public sealed class MainViewModel : ObservableObject
     /// 本地执行路径下读到的外部脚本日志行。
     ///
     /// 做两件事，用途不同：
-    ///   ① 落进 <c>external_logs/local/local-YYYY-MM-DD.log</c>（事后排障，一条不丢）；
+    ///   ① 落进 <c>external_logs/local/local-YYYY-MM-DD.log</c>（事后排障）；
     ///   ② 追加到「本地执行」组的独立实时日志列表（界面实时看）。
+    ///
+    /// TRACE/DEBUG 级不落盘也不上屏，理由见 <see cref="ExternalLogFilter.ShouldArchive"/>；
+    /// 被省略的行按批补一条摘要，避免让人误以为脚本没输出。
     ///
     /// 不弹通知 —— 日志是高频流，一条一弹等于刷屏；通知只留给任务完成这类里程碑。
     /// </summary>
     private readonly ConcurrentQueue<(RdpChannelSession Session, TaskExternalLogLine Item)> _localLiveLogs = new();
     private int _localLiveLogPostPending;
 
+    /// <summary>本地执行路径下累计被省略的 TRACE/DEBUG 行数（见 <see cref="ExternalLogFilter.ShouldArchive"/>）。</summary>
+    private int _omittedLocalLogLines;
+
+    private const int OmittedLocalLogReportBatch = 500;
+
     private void OnExternalLogLine(RdpChannelSession? session, TaskExternalLogLine item)
     {
         if (session is null || item.Line.Text.Length == 0) return;
+        var archivePath = ExternalLogStore.TodayFilePath(ExternalLogStore.LocalChannelTag, DateTime.Now);
+
+        if (!ExternalLogFilter.ShouldArchive(item.Line.Level))
+        {
+            var omitted = Interlocked.Increment(ref _omittedLocalLogLines);
+            if (omitted % OmittedLocalLogReportBatch == 0)
+            {
+                ExternalLogStore.Append(
+                    archivePath,
+                    $"[{FormatHelper.NowTimeText()}] [已省略累计 {omitted} 行 TRACE/DEBUG 日志" +
+                    "（外部日志只保留 INFO 及以上；需要明细请设 " +
+                    ExternalLogFilter.VerboseEnvironmentVariable + "=1 后重启）]");
+            }
+
+            return;
+        }
+
         var text = ExternalLogText(item.Line);
-        ExternalLogStore.Append(
-            ExternalLogStore.TodayFilePath(ExternalLogStore.LocalChannelTag, DateTime.Now),
-            $"[{FormatHelper.NowTimeText()}] [{item.TaskName}] {text}");
+        ExternalLogStore.Append(archivePath, $"[{FormatHelper.NowTimeText()}] [{item.TaskName}] {text}");
         _localLiveLogs.Enqueue((session, item));
         // The display queue is bounded independently from the archive.
         while (_localLiveLogs.Count > 4000) _localLiveLogs.TryDequeue(out _);

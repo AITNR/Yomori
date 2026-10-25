@@ -10,11 +10,59 @@ namespace Yomori.Services;
 /// 外部日志行的解析 —— **全部是纯函数**，不碰文件、不碰 WinUI，
 /// 这样整条逻辑能脱离界面直接跑断言。
 ///
-/// 级别（<see cref="Classify"/>）只用于**标注**（界面上区分普通行 / 告警 / 错误），
-/// 不作为丢弃依据 —— 日志一律**全部保留**。
+/// 级别（<see cref="Classify"/>）有两个用途：
+/// <list type="number">
+///   <item>**标注** —— 界面上区分普通行 / 告警 / 错误；</item>
+///   <item>**归档取舍** —— 见 <see cref="ShouldArchive"/>：TRACE/DEBUG 级不进归档文件。</item>
+/// </list>
+///
+/// <para>为什么现在要按级别丢弃一部分：见 <see cref="ShouldArchive"/> 的说明。</para>
 /// </summary>
 public static class ExternalLogFilter
 {
+    /// <summary>
+    /// 归档冗余行的逃生口：设为 <c>1</c> / <c>true</c> 时恢复「一条不丢」。
+    ///
+    /// 只在排障需要 TRACE/DEBUG 明细时用。改环境变量后主控端与代理都要重启才生效
+    /// （主控端靠它过滤本地执行的归档，代理靠它过滤目标账户会话里的归档）。
+    /// </summary>
+    public const string VerboseEnvironmentVariable = "YOMORI_EXTERNAL_LOG_VERBOSE";
+
+    private static readonly bool ArchiveVerbose = ReadVerboseFlag();
+
+    private static bool ReadVerboseFlag()
+    {
+        var value = Environment.GetEnvironmentVariable(VerboseEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        value = value.Trim();
+        return value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                          || value.Equals("yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// 这一行是否要落进归档文件 / 实时日志流。
+    ///
+    /// <para>TRACE 与 DEBUG 一律丢弃，其余（含识别不出级别的）全部保留。</para>
+    ///
+    /// <para>【为什么】实测 March7thAssistant 跑崩坏3（MaaFramework 侧）一天能吐
+    /// 100 万行以上、200MB 以上：MaaFW 把每个函数的进入/离开、每个 Pipeline 节点的解析、
+    /// GPU 适配器探测都以 TRC/DBG 级别打到 stdout，经 MaaEnd 的 maafw.log 被采集。
+    /// 按级别统计，TRC 占 44%、DBG 占 28.5%，而两者对排障几乎没有价值
+    /// （真正有用的是 INF 的识别结果与任务流转、WRN/ERR 的告警）。丢掉这两级能省 72% 体积。</para>
+    ///
+    /// <para>【为什么 Unknown 保留】识别不出级别的行可能是用户脚本自己 printf 的正文，
+    /// 丢了就等于把最该留的东西筛掉。宁可多留，不可误杀 —— 这是 fail-open。</para>
+    /// </summary>
+    public static bool ShouldArchive(ExternalLogLevel level)
+        => ArchiveVerbose || level is not (ExternalLogLevel.Trace or ExternalLogLevel.Debug);
+
+    /// <summary>同 <see cref="ShouldArchive(ExternalLogLevel)"/>，直接用已解析的行（null 视为不归档）。</summary>
+    public static bool ShouldArchive(ExternalLogLine? line)
+        => line is not null && ShouldArchive(line.Level);
     /// <summary>ANSI 转义序列（颜色码 / 光标控制），日志里常见但显示出来是一坨乱码。</summary>
     private static readonly Regex AnsiEscape = new(@"\x1B\[[0-9;?]*[a-zA-Z]", RegexOptions.Compiled);
 

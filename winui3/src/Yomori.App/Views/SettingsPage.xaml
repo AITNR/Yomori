@@ -121,6 +121,8 @@
                     <TextBlock Text="外部脚本日志" FontWeight="SemiBold" />
                     <TextBlock Text="脚本自己写出来的实时日志（BetterGI / March7thAssistant / MaaEnd 等），按通道分目录、每天一份文件保存。目标账户会话里的那份由代理写在 %ProgramData%\Yomori\agent\external_logs，本地执行的那份写在程序目录的 external_logs。"
                                TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
+                    <TextBlock Text="归档只保留 INFO 及以上：TRACE / DEBUG 级（MaaFramework 的函数进出、Pipeline 解析、GPU 探测）不写入文件，实测可减少约四分之三的体积。被省略的行会按批留下汇总行。需要完整明细时设环境变量 YOMORI_EXTERNAL_LOG_VERBOSE=1 后重启主控端与代理。"
+                               TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
 
                     <Grid ColumnSpacing="12">
                         <Grid.ColumnDefinitions>
