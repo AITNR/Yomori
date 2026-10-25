@@ -137,7 +137,8 @@
                                         Width="34" Height="30" Padding="0"
                                         ToolTipService.ToolTip="通知">
                                     <Button.Flyout>
-                                        <Flyout x:Name="NotifyFlyout" Placement="BottomEdgeAlignedRight">
+                                        <Flyout x:Name="NotifyFlyout" Placement="BottomEdgeAlignedRight"
+                                                Opened="OnNotifyFlyoutOpened">
                                             <Grid Width="380" RowSpacing="8">
                                                 <Grid.RowDefinitions>
                                                     <RowDefinition Height="Auto" />
@@ -172,6 +173,7 @@
                                                                     <ColumnDefinition Width="Auto" />
                                                                     <ColumnDefinition Width="*" />
                                                                     <ColumnDefinition Width="Auto" />
+                                                                    <ColumnDefinition Width="Auto" />
                                                                 </Grid.ColumnDefinitions>
 
                                                                 <!-- 未读标记：已读时是空串，不占宽 -->
@@ -190,6 +192,19 @@
                                                                 <TextBlock Grid.Column="2" Text="{x:Bind TimeText}"
                                                                            FontSize="11" Opacity="0.55"
                                                                            VerticalAlignment="Top" />
+
+                                                                <!-- 删除这条。Tag 绑数据项本身 —— 处理器里靠它认人，
+                                                                     不依赖 DataContext 的继承（模板里两条路都能走，选稳的）。 -->
+                                                                <Button Grid.Column="3"
+                                                                        Click="OnDeleteNotificationClicked"
+                                                                        Tag="{x:Bind}"
+                                                                        Width="26" Height="26" Padding="0"
+                                                                        Background="Transparent"
+                                                                        BorderThickness="0"
+                                                                        VerticalAlignment="Center"
+                                                                        ToolTipService.ToolTip="删除这条通知">
+                                                                    <FontIcon Glyph="&#xE711;" FontSize="11" />
+                                                                </Button>
                                                             </Grid>
                                                         </DataTemplate>
                                                     </ListView.ItemTemplate>

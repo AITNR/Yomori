@@ -30,6 +30,17 @@ public static class AppNotificationActions
 
     /// <summary>在资源管理器里打开 <c>ActionTarget</c>（文件或目录路径）。</summary>
     public const string OpenPath = "open_path";
+
+    /// <summary>点这条就开始下载安装包（<c>ActionTarget</c> = 安装包直链）。</summary>
+    public const string Download = "download";
+
+    /// <summary>
+    /// 点这条就退出程序并运行已下载的安装包（<c>ActionTarget</c> = 本地路径）。
+    ///
+    /// <para>为什么动作做到"安装"这一级：用户点的是"我决定现在升级"，
+    /// 再让他去文件夹里双击一次 exe 属于多余的一步。</para>
+    /// </summary>
+    public const string Install = "install";
 }
 
 /// <summary>
@@ -98,7 +109,10 @@ public sealed class AppNotification : ObservableObject
     [JsonIgnore]
     public bool HasAction =>
         ActionTarget.Length > 0
-        && ActionKind is AppNotificationActions.OpenUrl or AppNotificationActions.OpenPath;
+        && ActionKind is AppNotificationActions.OpenUrl
+            or AppNotificationActions.OpenPath
+            or AppNotificationActions.Download
+            or AppNotificationActions.Install;
 
     /// <summary>动作按钮上的字（没有动作时为空串）。</summary>
     [JsonIgnore]
@@ -106,6 +120,8 @@ public sealed class AppNotification : ObservableObject
     {
         AppNotificationActions.OpenUrl => "前往下载",
         AppNotificationActions.OpenPath => "打开所在文件夹",
+        AppNotificationActions.Download => "下载",
+        AppNotificationActions.Install => "安装",
         _ => string.Empty,
     };
 

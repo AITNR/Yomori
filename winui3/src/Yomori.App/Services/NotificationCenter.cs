@@ -122,13 +122,15 @@ public sealed class NotificationCenter
     }
 
     /// <summary>
-    /// 只在"标题还没出现过"时加一条。
+    /// 同标题的不重复堆叠，而是**就地换成新的一条**（已读状态保留）。
     ///
     /// 专门给启动时检查更新用：每次启动都会查一次，而"发现新版本 2.3.0"这条
-    /// 在用户升级之前会一直成立 —— 不去重的话，一天开十次就攒十条一样的，
-    /// 铃铛点开全是复读。
+    /// 在用户升级之前会一直成立 —— 不去重的话，一天开十次就攒十条一样的。
+    ///
+    /// 换而不是跳过：同一条更新提醒的动作可能变（例如从"去网页下载"改成"直接下载"），
+    /// 跳过就会让用户点着车上留下来的旧条目、又跳回浏览器。
     /// </summary>
-    /// <returns>新加的那条；已存在同标题时返回 null。</returns>
+    /// <returns>新加的那条；已有同标题时返回 null（但列表里那条已经被换掉了）。</returns>
     public AppNotification? AddIfNew(
         string title,
         string body,
@@ -136,12 +138,23 @@ public sealed class NotificationCenter
         string actionKind = AppNotificationActions.None,
         string actionTarget = "")
     {
-        if (Items.Any(item => string.Equals(item.Title, title, StringComparison.Ordinal)))
+        var existing = Items.FirstOrDefault(item => string.Equals(item.Title, title, StringComparison.Ordinal));
+
+        if (existing is null)
         {
-            return null;
+            return Add(title, body, kind, actionKind, actionTarget);
         }
 
-        return Add(title, body, kind, actionKind, actionTarget);
+        var wasRead = existing.IsRead;
+        Items.Remove(existing);
+
+        var replaced = Add(title, body, kind, actionKind, actionTarget);
+        if (wasRead)
+        {
+            MarkRead(replaced);
+        }
+
+        return null;
     }
 
     /// <summary>把某条标成已读（已读的不重复通知界面）。</summary>

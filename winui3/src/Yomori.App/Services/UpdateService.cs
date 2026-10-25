@@ -932,22 +932,33 @@ public static class UpdateService
             return null;
         }
 
-        string name;
+        return (url, FileNameFromUrl(url));
+    }
+
+    /// <summary>
+    /// 从资产直链里取文件名；取不到就给个兜底名。
+    ///
+    /// 公开是因为通知里只存了 URL（点"下载"时手上没有 GitHubRelease 对象），
+    /// 落盘文件名得从同一个规则来，否则和 <see cref="PickDownload"/> 会不一致。
+    /// </summary>
+    public static string FileNameFromUrl(string? url)
+    {
+        const string fallback = "Yomori-update.bin";
+
+        if (string.IsNullOrWhiteSpace(url))
+        {
+            return fallback;
+        }
+
         try
         {
-            name = Path.GetFileName(new Uri(url).AbsolutePath);
+            var name = Path.GetFileName(new Uri(url).AbsolutePath);
+            return string.IsNullOrWhiteSpace(name) ? fallback : name;
         }
         catch
         {
-            name = string.Empty;
+            return fallback;
         }
-
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            name = "Yomori-update.bin";
-        }
-
-        return (url, name);
     }
 
     /// <summary>

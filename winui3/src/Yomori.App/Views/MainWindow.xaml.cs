@@ -847,6 +847,33 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// 面板一打开就把未读清掉。
+    ///
+    /// 用户已经把它拉下来看了，再挂着红点、继续每 2 秒摇铃铛，就是"信息已经送达却还在催"。
+    /// （这是实际反馈：看到了通知，铃铛还显示未读。）
+    /// </summary>
+    private void OnNotifyFlyoutOpened(object? sender, object e)
+    {
+        VM.MarkAllNotificationsRead();
+        UpdateNotifyChrome();
+    }
+
+    /// <summary>删除单条通知。点的是"这一条"，所以不弹确认 —— 删错了再等下一次启动检查即可。</summary>
+    private void OnDeleteNotificationClicked(object sender, RoutedEventArgs e)
+    {
+        // 不用 e.Handled：Button.Click 的 RoutedEventArgs 根本没有这个属性（那是
+        // PointerRoutedEventArgs 等才有的）。也不担心冒泡成 ListView 的 ItemClick ——
+        // Button 自己会吃掉指针事件，ItemClick 不会跟着触发。
+        if (sender is not FrameworkElement element || element.Tag is not AppNotification item)
+        {
+            return;
+        }
+
+        VM.Notifications.Remove(item);
+        UpdateNotifyChrome();
+    }
+
     private void OnMarkAllNotificationsRead(object sender, RoutedEventArgs e)
     {
         VM.MarkAllNotificationsRead();

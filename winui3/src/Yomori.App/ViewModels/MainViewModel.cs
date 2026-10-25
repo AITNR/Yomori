@@ -138,6 +138,16 @@ public sealed class MainViewModel : ObservableObject
                 case AppNotificationActions.OpenPath when item.ActionTarget.Length > 0:
                     OpenDirectory(item.ActionTarget);
                     break;
+
+                case AppNotificationActions.Download when item.ActionTarget.Length > 0:
+                    // 不阻塞界面：下载几十秒到几分钟，交给后台，结果另挂一条通知
+                    _ = StartNotificationDownloadAsync(item.ActionTarget);
+                    break;
+
+                case AppNotificationActions.Install when item.ActionTarget.Length > 0:
+                    // 点了就等于"我决定现在升级"：启动安装包并退出（安装程序会先关掉本进程）
+                    StartInstallerAndExit(item.ActionTarget);
+                    break;
             }
         }
         catch (Exception ex)
@@ -159,6 +169,9 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>安装包下载到哪：程序目录下的 <c>updates</c>（管理员可写，用户也好找）。</summary>
     public static string UpdateDownloadDir => Path.Combine(AppPaths.BaseDir, "updates");
+
+    /// <summary>是否已有一次下载在跑（并发写同一个 *.part 会把文件搞坏）。</summary>
+    private bool _updateDownloadBusy;
 
     /// <summary>
     /// 启动时按设置检查一次更新（取值见 <see cref="UpdateCheckModes"/>）。
@@ -197,98 +210,138 @@ public sealed class MainViewModel : ObservableObject
         }
 
         var release = result.Latest;
+        var pick = UpdateService.PickDownload(release);
 
         if (mode == UpdateCheckModes.Download)
         {
-            await DownloadUpdateAsync(release, network).ConfigureAwait(false);
+            if (pick is null)
+            {
+                NotifyDownloadUnavailable(release);
+                return;
+            }
+
+            await DownloadPackageAsync(pick.Value.Url, pick.Value.FileName, network).ConfigureAwait(false);
             return;
         }
 
-        // AddIfNew：每次启动都会查到同一个新版本，不去重的话铃铛里会攒一串复读
+        // 「有更新时通知我」：通知本身就是下载入口 —— 点它直接在后台下，不必先去浏览器。
+        // AddIfNew：每次启动都会查到同一个新版本，不去重的话铃铛里会攒一串复读。
         Post(() => Notifications.AddIfNew(
             $"发现新版本 {release.Version}",
-            result.Message + "\n点这条去发布页下载。",
-            AppNotificationKinds.Update,
-            AppNotificationActions.OpenUrl,
-            release.PageUrl));
+            pick is null
+                ? result.Message + "\n这份发布里没有可下载的安装包，点这条去发布页看看。"
+                : result.Message + "\n点这条直接下载安装包，下完会再问你要不要装。",
+            pick is null ? AppNotificationKinds.Warning : AppNotificationKinds.Update,
+            pick is null ? AppNotificationActions.OpenUrl : AppNotificationActions.Download,
+            pick is null ? release.PageUrl : pick.Value.Url));
     }
 
-    private async Task DownloadUpdateAsync(GitHubRelease release, UpdateNetworkSettings network)
+    /// <summary>这份发布里没有可下载资产时的通知（只能去发布页）。</summary>
+    private void NotifyDownloadUnavailable(GitHubRelease release) =>
+        Post(() => Notifications.Add(
+            $"发现新版本 {release.Version}",
+            "这份发布里没有可下载的安装包，点这条去发布页看看。",
+            AppNotificationKinds.Warning,
+            AppNotificationActions.OpenUrl,
+            release.PageUrl));
+
+    /// <summary>
+    /// 把安装包下载到 <see cref="UpdateDownloadDir"/>，并按结果挂通知。
+    ///
+    /// <para>流程设计成"点通知就下、下完再给一条可以点的安装通知"，
+    /// 中间不弹任何对话框 —— 用户点的是"我要这个更新"，不该被两个弹窗拦一道。</para>
+    ///
+    /// <para>⚠️ 同一时刻只允许一个下载：用户在铃铛里连点两下、或者启动检查自动下载与
+    /// 手动点下载撞一起，会两个线程写同一个 <c>*.part</c>。</para>
+    /// </summary>
+    private async Task DownloadPackageAsync(string url, string fileName, UpdateNetworkSettings network)
     {
-        var pick = UpdateService.PickDownload(release);
-        if (pick is null)
+        if (_updateDownloadBusy)
         {
-            Post(() => Notifications.Add(
-                $"发现新版本 {release.Version}",
-                "这份发布里没有可下载的安装包，点这条去发布页看看。",
-                AppNotificationKinds.Warning,
-                AppNotificationActions.OpenUrl,
-                release.PageUrl));
+            AppendLog("[更新检查] 已经有一个安装包在下载了，忽略这次请求。");
             return;
         }
 
-        var (url, fileName) = pick.Value;
+        _updateDownloadBusy = true;
         var target = Path.Combine(UpdateDownloadDir, fileName);
 
-        AppendLog($"[更新检查] 开始下载 {fileName}（代理：{UpdateProxyModes.Label(Config.UpdateProxyMode)}）。");
+        // 立刻挂一条"正在下载"：下载可能几十秒到几分钟，没有回执用户会以为点了没反应
+        var progressItem = PostAndGet(() => Notifications.Add(
+            "正在下载安装包",
+            $"{fileName}\n下载完成后会再通知一次。",
+            AppNotificationKinds.Download));
 
-        var (ok, message) = await UpdateService
-            .DownloadAsync(url, target, network)
-            .ConfigureAwait(false);
-
-        AppendLog($"[更新检查] {message}");
-
-        if (!ok)
+        try
         {
-            Post(() => Notifications.Add("更新下载失败", message, AppNotificationKinds.Warning));
-            return;
+            AppendLog($"[更新检查] 开始下载 {fileName}（代理：{UpdateProxyModes.Label(network.ProxyMode)}）。");
+
+            var (ok, message) = await UpdateService
+                .DownloadAsync(url, target, network)
+                .ConfigureAwait(false);
+
+            AppendLog($"[更新检查] {message}");
+
+            Post(() =>
+            {
+                // 进度那条已被结果取代，删掉免得铃铛里留一条永远"正在下载"
+                Notifications.Remove(progressItem);
+
+                if (ok)
+                {
+                    Notifications.Add(
+                        "安装包已下载",
+                        $"{Path.GetFileName(target)}\n点这条退出程序并安装。",
+                        AppNotificationKinds.Download,
+                        AppNotificationActions.Install,
+                        target);
+                }
+                else
+                {
+                    Notifications.Add("更新下载失败", message, AppNotificationKinds.Warning);
+                }
+            });
         }
-
-        Post(() =>
+        finally
         {
-            Notifications.Add(
-                $"已下载 {release.Version} 安装包",
-                $"{Path.GetFileName(target)}\n点这条打开所在文件夹。",
-                AppNotificationKinds.Download,
-                AppNotificationActions.OpenPath,
-                UpdateDownloadDir);
-
-            _ = AskInstallUpdateAsync(target, release.Version);
-        });
+            _updateDownloadBusy = false;
+        }
     }
 
     /// <summary>
-    /// 下载完问一句要不要现在装。
+    /// 在 UI 线程上执行并拿回返回值（通知集合只能 UI 线程碰）。
     ///
-    /// <para>⚠️ 必须问：安装程序会先关掉正在运行的 Yomori，跑了一半的任务会当场断掉。
-    /// 这种后果不能由程序替用户决定 —— 尤其本程序的常见用法就是挂机跑长任务。</para>
+    /// ⚠️ 只在**后台线程**上才会阻塞等待；调用方若已在 UI 线程则直接执行 ——
+    /// UI 线程同步等自己排的队就是死锁（项目里记过这条）。
     /// </summary>
-    private async Task AskInstallUpdateAsync(string setupPath, string version)
+    private AppNotification? PostAndGet(Func<AppNotification?> action)
     {
-        ContentDialogResult result;
-        try
+        if (_dispatcher.HasThreadAccess)
         {
-            result = await DialogHelper.ShowMessageAsync(
-                "更新已下载",
-                $"新版本 {version} 的安装包已经下载好：\n{setupPath}\n\n"
-                + "现在安装吗？安装程序会先关闭 Yomori —— 正在执行的任务会被中断，"
-                + "建议等这一轮跑完再装。",
-                closeText: "稍后",
-                primaryText: "现在安装");
-        }
-        catch
-        {
-            return;
+            return action();
         }
 
-        if (result != ContentDialogResult.Primary)
+        AppNotification? result = null;
+        using var done = new ManualResetEventSlim(false);
+
+        if (!_dispatcher.TryEnqueue(() =>
+            {
+                result = action();
+                done.Set();
+            }))
         {
-            AppendLog("[更新检查] 用户选择稍后安装（安装包留在 updates 目录）。");
-            return;
+            return null;
         }
 
-        StartInstallerAndExit(setupPath);
+        done.Wait(TimeSpan.FromSeconds(2));
+        return result;
     }
+
+    /// <summary>点「下载」那条通知：从 URL 反推文件名，走的还是同一套下载流程。</summary>
+    private Task StartNotificationDownloadAsync(string url) =>
+        DownloadPackageAsync(
+            url,
+            UpdateService.FileNameFromUrl(url),
+            UpdateNetworkSettings.FromConfig(Config));
 
     private void StartInstallerAndExit(string setupPath)
     {
