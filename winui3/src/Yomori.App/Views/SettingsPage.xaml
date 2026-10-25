@@ -93,12 +93,16 @@
 
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button x:Name="RdpUnlockButton" Content="解锁 RDP" Click="OnRdpUnlock" />
-                        <Button x:Name="RdpUninstallButton" Content="卸载 RDP 解锁" IsEnabled="False" />
+                        <Button x:Name="RdpUninstallButton" Content="卸载 RDP 解锁" Click="OnRdpUninstall" IsEnabled="False" />
                         <Button x:Name="RdpRestoreRegistryButton" Content="还原注册表" Click="OnRdpRestoreRegistry" IsEnabled="False" />
                     </StackPanel>
 
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                               Text="三件事互不相同，因此是三个按钮：解锁 = 安装官方组件并改配置；还原注册表 = 只按快照恢复本功能改过的键值，不卸载组件；卸载 = 调用官方卸载器（本版本尚未接入）。三者共享同一把锁，同时只能跑一个。" />
+                               Text="三件事互不相同，因此是三个按钮：解锁 = 安装官方组件并改配置；还原注册表 = 只按快照恢复本功能改过的键值，不卸载组件；卸载 = 调用官方卸载器，不动账户与凭据。三者共享同一把锁，同时只能跑一个。" />
+
+                    <!-- 来源与许可说明（计划书 §9：外部下载资产不随包分发，但仍要交代来源与风险） -->
+                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
+                               Text="解锁组件来自上游 sebaxakerhtc/rdpwrap（Apache License 2.0，stascorp/rdpwrap 的分支）。Yomori 不随包分发任何解锁载荷，不修改 termsrv.dll，不做注入或进程内存写入；安装器与卸载器在需要时从官方 Releases 动态下载并在本机校验。该类组件可能被安全软件误报，Yomori 不隐藏、不混淆、不规避扫描。" />
 
                     <InfoBar x:Name="RdpResultBar" IsOpen="False" IsClosable="True" />
 

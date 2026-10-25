@@ -2907,6 +2907,97 @@ public sealed class MainViewModel : ObservableObject
         SaveConfig();
         AppendLog($"[会话通道] 已保存「{channel.DisplayName}」的凭据（{RdpTargets.Normalize(channel.Host)}|{channel.User}，配置文件不保存密码）。");
         RefreshChannelReadiness();
+
+        // 保存账户 = 明确提交动作：本机通道顺手完成组授权（计划书 §8）。
+        // 字段失焦 / 导入配置 / 复制通道都走不到这里，那些路径不修改系统权限。
+        StartAccountAuthorization(channel);
+    }
+
+    /// <summary>
+    /// 保存凭据之后的本机账户授权。fire-and-forget：失败只记日志，不打断保存流程。
+    /// </summary>
+    /// <remarks>
+    /// 计划书 §8 的边界逐条落在这里：
+    /// · 不创建 Windows 用户（账户不存在就报告，让用户自己去系统设置里建）；
+    /// · 只对本机通道授权，远端的同名账户一律不碰；
+    /// · 版本未知 / 账户边界不清 → 停止；
+    /// · 家庭版缺 RDP 组 → 加 Administrators，且必须用户显式确认"授予管理员权限"。
+    /// </remarks>
+    private void StartAccountAuthorization(RdpChannel channel)
+    {
+        // 账户名必须在**此刻**取快照：用户可能在授权对话框弹着的时候又去改了通道
+        var account = channel.User;
+        var displayName = channel.DisplayName;
+        var host = channel.Host;
+
+        _ = AuthorizeLocalAccountAsync(host, account, displayName);
+    }
+
+    private async Task AuthorizeLocalAccountAsync(string host, string account, string displayName)
+    {
+        try
+        {
+            if (!Config.Rdp.Enabled)
+            {
+                AppendLog("[账户授权] 未开启「在远程桌面会话中执行」，跳过本机账户授权。");
+                return;
+            }
+
+            if (!RdpTargets.IsLocal(host))
+            {
+                // 远端机器上的同名账户与本机无关，按计划书不加本机组
+                AppendLog($"[账户授权] 「{displayName}」是远程通道（{RdpTargets.Normalize(host)}），不做本机账户授权。");
+                return;
+            }
+
+            var (edition, editionId, productName) = LocalGroupMembershipService.DetectEdition();
+            var rdpGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.RemoteDesktopUsersSid);
+            var adminGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.AdministratorsSid);
+
+            var plan = RdpGrantPlanner.Plan(
+                account, Environment.MachineName, edition, rdpGroup is not null, adminGroup is not null);
+
+            if (!plan.Allowed)
+            {
+                AppendLog($"[账户授权] 跳过：{plan.Reason}"
+                          + $"（版本 {RdpEditions.Label(edition)}，EditionID={editionId}，ProductName={productName}）");
+                return;
+            }
+
+            if (plan.NeedsAdminWarning)
+            {
+                // 家庭版把账户提成管理员影响很大：必须明示，不能顺手做掉
+                var confirmed = await DialogHelper.ShowMessageAsync(
+                    "授予管理员权限",
+                    $"本机是家庭版，且没有 Remote Desktop Users 组。要让「{RdpGrantPlanner.BareAccountName(account)}」"
+                    + "通过远程桌面登录，需要把它加入 Administrators —— 这会授予该账户本机管理员权限。"
+                    + Environment.NewLine + Environment.NewLine
+                    + "选择「取消」不会做任何改动，之后也可以自己在「设置 → 账户」里手工添加。",
+                    closeText: "取消",
+                    primaryText: "确认授予管理员权限");
+
+                if (confirmed != ContentDialogResult.Primary)
+                {
+                    AppendLog("[账户授权] 用户取消了家庭版管理员授权，未改动任何组成员。");
+                    return;
+                }
+            }
+
+            var result = await Task.Run(() => LocalGroupMembershipService.Authorize(account, edition));
+
+            await RunOnUiThreadAsync(() =>
+            {
+                var recorded = RdpGrantStore.Append(account, result);
+                AppendLog($"[账户授权] {result.Message}"
+                          + (result.Detail.Length > 0 ? $"　{result.Detail}" : "")
+                          + (recorded ? "（已记入 grants.jsonl）" : ""));
+            });
+        }
+        catch (Exception ex)
+        {
+            // fire-and-forget：异常绝不能放出去，否则就是未观察异常
+            AppendLog($"[账户授权] 异常：{ex.GetType().Name}: {ex.Message}");
+        }
     }
 
     public void ClearChannelCredential()

@@ -852,7 +852,9 @@ public sealed partial class SettingsPage : Page
 
         RdpRedetectButton.IsEnabled = !busy;
         RdpUnlockButton.IsEnabled = !busy;
-        RdpUninstallButton.IsEnabled = false;   // 卸载在 M5 接入
+
+        // 卸载只在"确实装着"的时候可点：没装的时候点它是无意义的（服务也会直接返回"无需卸载"）
+        RdpUninstallButton.IsEnabled = !busy && _rdpSnapshot?.WrapperState == RdpWrapperState.Installed;
 
         var hasBaseline = false;
         var hasAnyTransaction = false;
@@ -1151,6 +1153,66 @@ public sealed partial class SettingsPage : Page
         var id = baseline.Id;
         await RunRdpOperationAsync("还原注册表",
             (progress, token) => RdpUnlockService.RestoreRegistryAsync(id, progress, token));
+    }
+
+    /// <summary>
+    /// 卸载：确认后果 →（缺卸载器时）杀软人工确认 → 调官方卸载器 → 回读 ServiceDll。
+    /// </summary>
+    /// <remarks>
+    /// 与「还原注册表」的分界写在确认框里：卸载只移除组件，不还原注册表、不删账户与凭据。
+    /// 两个动作都会断会话，所以也都不能静默执行。
+    /// </remarks>
+    private async void OnRdpUninstall(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        await EnsureRdpSnapshotAsync();
+
+        if (_rdpSnapshot?.WrapperState != RdpWrapperState.Installed)
+        {
+            SetRdpAction("本机没有安装解锁组件，无需卸载。");
+            return;
+        }
+
+        var hasLocalTool = RdpUninstallService.HasLocalUninstaller(out var toolDetail);
+
+        var confirmed = await DialogHelper.ShowMessageAsync(
+            "卸载 RDP 解锁",
+            "将移除本机 RDP Wrapper 解锁组件，可能断开所有相关远程桌面会话。"
+            + Environment.NewLine + Environment.NewLine
+            + "不会删除：Windows 用户、密码、Yomori 通道配置、凭据、恢复备份。"
+            + Environment.NewLine + Environment.NewLine
+            + "家庭版卸载后可能不再提供远程桌面服务端；专业版的原生远程桌面不受影响。"
+            + Environment.NewLine + Environment.NewLine
+            + $"卸载器：{toolDetail}",
+            closeText: "取消",
+            primaryText: "确认卸载");
+
+        if (confirmed != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        var antivirusConfirmed = false;
+        if (!hasLocalTool)
+        {
+            if (!await ConfirmAntivirusAsync())
+            {
+                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
+                return;
+            }
+
+            antivirusConfirmed = true;
+        }
+
+        var request = new RdpUninstallRequest { AntivirusConfirmed = antivirusConfirmed };
+        var network = UpdateNetworkSettings.FromConfig(VM.Config);
+
+        await RunRdpOperationAsync("卸载 RDP 解锁",
+            (progress, token) => RdpUninstallService.UninstallAsync(request, network, progress, token));
     }
 
     /// <summary>历史备份：列出所有事务，允许挑一份还原。</summary>

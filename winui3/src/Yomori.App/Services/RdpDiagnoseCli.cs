@@ -52,6 +52,7 @@ public static class RdpDiagnoseCli
             text.AppendLine();
 
             AppendTransactions(text);
+            AppendEditionAndGrants(text);
 
             Emit(text.ToString());
             return snapshot.AllPass ? 0 : 1;
@@ -90,6 +91,38 @@ public static class RdpDiagnoseCli
             text.AppendLine();
             text.AppendLine($"⚠ 有 {incomplete.Count} 个事务没有收尾（崩溃或强杀）。"
                             + "解锁/还原在它被处理掉之前会拒绝开始。");
+        }
+    }
+
+    /// <summary>
+    /// 版本与账户授权记录。用户报「账户加不进远程桌面组」时，这两段是最常见的两个原因
+    /// （版本判成未知 → 按规则拒绝；或者账户根本不是本机账户）。
+    /// </summary>
+    private static void AppendEditionAndGrants(StringBuilder text)
+    {
+        text.AppendLine();
+        text.AppendLine("--- 版本与账户授权 ---");
+
+        var (edition, editionId, productName) = LocalGroupMembershipService.DetectEdition();
+        text.AppendLine($"本机版本：{RdpEditions.Label(edition)}"
+                        + $"（EditionID={editionId}，ProductName={productName}）");
+
+        var rdpGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.RemoteDesktopUsersSid);
+        var adminGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.AdministratorsSid);
+        text.AppendLine($"Remote Desktop Users 组：{(rdpGroup is null ? "不存在" : rdpGroup)}");
+        text.AppendLine($"Administrators 组：{(adminGroup is null ? "不存在" : adminGroup)}");
+
+        var grants = RdpGrantStore.List();
+        if (grants.Count == 0)
+        {
+            text.AppendLine("授权记录：（还没由 Yomori 加过组成员）");
+            return;
+        }
+
+        text.AppendLine($"授权记录（{RdpGrantStore.FilePath}）：");
+        foreach (var grant in grants)
+        {
+            text.AppendLine($"· {grant.At}　{grant.AccountName}（{grant.AccountSid}）→ {grant.GroupName}（{grant.GroupSid}）");
         }
     }
 

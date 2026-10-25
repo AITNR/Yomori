@@ -241,7 +241,7 @@ public static class RdpUnlockService
                     return Fail(steps, "安装器在下载后被改动过，已停止：", verify.Message, before);
                 }
 
-                var run = await RunToolAsync(installer.LocalPath, "", ToolTimeout, cancellationToken).ConfigureAwait(false);
+                var run = await RdpToolRunner.RunAsync(installer.LocalPath, "", ToolTimeout, cancellationToken).ConfigureAwait(false);
                 RdpTransactionStore.AppendStep(manifest, $"安装器退出码 {run.ExitCode}：{run.OutputTail}");
 
                 if (run.TimedOut)
@@ -667,7 +667,7 @@ public static class RdpUnlockService
             manifest.IniBackup = RdpTransactionStore.BackupIni(manifest.Id, iniPath);
         }
 
-        var run = await RunToolAsync(tool, "-w", IniTimeout, cancellationToken).ConfigureAwait(false);
+        var run = await RdpToolRunner.RunAsync(tool, "-w", IniTimeout, cancellationToken).ConfigureAwait(false);
         RdpTransactionStore.AppendStep(manifest, $"INI 更新退出码 {run.ExitCode}：{run.OutputTail}");
 
         if (run.TimedOut)
@@ -782,7 +782,7 @@ public static class RdpUnlockService
                 }
                 else
                 {
-                    var run = await RunToolAsync(uninstallPath, "", ToolTimeout, cancellationToken).ConfigureAwait(false);
+                    var run = await RdpToolRunner.RunAsync(uninstallPath, "", ToolTimeout, cancellationToken).ConfigureAwait(false);
                     notes.Add($"卸载补偿退出码 {run.ExitCode}");
                 }
             }
@@ -813,85 +813,6 @@ public static class RdpUnlockService
         }
 
         return false;
-    }
-
-    /// <summary>
-    /// 跑一个外部工具并收集输出。**超时不杀进程**（计划书 6.2：正在写文件的工具不强杀）。
-    /// </summary>
-    private static async Task<(int ExitCode, bool TimedOut, string OutputTail)> RunToolAsync(
-        string path, string arguments, TimeSpan timeout, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = path,
-                Arguments = arguments,
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-                WorkingDirectory = Path.GetDirectoryName(path) ?? Environment.CurrentDirectory,
-                StandardOutputEncoding = Encoding.UTF8,
-                StandardErrorEncoding = Encoding.UTF8,
-            };
-
-            using var process = new Process { StartInfo = startInfo };
-            var output = new StringBuilder();
-
-            process.OutputDataReceived += (_, e) =>
-            {
-                if (e.Data is not null)
-                {
-                    output.AppendLine(e.Data);
-                }
-            };
-            process.ErrorDataReceived += (_, e) =>
-            {
-                if (e.Data is not null)
-                {
-                    output.AppendLine(e.Data);
-                }
-            };
-
-            if (!process.Start())
-            {
-                return (-1, false, "进程无法启动");
-            }
-
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(timeout);
-
-            try
-            {
-                await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
-                process.WaitForExit();   // 等异步输出读完
-                return (process.ExitCode, false, Tail(output.ToString()));
-            }
-            catch (OperationCanceledException)
-            {
-                // 不 Kill：让工具自己把文件写完，调用方按"结果不明"处理
-                return (-1, true, Tail(output.ToString()));
-            }
-        }
-        catch (Exception ex)
-        {
-            return (-1, false, $"{ex.GetType().Name}: {ex.Message}");
-        }
-    }
-
-    private static string Tail(string text)
-    {
-        var trimmed = (text ?? string.Empty).Trim();
-        if (trimmed.Length == 0)
-        {
-            return "（无输出）";
-        }
-
-        return trimmed.Length <= 400 ? trimmed : "…" + trimmed.Substring(trimmed.Length - 400);
     }
 
     private static string Short(string sha) => sha.Length > 12 ? sha.Substring(0, 12) : sha;
