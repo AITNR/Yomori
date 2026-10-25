@@ -17,7 +17,6 @@
     <Grid Padding="16,12" RowSpacing="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" MinHeight="220" />
         </Grid.RowDefinitions>
 
@@ -44,39 +43,15 @@
             </Grid>
         </Border>
 
-        <!-- ===== 这条通道自己的进度 ===== -->
-        <Border Grid.Row="1" Padding="14,8" Style="{StaticResource YomoriCardStyle}">
-            <StackPanel Spacing="6">
-                <ProgressBar Value="{x:Bind ProgressValue, Mode=OneWay}"
-                             Maximum="{x:Bind ProgressMax, Mode=OneWay}" />
-
-                <Grid ColumnSpacing="12">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="Auto" />
-                        <ColumnDefinition Width="Auto" />
-                    </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="{x:Bind TaskText, Mode=OneWay}"
-                               TextTrimming="CharacterEllipsis" />
-                    <TextBlock Grid.Column="1" Text="{x:Bind ProgressText, Mode=OneWay}" Opacity="0.75" />
-                    <TextBlock Grid.Column="2" Text="{x:Bind ElapsedText, Mode=OneWay}" Opacity="0.75" />
-                </Grid>
-
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBlock Text="{x:Bind StatusText, Mode=OneWay}" TextWrapping="Wrap" />
-                    <TextBlock Text="·" Opacity="0.5" />
-                    <TextBlock Text="{x:Bind HeartbeatText, Mode=OneWay}" Opacity="0.7" />
-                </StackPanel>
-            </StackPanel>
-        </Border>
-
-        <!-- ===== 内容区：左边是内嵌画面（吃满整块高度），右边竖排运行信息 =====
-             以前运行信息在画面**下方**，一条 174px 的固定高度把它钉死：窗口一矮，
-             画面被压成一条横带，而运行信息自己也溢出到窗口外（1080p 实测看不全）。
-             现在左右分栏：画面拿满剩余高度，运行信息在右侧竖排、随时可收起换空间。 -->
-        <Grid Grid.Row="2" ColumnSpacing="10">
+        <!-- ===== 内容区：左边是内嵌画面，右边竖排运行信息，中间可拖动改比例 =====
+             运行信息原来在画面下方、TabView 写死 174px：窗口一矮画面就被压成横带，
+             它自己也溢出到窗口外（1080p 实测看不全）。改成左右分栏后，
+             两栏之间的宽度由用户拖中间那条分隔条决定（宽度记进配置，下次沿用）。 -->
+        <Grid Grid.Row="1" ColumnSpacing="0">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
+                <!-- 分隔条自己占一列，宽度写死；拖动只改 EventsColumn 的宽度。 -->
+                <ColumnDefinition Width="Auto" />
                 <!-- 运行信息栏。收起时由代码把宽度收窄（见 OnToggleEventsClicked），
                      不设成 Auto —— TabView 里的列表会把 Auto 列撑到最宽。 -->
                 <ColumnDefinition x:Name="EventsColumn" Width="360" />
@@ -98,8 +73,25 @@
                 </Grid>
             </Border>
 
+            <!-- 拖动分隔条：改两栏宽度比例（拖动逻辑在 OnSplitterPointer*，宽度记进配置）。
+                 ⚠️ 必须显式给 Background="Transparent" —— Grid 没有背景时那块区域
+                    **收不到指针事件**（hit test 直接穿过去），看着在但拖不动。
+                 鼠标指针（↔）由 SplitterThumb 自己在构造函数里设：ProtectedCursor 是
+                 protected，页面里对着普通控件改不了，只能靠子类。 -->
+            <views:SplitterThumb x:Name="EventsSplitter"
+                                 Grid.Column="1" Width="8"
+                                 Background="Transparent"
+                                 PointerPressed="OnSplitterPointerPressed"
+                                 PointerMoved="OnSplitterPointerMoved"
+                                 PointerReleased="OnSplitterPointerReleased"
+                                 PointerCaptureLost="OnSplitterPointerReleased">
+                <Rectangle Width="2" RadiusX="1" RadiusY="1"
+                           HorizontalAlignment="Center"
+                           Fill="{ThemeResource DividerStrokeColorDefaultBrush}" />
+            </views:SplitterThumb>
+
             <!-- 运行信息：运行事件 / 实时日志（竖排在右侧，可收起） -->
-            <Border Grid.Column="1" Padding="12,8" Style="{StaticResource YomoriCardStyle}">
+            <Border Grid.Column="2" Padding="12,8" Style="{StaticResource YomoriCardStyle}">
                 <Grid RowSpacing="6">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />

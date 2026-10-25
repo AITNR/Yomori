@@ -35,6 +35,7 @@ public sealed class WindowConfig : ObservableObject, ICloneable
     private int _height;
     private bool _maximized;
     private bool _sidebarCollapsed;
+    private int _channelEventsWidth;
     private string _closeAction = CloseActionAsk;
 
     /// <summary>窗口左上角 X（物理像素）。null = 未记录。</summary>
@@ -91,6 +92,20 @@ public sealed class WindowConfig : ObservableObject, ICloneable
     }
 
     /// <summary>
+    /// 通道页「运行信息」栏的宽度（物理像素）。0 = 没拖过，按页面宽度取默认比例。
+    ///
+    /// <para>用户拖动画面与运行信息之间的分隔条后记下来，下次进页面沿用 ——
+    /// 和窗口几何、侧栏收起一样，都属纯界面偏好，放同一个节点也同一批落盘。
+    /// 实际使用时还要按当前窗口宽度钳制（见 RdpChannelPage.SetEventsColumnWidth）。</para>
+    /// </summary>
+    [JsonPropertyName("channel_events_width")]
+    public int ChannelEventsWidth
+    {
+        get => _channelEventsWidth;
+        set => SetProperty(ref _channelEventsWidth, value);
+    }
+
+    /// <summary>
     /// 点关闭按钮时怎么处理窗口。<c>ask</c> / <c>tray</c> / <c>exit</c> / <c>auto</c>。
     ///
     /// <para>放在 window 节点里，因为它和窗口几何是同一类东西 —— 纯界面偏好。
@@ -138,6 +153,12 @@ public sealed class WindowConfig : ObservableObject, ICloneable
         if (Y is < -32768 or > 32768)
         {
             Y = null;
+        }
+
+        // 负数是脏数据，当"没拖过"处理；真正的上下限随窗口宽度变，只能在使用处钳制
+        if (ChannelEventsWidth < 0)
+        {
+            ChannelEventsWidth = 0;
         }
     }
 

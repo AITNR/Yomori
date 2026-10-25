@@ -102,6 +102,12 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     /// <summary>运行信息栏是否收起（收起后整栏收窄，画面多占约 264px）。</summary>
     private bool _eventsCollapsed;
 
+    /// <summary>拖动分隔条：按下那一刻的右栏宽度（null = 当前没在拖）。</summary>
+    private double? _dragStartWidth;
+
+    /// <summary>拖动分隔条：按下那一刻的指针 X（页面坐标）。</summary>
+    private double _dragStartPointerX;
+
     /// <summary>
     /// 页面自身的属性变化通知。
     ///
@@ -188,19 +194,9 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
         }
     }
 
-    public string StatusText => _session?.StatusText ?? VM.SurfaceStateText(_channelId);
-
-    public string HeartbeatText => _session is null ? "－" : $"心跳：{_session.HeartbeatText}";
-
-    public string TaskText => _session is null ? "任务：－" : $"任务：{_session.TaskDisplay}";
-
-    public string ProgressText => _session is null ? "－" : $"{_session.Progress} / {_session.Total}";
-
-    public string ElapsedText => _session?.ElapsedText ?? "00:00";
-
-    public double ProgressValue => _session?.Progress ?? 0;
-
-    public double ProgressMax => Math.Max(1, _session?.Total ?? 1);
+    // 进度卡已移除（用户要求：那块"任务：－ / 已连接"的横条不再显示，画面让位）。
+    // 进度 / 心跳 / 状态这些数据仍在 _session 上，主窗口右侧的执行状态栏与多画面页照常显示，
+    // 只是本页不再复述一遍 —— 想加回来时从 _session 现算即可（这里是 1Hz 刷新的）。
 
     public ObservableCollection<RdpTaskEvent> Events => _session?.Events ?? _emptyEvents;
 
@@ -381,22 +377,97 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     }
 
     /// <summary>
-    /// 按页面宽度定右栏宽度：固定值在两种极端上都难看 ——
-    /// 窗口只有 960（最小宽度）时 360px 会把画面挤没，而大屏上又白白浪费宽度。
-    /// 所以取约三分之一并夹在 [260, 420] 之间；收起时固定窄条。
+    /// 按当前状态把右栏宽度落到列定义上。
+    ///
+    /// 三个来源按优先级：收起（固定窄条）→ 用户拖过的宽度（存配置里）→ 页面宽度的约 1/3。
+    /// 挂在 SizeChanged 上，所以窗口缩放时不会跑出有效范围。**只在页面里生效的前提**是：
+    /// 拖动过程中的中间值不走这里（否则每次 SizeChanged 都会被"用户宽度"覆盖回去，
+    /// 手指一拖就弹回原位）。
     /// </summary>
     private void ApplyEventsColumnWidth()
     {
-        var width = _eventsCollapsed
-            ? CollapsedEventsColumnWidth
-            : Math.Clamp(ActualWidth * 0.34, ExpandedEventsColumnWidthMin, ExpandedEventsColumnWidthMax);
+        if (_eventsCollapsed)
+        {
+            SetEventsColumnWidth(CollapsedEventsColumnWidth);
+            return;
+        }
 
-        if (EventsColumn is null || Math.Abs(EventsColumn.Width.Value - width) < 0.5)
+        var saved = VM.Config.Window.ChannelEventsWidth;
+        SetEventsColumnWidth(saved > 0 ? saved : ActualWidth * 0.34);
+    }
+
+    /// <summary>
+    /// 右栏宽度的唯一出口：先按窗口实际宽度钳制再写列定义。
+    /// 下限保底是为了 TabView 里的日志行不至于挤成一列字，
+    /// 上限取「页面宽度的 60%」与绝对上限的较小值 —— 窗口窄的时候不能把画面压没。
+    /// </summary>
+    private void SetEventsColumnWidth(double width)
+    {
+        if (EventsColumn is null)
         {
             return;
         }
 
-        EventsColumn.Width = new GridLength(width);
+        var clamped = _eventsCollapsed
+            ? CollapsedEventsColumnWidth
+            : Math.Clamp(
+                width,
+                ExpandedEventsColumnWidthMin,
+                Math.Min(ExpandedEventsColumnWidthMax,
+                         Math.Max(ExpandedEventsColumnWidthMin, ActualWidth * 0.6)));
+
+        if (Math.Abs(EventsColumn.Width.Value - clamped) >= 0.5)
+        {
+            EventsColumn.Width = new GridLength(clamped);
+        }
+    }
+
+    private void OnSplitterPointerPressed(object sender, PointerRoutedEventArgs e)
+    {
+        // 收起状态下不拖：右栏只剩一条窄条，拖动没有意义，还会和「展开」按钮抢事件
+        if (_eventsCollapsed || !EventsSplitter.CapturePointer(e.Pointer))
+        {
+            return;
+        }
+
+        _dragStartWidth = EventsColumn.Width.Value;
+        _dragStartPointerX = e.GetCurrentPoint(this).Position.X;
+        e.Handled = true;
+    }
+
+    private void OnSplitterPointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_dragStartWidth is not double start)
+        {
+            return;
+        }
+
+        // 指针往右 = 分隔条往右 = 右栏变窄，所以是"起点宽度 - 位移"
+        var x = e.GetCurrentPoint(this).Position.X;
+        SetEventsColumnWidth(start - (x - _dragStartPointerX));
+        e.Handled = true;
+    }
+
+    private void OnSplitterPointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (_dragStartWidth is null)
+        {
+            return;
+        }
+
+        _dragStartWidth = null;
+        EventsSplitter.ReleasePointerCapture(e.Pointer);
+        e.Handled = true;
+
+        // 松手才落盘：拖动过程中每一帧都写 config.json 是不可接受的（每帧一次磁盘 IO）
+        var width = (int)Math.Round(EventsColumn.Width.Value);
+        if (VM.Config.Window.ChannelEventsWidth == width)
+        {
+            return;
+        }
+
+        VM.Config.Window.ChannelEventsWidth = width;
+        VM.SaveConfig();
     }
 
     private void OnClearExternalLogsClicked(object sender, RoutedEventArgs e)
