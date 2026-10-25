@@ -46,6 +46,13 @@ public sealed class MainViewModel : ObservableObject
     private const string EmbedLogTag = "[embed]";
 
     /// <summary>
+    /// 内存探针行的标签（形如 <c>[memory] private_mb=393 working_set_mb=402 …</c>）。
+    /// 和 <see cref="EmbedLogTag"/> 一样默认不进「运行日志」页 —— 它每几秒一行、
+    /// 一屏全是数字，把"任务跑到哪一步"顶得看不见。要看同样去开发者模式。
+    /// </summary>
+    private const string MemoryLogTag = "[memory]";
+
+    /// <summary>
     /// 同步等 UI 线程干完一件事的上限（<see cref="RunOnUiThreadSync"/>）。
     /// 取值理由：那里排的都是「改个状态 + 刷个界面」的短活，正常几十微秒到几毫秒；
     /// 给 5 秒是留足余量 —— 真等满 5 秒基本可以确定 UI 线程卡住了，而不是慢。
@@ -199,28 +206,29 @@ public sealed class MainViewModel : ObservableObject
     /// 本次会话产生过的全部日志行（不按开发者模式过滤，上限同样是 <see cref="MaxLogLines"/>）。
     ///
     /// 留着它是为了让「开发者模式」开关一拨动就能**立刻**重排日志页：只按新开关决定
-    /// 往后收不收 <c>[embed]</c> 行的话，用户拨开开关后要等下一行诊断（最长 5 秒，
-    /// 还得正好挂着画面）才看出变化，会以为开关坏了。
+    /// 往后收不收诊断行（<c>[embed]</c> / <c>[memory]</c>）的话，用户拨开开关后要等下一行
+    /// 诊断（内存探针最长十几秒、内嵌画面最长 5 秒，还得正好挂着画面）才看出变化，
+    /// 会以为开关坏了。
     /// </summary>
     private readonly List<string> _logBacklog = new();
 
     public ObservableCollection<StatRow> StatRows { get; }
 
     /// <summary>
-    /// 本次会话里是不是**真的**藏起过 <c>[embed]</c> 诊断行。
+    /// 本次会话里是不是**真的**藏起过诊断行（<c>[embed]</c> / <c>[memory]</c>）。
     /// 只在 false → true 那一刻发一次变更通知，不用每条日志都刷一遍绑定。
     /// </summary>
-    private bool _hasHiddenEmbedLine;
+    private bool _hasHiddenDiagnosticLine;
 
     /// <summary>
-    /// 「运行日志」页上那句提示：开发者模式关着、并且确实藏了 <c>[embed]</c> 诊断行时才显示，
+    /// 「运行日志」页上那句提示：开发者模式关着、并且确实藏过诊断行时才显示，
     /// 说明它们去哪儿了、要打开哪个开关。
     ///
-    /// 加"确实藏过"这个条件是刻意的：从没挂过内嵌画面（也就没写过诊断行）时，
+    /// 加"确实藏过"这个条件是刻意的：从没挂过内嵌画面、也没写过内存探针行时，
     /// 页面上凭空多一行提示只是噪声。
     /// </summary>
-    public Visibility EmbedLogHintVisibility =>
-        !Config.DeveloperMode && _hasHiddenEmbedLine ? Visibility.Visible : Visibility.Collapsed;
+    public Visibility DiagnosticLogHintVisibility =>
+        !Config.DeveloperMode && _hasHiddenDiagnosticLine ? Visibility.Visible : Visibility.Collapsed;
 
     /// <summary>统计页的空状态提示（有数据就收起来）。表格全空时界面一片空白，容易被当成模块坏了。</summary>
     public Visibility StatsEmptyVisibility =>
@@ -1528,11 +1536,11 @@ public sealed class MainViewModel : ObservableObject
 
         if (!ShouldShowLogLine(line))
         {
-            // 第一次藏东西时才通知界面 —— 见 _hasHiddenEmbedLine 的注释
-            if (!_hasHiddenEmbedLine)
+            // 第一次藏东西时才通知界面 —— 见 _hasHiddenDiagnosticLine 的注释
+            if (!_hasHiddenDiagnosticLine)
             {
-                _hasHiddenEmbedLine = true;
-                OnPropertyChanged(nameof(EmbedLogHintVisibility));
+                _hasHiddenDiagnosticLine = true;
+                OnPropertyChanged(nameof(DiagnosticLogHintVisibility));
             }
 
             return;
@@ -1548,23 +1556,28 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>
     /// 这一行该不该出现在「运行日志」页面上。
     ///
-    /// 内嵌画面的诊断行（形如 <c>[embed] D3D 渲染器初始化成功…</c>）默认不显示：
-    /// 挂着画面时它每 5 秒写一行帧到达节奏 / GFX 状态，几路画面同时跑就能把
-    /// 「任务跑到哪一步、哪条通道出事了」这类要看的信息顶出屏幕。
+    /// 两类诊断行默认不显示：
+    ///   · 内嵌画面的（形如 <c>[embed] D3D 渲染器初始化成功…</c>）—— 挂着画面时它每 5 秒
+    ///     写一行帧到达节奏 / GFX 状态，几路画面同时跑就能把"任务跑到哪一步、哪条通道出事了"
+    ///     顶出屏幕；
+    ///   · 内存探针的（形如 <c>[memory] private_mb=393 working_set_mb=402 …</c>）—— 同理，
+    ///     而且它比内嵌那类更密（每几秒一行，一屏全是数字）。
     /// 要看得去「设置 → 开发者」打开开发者模式。
     ///
     /// ⚠️ 只挡显示，**不挡落盘**：<see cref="FileLogger"/> 那边的日志文件始终是完整的
     /// （AppendLog 是"先写文件、再决定要不要上页面"），排障时照旧能照着时间翻。
     /// </summary>
     private bool ShouldShowLogLine(string line) =>
-        Config.DeveloperMode || !line.Contains(EmbedLogTag, StringComparison.OrdinalIgnoreCase);
+        Config.DeveloperMode
+        || (!line.Contains(EmbedLogTag, StringComparison.OrdinalIgnoreCase)
+            && !line.Contains(MemoryLogTag, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// 开发者模式拨动后重排日志页：打开时把攒着的 <c>[embed]</c> 行补回来，
     /// 关闭时把已经显示在页面上的那些收掉。
     ///
-    /// 只改数据与 <see cref="_hasHiddenEmbedLine"/>，属性变更通知交给调用方发
-    /// （<see cref="EmbedLogHintVisibility"/> 同时取决于这个字段和配置开关，
+    /// 只改数据与 <see cref="_hasHiddenDiagnosticLine"/>，属性变更通知交给调用方发
+    /// （<see cref="DiagnosticLogHintVisibility"/> 同时取决于这个字段和配置开关，
     /// 分开发容易漏掉一边）。
     /// </summary>
     private void RefreshLogFilter()
@@ -1590,7 +1603,7 @@ public sealed class MainViewModel : ObservableObject
             }
         }
 
-        _hasHiddenEmbedLine = hidden;
+        _hasHiddenDiagnosticLine = hidden;
     }
 
     /// <summary>
@@ -1615,7 +1628,7 @@ public sealed class MainViewModel : ObservableObject
         }
 
         RefreshLogFilter();
-        OnPropertyChanged(nameof(EmbedLogHintVisibility));
+        OnPropertyChanged(nameof(DiagnosticLogHintVisibility));
     }
 
     public void ClearLogs()
@@ -1623,10 +1636,10 @@ public sealed class MainViewModel : ObservableObject
         _logBacklog.Clear();
         LogLines.Clear();
 
-        if (_hasHiddenEmbedLine)
+        if (_hasHiddenDiagnosticLine)
         {
-            _hasHiddenEmbedLine = false;
-            OnPropertyChanged(nameof(EmbedLogHintVisibility));
+            _hasHiddenDiagnosticLine = false;
+            OnPropertyChanged(nameof(DiagnosticLogHintVisibility));
         }
     }
 

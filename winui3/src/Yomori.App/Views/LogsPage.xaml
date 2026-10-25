@@ -22,15 +22,15 @@
             </TextBlock>
         </StackPanel>
 
-        <!-- 开发者模式关着、且确实藏了 [embed] 诊断行时才出现：不然用户只会看到
-             "以前有的那些 D3D / 帧率日志怎么不见了"，却找不到开关在哪儿。
-             可见性由 VM.EmbedLogHintVisibility 算（从没写过诊断行时不显示，免得白占一行）。 -->
+        <!-- 开发者模式关着、且确实藏过诊断行（[embed] / [memory]）时才出现：不然用户只会看到
+             "以前有的那些 D3D / 帧率 / 内存数字怎么不见了"，却找不到开关在哪儿。
+             可见性由 VM.DiagnosticLogHintVisibility 算（从没写过诊断行时不显示，免得白占一行）。 -->
         <TextBlock Grid.Row="2"
-                   Visibility="{x:Bind VM.EmbedLogHintVisibility, Mode=OneWay}"
+                   Visibility="{x:Bind VM.DiagnosticLogHintVisibility, Mode=OneWay}"
                    TextWrapping="Wrap"
                    FontSize="12"
                    Opacity="0.6"
-                   Text="带 [embed] 标签的内嵌画面诊断日志已隐藏（在「设置 → 开发者」里打开开发者模式即可显示；日志文件里始终完整保留）。" />
+                   Text="带 [embed]、[memory] 标签的诊断日志已隐藏（在「设置 → 开发者」里打开开发者模式即可显示；日志文件里始终完整保留）。" />
 
         <Border Grid.Row="3"
                 BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"

@@ -91,11 +91,12 @@ public sealed class AppConfig : ObservableObject
     }
 
     /// <summary>
-    /// 开发者模式：决定「运行日志」页要不要显示带 <c>[embed]</c> 标签的内嵌画面诊断行
-    /// （D3D 初始化 / 渲染路径 / GFX 管线状态 / 帧到达节奏……）。
+    /// 开发者模式：决定「运行日志」页要不要显示两类诊断行 ——
+    /// 带 <c>[embed]</c> 标签的内嵌画面诊断（D3D 初始化 / 渲染路径 / GFX 管线状态 / 帧到达节奏）
+    /// 与带 <c>[memory]</c> 标签的内存探针（private_mb / working_set_mb / threads…）。
     ///
     /// 只影响**页面显示**：关着的时候这些行照样写进 logs 目录里的日志文件，
-    /// 排障该翻的证据一条不少 —— 它们只是平时每 5 秒一条，会把任务调度那几条信息淹掉。
+    /// 排障该翻的证据一条不少 —— 它们只是每几秒一条，会把任务调度那几条信息淹掉。
     /// </summary>
     [JsonPropertyName("developer_mode")]
     public bool DeveloperMode
