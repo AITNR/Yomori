@@ -45,6 +45,9 @@ Python / PySide6 版（v1.0 RC1，legacy）的变更记录见仓库根的 [CHANG
 - **卸载时清理代理副本与自启项**：`%ProgramData%\Yomori\agent`、`agent_b` 与公共启动目录里的
   快捷方式都随卸载删除。指令桥目录 `%ProgramData%\Yomori\rdp\` 保留 —— 那是任务状态与统计，
   属于用户数据。
+- **仓库地址统一为新名 `AITNR/Yomori`**：检查更新（GitHub Releases 接口）、设置页「关于」里的
+  GitHub 按钮、安装包的「支持网址」原先都写着改名前的 `Anigame-script-manager`，
+  每次都多经一次 301 重定向。旧地址仍可访问，但新装的包与之后的检查更新都直连新地址。
 
 ### Fixed
 

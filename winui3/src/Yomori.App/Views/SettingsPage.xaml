@@ -188,7 +188,7 @@
                                TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <HyperlinkButton Content="联系作者" NavigateUri="https://space.bilibili.com/627260829" />
-                        <HyperlinkButton Content="GitHub" NavigateUri="https://github.com/AITNR/Anigame-script-manager" />
+                        <HyperlinkButton Content="GitHub" NavigateUri="https://github.com/AITNR/Yomori" />
                         <Button Content="☕ 赞赏支持" Click="OnSponsor" />
                     </StackPanel>
 

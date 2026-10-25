@@ -106,7 +106,15 @@ public static class UpdateService
     /// <summary>仓库归属。README / 安装程序里的下载入口与这里必须一致。</summary>
     public const string Owner = "AITNR";
 
-    public const string Repo = "Anigame-script-manager";
+    /// <summary>
+    /// 仓库名。
+    ///
+    /// ⚠️ 2026-10 产品从「Anigame-script-manager」改名为「Yomori」，GitHub 侧跟着改了：
+    /// 旧名会 301 跳过来，但每跳一次都多一回重定向，而且接口地址写旧名迟早会被清理。
+    /// 这里写的是**改后的**名字 —— 与 installer.iss 的 <c>MyAppURL</c>、
+    /// 设置页「关于」里的 GitHub 按钮保持一致。
+    /// </summary>
+    public const string Repo = "Yomori";
 
     public static string RepoUrl => $"https://github.com/{Owner}/{Repo}";
 

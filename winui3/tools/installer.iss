@@ -55,7 +55,8 @@
 #define MyAppName "Yomori"
 #define MyAppExe "Yomori.exe"
 #define MyAppPublisher "AITNR"
-#define MyAppURL "https://github.com/AITNR/Anigame-script-manager"
+; 仓库地址（产品已从 Anigame-script-manager 改名为 Yomori，旧名会 301 跳转 —— 这里写新名）
+#define MyAppURL "https://github.com/AITNR/Yomori"
 
 ; 改名前（v2.1.1 及更早）的安装目录名。仅用于升级后收掉旧目录的空壳，
 ; 不参与任何路径安装逻辑 —— 见 [Setup] 里 UsePreviousAppDir 的说明。
