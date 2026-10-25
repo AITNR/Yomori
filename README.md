@@ -4,7 +4,7 @@
   <img alt="访问量" src="https://count.getloli.com/@Yomori?theme=booru-lewd&amp;padding=7&amp;offset=0&amp;align=top&amp;scale=1&amp;pixelated=1&amp;darkmode=auto">
 </p>
 
-Windows 桌面应用，使用 C# 与 WinUI 3（Windows App SDK）开发。当前版本 **v2.3.1**。
+Windows 桌面应用，使用 C# 与 WinUI 3（Windows App SDK）开发。当前版本 **v2.3.2**。
 
 用途：统一管理多个 Windows 账户下的每日自动化任务 —— 配置执行环境、按通道编排任务、监控执行状态，
 并在任务结束后按配置完成收尾（保持会话 / 断开 / 注销 / 关机）。
