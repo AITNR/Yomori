@@ -193,11 +193,15 @@
                               SelectedValue="{x:Bind VM.ChannelResolutionKey, Mode=TwoWay}"
                               HorizontalAlignment="Stretch" />
 
-                    <ComboBox Header="该通道任务全部结束后的会话处理"
-                              ItemsSource="{x:Bind VM.SessionFinishItems}"
+                    <!-- 会话处理：数据源与选中值都由代码管（见 ChannelsPage.xaml.cs 的
+                         SyncSessionFinishSelection），不要改回 x:Bind。
+                         x:Bind 的路径是 VM.SelectedChannel.SessionFinish（两级），
+                         首次求值时 SelectedChannel 为空 / ItemsSource 还没填，那次赋值会被
+                         ComboBox 直接丢弃，之后就再也匹配不上 —— 表现就是下拉框一片空白。 -->
+                    <ComboBox x:Name="SessionFinishCombo"
+                              Header="该通道任务全部结束后的会话处理"
                               DisplayMemberPath="Value"
                               SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.SelectedChannel.SessionFinish, Mode=TwoWay}"
                               SelectionChanged="OnChannelFinishChanged"
                               HorizontalAlignment="Stretch" />
 

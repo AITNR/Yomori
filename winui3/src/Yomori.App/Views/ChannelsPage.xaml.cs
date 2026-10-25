@@ -41,6 +41,12 @@ public sealed partial class ChannelsPage : Page
         RenderBackendCombo.ItemsSource = RenderBackends.Items;
         SyncRenderBackendSelection();
 
+        // 会话处理下拉框同理，而且它更脆：x:Bind 的路径是 VM.SelectedChannel.SessionFinish
+        // （两级），首次求值时 SelectedChannel 可能还是 null、ItemsSource 也可能还没填 ——
+        // 那一次赋值会被 ComboBox 丢弃，之后填了选项也不会重新匹配，下拉框就一直是空的。
+        // 所以数据源在这里给，选中值跟着「选中通道」在 SyncChannelChrome 里刷。
+        SessionFinishCombo.ItemsSource = SessionFinishModes.Items;
+
         // 画面控件诊断直接进运行日志（便于无人值守验收）
         EmbedView.DiagnosticLog = VM.AppendLog;
 
@@ -132,6 +138,8 @@ public sealed partial class ChannelsPage : Page
             ? "未选择通道"
             : $"正在编辑：{selected.DisplayName}";
 
+        SyncSessionFinishSelection(selected);
+
         ChannelReadinessBar.Severity = VM.ChannelReadinessText.Contains("就绪")
             ? InfoBarSeverity.Success
             : InfoBarSeverity.Warning;
@@ -151,6 +159,23 @@ public sealed partial class ChannelsPage : Page
         if (!string.Equals(RenderBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
         {
             RenderBackendCombo.SelectedValue = key;
+        }
+    }
+
+    /// <summary>
+    /// 把「会话处理」下拉框拉到选中通道的当前值（为什么不用 x:Bind 见 XAML 里的说明）。
+    ///
+    /// 该字段在任何情况下都能归一成一个合法值（<see cref="SessionFinishModes.Normalize"/>
+    /// 对空串 / 未知值一律回落到 keep），所以只要有通道，下拉框就一定有选中项 ——
+    /// 不会出现"什么都不显示"。新建通道的默认值也是 keep（保持连接）。
+    /// </summary>
+    private void SyncSessionFinishSelection(RdpChannel? channel)
+    {
+        var key = channel is null ? null : SessionFinishModes.Normalize(channel.SessionFinish);
+
+        if (!string.Equals(SessionFinishCombo.SelectedValue as string, key, StringComparison.Ordinal))
+        {
+            SessionFinishCombo.SelectedValue = key;
         }
     }
 
@@ -217,7 +242,25 @@ public sealed partial class ChannelsPage : Page
     }
 
     /// <summary>离散控件（收尾方式 / 启用开关）改了就立刻落盘，不用等按钮。</summary>
-    private void OnChannelFinishChanged(object sender, SelectionChangedEventArgs e) => VM.PersistChannelEdits();
+    /// <summary>
+    /// 「会话处理」改了就写回通道并落盘。
+    ///
+    /// 值由本方法写回模型（不再靠 TwoWay 绑定），所以要自己判断"真的变了"：
+    /// <see cref="SyncSessionFinishSelection"/> 切换通道时也会设 SelectedValue、同样会走到这里，
+    /// 不判断就会拿刚设上的同一个值反复 PersistChannelEdits（那会每次都写一遍 config.json）。
+    /// </summary>
+    private void OnChannelFinishChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (VM.SelectedChannel is not RdpChannel channel
+            || SessionFinishCombo.SelectedValue is not string key
+            || string.Equals(channel.SessionFinish, key, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        channel.SessionFinish = key;
+        VM.PersistChannelEdits();
+    }
 
     private void OnChannelEnabledToggled(object sender, RoutedEventArgs e) => VM.PersistChannelEdits();
 

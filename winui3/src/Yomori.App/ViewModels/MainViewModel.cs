@@ -2719,8 +2719,11 @@ public sealed class MainViewModel : ObservableObject
         AppendLog($"[会话通道] 通道配置已保存（当前：{name}）。");
     }
 
-    public IReadOnlyList<KeyValuePair<string, string>> SessionFinishItems => SessionFinishModes.Items;
-
+    /// <summary>
+    /// 下拉框用的分辨率档位。注意「会话处理」那组选项不在这里 ——
+    /// 通道页直接绑 <see cref="SessionFinishModes.Items"/>，因为那个 ComboBox 的选中值
+    /// 由代码同步（见 ChannelsPage.xaml.cs 的 SyncSessionFinishSelection）。
+    /// </summary>
     public IReadOnlyList<KeyValuePair<string, string>> ResolutionItems => RdpResolutions.Items;
 
     /// <summary>下拉框用的分辨率档位；选中「自适应」时写 0 回配置。</summary>
