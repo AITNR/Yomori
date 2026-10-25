@@ -102,6 +102,21 @@ public static class RdpSessionService
     private const string StartupShortcutName = "Yomori RDP 会话代理.lnk";
 
     /// <summary>
+    /// 改名前（v2.1.1 及更早）留下的自启项文件名。
+    ///
+    /// 它们指向 <c>%ProgramData%\YukinoChan\agent</c> —— 那份副本现在既不再创建、
+    /// 也没人清理（部署只保证"新的那份"存在）。留着只会让每个账户登录时白试一次：
+    /// 快捷方式指向不存在的 exe，Explorer 静默失败，用户什么提示都看不到。
+    ///
+    /// 安装包的 <c>[UninstallDelete]</c> 里也有同名条目，两边必须一致。
+    /// </summary>
+    private static readonly string[] LegacyStartupShortcutNames =
+    {
+        "雪乃酱 RDP 会话代理.lnk",
+        "YukinoChan RDP 会话代理.lnk",
+    };
+
+    /// <summary>
     /// 代理副本专用 manifest 的文件名（内容 = asInvoker 版）。
     ///
     /// 为什么需要单独一份：主控端的 app.manifest 已改成 requireAdministrator
@@ -1323,6 +1338,10 @@ public static class RdpSessionService
     {
         message = string.Empty;
 
+        // 顺手收掉改名前留下的旧自启项。放在最前面是因为它和"这次要不要重写自启项"无关：
+        // 「新 lnk 已存在 → 保留不动」正是最常见的升级路径，而旧 lnk 恰好永远不会被那条路径碰到。
+        CleanupLegacyStartupShortcuts();
+
         // 代理载荷的来源有两种，优先用随包分发的精简版：
         //   ① <BaseDir>\agent\Yomori.Agent.exe —— 正式安装版 / CI 产物走这条。
         //      独立工程产出的纯后台程序，没有 WinUI / WindowsAppSDK / ONNX，
@@ -1408,6 +1427,37 @@ public static class RdpSessionService
 
         message = notes.ToString();
         return true;
+    }
+
+    /// <summary>
+    /// 删掉改名前留下的旧自启项（见 <see cref="LegacyStartupShortcutNames"/>）。
+    ///
+    /// 单文件删除，全程吞异常：删不掉（被占用 / 权限不够）最多让登录时多空试一次，
+    /// 不该让「部署代理」整个失败 —— 那两件事的后果完全不在一个量级。
+    /// </summary>
+    private static void CleanupLegacyStartupShortcuts()
+    {
+        var directory = Path.GetDirectoryName(AgentShortcutPath);
+        if (string.IsNullOrEmpty(directory))
+        {
+            return;
+        }
+
+        foreach (var name in LegacyStartupShortcutNames)
+        {
+            try
+            {
+                var stale = Path.Combine(directory, name);
+                if (File.Exists(stale))
+                {
+                    File.Delete(stale);
+                }
+            }
+            catch
+            {
+                // 忽略：见方法注释
+            }
+        }
     }
 
     /// <summary>
@@ -1520,6 +1570,10 @@ public static class RdpSessionService
     public static bool AutoDeployForInstall(out string message)
     {
         message = string.Empty;
+
+        // 与手动部署同一个理由：旧自启项要在**任何分支之前**收掉，
+        // 否则「已有自启项 → 原样保留」这个分支会连带把旧 lnk 也一起保留下来。
+        CleanupLegacyStartupShortcuts();
 
         var shippedExe = Path.Combine(ShippedAgentDir, AgentExeName);
         if (!File.Exists(shippedExe))

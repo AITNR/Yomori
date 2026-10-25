@@ -152,7 +152,16 @@ Filename: "{app}\{#MyAppExe}"; Description: "安装完成后启动 {#MyAppName}"
 ;
 ; ⚠️ 只删 agent 子目录，**不要**删整个 {commonappdata}\Yomori：那里还有指令桥 rdp\，
 ;    里面是任务状态、耗时统计与日志，属于用户数据，卸载程序不该替用户清。
+;
+; ⚠️ 这一段是「快速路径」，**不是**唯一保障：Inno 处理 [UninstallDelete] 时遇到被占用的
+;    文件只会静默跳过（日志里记一条失败，界面上什么都不提示），而卸载时代理多半还常驻着。
+;    真正的兜底在 [Code] 的 CurUninstallStepChanged(usPostUninstall)：先结束代理进程、
+;    再 DelTree 一遍，还删不掉就明确弹框告诉用户路径。
 Type: files; Name: "{commonstartup}\Yomori RDP 会话代理.lnk"
+; 改名前（v2.1.1 及更早）留下的自启项：指向 %ProgramData%\YukinoChan\agent，
+; 那份副本早就没人创建了，留着只会让每个账户登录时白试一次。
+Type: files; Name: "{commonstartup}\雪乃酱 RDP 会话代理.lnk"
+Type: files; Name: "{commonstartup}\YukinoChan RDP 会话代理.lnk"
 Type: filesandordirs; Name: "{commonappdata}\Yomori\agent"
 Type: filesandordirs; Name: "{commonappdata}\Yomori\agent_b"
 
@@ -225,4 +234,102 @@ begin
     // 主程序起来时代理已经就位，首次连接的预检就能直接看到"已部署"。
     DeploySessionAgent();
   end;
+end;
+
+// ── 卸载：收掉会话代理的程序副本 ─────────────────────────────────────────
+// 代理是「随目标账户登录自启、常驻」的，卸载时它多半正在运行。运行中的 exe/dll 被映像
+// 锁住，而 Inno 处理 [UninstallDelete] 时遇到占用只会静默跳过 —— 结果就是程序目录删干净了，
+// {commonappdata}\Yomori\agent 里还留着 70MB+ 的副本，卸载完看不出任何异常。
+//
+// 所以收尾时自己再来一遍：先结束进程，再删目录；还删不掉就明确告诉用户去哪删。
+// 用 usPostUninstall 而不是 usUninstall 是因为它**肯定**排在 [UninstallDelete] 之后
+// （后者是卸载的最后一步），不会出现"先杀进程、后又被别的阶段重新拉起"的窗口。
+procedure KillAgentImage(const ImageName: String);
+var
+  ResultCode: Integer;
+begin
+  if not Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "' + ImageName + '" /T',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Log('结束 ' + ImageName + ' 时没能启动 taskkill：' + SysErrorMessage(ResultCode));
+    Exit;
+  end;
+
+  // 0 = 至少结束了一个；128 = 本来就没有这个进程（正常，不是错误）
+  if ResultCode = 0 then
+    Log('已结束会话代理进程：' + ImageName);
+end;
+
+// 旧形态代理（v2.1.x 及更早的部署）：把整个程序目录复制到 ProgramData，
+// 跑的是主控端那份 Yomori.exe。
+// ⚠️ 不能直接 taskkill /IM Yomori.exe —— 那会把用户正开着的主控端界面一起杀掉。
+//    这里按可执行文件路径精确匹配，只结束副本目录里的那些。
+procedure KillLegacyAgentCopy();
+var
+  ResultCode: Integer;
+begin
+  if not FileExists(ExpandConstant('{commonappdata}\Yomori\agent\Yomori.exe')) then
+    Exit;
+
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+       '-NoProfile -NonInteractive -Command "Get-Process -Name Yomori -ErrorAction SilentlyContinue'
+       + ' | Where-Object { $_.Path -like ''*\Yomori\agent\*'' } | Stop-Process -Force"',
+       '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+procedure RemoveAgentCopies();
+var
+  Dir: String;
+begin
+  Dir := ExpandConstant('{commonappdata}\Yomori\agent');
+  if DirExists(Dir) then
+  begin
+    if DelTree(Dir, True, True, True) then
+      Log('已删除代理副本：' + Dir)
+    else
+      Log('代理副本删不干净（文件仍被占用）：' + Dir);
+  end;
+
+  Dir := ExpandConstant('{commonappdata}\Yomori\agent_b');
+  if DirExists(Dir) then
+  begin
+    if DelTree(Dir, True, True, True) then
+      Log('已删除备用代理副本：' + Dir)
+    else
+      Log('备用代理副本删不干净：' + Dir);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  AgentDir: String;
+  BackupDir: String;
+begin
+  if CurUninstallStep <> usPostUninstall then
+    Exit;
+
+  KillAgentImage('Yomori.Agent.exe');
+  KillAgentImage('YukinoChan.exe');          // 改名前（v2.1.1 及更早）
+  KillAgentImage('YukinoChan.Agent.exe');    // 曾经用过的独立代理名
+  KillLegacyAgentCopy();
+
+  // taskkill /F 返回之后句柄释放还有几十毫秒的延迟，删太快会撞上"正在被占用"
+  Sleep(500);
+  RemoveAgentCopies();
+
+  // 空目录才收（RemoveDir 语义）：rdp\ 里有任务状态与耗时统计，属于用户数据，
+  // 卸载程序不该替用户清 —— 它在就留着整个 Yomori 目录。
+  RemoveDir(ExpandConstant('{commonappdata}\Yomori'));
+
+  AgentDir := ExpandConstant('{commonappdata}\Yomori\agent');
+  BackupDir := ExpandConstant('{commonappdata}\Yomori\agent_b');
+
+  // 静默卸载（升级安装时 Inno 会静默跑一遍旧版卸载器）绝不能弹框 —— 无人值守，弹了就卡死。
+  if (DirExists(AgentDir) or DirExists(BackupDir)) and (UninstallSilent = False) then
+    MsgBox('会话代理的程序副本没能删掉：' + #13#10#13#10
+           + AgentDir + #13#10#13#10
+           + '常见原因是那个目录里的程序还在运行 —— 只要还有账户登录着，代理就会常驻，'
+           + '被占用的文件 Windows 不允许删除。' + #13#10
+           + '注销所有账户（或重启）后手动删掉该目录即可；其余内容已正常卸载。',
+           mbInformation, MB_OK);
 end;
