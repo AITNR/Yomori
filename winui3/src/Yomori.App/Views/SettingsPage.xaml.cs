@@ -5,6 +5,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Windows.UI;
 using Yomori.Helpers;
 using Yomori.Models;
 using Yomori.Services;
@@ -20,12 +22,38 @@ public sealed partial class SettingsPage : Page
     /// <summary>上一次「检查更新」的结果，用来决定「前往下载」按钮指哪儿。</summary>
     private GitHubRelease? _latestRelease;
 
+    /// <summary>最近一次 RDP 解锁只读检测的结果；「查看诊断」按它出文本，不再重新跑一遍检测。</summary>
+    private RdpUnlockSnapshot? _rdpSnapshot;
+
+    /// <summary>
+    /// 只读检测是否正在进行。互斥有两层意义：按钮连点不会叠起两次检测；
+    /// 以及「移动中」的结果不乱序盖掉上一份（检测本身是毫秒级，但服务状态的读取是 Win32 调用）。
+    /// </summary>
+    private bool _rdpDetecting;
+
+    /// <summary>页面是否已经卸载。卸载之后不能再往控件上写（会摸到失效元素）。</summary>
+    private bool _unloaded;
+
+    /// <summary>
+    /// 首次 Loaded 才自动检测。
+    /// 为什么不用构造函数：构造函数里控件树还没挂到窗口上，检测结果返回时若页面尚未 Loaded，
+    /// 写入的内容会被后续的布局重建覆盖掉。为什么只认第一次：改主题会让根元素的
+    /// RequestedTheme 变化、内容树重建，Loaded 会再来一次 —— 那时重跑检测纯属浪费。
+    /// </summary>
+    private bool _rdpAutoDetectDone;
+
     public SettingsPage()
     {
         InitializeComponent();
 
         // 离开页面就别再往回写提示控件了
-        Unloaded += (_, __) => _themeHintCts?.Cancel();
+        Unloaded += (_, __) =>
+        {
+            _unloaded = true;
+            _themeHintCts?.Cancel();
+        };
+
+        Loaded += OnRdpCardLoaded;
 
         _syncing = true;
         try
@@ -697,4 +725,296 @@ public sealed partial class SettingsPage : Page
     {
         await DialogHelper.ShowAsync(new ThirdPartyNoticesDialog());
     }
+
+    // ---------------- 远程桌面解锁：只读检测（计划书 M1） ----------------
+
+    /// <summary>
+    /// 首次进入设置页时自动跑一次只读检测。
+    /// 用户点「重新检测」也走同一条路径 —— 检测结果与诊断详情必须来自同一份快照，
+    /// 否则界面上的四项和复制出来的诊断可能对不上。
+    /// </summary>
+    private async void OnRdpCardLoaded(object sender, RoutedEventArgs e)
+    {
+        if (_rdpAutoDetectDone)
+        {
+            return;
+        }
+
+        _rdpAutoDetectDone = true;
+        await RefreshRdpSectionAsync(announce: false);
+    }
+
+    private async void OnRdpRedetect(object sender, RoutedEventArgs e)
+    {
+        await RefreshRdpSectionAsync(announce: true);
+    }
+
+    /// <summary>
+    /// 跑一次只读检测并刷新本页。
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ 检测读注册表、查 SCM、枚举会话，都是可能阻塞几十毫秒的 Win32 调用 ——
+    /// 一律丢到线程池，结果用 <see cref="RunOnUi"/> 搬回来再碰控件。
+    /// 「await 之后自然回到 UI 线程」在这个工程里不成立（见 OnCheckUpdate 的注释），
+    /// 而这里改的是 TextBlock.Text / Children，跨线程就是 RPC_E_WRONG_THREAD + 掀进程。
+    /// <para>检测器自己不抛异常，catch 只是兜底；兜底时也要把按钮恢复可点，那是用户唯一的重试入口。</para>
+    /// </remarks>
+    private async Task RefreshRdpSectionAsync(bool announce)
+    {
+        if (_rdpDetecting)
+        {
+            return;
+        }
+
+        _rdpDetecting = true;
+        var queue = DispatcherQueue;
+
+        SetRdpBusy(true);
+
+        try
+        {
+            var snapshot = await Task.Run(RdpReadOnlyDetector.Detect);
+            RunOnUi(queue, () =>
+            {
+                if (_unloaded)
+                {
+                    return;
+                }
+
+                _rdpSnapshot = snapshot;
+                RenderRdpSnapshot(snapshot);
+                SetRdpBusy(false);
+
+                if (announce)
+                {
+                    var line = RdpUnlockDiagnostics.FormatLogLine(snapshot);
+                    VM.AppendLog(line);
+                    SetRdpAction(line);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            var detail = $"{ex.GetType().Name}: {ex.Message}";
+            RunOnUi(queue, () =>
+            {
+                if (_unloaded)
+                {
+                    return;
+                }
+
+                SetRdpBusy(false);
+                RdpProbeSummaryText.Text = $"检测失败：{detail}";
+                VM.AppendLog($"[RDP 解锁] 检测异常：{detail}");
+                SetRdpAction($"检测失败：{detail}");
+            });
+        }
+        finally
+        {
+            _rdpDetecting = false;
+        }
+    }
+
+    private void SetRdpBusy(bool busy)
+    {
+        RdpRedetectButton.IsEnabled = !busy;
+
+        // 诊断按钮只在有一份结果之后可用：没有快照时点它只能弹「还没有结果」，不如直接灰着
+        RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
+
+        RdpProbeProgress.IsActive = busy;
+        RdpProbeProgress.Visibility = busy ? Visibility.Visible : Visibility.Collapsed;
+
+        if (busy)
+        {
+            RdpProbeSummaryText.Text = "正在检测…";
+        }
+    }
+
+    /// <summary>
+    /// 把快照画进本页：四行状态 + 一行汇总 + 一行补充信息。
+    /// </summary>
+    /// <remarks>
+    /// 颜色与文字同时表达（计划书 3.1）：色块只起快速定位作用，真正可读的信息是
+    /// 「已安装（通过）」这类文字。只给颜色的话，色觉障碍用户拿不到任何信息。
+    /// </remarks>
+    private void RenderRdpSnapshot(RdpUnlockSnapshot snapshot)
+    {
+        // 整体重建，不复用旧元素 —— 四项的等级每次都可能变，复用容易把上一轮的颜色留在界面上
+        RdpProbeRows.Children.Clear();
+        foreach (var item in snapshot.Items)
+        {
+            RdpProbeRows.Children.Add(BuildProbeRow(item));
+        }
+
+        RdpProbeSummaryText.Text = RdpUnlockDiagnostics.FormatSummaryLine(snapshot);
+
+        var details = new List<string>
+        {
+            $"termsrv.dll {Dash(snapshot.TermsrvVersion)}",
+            $"INI Updated {Dash(snapshot.IniUpdated)}",
+            $"安装目录 {Dash(snapshot.InstallDirectory)}",
+            snapshot.ListenerSessionId > 0 ? $"RDP-Tcp 会话 ID {snapshot.ListenerSessionId}" : "RDP-Tcp 会话 ID —",
+            snapshot.Tcp3389Listening ? "3389 有监听" : "3389 无监听",
+            "最近事务：尚无（解锁流程未接入）",
+            "恢复状态：无备份",
+        };
+
+        if (!snapshot.IsElevated)
+        {
+            details.Add("本进程不是管理员：部分注册表值可能读不到，结果会标为未知");
+        }
+
+        RdpProbeDetailText.Text = string.Join("　·　", details);
+    }
+
+    private static FrameworkElement BuildProbeRow(RdpProbeItem item)
+    {
+        var row = new Grid { ColumnSpacing = 8 };
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
+        row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+        var dot = new Border
+        {
+            Width = 8,
+            Height = 8,
+            CornerRadius = new CornerRadius(4),
+            Background = LevelBrush(item.Level),
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(2, 7, 0, 0),
+        };
+        Grid.SetColumn(dot, 0);
+
+        var stack = new StackPanel { Spacing = 2 };
+
+        stack.Children.Add(new TextBlock
+        {
+            Text = $"{item.Title}　{item.StateText}（{RdpProbeText.LevelLabel(item.Level)}）",
+            FontSize = 13,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        stack.Children.Add(new TextBlock
+        {
+            Text = item.ValueText,
+            FontSize = 12,
+            Opacity = 0.72,
+            TextWrapping = TextWrapping.Wrap,
+            IsTextSelectionEnabled = true,
+        });
+
+        Grid.SetColumn(stack, 1);
+        row.Children.Add(dot);
+        row.Children.Add(stack);
+        return row;
+    }
+
+    /// <summary>
+    /// 等级 → 色块。四色在两套主题下都要能看清，所以取饱和度较高的固定色，
+    /// 不跟主题色走（主题资源里的 Accent 在深色主题下偏暗，做小圆点会糊成背景）。
+    /// </summary>
+    private static SolidColorBrush LevelBrush(RdpProbeLevel level) => level switch
+    {
+        RdpProbeLevel.Pass => new SolidColorBrush(Color.FromArgb(0xFF, 0x2F, 0xAE, 0x5B)),
+        RdpProbeLevel.Warn => new SolidColorBrush(Color.FromArgb(0xFF, 0xC9, 0x9A, 0x00)),
+        RdpProbeLevel.Fail => new SolidColorBrush(Color.FromArgb(0xFF, 0xC4, 0x2B, 0x1C)),
+        _ => new SolidColorBrush(Color.FromArgb(0xFF, 0x8A, 0x8A, 0x8A)),
+    };
+
+    /// <summary>
+    /// 诊断详情：只读文本框 + 复制。
+    /// </summary>
+    /// <remarks>
+    /// 用 TextBox 而不是 TextBlock：需要 Ctrl+C 与拖动选择，而 ContentDialog 的
+    /// Content 直接放字符串时用户没法选中。只读 + 无边框，视觉上仍是一段文字。
+    /// </remarks>
+    private async void OnRdpDiagnose(object sender, RoutedEventArgs e)
+    {
+        if (_rdpSnapshot is not { } snapshot)
+        {
+            await DialogHelper.ShowMessageAsync("还没有检测结果", "先点「重新检测」拿到一份结果，再看诊断。");
+            return;
+        }
+
+        var text = RdpUnlockDiagnostics.FormatDetail(snapshot);
+
+        var box = new TextBox
+        {
+            Text = text,
+            IsReadOnly = true,
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.NoWrap,
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 12,
+            BorderThickness = new Thickness(0),
+        };
+
+        var scroll = new ScrollViewer
+        {
+            Content = box,
+            MaxHeight = 420,
+            MaxWidth = 640,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+        };
+
+        var dialog = new ContentDialog
+        {
+            Title = "RDP 解锁诊断",
+            Content = scroll,
+            CloseButtonText = "关闭",
+            PrimaryButtonText = "复制诊断",
+            DefaultButton = ContentDialogButton.Close,
+        };
+
+        if (await DialogHelper.ShowAsync(dialog) == ContentDialogResult.Primary)
+        {
+            CopyRdpDiagnostics(text);
+        }
+    }
+
+    private void CopyRdpDiagnostics(string text)
+    {
+        try
+        {
+            var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
+            package.SetText(text);
+            Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+
+            SetRdpAction($"诊断已复制到剪贴板（{text.Length} 字）—— {DateTime.Now:HH:mm:ss}");
+            VM.AppendLog("[RDP 解锁] 诊断文本已复制到剪贴板。");
+        }
+        catch (Exception ex)
+        {
+            // 剪贴板被别的进程独占时 SetContent 会抛 —— 这条路径是 async void 的上游，绝不能放出去
+            SetRdpAction($"复制失败：{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 打不开就直说。教程只在用户点的时候才开浏览器（计划书 3.4）。
+    /// </summary>
+    private void OnRdpTutorial(object sender, RoutedEventArgs e)
+    {
+        const string url = "https://www.bettergi.com/tutorial/rdp.html";
+
+        if (UpdateService.OpenUrl(url))
+        {
+            SetRdpAction("已在浏览器打开排查教程。");
+            return;
+        }
+
+        SetRdpAction($"打不开浏览器，请手动访问：{url}");
+        _ = DialogHelper.ShowMessageAsync("打不开浏览器", $"请手动访问：{Environment.NewLine}{url}");
+    }
+
+    private void SetRdpAction(string text)
+    {
+        RdpProbeActionText.Text = text;
+        RdpProbeActionText.Visibility = Visibility.Visible;
+    }
+
+    private static string Dash(string text) => string.IsNullOrWhiteSpace(text) ? "—" : text;
 }

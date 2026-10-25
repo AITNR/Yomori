@@ -81,6 +81,55 @@
                 </StackPanel>
             </Border>
 
+            <!-- 远程桌面解锁（RDP 多用户）。
+                 本版（计划书 M1）只做只读检测：读注册表值、服务状态、会话枚举、文件版本与 INI，
+                 不写任何键、不下载、不装组件。三个修改按钮因此保持禁用并说明原因 ——
+                 宁可明确摆出「还没接」，也不要留一个点了没反应的按钮。 -->
+            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="远程桌面解锁（RDP）" FontWeight="SemiBold" />
+                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.7"
+                               Text="用于让本机支持多账户同时远程连接。本区当前只做只读检测：读取 TermService 的 ServiceDll、服务状态、会话枚举、termsrv.dll 版本与本机 rdpwrap.ini。检测不修改任何系统设置，也不下载任何文件。" />
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="RdpUnlockButton" Content="解锁 RDP" IsEnabled="False" />
+                        <Button x:Name="RdpUninstallButton" Content="卸载 RDP 解锁" IsEnabled="False" />
+                        <Button x:Name="RdpRestoreRegistryButton" Content="还原注册表" IsEnabled="False" />
+                    </StackPanel>
+
+                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
+                               Text="解锁、卸载与还原注册表尚未接入本版本，按钮暂不可用。它们分别对应：安装官方解锁组件、调用官方卸载器、按快照恢复注册表 —— 三者不是同一个「回滚」，因此不会做成一个按钮。" />
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button x:Name="RdpRedetectButton" Content="重新检测" Click="OnRdpRedetect" />
+                        <Button x:Name="RdpDiagnoseButton" Content="查看诊断" Click="OnRdpDiagnose" IsEnabled="False" />
+                        <Button Content="打开排查教程" Click="OnRdpTutorial" />
+                        <Button x:Name="RdpBackupButton" Content="历史备份" IsEnabled="False" />
+                    </StackPanel>
+
+                    <!-- 四行检测结果由 SettingsPage.xaml.cs 直接填入 StackPanel：
+                         行内容随检测结果变化，用 DataTemplate + x:Bind 反而要多写一套 ViewModel。 -->
+                    <StackPanel x:Name="RdpProbeRows" Spacing="6" />
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <ProgressRing x:Name="RdpProbeProgress" Width="16" Height="16"
+                                      IsActive="False" Visibility="Collapsed" />
+                        <TextBlock x:Name="RdpProbeSummaryText" VerticalAlignment="Center"
+                                   TextWrapping="Wrap" Text="尚未检测。" />
+                    </StackPanel>
+
+                    <TextBlock x:Name="RdpProbeDetailText"
+                               TextWrapping="Wrap" FontSize="12" Opacity="0.65"
+                               IsTextSelectionEnabled="True" />
+
+                    <!-- 操作反馈（复制诊断、检测完成等）留在这里，别只往运行日志页写 -->
+                    <TextBlock x:Name="RdpProbeActionText"
+                               Visibility="Collapsed"
+                               TextWrapping="Wrap" FontSize="12"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+            </Border>
+
             <!-- 开发者 -->
             <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
                 <StackPanel Spacing="12">
