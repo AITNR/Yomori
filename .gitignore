@@ -70,6 +70,10 @@ obj/
 # GitHub Actions / 本地复现 CI 的中间目录（winui3/README.md §三）
 ci-build/
 ci-publish/
+# 代理载荷的发布输出（package_release.py --agent-dir 的输入，约 73MB）
+ci-agent/
+# Inno 编译器的工作副本（CI 为了改 SetupLdr 清单复制出来的那份，本机编安装包也会用）
+inno-patched/
 native-out/
 .native-build/
 .vcpkg/
