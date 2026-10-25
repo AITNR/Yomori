@@ -220,9 +220,16 @@ docs/         文档截图
 
 ## 12. 许可证
 
-本程序以 [MIT](LICENSE) 许可证发布。
+本程序以 [GNU General Public License v3.0](LICENSE) 发布。Copyright (c) 2026 YukinoChan。
 
-程序在分发时包含下列第三方组件：FreeRDP、WinPR（FreeRDP 的 Windows 平台抽象层）、OpenSSL（以上均为 Apache License 2.0），以及 zlib、cJSON（zlib License / MIT）；托管层为 .NET 8 运行时、Windows App SDK 与若干 NuGet 包（均为 MIT）。
+GPL-3.0 要求在分发目标代码时一并提供对应源码，并随附许可证全文。源码即本仓库
+（<https://github.com/AITNR/Yomori>），与各次发布的版本一致；发布包与安装目录内也带有
+许可证全文（`LICENSE.txt`）。
+
+分发修改后的版本时，整份作品仍须以 GPL-3.0 发布并提供源码 —— 这是该许可证的义务，
+不因改动多少而豁免。
+
+程序在分发时包含下列第三方组件：FreeRDP、WinPR（FreeRDP 的 Windows 平台抽象层）、OpenSSL（以上均为 Apache License 2.0），以及 zlib、cJSON（zlib License / MIT）；托管层为 .NET 8 运行时、Windows App SDK 与若干 NuGet 包（均为 MIT）。上述许可均与 GPL-3.0 兼容，各自的原始条款不被本项目的许可取代。
 
 各组件的完整版权与许可条款见安装目录或发布包内的 `THIRD-PARTY-NOTICES.txt`，也可在程序内「设置 → 关于 → 开源许可」查看清单。
 

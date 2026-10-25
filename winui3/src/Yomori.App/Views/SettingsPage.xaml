@@ -201,6 +201,12 @@
                                      Padding="0"
                                      HorizontalAlignment="Left" />
 
+                    <!-- 本程序自己的许可。与上面那项区分开：那一项是 FreeRDP 等第三方组件的
+                         声明，这一项才是本程序的许可 —— 两者混在一起时，用户会以为 GPL 只覆盖
+                         别人那部分。 -->
+                    <TextBlock Text="本程序以 GNU General Public License v3.0 发布，许可证全文与源码见上方 GitHub 链接。"
+                               TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+
                     <!-- 版本号 + 检查更新。版本号从程序集信息版本里取（CI 传 -p:Version=），
                          不是写死的字面量 —— 见 SettingsPage.xaml.cs 的 RefreshVersionText -->
                     <TextBlock x:Name="VersionText"

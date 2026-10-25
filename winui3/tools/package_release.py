@@ -303,6 +303,10 @@ def _verify(app_dir: Path, *, require_dotnet_runtime: bool, agent_included: bool
     # 随附许可证副本 —— 这个文件缺了就是不合规的包，按硬性缺失处理（与"跑不起来"同级）。
     need("THIRD-PARTY-NOTICES.txt", "第三方组件与许可声明（Apache-2.0 要求随包分发）")
 
+    # 本程序自己的许可证：GPL-3.0 §1 要求「随目标代码分发本许可证副本」。
+    # 与上面那份同为硬性缺失 —— 少了它，这个包在合规上与"跑不起来"同级。
+    need("LICENSE.txt", "本程序许可证全文（GPL-3.0 要求随包分发）")
+
     # 外置 UI 看门狗（可选但强烈建议带上）：独立进程，主控端整窗假死时它不受影响，
     # 负责记录现场 + 抓 dump。进程内看门狗会被同一个冻结拖住，这就是要它的理由。
     # 不设为硬性缺失：CI 未构建它时不该让整个打包失败。
@@ -406,7 +410,9 @@ Yomori · WinUI 3 版
 注意
 ────────────────────────────────────────
 · WinUI 3 内嵌画面依赖 D3D11，远程桌面/虚拟机里可能需要图形加速；
-· 程序本体只支持 Windows 10 1809 及以上、x64。
+· 程序本体只支持 Windows 10 1809 及以上、x64；
+· 许可证：GNU General Public License v3.0，全文见同目录 LICENSE.txt，
+  源码见 https://github.com/AITNR/Yomori 。
 """
 
 
@@ -450,6 +456,28 @@ def _write_third_party_notices(app_dir: Path, version: str, vcpkg_inst: str | No
         )
 
 
+def _write_license(app_dir: Path, license_src: Path) -> None:
+    """把本程序的许可证全文落到包根目录。
+
+    GPL-3.0 §1 要求「分发目标代码时随附本许可证副本」—— 只在 README 里写一句
+    "以 GPL-3.0 发布"不算履行义务：拿到 zip 的人必须能在包里读到条款正文。
+
+    与 THIRD-PARTY-NOTICES.txt 的分工：那一份是**别人**的许可（FreeRDP 等要求随附），
+    这一份是本程序自己的。
+
+    落成 `LICENSE.txt` 而不是无扩展名的 `LICENSE`：最终用户双击就能用记事本打开。
+    仓库根那份仍叫 `LICENSE` —— GitHub 靠这个名字识别许可证类型。
+    """
+    if not license_src.is_file():
+        raise SystemExit(
+            f"找不到许可证文件：{license_src}\n"
+            "  仓库根的 LICENSE 缺失或被改名了 —— 缺了它就不该产出发布包"
+            "（GPL-3.0 §1 要求随二进制分发许可证副本）。"
+        )
+
+    shutil.copyfile(license_src, app_dir / "LICENSE.txt")
+
+
 # ---------------------------------------------------------------- 主流程
 
 def main(argv: list[str] | None = None) -> int:
@@ -471,6 +499,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-pdb", action="store_true", help="保留 pdb 符号（排查崩溃用）")
     parser.add_argument("--no-zip", action="store_true", help="只铺目录，不压缩（本地调试用）")
     parser.add_argument(
+        "--license",
+        default=None,
+        help="本程序的许可证文件（默认取仓库根的 LICENSE）",
+    )
+    parser.add_argument(
         "--vcpkg-inst",
         default=None,
         help="vcpkg 的 installed/x64-windows 目录（读第三方组件许可证原文用；"
@@ -484,6 +517,13 @@ def main(argv: list[str] | None = None) -> int:
     assets_dir = Path(args.assets).resolve()
     out_dir = Path(args.out).resolve()
     app_dir = out_dir / "app"
+
+    # 默认按本脚本位置回推仓库根：<repo>/winui3/tools/package_release.py
+    license_src = (
+        Path(args.license).resolve()
+        if args.license
+        else Path(__file__).resolve().parents[2] / "LICENSE"
+    )
 
     for path, label in ((build_dir, "build 输出"), (assets_dir, "assets")):
         if not path.is_dir():
@@ -543,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         else "框架依赖包 —— 需要目标机器已安装 .NET 8 运行时（Desktop Runtime 或 SDK 均可）。"
     )
     _write_help(app_dir, args.version, package_kind, built_at)
+    _write_license(app_dir, license_src)
     _write_third_party_notices(app_dir, args.version, args.vcpkg_inst)
 
     _verify(

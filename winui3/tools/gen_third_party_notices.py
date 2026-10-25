@@ -5,7 +5,7 @@
 
 1. **法律义务**。发布包里实际分发着 FreeRDP / WinPR / OpenSSL 的 DLL，三者都是
    **Apache-2.0**。该许可证 §4 明确规定：分发衍生作品时须 (a) 给接收者一份本许可证
-   副本；(b) 保留原作品的版权与归属声明。只在自己的 LICENSE（MIT）里写一句
+   副本；(b) 保留原作品的版权与归属声明。只在自己的 LICENSE（GPL-3.0）里写一句
    "用了 FreeRDP" 是不够的 —— 必须把许可证原文一起发出去。
    zlib / MIT 类只要求「保留版权与许可声明」，同样得落在文字里。
 
@@ -242,8 +242,8 @@ def _render(
     out.append(f"生成时间：{now}")
     out.append("")
     out.append("本程序在分发时包含下列第三方组件。各组件的版权归属与许可条款如下，")
-    out.append("按许可证要求原文附录于每个组件之后。本程序自身以 MIT 许可证发布，")
-    out.append("详见程序目录下的 LICENSE。")
+    out.append("按许可证要求原文附录于每个组件之后。本程序自身以 GNU General Public")
+    out.append("License v3.0 发布，许可证全文见程序目录下的 LICENSE.txt。")
     out.append("")
     out.append(_SEP)
     out.append("一、原生层（C/C++ 运行库，随安装包分发的本机 DLL）")
