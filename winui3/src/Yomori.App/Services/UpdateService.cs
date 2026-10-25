@@ -203,19 +203,29 @@ public static class UpdateService
         try
         {
             var release = normalized == UpdateChannels.Beta
-                ? await FetchNewestAsync(cancellationToken).ConfigureAwait(false)
+                ? await FetchNewestPrereleaseAsync(cancellationToken).ConfigureAwait(false)
                 : await FetchLatestStableAsync(cancellationToken).ConfigureAwait(false);
 
             if (release is null)
             {
-                // 正式版通道专有：/releases/latest 返回 404 = 一份正式版都还没发过
-                return new UpdateCheckResult
-                {
-                    Status = UpdateCheckStatus.NoRelease,
-                    Message = $"还没有发布过正式版（当前 {CurrentVersion}）。"
-                        + "想看自动构建的测试版，把更新渠道切到「测试版」。",
-                    LogLine = $"[更新检查 · {channelLabel}] 正式版通道暂无发布（GitHub 返回 404）。",
-                };
+                // 两条通道"什么都没有"的含义不同，文案必须分开：
+                //   · 正式版：/releases/latest 返回 404 = 一份正式版都还没发过（正常状态）；
+                //   · 测试版：列表里没有被标成预发布的 = CI 没在跑，或发布时漏了 prerelease 标记。
+                return normalized == UpdateChannels.Beta
+                    ? new UpdateCheckResult
+                    {
+                        Status = UpdateCheckStatus.NoRelease,
+                        Message = $"测试版通道上还没有构建（当前 {CurrentVersion}）。"
+                            + "CI 每推一次 main 才会发一份；想看正式发布请把更新渠道切到「正式版」。",
+                        LogLine = $"[更新检查 · {channelLabel}] 发布列表里没有标记为预发布的构建。",
+                    }
+                    : new UpdateCheckResult
+                    {
+                        Status = UpdateCheckStatus.NoRelease,
+                        Message = $"还没有发布过正式版（当前 {CurrentVersion}）。"
+                            + "想看自动构建的测试版，把更新渠道切到「测试版」。",
+                        LogLine = $"[更新检查 · {channelLabel}] 正式版通道暂无发布（GitHub 返回 404）。",
+                    };
             }
 
             if (release.Version.Length == 0)
@@ -261,8 +271,14 @@ public static class UpdateService
                 UpdateCheckStatus.UpToDate =>
                     $"已是最新版本（{CurrentVersion}，{channelLabel}）。",
 
-                _ => $"当前版本（{CurrentVersion}）比{channelLabel}通道上最新的 {release.Version} 还要新 ——"
-                    + "多半是远端那份被回退过，或者本地在跑自己编译的包。",
+                _ => normalized == UpdateChannels.Beta
+                    // 测试版走 2.0.0-dev.N，正式版走 v2.x —— 装的是正式版时一定会落到这里，
+                    // 但这个"更旧"只是编号体系不同，说清缘由，别让用户以为远端回退了。
+                    ? $"测试版通道上最新的是 {release.Version}（{FormatPublishedAt(release)}），"
+                        + $"比当前 {CurrentVersion} 的版本号小 —— 测试版构建走 2.0.0-dev.N 编号，"
+                        + "和正式版 v2.x 不是一条线，别按大小理解。想换测试版请点「前往下载」。"
+                    : $"当前版本（{CurrentVersion}）比{channelLabel}通道上最新的 {release.Version} 还要新 ——"
+                        + "多半是远端那份被回退过，或者本地在跑自己编译的包。",
             };
 
             return new UpdateCheckResult
@@ -328,12 +344,17 @@ public static class UpdateService
     }
 
     /// <summary>
-    /// 测试版通道：发布列表里挑版本号最大的一份（含预发布）。
+    /// 测试版通道：**只在预发布里**挑版本号最大的一份。
     ///
-    /// 为什么不用「列表第一个」：列表按创建时间排，而 CI 每推一次 main 就发一份，
-    /// 时间顺序不等于版本大小（重跑、回退、手改 tag 都会打乱）。按版本号挑才是稳的。
+    /// <para>为什么不把正式版也放进来比：两条线的版本号压根不是一条 —— 正式版发 <c>v2.2.1</c>，
+    /// 测试版是 CI 每推一次 main 就发的 <c>2.0.0-dev.N</c>。混在一起按大小取最大，
+    /// 正式版永远赢（2.2.1 &gt; 2.0.0-dev.105），于是「选了测试版却拿到正式版」——
+    /// 2026-10-25 用户实测反馈的就是这个。</para>
+    ///
+    /// <para>为什么不用「列表第一个」：列表按创建时间排，而 CI 每推一次 main 就发一份，
+    /// 时间顺序不等于版本大小（重跑、回退、手改 tag 都会打乱）。按版本号挑才是稳的。</para>
     /// </summary>
-    private static async Task<GitHubRelease?> FetchNewestAsync(CancellationToken cancellationToken)
+    private static async Task<GitHubRelease?> FetchNewestPrereleaseAsync(CancellationToken cancellationToken)
     {
         var url = $"https://api.github.com/repos/{Owner}/{Repo}/releases?per_page=50";
 
@@ -348,11 +369,10 @@ public static class UpdateService
             throw new InvalidOperationException("发布列表的返回不是数组");
         }
 
-        GitHubRelease? best = null;
-
+        var releases = new List<GitHubRelease>();
         foreach (var element in document.RootElement.EnumerateArray())
         {
-            // 草稿不算「已发布」；没有版本号的（纯 tag 归档）比不了，跳过
+            // 草稿不算「已发布」
             if (element.ValueKind != JsonValueKind.Object ||
                 element.TryGetProperty("draft", out var draft) && draft.ValueKind == JsonValueKind.True)
             {
@@ -360,7 +380,39 @@ public static class UpdateService
             }
 
             var release = ParseRelease(element);
-            if (release is null || release.Version.Length == 0)
+            if (release is not null)
+            {
+                releases.Add(release);
+            }
+        }
+
+        // 筛候选与排序都在 PickNewest 里 —— 那是纯函数，冒烟能直接验
+        // 「正式版 v2.2.1 + 预发布 2.0.0-dev.105 同时在列表里该选谁」这个真机踩过的组合。
+        return PickNewest(releases, UpdateChannels.Beta);
+    }
+
+    /// <summary>
+    /// 从一批发布里挑出该通道的「最新」。
+    ///
+    /// <para><b>渠道决定候选集，版本号决定先后</b> —— 这两件事必须分开。正式版 <c>v2.2.1</c>
+    /// 与测试版 <c>2.0.0-dev.105</c> 不在一套编号里，混着比大小永远是正式版赢，
+    /// 「选了测试版却拿到正式版」就是这么来的（2026-10-25 实测）。</para>
+    ///
+    /// <para>同类里按版本号取最大而不是按发布时间：CI 每推一次 main 就发一份，
+    /// 时间顺序不等于版本大小（重跑、回退、手改 tag 都会打乱）。</para>
+    /// </summary>
+    /// <param name="releases">待挑选的发布（可以混着正式版与预发布）。</param>
+    /// <param name="channel">更新渠道，决定只看哪一类。</param>
+    public static GitHubRelease? PickNewest(IEnumerable<GitHubRelease> releases, string channel)
+    {
+        var wantPrerelease = UpdateChannels.Normalize(channel) == UpdateChannels.Beta;
+        GitHubRelease? best = null;
+
+        foreach (var release in releases)
+        {
+            if (release is null
+                || release.Version.Length == 0
+                || release.IsPrerelease != wantPrerelease)
             {
                 continue;
             }
@@ -376,9 +428,9 @@ public static class UpdateService
             {
                 best = release;
             }
-            else if (comparison == 0 &&
-                     !string.Equals(release.Tag, best.Tag, StringComparison.OrdinalIgnoreCase) &&
-                     IsRollingTag(release.Tag))
+            else if (comparison == 0
+                     && !string.Equals(release.Tag, best.Tag, StringComparison.OrdinalIgnoreCase)
+                     && IsRollingTag(release.Tag))
             {
                 // 同版本时优先滚动入口 test-build：它才是「只想拿最新版」的固定地址
                 best = release;
