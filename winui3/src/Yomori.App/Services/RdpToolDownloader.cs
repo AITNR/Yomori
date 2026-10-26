@@ -27,7 +27,8 @@ public readonly record struct RdpPeInspection(bool IsPe, ushort Machine, bool Is
 /// <para>计划书 4.1 / 4.2 的落点：</para>
 /// <list type="bullet">
 /// <item>下到受保护的 staging 目录，用临时扩展名，完整性通过后才改名为 <c>.exe</c>。</item>
-/// <item>校验顺序：大小 → 官方 digest（有才算）→ PE 架构 → 本地 SHA-256 记录。</item>
+/// <item>校验顺序：大小 → 官方 digest（有才算）→ PE 有效性 → 本地 SHA-256 记录。
+/// <b>架构只记录不拦截</b>：上游安装器/卸载器本身就是 32 位程序。</item>
 /// <item>官方没给 digest 时**不编造通过**：<see cref="RdpDownloadedTool.Limits"/> 如实写出来。</item>
 /// <item>执行前二次核对（<see cref="VerifyExisting"/>）：从下载完成到真正执行之间，
 /// 普通用户理论上能替换那个文件。</item>
@@ -121,12 +122,11 @@ public static class RdpToolDownloader
                 return (null, $"{asset.Name} 不是有效的 PE 文件");
             }
 
-            if (!pe.Is64Bit)
-            {
-                // 本程序只有 x64 构建，跑 32 位安装器会写出 32 位载荷
-                TryDelete(stagingPath);
-                return (null, $"{asset.Name} 是 {pe.MachineName} 架构，与预期的 x64 不符");
-            }
+            // ⚠️ 这里**不**按架构拦截。计划书 4.2 写的是「错误架构时安全失败」，但实测上游
+            // RDPW_Installer.exe / RDPW_Uninstaller.exe 本身就是 **32 位**（Delphi 程序），
+            // 它负责装的是 64 位的 rdpwrap.dll。按 x64 拦一道等于永远装不上（2026-10-26 真机反馈）。
+            // 架构只作为诊断信息记下来：真拿到一个陌生的可执行文件时，写错了架构仍会在
+            // 大小/摘要/签名三项上暴露。
 
             // 校验全过之后才改名成 .exe —— 中途失败的文件永远带着 .download 后缀
             if (File.Exists(finalPath))
@@ -143,7 +143,10 @@ public static class RdpToolDownloader
 
             limits.Add(verifiedAgainstOfficial
                 ? "已按官方提供的 SHA-256 摘要校验。"
-                : "上游未提供 SHA-256 摘要，本次只能校验大小、PE 架构与来源 HTTPS —— 这不构成密码学意义上的发布者认证。");
+                : "上游未提供 SHA-256 摘要，本次只能校验大小、PE 有效性与来源 HTTPS —— 这不构成密码学意义上的发布者认证。");
+
+            // 架构只报告不拦截：上游工具本身就是 32 位（见上面的说明）
+            limits.Add($"工具架构：{pe.MachineName}（上游安装器为 32 位程序，属正常）。");
 
             limits.Add(pe.HasSignatureDirectory
                 ? "文件带 Authenticode 签名目录（Yomori 未对证书链做信任校验）。"
