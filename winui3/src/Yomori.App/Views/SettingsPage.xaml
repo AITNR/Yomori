@@ -127,23 +127,6 @@
                                 ToolTipService.ToolTip="在线取不到 rdpwrap.ini 时，手动下载最新 INI 后在这里选中它（会先校验是否含当前系统版本的补丁段）" />
                     </StackPanel>
 
-                    <!-- GitHub 访问令牌：只进 Windows 凭据管理器，不进 config.json。
-                         匿名接口每小时 60 次，配令牌后 5000 次 —— 这是绕过限流的正路。 -->
-                    <StackPanel Spacing="6">
-                        <TextBlock Text="GitHub 访问令牌（可选）" FontSize="13" FontWeight="SemiBold" />
-                        <StackPanel Orientation="Horizontal" Spacing="8">
-                            <PasswordBox x:Name="RdpGitHubTokenBox"
-                                         Width="320"
-                                         PlaceholderText="ghp_… 或 github_pat_…"
-                                         PasswordRevealMode="Hidden" />
-                            <Button x:Name="RdpGitHubTokenSaveButton" Content="保存并验证" Click="OnRdpSaveGitHubToken" />
-                            <Button x:Name="RdpGitHubTokenClearButton" Content="清除" Click="OnRdpClearGitHubToken" />
-                        </StackPanel>
-                        <TextBlock x:Name="RdpGitHubTokenState" FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
-                        <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                                   Text="只用于提高 GitHub 接口配额：匿名每小时 60 次，带令牌 5000 次。不需要勾选任何权限（只读公开仓库即可）。令牌存进 Windows 凭据管理器，不写进 config.json，界面上只显示首尾各 4 位。" />
-                    </StackPanel>
-
                     <!-- 四行检测结果由 SettingsPage.xaml.cs 直接填入 StackPanel：
                          行内容随检测结果变化，用 DataTemplate + x:Bind 反而要多写一套 ViewModel。 -->
                     <StackPanel x:Name="RdpProbeRows" Spacing="6" />
@@ -184,6 +167,26 @@
 
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.6"
                                Text="打开后「运行日志」页才显示带 [embed] 标签的内嵌画面诊断日志（D3D 初始化、渲染路径、GFX 管线状态、帧到达节奏等）。关着时这些行不在页面上显示，但日志文件里始终完整保留，排障时可以照旧去日志目录里翻。" />
+
+                    <!-- GitHub 访问令牌：从「远程桌面解锁」区挪到这里（2026-10-26）——
+                         它只影响访问 GitHub 接口的配额，跟某个功能是一对一关系，不是 RDP 专属，
+                         放在开发者工具区才不会让人以为"不解锁 RDP 就不用管它"。
+                         令牌只进 Windows 凭据管理器，不进 config.json：
+                         匿名接口每小时 60 次，配令牌后 5000 次 —— 这是绕过限流的正路。 -->
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="GitHub 访问令牌（可选）" FontSize="13" FontWeight="SemiBold" />
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <PasswordBox x:Name="GitHubTokenBox"
+                                         Width="320"
+                                         PlaceholderText="ghp_… 或 github_pat_…"
+                                         PasswordRevealMode="Hidden" />
+                            <Button x:Name="GitHubTokenSaveButton" Content="保存并验证" Click="OnSaveGitHubToken" />
+                            <Button x:Name="GitHubTokenClearButton" Content="清除" Click="OnClearGitHubToken" />
+                        </StackPanel>
+                        <TextBlock x:Name="GitHubTokenState" FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                        <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
+                                   Text="用于检查更新、下载安装包与下载 RDP 解锁组件时提高 GitHub 接口配额：匿名每小时 60 次，带令牌 5000 次。不需要勾选任何权限（只读公开仓库即可）。令牌存进 Windows 凭据管理器，不写进 config.json，界面上只显示首尾各 4 位。" />
+                    </StackPanel>
                 </StackPanel>
             </Border>
 
@@ -328,11 +331,18 @@
                         </ComboBox>
                     </StackPanel>
 
-                    <TextBox x:Name="UpdateProxyUrlBox"
-                             Header="自定义代理地址"
-                             PlaceholderText="http://127.0.0.1:7890"
-                             Visibility="Collapsed"
-                             LostFocus="OnUpdateProxyUrlLostFocus" />
+                    <!-- 自定义代理地址：留空 = 直连；需要认证时把「用户名:密码@」写在主机前面。
+                         密码不会跟着地址落盘（见 UpdateProxySecretStore），所以框里只回显用户名。 -->
+                    <StackPanel Spacing="4">
+                        <TextBox x:Name="UpdateProxyUrlBox"
+                                 Header="自定义代理地址"
+                                 PlaceholderText="http://127.0.0.1:7890"
+                                 Visibility="Collapsed"
+                                 LostFocus="OnUpdateProxyUrlLostFocus" />
+                        <TextBlock x:Name="UpdateProxyUrlHint"
+                                   TextWrapping="Wrap" FontSize="12" Opacity="0.6"
+                                   Visibility="Collapsed" />
+                    </StackPanel>
 
                     <Grid ColumnSpacing="8" RowSpacing="8">
                         <Grid.ColumnDefinitions>

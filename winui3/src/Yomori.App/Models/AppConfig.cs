@@ -260,12 +260,12 @@ public sealed class AppConfig : ObservableObject
     /// 这里把它变成一个「默认通道」，并把没指定通道的任务都指过去 —— 升级后行为不变。
     ///
     /// 幂等：已经有通道（用户自己建过）或从没配过目标账户时，什么都不做。
-    /// 注意只在 RDP 总开关打开时迁移：关掉开关时全部任务本来就跑本地，
-    /// 此时凭空多出一个通道只会让人困惑。
+    /// （早先还要看 RDP 总开关，2026-10-26 总开关已从界面移除且恒为开启 —— 见
+    /// <see cref="RdpConfig.Enabled"/>，这条前置条件随之消失。）
     /// </summary>
     private void MigrateLegacyChannel()
     {
-        if (!Rdp.Enabled || Rdp.Channels.Count > 0)
+        if (Rdp.Channels.Count > 0)
         {
             return;
         }

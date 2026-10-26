@@ -194,7 +194,7 @@ public static class UpdateProxyModes
     /// <summary>跟随系统代理（WinINET / 环境变量，<c>HttpClient.DefaultProxy</c>）。</summary>
     public const string System = "system";
 
-    /// <summary>自定义代理地址，形如 <c>http://127.0.0.1:7890</c>。</summary>
+    /// <summary>自定义代理地址，形如 <c>http://127.0.0.1:7890</c>，也可带认证 <c>http://用户:密码@主机:端口</c>。</summary>
     public const string Custom = "custom";
 
     /// <summary>不走代理（直连）。系统代理配错时用它绕开。</summary>
@@ -224,4 +224,73 @@ public static class UpdateProxyModes
         None => "不使用代理",
         _ => "系统代理",
     };
+
+    /// <summary>
+    /// 解析代理地址，允许把认证直接写在地址里：
+    /// <c>http://user:pass@127.0.0.1:7890</c>、<c>socks5://user:pass@10.0.0.2:1080</c>；
+    /// 不带协议时按 <c>http://</c> 补 —— 用户更习惯只写「主机:端口」。
+    ///
+    /// <para>认证段为空（没写 <c>@</c>，或 <c>@</c> 前面是空的）时 <see cref="ProxyAddress.User"/> 是空串，
+    /// 调用方据此决定不加凭据。地址里的路径 / 查询串统一丢弃：代理只认协议、主机、端口。</para>
+    /// <para>纯函数，不碰网络也不碰凭据库 —— 冒烟可以直接断言（见 UpdateChannelCheck）。</para>
+    /// </summary>
+    public static bool TryParse(string? raw, out ProxyAddress address)
+    {
+        address = default;
+
+        var text = (raw ?? string.Empty).Trim();
+        if (text.Length == 0)
+        {
+            return false;
+        }
+
+        if (!text.Contains("://", StringComparison.Ordinal))
+        {
+            text = "http://" + text;
+        }
+
+        if (!Uri.TryCreate(text, UriKind.Absolute, out var parsed) || parsed.Host.Length == 0)
+        {
+            return false;
+        }
+
+        var user = string.Empty;
+        var password = string.Empty;
+        var info = parsed.UserInfo;
+        if (info.Length > 0)
+        {
+            var colon = info.IndexOf(':');
+            user = Uri.UnescapeDataString(colon < 0 ? info : info[..colon]).Trim();
+            password = colon < 0 ? string.Empty : Uri.UnescapeDataString(info[(colon + 1)..]);
+        }
+
+        // userinfo 必须摘掉再交给 WebProxy：留着的话有的实现会把整段当成主机名去连。
+        // SchemeAndServer 恰好是 Scheme|Host|Port|Path，不含 UserInfo。
+        var bare = new Uri(parsed.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped));
+        address = new ProxyAddress(bare, user, password);
+        return true;
+    }
+}
+
+/// <summary>
+/// 从用户填的地址里解析出来的代理端点：地址与认证分开，密码不跟着地址走
+/// （落盘只留用户名，密码进 Windows 凭据管理器 —— 见 UpdateProxySecretStore）。
+/// </summary>
+public readonly record struct ProxyAddress(Uri Address, string User, string Password)
+{
+    /// <summary>有没有用户名。没有用户名就等于不用认证。</summary>
+    public bool HasUser => User.Length > 0;
+
+    /// <summary>协议 + 主机 + 端口，例如 <c>http://127.0.0.1:7890</c>。</summary>
+    public string Authority => Address.GetLeftPart(UriPartial.Authority);
+
+    /// <summary>落盘用的写法：带用户名、不带密码。</summary>
+    public string StoredText => HasUser
+        ? $"{Address.Scheme}://{Uri.EscapeDataString(User)}@{Address.Authority}"
+        : Authority;
+
+    /// <summary>日志 / 界面用的写法：密码换成 <c>***</c>，绝不回显。</summary>
+    public override string ToString() => HasUser
+        ? $"{Address.Scheme}://{Uri.EscapeDataString(User)}:***@{Address.Authority}"
+        : Authority;
 }

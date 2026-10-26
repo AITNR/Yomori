@@ -135,11 +135,23 @@ public static class UpdateService
     /// </summary>
     private static readonly Dictionary<string, HttpClient> Clients = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 代理设置的"代次"：地址或认证一变就 +1，缓存键跟着变，下一次请求按新设置重建 client。
+    ///
+    /// 为什么需要它：认证密码不写在地址里（它进凭据管理器），所以「只改了密码」这件事
+    /// 从地址上看不出来 —— 光靠 <c>mode|url</c> 当键会一直拿回带旧密码的那个 client，
+    /// 表现是「改了密码还是 407」。
+    /// </summary>
+    private static int _clientGeneration;
+
+    /// <summary>代理地址 / 认证改了：让下一次请求用新设置重建 client。见 <see cref="_clientGeneration"/>。</summary>
+    public static void InvalidateClients() => Interlocked.Increment(ref _clientGeneration);
+
     private static HttpClient GetClient(UpdateNetworkSettings network)
     {
         var mode = UpdateProxyModes.Normalize(network.ProxyMode);
         var proxyUrl = (network.ProxyUrl ?? string.Empty).Trim();
-        var key = mode + "|" + proxyUrl;
+        var key = mode + "|" + proxyUrl + "|" + Volatile.Read(ref _clientGeneration);
 
         lock (Clients)
         {
@@ -166,19 +178,34 @@ public static class UpdateService
                 break;
 
             case UpdateProxyModes.Custom:
-                if (Uri.TryCreate(proxyUrl, UriKind.Absolute, out var proxyUri))
+                if (proxyUrl.Length == 0)
                 {
-                    handler.Proxy = new WebProxy(proxyUri);
-                    handler.UseProxy = true;
+                    // 空 → 不使用代理。用户要的语义就是"填了才走代理"，
+                    // 而不是"选了自定义却没填，于是又偷偷走系统代理"。
+                    handler.UseProxy = false;
+                    break;
                 }
-                else
+
+                var endpoint = ResolveProxy(proxyUrl);
+                if (endpoint is null)
                 {
-                    // 地址填错或留空 → 退回系统代理，而不是"静默不用代理"。
+                    // 填了但解析不出来 → 退回系统代理，而不是"静默不用代理"。
                     // 检查更新照常能走；用户会从结果里看到是网络问题还是没更新。
                     handler.UseProxy = true;
                     handler.Proxy = HttpClient.DefaultProxy;
+                    break;
                 }
 
+                var proxy = new WebProxy(endpoint.Value.Address);
+                if (endpoint.Value.HasUser)
+                {
+                    // 用户名有、密码为空也照样设：有的代理只认用户名当口令。
+                    // 401 时底层会按 Basic / Digest 协商自动带上这份凭据。
+                    proxy.Credentials = new NetworkCredential(endpoint.Value.User, endpoint.Value.Password);
+                }
+
+                handler.Proxy = proxy;
+                handler.UseProxy = true;
                 break;
 
             default:
@@ -194,6 +221,26 @@ public static class UpdateService
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 
         return client;
+    }
+
+    /// <summary>
+    /// 解析代理地址；地址里没带密码时从 Windows 凭据管理器补上
+    /// （密码不落 config.json，见 <see cref="UpdateProxySecretStore"/>）。
+    /// 返回 <c>null</c> 表示地址本身解析不出来。
+    /// </summary>
+    private static ProxyAddress? ResolveProxy(string proxyUrl)
+    {
+        if (!UpdateProxyModes.TryParse(proxyUrl, out var address))
+        {
+            return null;
+        }
+
+        if (address.HasUser && address.Password.Length == 0)
+        {
+            address = address with { Password = UpdateProxySecretStore.Read() };
+        }
+
+        return address;
     }
 
     /// <summary>
@@ -1070,7 +1117,11 @@ public static class UpdateService
 /// 语义见 <see cref="UpdateProxyModes"/>。
 /// </summary>
 /// <param name="ProxyMode">system / custom / none。</param>
-/// <param name="ProxyUrl">自定义代理地址（仅 custom 用），形如 http://127.0.0.1:7890。</param>
+/// <param name="ProxyUrl">
+/// 自定义代理地址（仅 custom 用），形如 http://127.0.0.1:7890。
+/// 可带认证 <c>http://用户:密码@主机:端口</c>；落盘的那份**不带密码**（密码在凭据管理器里，
+/// 见 <see cref="UpdateProxySecretStore"/>）。留空 = 直连，不退回系统代理。
+/// </param>
 public readonly record struct UpdateNetworkSettings(string ProxyMode, string ProxyUrl)
 {
     /// <summary>从配置里取一份快照。传值而不是传 AppConfig，避免后台线程长时间持有可变对象。</summary>

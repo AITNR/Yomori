@@ -498,7 +498,7 @@ public static class RdpHeartbeat
 /// </summary>
 public sealed class RdpConfig : ObservableObject, ICloneable
 {
-    private bool _enabled;
+    private bool _enabled = true;
     private string _targetHost = RdpTargets.DefaultHost;
     private string _bridgePath = string.Empty;
     private string _targetUser = string.Empty;
@@ -518,7 +518,17 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private int _desktopHeight = RdpResolutions.DefaultHeight;
     private List<RdpChannel> _channels = new();
 
-    /// <summary>是否在 RDP 会话中执行任务（关闭则仍在当前会话本地执行）。</summary>
+    /// <summary>
+    /// 是否在目标账户的会话里执行任务。
+    ///
+    /// <para><b>2026-10-26 起恒为 <c>true</c></b>：通道管理页上的总开关去掉了，有通道就按通道下发，
+    /// 没配通道的任务照旧跑本地。因此 <see cref="Sanitize"/> 会把任何来源的 <c>false</c>（旧 config.json
+    /// 里存过这个键）一律改写回 <c>true</c> —— 否则升级用户的配置会永远把自己钉在「全部本地执行」，
+    /// 而界面上再没有回头路。</para>
+    /// <para>字段与 JSON 键保留有两个原因：旧配置里的 <c>enabled</c> 键不会掉进 ExtensionData；
+    /// 下游的 <c>RdpChannelPlanner</c> / <c>TaskScopePlanner</c> / <c>StatsSourcePlanner</c>
+    /// 仍把它当入参传（纯函数保留这条分支，冒烟可继续验证"总开关关掉时全走本地"）。</para>
+    /// </summary>
     [JsonPropertyName("enabled")]
     public bool Enabled
     {
@@ -705,6 +715,11 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     public void Sanitize()
     {
         MigrateLegacyKeys();
+
+        // 总开关已从界面移除，行为恒为开启（见 Enabled 的说明）。旧配置里存过 false 的也要拨回来，
+        // 所以放在 MigrateLegacyKeys 之后 —— 那一步可能刚把旧键的 false 读进来。
+        Enabled = true;
+
         TargetHost = RdpTargets.Normalize(TargetHost);
         BridgePath = (BridgePath ?? string.Empty).Trim();
         TargetUser = (TargetUser ?? string.Empty).Trim();

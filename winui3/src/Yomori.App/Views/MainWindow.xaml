@@ -170,32 +170,26 @@
                                                         <DataTemplate x:DataType="models:AppNotification">
                                                             <Grid ColumnSpacing="8" Padding="0,4">
                                                                 <Grid.ColumnDefinitions>
-                                                                    <ColumnDefinition Width="Auto" />
                                                                     <ColumnDefinition Width="*" />
                                                                     <ColumnDefinition Width="Auto" />
                                                                     <ColumnDefinition Width="Auto" />
                                                                 </Grid.ColumnDefinitions>
 
-                                                                <!-- 未读标记：已读时是空串，不占宽 -->
-                                                                <TextBlock Grid.Column="0"
-                                                                           Text="{x:Bind UnreadMark}"
-                                                                           FontSize="11"
-                                                                           Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}"
-                                                                           VerticalAlignment="Center" />
-
-                                                                <StackPanel Grid.Column="1" Spacing="2">
+                                                                <!-- 这里原来有个「未读」文字标记，2026-10-26 去掉了 ——
+                                                                     未读状态看铃铛上的红点就够，列表行左边不用再顶两个字。 -->
+                                                                <StackPanel Grid.Column="0" Spacing="2">
                                                                     <TextBlock Text="{x:Bind Title}" TextWrapping="Wrap" />
                                                                     <TextBlock Text="{x:Bind Body}" TextWrapping="Wrap"
                                                                                FontSize="12" Opacity="0.7" />
                                                                 </StackPanel>
 
-                                                                <TextBlock Grid.Column="2" Text="{x:Bind TimeText}"
+                                                                <TextBlock Grid.Column="1" Text="{x:Bind TimeText}"
                                                                            FontSize="11" Opacity="0.55"
                                                                            VerticalAlignment="Top" />
 
                                                                 <!-- 删除这条。Tag 绑数据项本身 —— 处理器里靠它认人，
                                                                      不依赖 DataContext 的继承（模板里两条路都能走，选稳的）。 -->
-                                                                <Button Grid.Column="3"
+                                                                <Button Grid.Column="2"
                                                                         Click="OnDeleteNotificationClicked"
                                                                         Tag="{x:Bind}"
                                                                         Width="26" Height="26" Padding="0"

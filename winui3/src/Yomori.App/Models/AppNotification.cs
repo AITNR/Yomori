@@ -76,14 +76,7 @@ public sealed class AppNotification : ObservableObject
     public bool IsRead
     {
         get => _isRead;
-        set
-        {
-            if (SetProperty(ref _isRead, value))
-            {
-                OnPropertyChanged(nameof(IsUnread));
-                OnPropertyChanged(nameof(UnreadMark));
-            }
-        }
+        set => SetProperty(ref _isRead, value);
     }
 
     /// <summary>取值见 <see cref="AppNotificationActions"/>。</summary>
@@ -93,17 +86,6 @@ public sealed class AppNotification : ObservableObject
     /// <summary>动作参数（URL 或路径）。</summary>
     [JsonPropertyName("action_target")]
     public string ActionTarget { get; set; } = string.Empty;
-
-    /// <summary>未读（绑定用，省得 XAML 写取反）。</summary>
-    [JsonIgnore]
-    public bool IsUnread => !IsRead;
-
-    /// <summary>
-    /// 列表里那个"未读"标记的文字。已读时是空串 —— 空 TextBlock 不占宽，
-    /// 比再用一个 bool→Visibility 的转换器省事（项目里没有转换器，也不打算加）。
-    /// </summary>
-    [JsonIgnore]
-    public string UnreadMark => IsRead ? string.Empty : "未读";
 
     /// <summary>这条有没有可点的动作。</summary>
     [JsonIgnore]

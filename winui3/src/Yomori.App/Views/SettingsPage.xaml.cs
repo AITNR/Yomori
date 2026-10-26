@@ -68,7 +68,7 @@ public sealed partial class SettingsPage : Page
             _themeHintCts?.Cancel();
         };
 
-        Loaded += OnRdpCardLoaded;
+        Loaded += OnPageLoaded;
 
         _syncing = true;
         try
@@ -100,9 +100,7 @@ public sealed partial class SettingsPage : Page
             UpdateProxyModeBox.SelectedIndex = IndexOfItem(
                 UpdateProxyModes.Items, UpdateProxyModes.Normalize(VM.Config.UpdateProxyMode));
             UpdateProxyUrlBox.Text = VM.Config.UpdateProxyUrl;
-            UpdateProxyUrlBox.Visibility = VM.Config.UpdateProxyMode == UpdateProxyModes.Custom
-                ? Visibility.Visible
-                : Visibility.Collapsed;
+            ApplyProxyMode(VM.Config.UpdateProxyMode, DescribeStoredProxy(VM.Config.UpdateProxyUrl));
         }
         finally
         {
@@ -557,31 +555,140 @@ public sealed partial class SettingsPage : Page
             VM.Config.UpdateProxyMode = mode;
             VM.SaveConfig();
             VM.AppendLog($"更新下载代理已切换为「{UpdateProxyModes.Label(mode)}」。");
+
+            // 换模式等于换出口：缓存里按旧模式建的 client 不能再复用
+            UpdateService.InvalidateClients();
         }
 
-        // 只有"自定义"才需要地址框；切走时保留已填内容，不主动清空
-        UpdateProxyUrlBox.Visibility = mode == UpdateProxyModes.Custom
-            ? Visibility.Visible
-            : Visibility.Collapsed;
+        // 只有"自定义"才需要地址与说明；切走时保留已填内容，不主动清空
+        ApplyProxyMode(mode, DescribeStoredProxy(VM.Config.UpdateProxyUrl));
+    }
+
+    /// <summary>「自定义代理」才显示地址框与它下面那行说明。状态文案为空时只显示固定写法提示。</summary>
+    private void ApplyProxyMode(string mode, string status = "")
+    {
+        var custom = UpdateProxyModes.Normalize(mode) == UpdateProxyModes.Custom;
+        UpdateProxyUrlBox.Visibility = custom ? Visibility.Visible : Visibility.Collapsed;
+        UpdateProxyUrlHint.Visibility = custom ? Visibility.Visible : Visibility.Collapsed;
+
+        if (custom)
+        {
+            SetProxyHint(status);
+        }
+    }
+
+    /// <summary>固定的写法提示（教怎么填认证）+ 一句当前状态。</summary>
+    private void SetProxyHint(string status)
+    {
+        const string usage =
+            "留空表示直连（不使用代理）。需要认证时把「用户名:密码@」写在主机前面，例如 " +
+            "http://user:pass@127.0.0.1:7890；密码在保存时存进 Windows 凭据管理器，不写进 config.json，" +
+            "所以框里回显的只有用户名。";
+
+        UpdateProxyUrlHint.Text = status.Length == 0 ? usage : usage + "\n" + status;
+    }
+
+    /// <summary>页面打开时说明"现在存的是什么"（已配认证 / 地址可疑 / 没配）。</summary>
+    private static string DescribeStoredProxy(string storedUrl)
+    {
+        var text = (storedUrl ?? string.Empty).Trim();
+        if (text.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        if (!UpdateProxyModes.TryParse(text, out var address))
+        {
+            return "现在存的地址解析不出来，检查更新时会退回系统代理 —— 请重新填写。";
+        }
+
+        return address.HasUser
+            ? $"当前认证：用户 {address.User}（密码存于 Windows 凭据管理器）。"
+            : string.Empty;
     }
 
     private void OnUpdateProxyUrlLostFocus(object sender, RoutedEventArgs e)
     {
-        var text = (UpdateProxyUrlBox.Text ?? string.Empty).Trim();
-        if (VM.Config.UpdateProxyUrl == text)
+        var typed = (UpdateProxyUrlBox.Text ?? string.Empty).Trim();
+        var commit = CommitProxyAddress(typed);
+        var changed = VM.Config.UpdateProxyUrl != commit.Stored;
+
+        if (changed)
         {
-            return;
+            VM.Config.UpdateProxyUrl = commit.Stored;
+            VM.SaveConfig();
         }
 
-        VM.Config.UpdateProxyUrl = text;
-        VM.SaveConfig();
+        // 只改密码时地址一字不变，缓存键也就没变 —— 必须显式让旧的 client 作废，
+        // 否则表现是"密码改了还是 407"（见 UpdateService.InvalidateClients）。
+        // 反过来，光标进出但什么都没改时不能动缓存，那等于每次失焦都新建一个连接池。
+        if (changed || commit.SecretTouched)
+        {
+            UpdateService.InvalidateClients();
+            VM.AppendLog("更新下载代理：" + commit.Status);
+        }
 
-        // 顺手说一句地址能不能解析，省得用户到"下载失败"才发现填错
-        var usable = string.IsNullOrEmpty(text) || Uri.TryCreate(text, UriKind.Absolute, out _);
-        VM.AppendLog(usable
-            ? $"更新下载代理地址已保存：{(text.Length == 0 ? "（空 → 回退系统代理）" : text)}"
-            : $"更新下载代理地址格式可疑（{text}）—— 需要带协议，例如 http://127.0.0.1:7890；" +
-              "解析不出来时会退回系统代理。");
+        // 回显落盘后的形状（密码不在里面），免得用户以为没存住又反复重填
+        if (typed != commit.Stored)
+        {
+            UpdateProxyUrlBox.Text = commit.Stored;
+        }
+
+        SetProxyHint(commit.Status);
+    }
+
+    /// <summary>
+    /// 把输入框里的内容落成"配置里该存的样子"：认证拆开，密码交给凭据管理器。
+    /// </summary>
+    private static (string Stored, string Status, bool SecretTouched) CommitProxyAddress(string typed)
+    {
+        if (typed.Length == 0)
+        {
+            return (string.Empty, "地址已清空 —— 自定义代理不再使用，请求直连。", ClearSecretIfAny());
+        }
+
+        if (!UpdateProxyModes.TryParse(typed, out var address))
+        {
+            // 解析不出来就原样存着，让用户自己改回来（静默清掉他填的东西更糟）。
+            // 状态里不回显地址本身 —— 未解析的串里可能带着密码。
+            return (typed, "地址解析不出来：这次请求会退回系统代理，请检查协议与端口。", false);
+        }
+
+        if (!address.HasUser)
+        {
+            return (address.StoredText, $"已保存代理 {address.Authority}（不使用认证）。", ClearSecretIfAny());
+        }
+
+        if (address.Password.Length > 0 && !UpdateProxySecretStore.Save(address.User, address.Password))
+        {
+            return (address.StoredText,
+                $"代理地址已保存，但密码写不进 Windows 凭据管理器 —— 认证会失败（用户 {address.User}）。",
+                false);
+        }
+
+        var tail = address.Password.Length > 0
+            ? "密码已存进 Windows 凭据管理器"
+            : "密码沿用上次保存的那份";
+
+        return (address.StoredText,
+            $"已保存代理 {address.Authority}（用户 {address.User}，{tail}）。",
+            address.Password.Length > 0);
+    }
+
+    /// <summary>
+    /// 清掉凭据管理器里那份代理密码，返回"原来确实有"。
+    /// 为什么要判断：光标进出输入框每次都会走一遍落盘逻辑，如果无脑返回 true，
+    /// 每次失焦都会作废 HttpClient 缓存并往运行日志写一行 —— 纯噪声。
+    /// </summary>
+    private static bool ClearSecretIfAny()
+    {
+        if (UpdateProxySecretStore.Read().Length == 0)
+        {
+            return false;
+        }
+
+        UpdateProxySecretStore.Clear();
+        return true;
     }
 
     /// <summary>
@@ -744,11 +851,17 @@ public sealed partial class SettingsPage : Page
     // ---------------- 远程桌面解锁：只读检测（计划书 M1） ----------------
 
     /// <summary>
-    /// 首次进入设置页时自动跑一次只读检测。
-    /// 用户点「重新检测」也走同一条路径 —— 检测结果与诊断详情必须来自同一份快照，
-    /// 否则界面上的四项和复制出来的诊断可能对不上。
+    /// 首次进入设置页时的统一入口：刷新 GitHub 令牌状态 + 自动跑一次 RDP 只读检测。
+    /// 用户点「重新检测」不经过这里，走 <see cref="OnRdpRedetect"/>（同一条检测路径）。
     /// </summary>
-    private async void OnRdpCardLoaded(object sender, RoutedEventArgs e)
+    /// <remarks>
+    /// 为什么不用构造函数：构造函数里控件树还没挂到窗口上，检测结果返回时若页面尚未 Loaded，
+    /// 写入的内容会被后续的布局重建覆盖掉。为什么只认第一次：改主题会让根元素的
+    /// RequestedTheme 变化、内容树重建，Loaded 会再来一次 —— 那时重跑检测纯属浪费。
+    /// <para>令牌区 2026-10-26 从「远程桌面解锁」卡挪进了「开发者」卡，但状态刷新仍然挂在
+    /// 这个页面级入口上 —— 它和 RDP 检测本来就没有因果关系。</para>
+    /// </remarks>
+    private async void OnPageLoaded(object sender, RoutedEventArgs e)
     {
         if (_rdpAutoDetectDone)
         {
@@ -765,7 +878,7 @@ public sealed partial class SettingsPage : Page
     /// <summary>把「令牌配没配」写到界面上。只显示掩码，绝不回显整串。</summary>
     private void RefreshGitHubTokenState()
     {
-        RdpGitHubTokenState.Text = GitHubTokenStore.DescribeState();
+        GitHubTokenState.Text = GitHubTokenStore.DescribeState();
     }
 
     /// <summary>
@@ -775,27 +888,24 @@ public sealed partial class SettingsPage : Page
     /// 顺序是「先落盘，再验证」：断网时用户仍然能把令牌存好，界面如实说「暂时无法验证」。
     /// 唯一会回滚的情况是 <see cref="GitHubTokenProbe.Invalid"/> —— 401 或配额仍是 60/小时，
     /// 说明这串东西根本不被认，留着只会让之后每次请求都失败。
+    /// <para>这里不再等 RDP 操作（解锁 / 还原）跑完：令牌与解锁流程无关，原来那道
+    /// <c>_rdpBusy</c> 门禁只是当年放在同一张卡里的副产物。</para>
     /// </remarks>
-    private async void OnRdpSaveGitHubToken(object sender, RoutedEventArgs e)
+    private async void OnSaveGitHubToken(object sender, RoutedEventArgs e)
     {
-        if (_rdpBusy || _rdpDetecting)
-        {
-            return;
-        }
-
-        var (ok, error) = GitHubTokenStore.Save(RdpGitHubTokenBox.Password);
+        var (ok, error) = GitHubTokenStore.Save(GitHubTokenBox.Password);
 
         if (!ok)
         {
-            PostUi(() => RdpGitHubTokenState.Text = "没有保存：" + error);
+            PostUi(() => GitHubTokenState.Text = "没有保存：" + error);
             return;
         }
 
         // 明文不留在控件里
         PostUi(() =>
         {
-            RdpGitHubTokenBox.Password = "";
-            RdpGitHubTokenState.Text = "已保存，正在向 GitHub 验证…";
+            GitHubTokenBox.Password = "";
+            GitHubTokenState.Text = "已保存，正在向 GitHub 验证…";
         });
 
         var network = UpdateNetworkSettings.FromConfig(VM.Config);
@@ -804,27 +914,22 @@ public sealed partial class SettingsPage : Page
         if (state == GitHubTokenProbe.Invalid)
         {
             GitHubTokenStore.Clear();
-            PostUi(() => RdpGitHubTokenState.Text = "验证失败，已清除：" + message);
+            PostUi(() => GitHubTokenState.Text = "验证失败，已清除：" + message);
             return;
         }
 
-        PostUi(() => RdpGitHubTokenState.Text =
+        PostUi(() => GitHubTokenState.Text =
             message + (state == GitHubTokenProbe.Valid ? "" : "（令牌已保存）"));
     }
 
     /// <summary>清除令牌。</summary>
-    private void OnRdpClearGitHubToken(object sender, RoutedEventArgs e)
+    private void OnClearGitHubToken(object sender, RoutedEventArgs e)
     {
-        if (_rdpBusy || _rdpDetecting)
-        {
-            return;
-        }
-
         GitHubTokenStore.Clear();
         PostUi(() =>
         {
-            RdpGitHubTokenBox.Password = "";
-            RdpGitHubTokenState.Text = "已清除。" + GitHubTokenStore.DescribeState();
+            GitHubTokenBox.Password = "";
+            GitHubTokenState.Text = "已清除。" + GitHubTokenStore.DescribeState();
         });
     }
 
@@ -948,8 +1053,8 @@ public sealed partial class SettingsPage : Page
         RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
         RdpPickInstallerButton.IsEnabled = !busy;
         RdpPickIniButton.IsEnabled = !busy;
-        RdpGitHubTokenSaveButton.IsEnabled = !busy;
-        RdpGitHubTokenClearButton.IsEnabled = !busy;
+
+        // 令牌按钮不跟着 RDP 忙闲走：令牌区已挪进「开发者」卡，和解锁流程没有关系。
     }
 
     /// <summary>

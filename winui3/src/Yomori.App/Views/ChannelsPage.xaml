@@ -31,19 +31,17 @@
                 </Button>
             </StackPanel>
 
+            <!-- 总开关已移除（2026-10-26）：有通道就按通道下发，没配通道的任务照旧跑本地。
+                 这条卡片只留多会话说明 —— 它是用户排「第二条通道顶掉前一个桌面」时最需要的一句话。 -->
             <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
                     BorderThickness="1"
                     CornerRadius="8"
                     Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
                     Padding="14">
-                <StackPanel Spacing="10">
-                    <ToggleSwitch Header="在目标账户会话中执行任务"
-                                  OnContent="已启用（点「开始执行」时会先连接各通道的目标账户）"
-                                  OffContent="关闭（全部任务都在当前账户本地执行）"
-                                  IsOn="{x:Bind VM.RdpSettings.Enabled, Mode=TwoWay}" />
-
+                <StackPanel Spacing="8">
+                    <TextBlock Text="多条通道同时执行" FontWeight="SemiBold" FontSize="13" />
                     <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="多条通道能否同时跑，取决于系统是否允许多个交互式会话并存：系统允许多会话时各通道互不影响；普通 Windows 客户端版同一台机器只允许一个交互式会话，第二条通道会顶掉前一个桌面，这种情况请把通道分到不同机器。" />
+                               Text="有通道就按通道下发，没配通道的任务在主控端当前会话里跑（通道功能恒为开启，没有总开关）。多条通道能否同时跑，取决于系统是否允许多个交互式会话并存：系统允许多会话时各通道互不影响；普通 Windows 客户端版同一台机器只允许一个交互式会话，第二条通道会顶掉前一个桌面，这种情况请把通道分到不同机器。" />
                 </StackPanel>
             </Border>
 
