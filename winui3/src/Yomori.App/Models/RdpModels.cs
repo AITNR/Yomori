@@ -1020,6 +1020,14 @@ public sealed class RdpStatus
     public int LiveLogProtocol { get; set; }
     public string LiveLogError { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 代理是否<b>正在执行任务</b>。
+    ///
+    /// <para>⚠️ 2026-10-26 收紧：以前是 <c>Phase is "running" or "idle"</c> ——
+    /// 把 idle 也算成"在跑"。这让「空闲心跳是否会覆盖别人的 running」在语义上无法判定
+    /// （两边都叫 IsRunning），也让调用方没法用它判断"能不能接管"。
+    /// 现在只认 running；想要「代理在线」请判断 <see cref="Phase"/> 是否为 idle/running。</para>
+    /// </summary>
     [JsonIgnore]
-    public bool IsRunning => Phase is "running" or "idle";
+    public bool IsRunning => string.Equals(Phase, "running", StringComparison.OrdinalIgnoreCase);
 }
