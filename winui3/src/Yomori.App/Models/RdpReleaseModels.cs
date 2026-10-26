@@ -277,6 +277,17 @@ public sealed class RdpUnlockRequest
 {
     public required bool AntivirusConfirmed { get; init; }
 
+    /// <summary>
+    /// 用户手动指定的安装包（本机路径）。空串表示按官方发布下载。
+    /// </summary>
+    /// <remarks>
+    /// 存在的理由：GitHub 的 Release 附件在国内网络下经常拿不到完整文件
+    /// （2026-10-26 真机报「不是有效的 PE 文件」，实际是被拦成了网页）。
+    /// 这时让用户用浏览器自己下一个，再指给程序，比反复重试有意义。
+    /// 手动指定的文件仍然要做 PE 校验与哈希记录，只是不能和官方 digest 比对。
+    /// </remarks>
+    public string ManualInstallerPath { get; init; } = "";
+
     /// <summary>是否在安装后更新 INI（<c>RDPWInst -w</c>）。</summary>
     public bool UpdateIni { get; init; } = true;
 

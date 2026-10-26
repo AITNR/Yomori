@@ -128,33 +128,66 @@ public static class RdpUnlockService
                 Add(steps, "release", "锁定发布", RdpStepOutcome.Ok,
                     $"{resolved.Tag}（release {resolved.Id}，安装器 {installerAsset.Name} / 卸载器 {uninstallerAsset.Name}）");
 
-                Report(progress, 3, "下载安装器与卸载器");
-                var (downloadedInstaller, installerError) = await RdpToolDownloader
-                    .DownloadAsync(installerAsset, resolved.Id, network, progress: null, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (downloadedInstaller is null)
+                // ---- 安装器：手动指定的优先，其次官方下载 ----
+                if (request.ManualInstallerPath.Length > 0)
                 {
-                    return Fail(steps, "下载安装器失败：", installerError, before);
+                    Report(progress, 3, "校验手动指定的安装包");
+                    var (manual, manualError) = RdpToolDownloader.InspectLocalTool(request.ManualInstallerPath);
+
+                    if (manual is null)
+                    {
+                        return Fail(steps, "手动指定的安装包不可用：", manualError, before);
+                    }
+
+                    installer = manual;
+                    Add(steps, "manual", "使用手动指定的安装包", RdpStepOutcome.Warn,
+                        $"{Path.GetFileName(request.ManualInstallerPath)}（{manual.SizeBytes} 字节，"
+                        + $"sha256={Short(manual.Sha256)}）。来源由用户提供，未与官方摘要比对。" + manual.Limits);
+                }
+                else
+                {
+                    Report(progress, 3, "下载安装器");
+                    var (downloadedInstaller, installerError) = await DownloadWithRetryAsync(
+                        installerAsset, resolved.Id, network, steps, "安装器", cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (downloadedInstaller is null)
+                    {
+                        return Fail(steps, "下载安装器失败：",
+                            installerError + ManualHint, before);
+                    }
+
+                    installer = downloadedInstaller;
                 }
 
-                installer = downloadedInstaller;
-
-                var (downloadedUninstaller, uninstallerError) = await RdpToolDownloader
-                    .DownloadAsync(uninstallerAsset, resolved.Id, network, progress: null, cancellationToken)
+                // ---- 卸载器：手动模式允许没有（装完就有本地控制台工具可卸） ----
+                Report(progress, 3, "下载卸载器");
+                var (downloadedUninstaller, uninstallerError) = await DownloadWithRetryAsync(
+                    uninstallerAsset, resolved.Id, network, steps, "卸载器", cancellationToken)
                     .ConfigureAwait(false);
 
                 if (downloadedUninstaller is null)
                 {
-                    // 卸载器拿不到就别装了：装完无法按计划书卸载，等于留一个卸不掉的东西
-                    return Fail(steps, "下载配套卸载器失败：", uninstallerError + "（没有卸载器就不安装）", before);
+                    if (request.ManualInstallerPath.Length == 0)
+                    {
+                        // 卸载器拿不到就别装了：装完无法按计划书卸载，等于留一个卸不掉的东西
+                        return Fail(steps, "下载配套卸载器失败：", uninstallerError + "（没有卸载器就不安装）", before);
+                    }
+
+                    // 手动模式下继续：装完之后安装目录里会有 RDPWInst.exe，「卸载」按钮就靠它。
+                    // 代价是这一步失败时无法自动回滚，所以必须写成「注意」而不是「通过」。
+                    Add(steps, "uninstaller", "下载配套卸载器", RdpStepOutcome.Warn,
+                        $"{uninstallerError}。本轮继续安装：装完后可用安装目录里的 RDPWInst.exe 卸载；"
+                        + "但如果本次安装中途失败，将无法自动回滚。");
                 }
+                else
+                {
+                    uninstaller = downloadedUninstaller;
 
-                uninstaller = downloadedUninstaller;
-
-                Add(steps, "download", "下载与校验", RdpStepOutcome.Ok,
-                    $"{installer.Asset.Name} {installer.SizeBytes} 字节 sha256={Short(installer.Sha256)}；"
-                    + $"{uninstaller.Asset.Name} sha256={Short(uninstaller.Sha256)}。" + installer.Limits);
+                    Add(steps, "download", "下载与校验", RdpStepOutcome.Ok,
+                        $"{installer.Asset.Name} {installer.SizeBytes} 字节 sha256={Short(installer.Sha256)}；"
+                        + $"{uninstaller.Asset.Name} sha256={Short(uninstaller.Sha256)}。" + installer.Limits);
+                }
             }
             else
             {
@@ -890,6 +923,51 @@ public static class RdpUnlockService
     }
 
     private static string Short(string sha) => sha.Length > 12 ? sha.Substring(0, 12) : sha;
+
+    /// <summary>下载失败时附在后面的出口：告诉用户「还可以手动给一个安装包」。</summary>
+    private const string ManualHint =
+        "　如果本机网络拿不到 GitHub 的附件（被代理或安全软件拦截时很常见），"
+        + "可以用浏览器手动下载 RDPW_Installer.exe，再点「指定安装包」选中它，然后重试。";
+
+    /// <summary>
+    /// 下载一个资产；如果是「内容不对 / 读不出来」这类偶发问题，原样再下一次。
+    /// </summary>
+    /// <remarks>
+    /// 值一次重试的理由：Release 附件走 <c>objects.githubusercontent.com</c>，
+    /// 国内链路上偶发断流与被代理塞网页都是随机的；而「拒绝非 HTTPS」「没有下载地址」
+    /// 这类确定性失败在 <see cref="RdpToolDownloader.LooksRetryable"/> 里已经被排除，
+    /// 不会浪费用户时间。
+    /// </remarks>
+    private static async Task<(RdpDownloadedTool? Tool, string Error)> DownloadWithRetryAsync(
+        RdpAsset asset,
+        long releaseId,
+        UpdateNetworkSettings network,
+        List<RdpStepRecord> steps,
+        string label,
+        CancellationToken cancellationToken)
+    {
+        var (tool, error) = await RdpToolDownloader
+            .DownloadAsync(asset, releaseId, network, progress: null, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (tool is not null || !RdpToolDownloader.LooksRetryable(error))
+        {
+            return (tool, error);
+        }
+
+        Add(steps, "retry", $"重新下载{label}", RdpStepOutcome.Warn,
+            $"第一次拿到的内容不可用（{error}），正在重试一次。");
+
+        await Task.Delay(600, cancellationToken).ConfigureAwait(false);
+
+        var (retryTool, retryError) = await RdpToolDownloader
+            .DownloadAsync(asset, releaseId, network, progress: null, cancellationToken)
+            .ConfigureAwait(false);
+
+        return retryTool is not null
+            ? (retryTool, "")
+            : (null, retryError + "（已自动重试一次）");
+    }
 
     private static void Add(List<RdpStepRecord> steps, string key, string title, RdpStepOutcome outcome, string detail) =>
         steps.Add(new RdpStepRecord { Key = key, Title = title, Outcome = outcome, Detail = detail });

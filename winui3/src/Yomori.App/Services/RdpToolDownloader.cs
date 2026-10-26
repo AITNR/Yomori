@@ -1,6 +1,7 @@
 // -*- coding: utf-8 -*-
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Yomori.Models;
@@ -8,7 +9,22 @@ using Yomori.Models;
 namespace Yomori.Services;
 
 /// <summary>PE 文件的结构信息（架构与是否带签名目录）。</summary>
-public readonly record struct RdpPeInspection(bool IsPe, ushort Machine, bool Is64Bit, bool HasSignatureDirectory)
+/// <remarks>
+/// <para><see cref="Unreadable"/> 与 <see cref="IsPe"/>=false 是**两件事**，必须分开：</para>
+/// <list type="bullet">
+/// <item>读不出来（文件被占用 / 权限不足）：说明不了文件好坏，多半是安全软件正在扫描刚下完的文件；</item>
+/// <item>读出来了但不是 PE：内容确实不对（网页、压缩包、截断）。</item>
+/// </list>
+/// <para>2026-10-26 真机把这两件事混成一句「不是有效的 PE 文件」，
+/// 结果是文件其实是好的、只是被杀软握着，却报成「文件无效」—— 用户拿着这条信息无从下手。</para>
+/// </remarks>
+public readonly record struct RdpPeInspection(
+    bool IsPe,
+    ushort Machine,
+    bool Is64Bit,
+    bool HasSignatureDirectory,
+    string Detail = "",
+    bool Unreadable = false)
 {
     public string MachineName => Machine switch
     {
@@ -18,6 +34,13 @@ public readonly record struct RdpPeInspection(bool IsPe, ushort Machine, bool Is
         0 => "未知",
         _ => $"0x{Machine:X4}",
     };
+
+    /// <summary>给用户看的一句话。空串表示没有异常。</summary>
+    public string ProblemText => IsPe
+        ? ""
+        : Unreadable
+            ? $"读不出来（{Detail}）—— 这不能说明文件坏了，通常是安全软件正在扫描刚下载的文件。请稍等几秒重试；一直被占用就把该目录加入信任。"
+            : $"不是可执行文件（{Detail}）";
 }
 
 /// <summary>
@@ -41,6 +64,58 @@ public static class RdpToolDownloader
 
     public static string StagingDir(long releaseId) =>
         Path.Combine(RdpTransactionStore.ToolsDir, releaseId.ToString());
+
+    /// <summary>
+    /// 校验一个用户自己给的安装包：仍然做 PE 校验与哈希记录，只是不与官方摘要比对。
+    /// </summary>
+    public static (RdpDownloadedTool? Tool, string Error) InspectLocalTool(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return (null, $"文件不存在：{path}");
+            }
+
+            var info = new FileInfo(path);
+            if (info.Length == 0)
+            {
+                return (null, $"{Path.GetFileName(path)} 是空文件");
+            }
+
+            var pe = RdpToolDownloader.InspectPe(path);
+            if (!pe.IsPe)
+            {
+                return (null, $"{Path.GetFileName(path)} {pe.ProblemText}（{info.Length} 字节）");
+            }
+
+            return (new RdpDownloadedTool
+            {
+                Asset = new RdpAsset { Name = Path.GetFileName(path), Size = info.Length },
+                LocalPath = path,
+                Sha256 = RdpTransactionStore.Sha256File(path),
+                SizeBytes = info.Length,
+                VerifiedAgainstOfficialDigest = false,
+                Limits = "来源为手动指定，只校验了 PE 有效性并记录哈希；无法与官方摘要比对。",
+            }, "");
+        }
+        catch (Exception ex)
+        {
+            return (null, $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 这次失败是不是「内容/读取」类问题（值得原样再下一次）。
+    /// </summary>
+    /// <remarks>
+    /// 判据来自 <see cref="RdpPeInspection.ProblemText"/> 的两个开头，和它在同一个文件里维护。
+    /// 网络层断流、被代理塞了网页、杀软扫描占文件，这三件事都会随机失败一次就好，
+    /// 而「拒绝 HTTPS」「没有下载地址」这类失败重试多少次都一样，不在此列。
+    /// </remarks>
+    public static bool LooksRetryable(string error) =>
+        error.Contains("不是可执行文件", StringComparison.Ordinal)
+        || error.Contains("读不出来", StringComparison.Ordinal);
 
     /// <summary>
     /// 下载一个资产并校验。成功返回本地路径与哈希；失败返回原因（不含异常）。
@@ -119,7 +194,7 @@ public static class RdpToolDownloader
             if (!pe.IsPe)
             {
                 TryDelete(stagingPath);
-                return (null, $"{asset.Name} 不是有效的 PE 文件");
+                return (null, $"{asset.Name} {pe.ProblemText}（实际 {fileInfo.Length} 字节）");
             }
 
             // ⚠️ 这里**不**按架构拦截。计划书 4.2 写的是「错误架构时安全失败」，但实测上游
@@ -212,28 +287,62 @@ public static class RdpToolDownloader
     /// </remarks>
     public static RdpPeInspection InspectPe(string path)
     {
+        // 刚下载完的文件常被杀软实时扫描短暂独占（FileShare.None），
+        // 这时打不开**不代表文件无效**。重试几次，仍然不行才报「读不出来」。
+        RdpPeInspection last = default;
+
+        for (var attempt = 0; attempt < 6; attempt++)
+        {
+            last = InspectPeOnce(path);
+            if (last.IsPe || !last.Unreadable)
+            {
+                return last;
+            }
+
+            Thread.Sleep(attempt == 0 ? 80 : 150);
+        }
+
+        return last;
+    }
+
+    /// <summary>读一次 PE 头。失败时区分「读不出来」与「内容不是 PE」。</summary>
+    private static RdpPeInspection InspectPeOnce(string path)
+    {
         try
         {
-            using var stream = File.OpenRead(path);
+            // 用 FileShare.ReadWrite | Delete：杀软扫描时通常以共享读打开，
+            // 我们这里退一步，避免为了一个只读检查去和它对撞。
+            using var stream = new FileStream(
+                path, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
             using var reader = new BinaryReader(stream);
 
-            if (stream.Length < 0x40)
+            var length = stream.Length;
+            var head = reader.ReadBytes((int)Math.Min(64, length));
+
+            if (length < 0x40)
             {
-                return new RdpPeInspection(false, 0, false, false);
+                // 太小也要说清是什么：48 字节的 HTML 页面比「文件只有 48 字节」有用得多
+                return NotPe($"{SniffHead(head)}（{length} 字节）");
+            }
+
+            if (head.Length < 2 || head[0] != (byte)'M' || head[1] != (byte)'Z')
+            {
+                return NotPe(SniffHead(head));
             }
 
             stream.Seek(0x3C, SeekOrigin.Begin);
             var peOffset = reader.ReadInt32();
 
-            if (peOffset <= 0 || peOffset + 24 > stream.Length)
+            if (peOffset <= 0 || peOffset + 24 > length)
             {
-                return new RdpPeInspection(false, 0, false, false);
+                return NotPe($"PE 头偏移不合法（{peOffset}），文件可能没下完");
             }
 
             stream.Seek(peOffset, SeekOrigin.Begin);
             if (reader.ReadUInt32() != 0x00004550)   // "PE\0\0"
             {
-                return new RdpPeInspection(false, 0, false, false);
+                return NotPe("有 MZ 头但 PE 签名不符，文件可能没下完或被改过");
             }
 
             var machine = reader.ReadUInt16();
@@ -249,7 +358,7 @@ public static class RdpToolDownloader
             var optionalHeaderOffset = peOffset + 24;
             var signed = false;
 
-            if (sizeOfOptionalHeader >= 70 && optionalHeaderOffset + sizeOfOptionalHeader <= stream.Length)
+            if (sizeOfOptionalHeader >= 70 && optionalHeaderOffset + sizeOfOptionalHeader <= length)
             {
                 stream.Seek(optionalHeaderOffset, SeekOrigin.Begin);
                 var magic = reader.ReadUInt16();
@@ -267,11 +376,54 @@ public static class RdpToolDownloader
 
             _ = numberOfSections;
             return new RdpPeInspection(true, machine, is64, signed);
+
+            RdpPeInspection NotPe(string detail) => new(false, 0, false, false, detail);
         }
-        catch
+        catch (UnauthorizedAccessException ex)
         {
-            return new RdpPeInspection(false, 0, false, false);
+            return new RdpPeInspection(false, 0, false, false,
+                $"拒绝访问：{ex.Message}", Unreadable: true);
         }
+        catch (IOException ex)
+        {
+            return new RdpPeInspection(false, 0, false, false,
+                ex.GetType().Name, Unreadable: true);
+        }
+        catch (Exception ex)
+        {
+            return new RdpPeInspection(false, 0, false, false,
+                $"{ex.GetType().Name}: {ex.Message}", Unreadable: true);
+        }
+    }
+
+    /// <summary>
+    /// 猜一下「这到底是什么文件」。判错时的日志价值全在这一句上 ——
+    /// 只写「不是 PE」，下次还是查不出是网络拦了还是文件被换了。
+    /// </summary>
+    private static string SniffHead(byte[] head)
+    {
+        if (head.Length == 0)
+        {
+            return "文件是空的";
+        }
+
+        if (head[0] == (byte)'<')
+        {
+            return "内容是网页/XML（多半是下载被网络或代理拦截了）";
+        }
+
+        if (head.Length >= 2 && head[0] == (byte)'P' && head[1] == (byte)'K')
+        {
+            return "内容是 ZIP 压缩包";
+        }
+
+        if (head.Length >= 2 && head[0] == 0x1F && head[1] == 0x8B)
+        {
+            return "内容是 gzip 压缩包";
+        }
+
+        var hex = string.Join(" ", head.Take(Math.Min(8, head.Length)).Select(b => b.ToString("X2")));
+        return $"开头是 {hex}（不是 MZ）";
     }
 
     private static void TryDelete(string path)

@@ -121,6 +121,8 @@
                         <Button x:Name="RdpDiagnoseButton" Content="查看诊断" Click="OnRdpDiagnose" IsEnabled="False" />
                         <Button Content="打开排查教程" Click="OnRdpTutorial" />
                         <Button x:Name="RdpBackupButton" Content="历史备份" Click="OnRdpBackups" />
+                        <Button x:Name="RdpPickInstallerButton" Content="指定安装包" Click="OnRdpPickInstaller"
+                                ToolTipService.ToolTip="网络拿不到 GitHub 附件时，用浏览器手动下载 RDPW_Installer.exe 后在这里选中它" />
                     </StackPanel>
 
                     <!-- 四行检测结果由 SettingsPage.xaml.cs 直接填入 StackPanel：

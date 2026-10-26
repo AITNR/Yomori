@@ -25,6 +25,9 @@ public sealed partial class SettingsPage : Page
     /// <summary>最近一次 RDP 解锁只读检测的结果；「查看诊断」按它出文本，不再重新跑一遍检测。</summary>
     private RdpUnlockSnapshot? _rdpSnapshot;
 
+    /// <summary>用户手动指定的安装包路径；空串表示按官方发布下载。</summary>
+    private string _rdpManualInstaller = "";
+
     /// <summary>上一次修改操作的完整报告（含逐步现场）。「查看诊断」优先把它带出来。</summary>
     private string _rdpLastReport = "";
 
@@ -871,6 +874,41 @@ public sealed partial class SettingsPage : Page
         RdpRestoreRegistryButton.IsEnabled = !busy && hasBaseline;
         RdpBackupButton.IsEnabled = !busy && hasAnyTransaction;
         RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
+        RdpPickInstallerButton.IsEnabled = !busy;
+    }
+
+    /// <summary>
+    /// 指定本地安装包：GitHub 附件在国内网络常被拦成网页，这时让用户自己下一个交给程序。
+    /// </summary>
+    /// <remarks>
+    /// 选完不立刻安装 —— 装系统组件是重动作，要用户在确认窗口里看到「会用什么、从哪来」。
+    /// 所以这里只记路径并把状态写到操作行，下次点「解锁 RDP」才用它。
+    /// </remarks>
+    private async void OnRdpPickInstaller(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        var path = await DialogHelper.PickOpenFileAsync(("可执行文件", ".exe"));
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        var pe = RdpToolDownloader.InspectPe(path);
+        if (!pe.IsPe)
+        {
+            // 用户选错文件是常事（选成网页另存的 .exe、选成压缩包），必须当场说清楚
+            _rdpManualInstaller = "";
+            SetRdpAction($"这个文件用不了：{Path.GetFileName(path)} {pe.ProblemText}");
+            return;
+        }
+
+        _rdpManualInstaller = path;
+        SetRdpAction($"已指定安装包：{Path.GetFileName(path)}（{new FileInfo(path).Length} 字节，架构 {pe.MachineName}）。"
+                     + "下次点「解锁 RDP」将直接使用它，不再下载。");
     }
 
     /// <summary>
@@ -1106,7 +1144,11 @@ public sealed partial class SettingsPage : Page
             antivirusConfirmed = true;
         }
 
-        var request = new RdpUnlockRequest { AntivirusConfirmed = antivirusConfirmed };
+        var request = new RdpUnlockRequest
+        {
+            AntivirusConfirmed = antivirusConfirmed,
+            ManualInstallerPath = _rdpManualInstaller,
+        };
         var network = UpdateNetworkSettings.FromConfig(VM.Config);
 
         await RunRdpOperationAsync("解锁 RDP",
