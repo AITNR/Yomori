@@ -1782,14 +1782,17 @@ public sealed partial class SettingsPage : Page
         RdpResultBar.Message = result.Summary;
         RdpResultBar.IsOpen = true;
 
-        // 步骤
+        // 步骤：界面只列骨架，说明一律进「运行日志」—— 十几步铺开会把结果条顶出屏幕
         RdpStepsLines.Children.Clear();
         foreach (var step in result.Steps)
         {
             RdpStepsLines.Children.Add(BuildStepLine(step));
+            VM.AppendLog($"[RDP 解锁] {step.ToLine()}");
         }
 
-        RdpStepsTitle.Text = $"执行步骤（{result.Steps.Count} 步）";
+        RdpStepsTitle.Text = result.Steps.Count > 0
+            ? $"执行步骤（{result.Steps.Count} 步）· 明细见「运行日志」"
+            : "执行步骤";
         RdpStepsPanel.Visibility = result.Steps.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
 
         // 用流程内部的最终检测刷新四项，不重跑一次检测（重跑可能读到中间态）
@@ -1814,13 +1817,22 @@ public sealed partial class SettingsPage : Page
         _rdpLastReport = result.FormatReport();
     }
 
+    /// <summary>
+    /// 一行步骤。
+    /// </summary>
+    /// <remarks>
+    /// 通过 / 跳过的步骤只写「等级 + 标题」，说明部分写进运行日志 —— 本页要回答的是
+    /// 「走到第几步」，不是审计正文。注意 / 失败例外：它必须在本页就说清哪里不对，
+    /// 否则用户得先翻日志才知道出了什么事。
+    /// </remarks>
     private static FrameworkElement BuildStepLine(RdpStepRecord step)
     {
+        var needsDetail = step.Outcome is RdpStepOutcome.Warn or RdpStepOutcome.Fail;
         var panel = new StackPanel { Spacing = 1 };
 
         panel.Children.Add(new TextBlock
         {
-            Text = step.ToLine(),
+            Text = needsDetail ? step.ToLine() : step.BriefLine(),
             FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
             Foreground = StepBrush(step.Outcome),
