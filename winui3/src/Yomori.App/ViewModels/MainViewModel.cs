@@ -2474,6 +2474,20 @@ public sealed class MainViewModel : ObservableObject
     private string _channelSessionSummary = string.Empty;
     private string _channelAgentStatusText = string.Empty;
     private string _channelCredentialText = string.Empty;
+    private string _channelGrantText = string.Empty;
+
+    /// <summary>
+    /// 本机账户授权按「机器 + 账户」串行（计划书 §6）：同一账户被多条通道复用时，
+    /// 后到的那次等前一次做完，然后查到"已是管理员"就不再重复弹框/记账。
+    /// 单机单用户场景，一把信号量足够，不必按账户分桶。
+    /// </summary>
+    private readonly SemaphoreSlim _grantGate = new(1, 1);
+
+    /// <summary>正在授权的通道 id。连点两次「保存凭据」时不重复弹框、不重复记账。</summary>
+    private readonly HashSet<string> _grantInFlight = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>各通道最近一次的管理员授权结果（按通道 id 存，切通道不互相覆盖）。</summary>
+    private readonly Dictionary<string, string> _channelGrantTexts = new(StringComparer.OrdinalIgnoreCase);
 
     private RelayCommand? _addChannelCommand;
     private RelayCommand? _duplicateChannelCommand;
@@ -2529,6 +2543,16 @@ public sealed class MainViewModel : ObservableObject
     {
         get => _channelCredentialText;
         private set => SetProperty(ref _channelCredentialText, value);
+    }
+
+    /// <summary>
+    /// 该通道最近一次的本机管理员授权结果。与「凭据」是两件事：
+    /// 凭据保存成功不代表授权成功，反之亦然（计划书 §4.1 第 7 条）。
+    /// </summary>
+    public string ChannelGrantText
+    {
+        get => _channelGrantText;
+        private set => SetProperty(ref _channelGrantText, value);
     }
 
     /// <summary>该通道的分辨率档位（按通道存，不再共用一个全局档位）。</summary>
@@ -2615,6 +2639,7 @@ public sealed class MainViewModel : ObservableObject
             ChannelSessionSummary = "－";
             ChannelAgentStatusText = "－";
             ChannelCredentialText = "－";
+            ChannelGrantText = "－";
             OnPropertyChanged(nameof(ChannelBridgeDir));
             return;
         }
@@ -2651,6 +2676,9 @@ public sealed class MainViewModel : ObservableObject
 
         ChannelAgentStatusText = DescribeAgentStatus(readiness);
         ChannelCredentialText = readiness.CredentialSaved ? "已保存" : "未保存";
+        ChannelGrantText = _channelGrantTexts.TryGetValue(channel.Id, out var grantText)
+            ? grantText
+            : "－";
 
         channel.CredentialSaved = readiness.CredentialSaved;
         OnPropertyChanged(nameof(ChannelResolutionKey));
@@ -2914,26 +2942,27 @@ public sealed class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// 保存凭据之后的本机账户授权。fire-and-forget：失败只记日志，不打断保存流程。
+    /// 保存凭据之后的本机账户授权。fire-and-forget：失败只记日志/状态，不打断保存流程。
     /// </summary>
     /// <remarks>
-    /// 计划书 §8 的边界逐条落在这里：
-    /// · 不创建 Windows 用户（账户不存在就报告，让用户自己去系统设置里建）；
-    /// · 只对本机通道授权，远端的同名账户一律不碰；
-    /// · 版本未知 / 账户边界不清 → 停止；
-    /// · 家庭版缺 RDP 组 → 加 Administrators，且必须用户显式确认"授予管理员权限"。
+    /// <para>统一管理员策略（2026-10-26 增量计划书 §4、§5.3）：不再读系统版本、不再看
+    /// Remote Desktop Users 组，先查「是不是已经管理员」，是就什么都不做，
+    /// 不是才弹一次统一确认。</para>
+    /// <para>计划书 §6：同一账户被多条通道复用时按「机器 + 账户」串行 —— 用一把信号量排队，
+    /// 后到的那次会在前一次完成后查到"已是管理员"，于是不再重复弹框、也不重复记账。</para>
     /// </remarks>
     private void StartAccountAuthorization(RdpChannel channel)
     {
         // 账户名必须在**此刻**取快照：用户可能在授权对话框弹着的时候又去改了通道
+        var channelId = channel.Id;
         var account = channel.User;
         var displayName = channel.DisplayName;
         var host = channel.Host;
 
-        _ = AuthorizeLocalAccountAsync(host, account, displayName);
+        _ = AuthorizeLocalAccountAsync(channelId, host, account, displayName);
     }
 
-    private async Task AuthorizeLocalAccountAsync(string host, string account, string displayName)
+    private async Task AuthorizeLocalAccountAsync(string channelId, string host, string account, string displayName)
     {
         try
         {
@@ -2945,59 +2974,191 @@ public sealed class MainViewModel : ObservableObject
 
             if (!RdpTargets.IsLocal(host))
             {
-                // 远端机器上的同名账户与本机无关，按计划书不加本机组
-                AppendLog($"[账户授权] 「{displayName}」是远程通道（{RdpTargets.Normalize(host)}），不做本机账户授权。");
+                // 远端机器上的同名账户与本机无关：不碰本机账户，也不把它算成"已授权"
+                var remoteNote = "已保存远程通道；请在目标计算机设置管理员账户，未修改主控机账户。";
+                SetChannelGrantText(channelId, remoteNote);
+                AppendLog($"[账户授权] 「{displayName}」是远程通道（{RdpTargets.Normalize(host)}），{remoteNote}");
                 return;
             }
 
-            var (edition, editionId, productName) = LocalGroupMembershipService.DetectEdition();
-            var rdpGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.RemoteDesktopUsersSid);
-            var adminGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.AdministratorsSid);
+            // 串行化：同一账户的多条通道、以及连点两次保存，都排队过这一处
+            await _grantGate.WaitAsync();
 
-            var plan = RdpGrantPlanner.Plan(
-                account, Environment.MachineName, edition, rdpGroup is not null, adminGroup is not null);
-
-            if (!plan.Allowed)
+            try
             {
-                AppendLog($"[账户授权] 跳过：{plan.Reason}"
-                          + $"（版本 {RdpEditions.Label(edition)}，EditionID={editionId}，ProductName={productName}）");
-                return;
-            }
-
-            if (plan.NeedsAdminWarning)
-            {
-                // 家庭版把账户提成管理员影响很大：必须明示，不能顺手做掉
-                var confirmed = await DialogHelper.ShowMessageAsync(
-                    "授予管理员权限",
-                    $"本机是家庭版，且没有 Remote Desktop Users 组。要让「{RdpGrantPlanner.BareAccountName(account)}」"
-                    + "通过远程桌面登录，需要把它加入 Administrators —— 这会授予该账户本机管理员权限。"
-                    + Environment.NewLine + Environment.NewLine
-                    + "选择「取消」不会做任何改动，之后也可以自己在「设置 → 账户」里手工添加。",
-                    closeText: "取消",
-                    primaryText: "确认授予管理员权限");
-
-                if (confirmed != ContentDialogResult.Primary)
+                if (!_grantInFlight.Add(channelId))
                 {
-                    AppendLog("[账户授权] 用户取消了家庭版管理员授权，未改动任何组成员。");
+                    // 同一通道已有一轮在跑（多半正停在确认框上）：不重复弹框
+                    AppendLog($"[账户授权] 「{displayName}」已有一轮授权在进行，本次跳过。");
                     return;
                 }
+
+                try
+                {
+                    SetChannelGrantText(channelId, "正在检查该账户是否已是本机管理员…");
+
+                    var precheck = await Task.Run(() => LocalGroupMembershipService.Inspect(account));
+
+                    if (precheck.Failure.Length > 0)
+                    {
+                        SetChannelGrantText(channelId, precheck.Failure);
+                        AppendLog($"[账户授权] 「{displayName}」未授权：{precheck.Failure}{DescribeEditionSuffix()}");
+                        return;
+                    }
+
+                    if (precheck.AlreadyAdministrator)
+                    {
+                        const string text = "账户已是本机管理员，无需修改。";
+                        SetChannelGrantText(channelId, text);
+                        AppendLog($"[账户授权] 「{displayName}」{text}（{precheck.AccountSid}）");
+                        return;
+                    }
+
+                    // 到这里一定是「账户存在 + 确认不是管理员」：统一弹一次确认
+                    var confirmed = await ShowGrantDialogOnUiThreadAsync(account);
+
+                    if (confirmed != ContentDialogResult.Primary)
+                    {
+                        SetChannelGrantText(channelId, "凭据已保存；管理员授权已取消。");
+                        AppendLog("[账户授权] 用户取消，未改动任何组成员；凭据仍然保留。");
+                        return;
+                    }
+
+                    SetChannelGrantText(channelId, "正在授予管理员权限…");
+
+                    var result = await Task.Run(() =>
+                        LocalGroupMembershipService.AuthorizeAsAdministrator(account, precheck.AccountSid));
+
+                    // 结果文字是绑定属性：一律收口到 UI 线程（await Task.Run 的续体不保证回来）
+                    SetChannelGrantText(channelId, DescribeGrantResult(result));
+                    AppendLog($"[账户授权] 「{displayName}」{result.Message}"
+                              + (result.Detail.Length > 0 ? $"　{result.Detail}" : "")
+                              + (result.RecordSaved ? "（已记入 grants.jsonl）" : "（授权记录写入失败）"));
+                }
+                finally
+                {
+                    _grantInFlight.Remove(channelId);
+                }
             }
-
-            var result = await Task.Run(() => LocalGroupMembershipService.Authorize(account, edition));
-
-            await RunOnUiThreadAsync(() =>
+            finally
             {
-                var recorded = RdpGrantStore.Append(account, result);
-                AppendLog($"[账户授权] {result.Message}"
-                          + (result.Detail.Length > 0 ? $"　{result.Detail}" : "")
-                          + (recorded ? "（已记入 grants.jsonl）" : ""));
-            });
+                _grantGate.Release();
+            }
         }
         catch (Exception ex)
         {
             // fire-and-forget：异常绝不能放出去，否则就是未观察异常
+            SetChannelGrantText(channelId, "管理员授权过程出错，详见运行日志。");
             AppendLog($"[账户授权] 异常：{ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    /// <summary>统一的管理员授权确认框。家庭版与非家庭版使用同一份内容，不再解释 SKU。</summary>
+    private Task<ContentDialogResult> ShowAdministratorGrantDialog(string account)
+    {
+        var qualified = RdpGrantPlanner.QualifiedName(Environment.MachineName, account);
+
+        return DialogHelper.ShowMessageAsync(
+            "设为本机管理员",
+            $"将把此计算机上的账户「{qualified}」设为管理员。该账户将获得本机管理员权限，"
+            + "可管理系统设置和其他用户。原有组成员关系保持不变。是否继续？"
+            + Environment.NewLine + Environment.NewLine
+            + "取消仅取消管理员授权；已经成功保存的凭据会保留。",
+            closeText: "取消",
+            primaryText: "确认设为管理员");
+    }
+
+    /// <summary>
+    /// 在 UI 线程上开确认框并等结果。
+    /// </summary>
+    /// <remarks>
+    /// 为什么要多这一层：<c>ContentDialog</c> 必须在 UI 线程上创建与显示，
+    /// 而本方法的上游是 <c>await Task.Run(...)</c>，其续体<b>不保证</b>回到 UI 线程。
+    /// 在别的线程上 new ContentDialog 会拿到 <c>0x8001010E</c>，而 <see cref="DialogHelper"/>
+    /// 会把它吞成「取消」—— 表现就是"点了保存、什么都没发生、也没授权"，查起来极费劲。
+    /// </remarks>
+    private async Task<ContentDialogResult> ShowGrantDialogOnUiThreadAsync(string account)
+    {
+        if (_dispatcher.HasThreadAccess)
+        {
+            return await ShowAdministratorGrantDialog(account);
+        }
+
+        var tcs = new TaskCompletionSource<ContentDialogResult>();
+        if (!_dispatcher.TryEnqueue(() => ShowOnUiThreadAsync()))
+        {
+            // 队列已关闭（窗口正在关）：按取消处理，别让调用方死等
+            return ContentDialogResult.None;
+        }
+
+        return await tcs.Task;
+
+        async void ShowOnUiThreadAsync()
+        {
+            try
+            {
+                tcs.SetResult(await ShowAdministratorGrantDialog(account));
+            }
+            catch (Exception ex)
+            {
+                tcs.SetException(ex);
+            }
+        }
+    }
+
+    /// <summary>把授权结果翻成一句用户能直接读的话（计划书 §4.2 的六种结果）。</summary>
+    private static string DescribeGrantResult(RdpGrantResult result)
+    {
+        var text = result.Outcome switch
+        {
+            RdpGrantOutcome.AlreadyMember => "账户已是本机管理员，无需修改。",
+            RdpGrantOutcome.AddedAdministrators =>
+                "已将账户设为本机管理员。新权限需要该账户注销并重新登录后才生效（已有会话不会被自动断开）。",
+            RdpGrantOutcome.Unconfirmed => "管理员授权结果未确认，请重新检查。",
+            RdpGrantOutcome.Failed => $"凭据保存状态：已保存；管理员授权失败：{result.Message}",
+            RdpGrantOutcome.Refused => $"凭据保存状态：已保存；管理员授权未执行：{result.Message}",
+            RdpGrantOutcome.SkippedRemote =>
+                "已保存远程通道；请在目标计算机设置管理员账户，未修改主控机账户。",
+            _ => result.Message,
+        };
+
+        if (!result.RecordSaved && result.WasAddedThisRound)
+        {
+            text += "（管理员已授予，但授权记录保存失败）";
+        }
+
+        return text;
+    }
+
+    /// <summary>日志里附带的系统版本信息。**只作诊断**，不参与任何授权判断。</summary>
+    private static string DescribeEditionSuffix()
+    {
+        try
+        {
+            var (edition, editionId, productName) = LocalGroupMembershipService.DetectEdition();
+            return $"（诊断：{RdpEditions.Label(edition)}，EditionID={editionId}，ProductName={productName}）";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// 把授权结果写到该通道的状态里。绑定属性只能在 UI 线程上改，
+    /// 而本方法会被后台续体调用（<c>await Task.Run</c> 之后不保证回到 UI 线程）。
+    /// </summary>
+    private void SetChannelGrantText(string channelId, string text)
+    {
+        RunOnUiThreadSync(() =>
+        {
+            _channelGrantTexts[channelId] = text;
+
+            if (string.Equals(_selectedChannel?.Id, channelId, StringComparison.Ordinal))
+            {
+                ChannelGrantText = text;
+            }
+        });
     }
 
     public void ClearChannelCredential()

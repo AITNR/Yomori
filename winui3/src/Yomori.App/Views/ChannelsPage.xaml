@@ -186,6 +186,14 @@
                     <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
                                Text="密码只进 Windows 凭据管理器（按「主机 + 账户」各存一条，通道之间互不覆盖），不会写进 config.json。目标账户必须设置过登录密码。" />
 
+                    <TextBlock TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                               Text="保存凭据后会自动检查该账户是不是本机管理员：已是管理员则不做任何修改；不是管理员时先征求确认，确认后把该账户加入本机 Administrators 组，即授予本机管理员权限。原有组成员关系（Users、Remote Desktop Users 等）全部保持不变。远程主机的通道不受影响 —— 那些账户要在目标计算机上设置。" />
+
+                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.85">
+                        <Run Text="管理员授权：" />
+                        <Run Text="{x:Bind VM.ChannelGrantText, Mode=OneWay}" />
+                    </TextBlock>
+
                     <ComboBox Header="远程桌面窗口尺寸"
                               ItemsSource="{x:Bind VM.ResolutionItems}"
                               DisplayMemberPath="Value"

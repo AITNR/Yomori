@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using Yomori.Models;
 
 namespace Yomori.Services;
@@ -95,22 +96,32 @@ public static class RdpDiagnoseCli
     }
 
     /// <summary>
-    /// 版本与账户授权记录。用户报「账户加不进远程桌面组」时，这两段是最常见的两个原因
-    /// （版本判成未知 → 按规则拒绝；或者账户根本不是本机账户）。
+    /// 账户授权现场：策略、目标账户的实际管理员身份、历史授权记录。
     /// </summary>
+    /// <remarks>
+    /// 用户报「保存账户后没变成管理员」时，按顺序看三件事就够：
+    /// ① 该账户在本机是否存在、SID 是多少；② 它实际在不在 Administrators；
+    /// ③ 授权记录里那一轮是 added / already / failed / unconfirmed。
+    /// 系统版本与 Remote Desktop Users 组只作附加诊断 —— 它们**不参与**授权决策。
+    /// </remarks>
     private static void AppendEditionAndGrants(StringBuilder text)
     {
         text.AppendLine();
-        text.AppendLine("--- 版本与账户授权 ---");
+        text.AppendLine("--- 账户授权（统一管理员策略）---");
+        text.AppendLine($"策略版本：{RdpGrantPlanner.PolicyVersion}　目标组恒定 SID={RdpEditions.AdministratorsSid}");
 
         var (edition, editionId, productName) = LocalGroupMembershipService.DetectEdition();
-        text.AppendLine($"本机版本：{RdpEditions.Label(edition)}"
-                        + $"（EditionID={editionId}，ProductName={productName}）");
-
-        var rdpGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.RemoteDesktopUsersSid);
         var adminGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.AdministratorsSid);
-        text.AppendLine($"Remote Desktop Users 组：{(rdpGroup is null ? "不存在" : rdpGroup)}");
-        text.AppendLine($"Administrators 组：{(adminGroup is null ? "不存在" : adminGroup)}");
+        var rdpGroup = LocalGroupMembershipService.ResolveGroupName(RdpEditions.RemoteDesktopUsersSid);
+
+        text.AppendLine($"Administrators 组：{(adminGroup is null ? "不存在（授权会直接失败）" : adminGroup)}"
+                        + $"（{RdpEditions.AdministratorsSid}）");
+        text.AppendLine($"本机版本：{RdpEditions.Label(edition)}"
+                        + $"（EditionID={editionId}，ProductName={productName}）—— 仅诊断，不影响授权");
+        text.AppendLine($"Remote Desktop Users 组：{(rdpGroup is null ? "不存在" : rdpGroup)}"
+                        + "　（仅诊断：新策略不再往这里加人）");
+
+        AppendTargetAccounts(text, adminGroup);
 
         var grants = RdpGrantStore.List();
         if (grants.Count == 0)
@@ -122,7 +133,119 @@ public static class RdpDiagnoseCli
         text.AppendLine($"授权记录（{RdpGrantStore.FilePath}）：");
         foreach (var grant in grants)
         {
-            text.AppendLine($"· {grant.At}　{grant.AccountName}（{grant.AccountSid}）→ {grant.GroupName}（{grant.GroupSid}）");
+            var action = grant.Action is { Length: > 0 } ? grant.Action : "add";
+
+            // 旧行只有 action=add；新行是 intent/result 两段式，靠 op_id 串起来
+            var tail = new StringBuilder();
+            if (grant.OpId is { Length: > 0 })
+            {
+                tail.Append($"　op={grant.OpId}");
+            }
+
+            if (grant.BeforeMember is { Length: > 0 })
+            {
+                tail.Append($"　前={grant.BeforeMember}");
+            }
+
+            if (grant.Request is { Length: > 0 })
+            {
+                tail.Append($"　请求={grant.Request}");
+            }
+
+            if (grant.Readback is { Length: > 0 })
+            {
+                tail.Append($"　回读={grant.Readback}");
+            }
+
+            if (grant.Result is { Length: > 0 })
+            {
+                tail.Append($"　结论={grant.Result}");
+            }
+
+            // 组 SID 决定这行是老账（RDP 组）还是新账（管理员组），历史事实不改写
+            var groupTag = grant.GroupSid == RdpEditions.AdministratorsSid
+                ? "管理员"
+                : grant.GroupSid == RdpEditions.RemoteDesktopUsersSid ? "RDP组（历史）" : "其它组";
+
+            text.AppendLine($"· {grant.At}　[{action}]　{grant.AccountName}（{grant.AccountSid}）"
+                            + $" → {grant.GroupName}（{grant.GroupSid}，{groupTag}）{tail}");
+        }
+    }
+
+    /// <summary>逐条通道核对目标账户的实际管理员身份。只读。</summary>
+    private static void AppendTargetAccounts(StringBuilder text, string? adminGroup)
+    {
+        text.AppendLine();
+        text.AppendLine("--- 通道目标账户 ---");
+
+        List<RdpChannel> channels;
+        try
+        {
+            var path = AppPaths.ConfigPath;
+            if (!File.Exists(path))
+            {
+                text.AppendLine("（还没有配置文件，无法核对通道账户）");
+                return;
+            }
+
+            var config = JsonSerializer.Deserialize<AppConfig>(
+                File.ReadAllText(path, Encoding.UTF8),
+                new JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true,
+                    ReadCommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true,
+                });
+
+            channels = config?.Rdp?.Channels ?? new List<RdpChannel>();
+        }
+        catch (Exception ex)
+        {
+            text.AppendLine($"（配置读不出来：{ex.GetType().Name}）");
+            return;
+        }
+
+        if (channels.Count == 0)
+        {
+            text.AppendLine("（配置里没有通道）");
+            return;
+        }
+
+        foreach (var channel in channels)
+        {
+            var label = channel.DisplayName;
+
+            if (!RdpTargets.IsLocal(channel.Host))
+            {
+                text.AppendLine($"· {label}：远程目标（{RdpTargets.Normalize(channel.Host)}），"
+                                + "本机不判断、不修改 —— 需在目标计算机上设置管理员");
+                continue;
+            }
+
+            var plan = RdpGrantPlanner.Plan(channel.User, Environment.MachineName, adminGroup is not null);
+            if (!plan.Allowed)
+            {
+                text.AppendLine($"· {label}：账户「{channel.User}」不可授权（{plan.Reason}）");
+                continue;
+            }
+
+            var sid = LocalGroupMembershipService.ResolveAccountSid(plan.AccountName);
+            if (sid is null)
+            {
+                text.AppendLine($"· {label}：本机没有账户「{plan.AccountName}」");
+                continue;
+            }
+
+            var member = LocalGroupMembershipService.IsMember(adminGroup!, sid);
+            var state = member switch
+            {
+                true => "已是管理员",
+                false => "不是管理员",
+                _ => "成员关系读不出来",
+            };
+
+            text.AppendLine($"· {label}：{RdpGrantPlanner.QualifiedName(Environment.MachineName, plan.AccountName)}"
+                            + $"（{sid}）→ {state}");
         }
     }
 
