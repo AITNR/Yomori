@@ -246,59 +246,82 @@ public static class RdpUnlockService
                     return Fail(steps, "安装器在下载后被改动过，已停止：", verify.Message, before);
                 }
 
-                // ⚠️ 必须带 -i：无参运行是交互式菜单（等着按键），会一直挂着不退出
-                var run = await RdpToolRunner
-                    .RunAsync(installer.LocalPath, RdpToolRunner.InstallArguments, ToolTimeout, cancellationToken)
-                    .ConfigureAwait(false);
-                RdpTransactionStore.AppendStep(
-                    manifest, $"安装器（{RdpToolRunner.InstallArguments}）退出码 {run.ExitCode}：{run.OutputTail}");
+                // 上游这个「安装器」是一键图形程序：装完会照官方 install.bat 的做法把 RDP_CnC.exe
+                // 拉起来当状态窗口 —— 既挡屏幕，又让我们永远等不到"进程退出"（2026-10-26 真机）。
+                // 所以优先在隐藏桌面上启动：窗口照建，但不会出现在用户屏幕上，句柄也不继承。
+                var hidden = RdpHiddenProcess.Start(installer.LocalPath, RdpToolRunner.InstallArguments);
+                var run = new RdpToolRunResult(0, false, "（隐藏桌面启动，无输出）");
 
-                // 退出码只作参考，最终认 ServiceDll（计划书 4.3：不认退出码，认回读状态）
-                var afterInstall = RdpReadOnlyDetector.Detect();
-                var installed = afterInstall.WrapperState == RdpWrapperState.Installed;
-                installDir = afterInstall.InstallDirectory;
-
-                if (run.TimedOut)
+                if (hidden.Ok)
                 {
-                    if (installed)
+                    RdpTransactionStore.AppendStep(manifest, $"安装器在隐藏桌面上启动，pid={hidden.ProcessId}");
+
+                    var reached = await WaitUntilAsync(
+                        () => RdpReadOnlyDetector.Detect().WrapperState == RdpWrapperState.Installed,
+                        ToolTimeout,
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (!reached)
                     {
-                        // 2026-10-26 真机就是这一种：装成功了、工具没退出（无参菜单）。
-                        // 状态到了就继续，报"注意"而不是"失败" —— 用户要的是能远程登录，不是退出码。
-                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Warn,
-                            $"安装器 {ToolTimeout.TotalSeconds:0} 秒未退出，但 ServiceDll 已指向 "
-                            + $"{afterInstall.ServiceDllPath} —— 按状态判定为已安装，继续后续步骤。");
-                    }
-                    else
-                    {
-                        // 结果不明且没达成：不杀进程、不补偿、事务保持 Running 供下次识别（计划书 6.2）
                         Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                            $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍为 "
-                            + $"{afterInstall.ServiceDllPath}。事务保持未完成状态。");
-                        return Fail(steps, "安装器超时，结果不明：",
-                            "没有强制结束安装器。请等它自行结束后重新检测；若一直不结束，重启电脑后再来。", before,
-                            manifest.Id);
+                            $"安装器在隐藏桌面上 {ToolTimeout.TotalSeconds:0} 秒内未完成，ServiceDll 仍未被接管。"
+                            + "事务保持未完成状态。");
+                        return Fail(steps, "安装器没有生效：",
+                            "它的窗口开在隐藏桌面上（你看不到），可能停在某个提示上。重启电脑后再试一次；"
+                            + "仍然不行请点「查看诊断」把结果发出来。", before, manifest.Id);
                     }
-                }
-                else if (run.ExitCode != 0)
-                {
-                    var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
-                        .ConfigureAwait(false);
-                    return Fail(steps, "安装器返回失败：", $"退出码 {run.ExitCode}。{run.OutputTail}", before, manifest.Id,
-                        compensated);
-                }
-                else if (!installed)
-                {
-                    var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
-                        .ConfigureAwait(false);
-                    return Fail(steps, "安装器报告成功，但本机没有接管：",
-                        $"ServiceDll 仍为 {afterInstall.ServiceDllPath}。可能是安全软件拦截，或系统版本不被该版本支持。",
-                        afterInstall, manifest.Id, compensated);
+
+                    Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok,
+                        "已在隐藏桌面上完成安装 —— 那个图形安装器的窗口不会出现在你屏幕上。");
                 }
                 else
                 {
-                    Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok,
-                        $"退出码 0；ServiceDll 已指向 {afterInstall.ServiceDllPath}");
+                    // 隐藏桌面建不出来（会话异常 / 权限被改，极少见）→ 退回可见启动，并如实说明会弹窗
+                    Add(steps, "install", "运行官方安装器", RdpStepOutcome.Warn,
+                        $"无法在隐藏桌面上启动（{hidden.Error}），改为普通启动；此时会弹出第三方安装界面。");
+
+                    run = await RdpToolRunner
+                        .RunAsync(installer.LocalPath, RdpToolRunner.InstallArguments, ToolTimeout, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    RdpTransactionStore.AppendStep(
+                        manifest, $"安装器（{RdpToolRunner.InstallArguments}）退出码 {run.ExitCode}：{run.OutputTail}");
+
+                    var reachedByRun = RdpReadOnlyDetector.Detect().WrapperState == RdpWrapperState.Installed;
+
+                    if (!reachedByRun)
+                    {
+                        if (run.TimedOut)
+                        {
+                            Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
+                                $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍未被接管。事务保持未完成状态。");
+                            return Fail(steps, "安装器超时，结果不明：",
+                                "没有强制结束安装器。请等它自行结束后重新检测；若一直不结束，重启电脑后再来。",
+                                before, manifest.Id);
+                        }
+
+                        var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
+                            .ConfigureAwait(false);
+                        return Fail(steps, "安装器报告成功，但本机没有接管：",
+                            $"ServiceDll 仍为 {RdpReadOnlyDetector.Detect().ServiceDllPath}。"
+                            + "可能是安全软件拦截，或系统版本不被该版本支持。", before, manifest.Id, compensated);
+                    }
+
+                    if (run.TimedOut || run.ExitCode != 0)
+                    {
+                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Warn,
+                            $"退出码 {run.ExitCode}{(run.TimedOut ? "、超时" : "")}，"
+                            + "但 ServiceDll 已被接管 —— 按状态判定为已安装，继续后续步骤。");
+                    }
+                    else
+                    {
+                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok, "退出码 0，安装完成。");
+                    }
                 }
+
+                // 安装目录落定（后续 INI 更新要靠它定位 RDPWInst.exe）
+                var afterInstall = RdpReadOnlyDetector.Detect();
+                installDir = afterInstall.InstallDirectory;
             }
             else
             {
@@ -862,6 +885,33 @@ public static class RdpUnlockService
 
     private static void Add(List<RdpStepRecord> steps, string key, string title, RdpStepOutcome outcome, string detail) =>
         steps.Add(new RdpStepRecord { Key = key, Title = title, Outcome = outcome, Detail = detail });
+
+    /// <summary>轮询直到条件成立或超时。装完与否看状态，不看进程退没退。</summary>
+    private static async Task<bool> WaitUntilAsync(Func<bool> predicate, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.Now + timeout;
+
+        while (DateTimeOffset.Now < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                if (predicate())
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                // 读失败当作"还没好"，继续等
+            }
+
+            await Task.Delay(500, cancellationToken).ConfigureAwait(false);
+        }
+
+        return false;
+    }
 
     private static void Report(IProgress<RdpProgressInfo>? progress, int step, string text) =>
         progress?.Report(new RdpProgressInfo(step, TotalSteps, text));

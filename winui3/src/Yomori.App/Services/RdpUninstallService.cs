@@ -159,7 +159,8 @@ public static class RdpUninstallService
 
             // ---- 3. 找卸载器 ----
             Report(progress, 3, "定位配套卸载器");
-            var lookup = await FindUninstallerAsync(request, network, cancellationToken).ConfigureAwait(false);
+            var lookup = await FindUninstallerAsync(request, network, before.InstallDirectory, cancellationToken)
+                .ConfigureAwait(false);
 
             if (lookup.Tool is null)
             {
@@ -300,8 +301,23 @@ public static class RdpUninstallService
     private static async Task<UninstallerLookup> FindUninstallerAsync(
         RdpUninstallRequest request,
         UpdateNetworkSettings network,
+        string installDirectory,
         CancellationToken cancellationToken)
     {
+        // 0) 安装目录里的控制台工具 —— 最优解：它就是官方 install.bat 用的那个 RDPWInst.exe，
+        //    跑起来没有任何窗口，不需要下载，也与当前已装版本天然同源。
+        var localTool = FindLocalConsoleTool(installDirectory);
+        if (localTool is not null)
+        {
+            return new UninstallerLookup(
+                localTool,
+                FromRecord: true,
+                Detail: $"使用安装目录里的控制台工具：{localTool.LocalPath}（不会弹出任何界面）",
+                Error: "",
+                ReleaseId: 0,
+                ReleaseTag: "");
+        }
+
         var recordedTag = "";
         var recordedReleaseId = 0L;
 
@@ -447,6 +463,42 @@ public static class RdpUninstallService
 
         detail = "本机没有卸载器，需要从官方 Releases 重新下载";
         return false;
+    }
+
+    /// <summary>
+    /// 安装目录里的控制台卸载工具（<c>RDPWInst.exe</c>）。没有就返回 null。
+    /// </summary>
+    /// <remarks>
+    /// 它和那个 2.5MB 的图形"安装器/卸载器"是同一套工具链里的控制台版，
+    /// 官方 <c>uninstall.bat</c> 就是 <c>RDPWInst.exe -u</c>。用它卸载不会有任何窗口。
+    /// </remarks>
+    private static RdpDownloadedTool? FindLocalConsoleTool(string? installDirectory)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(installDirectory))
+            {
+                return null;
+            }
+
+            var path = Path.Combine(installDirectory, "RDPWInst.exe");
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            return new RdpDownloadedTool
+            {
+                Asset = new RdpAsset { Name = "RDPWInst.exe" },
+                LocalPath = path,
+                Sha256 = RdpTransactionStore.Sha256File(path),
+                SizeBytes = new FileInfo(path).Length,
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static RdpDownloadedTool? FindStagedUninstaller(long preferredReleaseId)
