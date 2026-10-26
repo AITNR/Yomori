@@ -162,6 +162,40 @@ public static class RdpServiceControl
         return (result, "");
     }
 
+    /// <summary>
+    /// 有没有权限停这个服务（**只查权限，不动它**）。
+    /// </summary>
+    /// <remarks>
+    /// 用在自检里：停 TermService 之前要先停依赖服务（UmRdpService），
+    /// 如果对依赖服务没有 SERVICE_STOP 权限，整套「先停依赖」的方案就落不了地 ——
+    /// 这件事必须能在不真的停服务的前提下验证。
+    /// </remarks>
+    public static bool CanStop(string serviceName)
+    {
+        var scm = Native.OpenSCManagerW(null, null, Native.SC_MANAGER_CONNECT);
+        if (scm == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        try
+        {
+            var service = Native.OpenServiceW(
+                scm, serviceName, Native.SERVICE_STOP | Native.SERVICE_QUERY_STATUS);
+            if (service == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            Native.CloseServiceHandle(service);
+            return true;
+        }
+        finally
+        {
+            Native.CloseServiceHandle(scm);
+        }
+    }
+
     /// <summary>停止服务并等它真的停下。</summary>
     public static (bool Ok, string Message) Stop(string serviceName, TimeSpan? wait = null)
     {
@@ -200,9 +234,16 @@ public static class RdpServiceControl
                     var code = Marshal.GetLastWin32Error();
 
                     // 1062 = 服务没在运行；1061 = 当前不接受控制命令（正在切换中）
+                    // 1051 = 还有依赖服务在跑，系统不允许单独停它
                     if (code == 1062)
                     {
                         return (true, $"{serviceName} 已经停止");
+                    }
+
+                    if (code == 1051)
+                    {
+                        return (false,
+                            $"{serviceName} 有依赖服务正在运行，系统不允许单独停止它（Win32 1051）");
                     }
 
                     return (false, $"ControlService(STOP) 失败：Win32 {code}");
@@ -310,10 +351,33 @@ public static class RdpServiceControl
             touched.Add(dependent);
         }
 
+        // ⚠️ **必须先停依赖服务，再停宿主。**
+        // ControlService(STOP) 对 TermService 只会返回 Win32 1051
+        // （ERROR_DEPENDENT_SERVICES_RUNNING）—— 它不会替你停依赖，只有 `net stop` 会。
+        // 2026-10-26 真机就卡在这里：UmRdpService 正在运行，TermService 停不下去，
+        // 于是整轮被判失败、刚装好的组件又被补偿卸掉。
+        var stoppedDependents = new List<string>();
+        foreach (var dependent in dependents)
+        {
+            var (depStopOk, depStopMessage) = Stop(dependent, wait);
+            notes.Add(depStopOk ? $"已停依赖服务 {dependent}" : $"依赖服务 {dependent} 停不下来：{depStopMessage}");
+
+            if (depStopOk)
+            {
+                stoppedDependents.Add(dependent);
+            }
+        }
+
         var (stopOk, stopMessage) = Stop(serviceName, wait);
         notes.Add(stopMessage);
         if (!stopOk)
         {
+            // 依赖没停干净时，把「是谁挡着」写出来，比只报 1051 有用
+            if (stopMessage.Contains("1051", StringComparison.Ordinal) && dependents.Count > 0)
+            {
+                notes.Add($"仍被依赖服务挡着：{string.Join("、", dependents)}");
+            }
+
             return (false, string.Join("；", notes), touched);
         }
 
@@ -331,6 +395,7 @@ public static class RdpServiceControl
             notes.Add(depOk ? $"已恢复依赖服务 {dependent}" : $"依赖服务 {dependent} 恢复失败：{depMessage}");
         }
 
+        _ = stoppedDependents;
         return (true, string.Join("；", notes), touched);
     }
 
