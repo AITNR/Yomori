@@ -461,7 +461,12 @@ public sealed class RdpAgentRunner
         });
 
         var mode = SessionFinishModes.Normalize(_command.SessionFinish);
-        var session = RdpSessionService.FindSession(Environment.UserName);
+
+        // 代理要处置的必须是【自己所在】的那条会话。
+        // 旧写法是 FindSession(Environment.UserName) —— 同账户出现多条会话时，
+        // 它可能挑到另一条，于是"任务结束断开连接"把别人的桌面给断了（甚至注销掉）。
+        // 先取本进程的 WTS 会话 id；取不到才退化为"该账户恰好一条"。
+        var session = ResolveOwnSession();
 
         switch (mode)
         {
@@ -495,6 +500,39 @@ public sealed class RdpAgentRunner
                 Log("会话收尾：保持连接，方便随时切回来查看结果。");
                 break;
         }
+    }
+
+    /// <summary>
+    /// 定位「代理自己所在」的会话。
+    ///
+    /// <para>优先用 <c>ProcessIdToSessionId</c> 拿本进程的真实会话号 —— 这是唯一不会认错的依据。
+    /// 拿不到时退化为「该账户恰好一条会话」；多于一条就返回 null（宁可不做，也不动别人的会话）。</para>
+    /// </summary>
+    private RdpSessionService.RdpSessionHandle? ResolveOwnSession()
+    {
+        var own = RdpSessionService.TryGetCurrentSessionId();
+        var sessions = RdpSessionService.FindSessions(Environment.UserName);
+
+        if (own is uint id)
+        {
+            var match = sessions.FirstOrDefault(s => s.SessionId == id);
+            if (match is not null)
+            {
+                return new RdpSessionService.RdpSessionHandle(match.SessionId, match.UserName, match.StateText);
+            }
+
+            // 自己的会话枚举不到（权限 / 时序）：只凭 id 也足够安全，仍按自己的处理。
+            return new RdpSessionService.RdpSessionHandle(id, Environment.UserName, "未知");
+        }
+
+        if (sessions.Count == 1)
+        {
+            return new RdpSessionService.RdpSessionHandle(
+                sessions[0].SessionId, sessions[0].UserName, sessions[0].StateText);
+        }
+
+        Log($"会话收尾：无法确定本进程属于哪条会话（枚举到 {sessions.Count} 条），本次不做会话处置。");
+        return null;
     }
 
     // ---------------- 状态与日志 ----------------

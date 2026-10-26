@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
@@ -37,6 +38,12 @@ public sealed class RdpSessionInfo
 
     public string Domain { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 账户 SID（<c>S-1-5-21-…</c>）。解析不出来就是空串 ——
+    /// 空串意味着「身份不可证明」，准入判定会据此阻断，而不是退化成比用户名。
+    /// </summary>
+    public string AccountSid { get; set; } = string.Empty;
+
     public string WinStationName { get; set; } = string.Empty;
 
     public SessionConnectState State { get; set; }
@@ -53,6 +60,18 @@ public sealed class RdpSessionInfo
         SessionConnectState.Idle => "空闲",
         SessionConnectState.Listen => "监听中",
         _ => State.ToString(),
+    };
+
+    /// <summary>转成准入判定用的身份快照。</summary>
+    public RdpSessionTarget ToTarget(string? host) => new()
+    {
+        Host = (host ?? string.Empty).Trim(),
+        Domain = Domain,
+        UserName = UserName,
+        Sid = AccountSid,
+        SessionId = Id,
+        State = State,
+        CapturedAt = DateTimeOffset.Now,
     };
 }
 
@@ -100,6 +119,25 @@ public sealed class RdpReadiness
 /// </summary>
 public static class RdpSessionService
 {
+    /// <summary>
+    /// 「一条已经定位好的会话」。只带处置会话真正需要的三项，
+    /// 避免调用方顺手去读其它字段再自行判断（那正是"按用户名挑第一条"的老路）。
+    /// </summary>
+    public sealed class RdpSessionHandle
+    {
+        public RdpSessionHandle(uint id, string userName, string stateText)
+        {
+            Id = id;
+            UserName = userName;
+            StateText = stateText;
+        }
+
+        public uint Id { get; }
+
+        public string UserName { get; }
+
+        public string StateText { get; }
+    }
     private const string StartupShortcutName = "Yomori RDP 会话代理.lnk";
 
     /// <summary>
@@ -157,27 +195,75 @@ public static class RdpSessionService
 
     // ---------------- 会话查询（WTS API） ----------------
 
-    public static List<RdpSessionInfo> EnumerateSessions()
-    {
-        var result = new List<RdpSessionInfo>();
-        var server = NativeMethods.WtsCurrentServerHandle;
+    /// <summary>
+    /// 兼容入口：只要会话列表。
+    ///
+    /// <para>⚠️ <b>新代码不要再用它做准入判断</b> —— 它把「查询失败」和「没有会话」
+    /// 折成了同一个空列表，正是同账户重复会话问题的第一条成因
+    /// （见 <see cref="SessionQueryStatus"/> 的说明）。请改用
+    /// <see cref="QuerySessions"/> / <see cref="RdpSessionGuard.Evaluate"/>。</para>
+    /// </summary>
+    public static List<RdpSessionInfo> EnumerateSessions() =>
+        QuerySessions().Sessions.Select(t => new RdpSessionInfo
+        {
+            Id = t.SessionId,
+            UserName = t.UserName,
+            Domain = t.Domain,
+            AccountSid = t.Sid,
+            State = t.State,
+        }).ToList();
 
+    /// <summary>
+    /// 枚举会话，并把结果分成「成功有结果 / 成功为空 / 部分失败 / 完全失败」四态。
+    ///
+    /// <para>部分失败的定义：列表拿到了，但某条会话的账户名或域查询失败。
+    /// 这时只知道「有一部分会话」，唯一性无法证明，必须按失败处理。</para>
+    /// </summary>
+    /// <param name="host">目标主机（仅用于填进快照，便于审计对齐）。</param>
+    /// <param name="resolveSid">
+    /// 是否顺便解析账户 SID。准入判定必须为 true（唯一性要以 SID 为准）；
+    /// 纯展示路径可以传 false —— 域环境里 <c>NTAccount.Translate</c> 首次解析可能要走 DC，
+    /// 放在界面刷新线程上会卡顿。
+    /// </param>
+    public static SessionQueryResult QuerySessions(string? host = null, bool resolveSid = true)
+    {
+        var result = new SessionQueryResult
+        {
+            Host = (host ?? string.Empty).Trim(),
+            At = DateTimeOffset.Now,
+        };
+
+        var server = NativeMethods.WtsCurrentServerHandle;
         if (!NativeMethods.WTSEnumerateSessionsW(server, 0, 1, out var pInfo, out var count) || pInfo == IntPtr.Zero)
         {
+            result.Status = SessionQueryStatus.Failed;
+            result.Error = $"WTSEnumerateSessionsW 失败，Win32 错误码 {Marshal.GetLastWin32Error()}。";
             return result;
         }
 
+        var partialFailures = 0;
+        var infos = new List<RdpSessionInfo>();
         try
         {
             var size = Marshal.SizeOf<NativeMethods.WtsSessionInfo>();
             for (var i = 0; i < (int)count; i++)
             {
                 var raw = Marshal.PtrToStructure<NativeMethods.WtsSessionInfo>(pInfo + (i * size));
-                result.Add(new RdpSessionInfo
+
+                var userOk = TryQuerySessionString(raw.SessionId, NativeMethods.WtsUserName, out var user);
+                var domainOk = TryQuerySessionString(raw.SessionId, NativeMethods.WtsDomainName, out var domain);
+                if (!userOk || !domainOk)
+                {
+                    // 这一条的身份读不出来 —— 计入部分失败，但仍然把已知部分留下供审计。
+                    partialFailures++;
+                }
+
+                infos.Add(new RdpSessionInfo
                 {
                     Id = raw.SessionId,
-                    UserName = QuerySessionString(raw.SessionId, NativeMethods.WtsUserName),
-                    Domain = QuerySessionString(raw.SessionId, NativeMethods.WtsDomainName),
+                    UserName = user,
+                    Domain = domain,
+                    AccountSid = resolveSid && user.Length > 0 ? TryResolveAccountSid(domain, user) : string.Empty,
                     WinStationName = Marshal.PtrToStringUni(raw.WinStationName) ?? string.Empty,
                     State = (SessionConnectState)raw.State,
                 });
@@ -188,10 +274,45 @@ public static class RdpSessionService
             NativeMethods.WTSFreeMemory(pInfo);
         }
 
+        result.Sessions = infos.Select(info => info.ToTarget(result.Host)).ToList();
+        result.PartialFailures = partialFailures;
+        result.Status = partialFailures > 0
+            ? SessionQueryStatus.PartialFailure
+            : result.Sessions.Count == 0
+                ? SessionQueryStatus.Empty
+                : SessionQueryStatus.Ok;
+
+        if (partialFailures > 0)
+        {
+            result.Error = $"{partialFailures} 条会话的账户名或域查询失败。";
+        }
+
         return result;
     }
 
+    /// <summary>
+    /// 某账户名下的<b>全部</b>会话（按 SessionId 升序）。
+    ///
+    /// <para>存在的意义就是替代「取了第一条就走」：
+    /// 允许同账户多会话的环境里，第一条既不一定是 Active 那条，也不一定是对的账户。</para>
+    /// </summary>
+    public static List<RdpSessionTarget> FindSessions(string? userName, string? host = null)
+    {
+        var query = QuerySessions(host);
+        var targets = query.ForUser(userName);
+        foreach (var target in targets)
+        {
+            target.Host = query.Host;
+        }
+
+        return targets;
+    }
+
     /// <summary>按用户名找会话。支持 "Player2" 与 "Machine\Player2" 两种写法。</summary>
+    /// <remarks>
+    /// ⚠️ 只保留给「展示 / 断开」这类单条操作使用。准入与任务派发必须走
+    /// <see cref="RdpSessionGuard.Evaluate"/>，它会把多会话的情况挡在外面而不是挑一条。
+    /// </remarks>
     public static RdpSessionInfo? FindSession(string? userName)
     {
         var bare = BareName(userName);
@@ -200,15 +321,13 @@ public static class RdpSessionService
             return null;
         }
 
-        foreach (var session in EnumerateSessions())
-        {
-            if (string.Equals(session.UserName, bare, StringComparison.OrdinalIgnoreCase))
-            {
-                return session;
-            }
-        }
-
-        return null;
+        // 排序而不是取枚举顺序里的第一条：Active/Connected 优先，其次 SessionId 小的。
+        // 这样即便调用方只看一条，拿到的也是「最像在用的那条」。
+        return EnumerateSessions()
+            .Where(session => string.Equals(session.UserName, bare, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(session => session.IsActive)
+            .ThenBy(session => session.Id)
+            .FirstOrDefault();
     }
 
     /// <summary>
@@ -230,19 +349,35 @@ public static class RdpSessionService
     /// <summary>
     /// 目标账户是否已经登录着（本机枚举到 Active / Connected 会话），可以直接复用。
     ///
-    /// 为什么必须先问这一句再决定要不要启动 mstsc：
-    ///   Windows 客户端版同时只允许一个交互式会话，再连一次不是"多开一个窗口"，
-    ///   而是把目标账户正在用的那个桌面接管过来（当前桌面则被踢到锁屏）。
-    ///   会话已经在了，代理直接在里面跑就行 —— 新建连接对执行任务没有任何帮助，
-    ///   只有副作用。
-    ///
-    /// 注意「已断开」（Disconnected）不算：登录态还在，但没有交互式画面在显示，
-    /// 想让用户看到桌面仍然需要用 mstsc 重连（重连会接回同一个会话，不会新建）。
+    /// <para>⚠️ 2026-10-26 起语义收紧：<b>只有该账户恰好一条会话</b>且处于 Active / Connected
+    /// 时才返回 true。同账户出现两条以上时返回 false —— 那种情况下"复用哪一条"本身
+    /// 就无从确定，必须交给 <see cref="RdpSessionGuard"/> 阻断并让用户先处理历史会话。</para>
     /// </summary>
     public static bool TryGetReusableSession(string? userName, out RdpSessionInfo? session)
     {
-        session = FindSession(userName);
-        return session is not null && session.IsActive;
+        session = null;
+        var query = QuerySessions();
+        if (!query.Usable)
+        {
+            // 查不清就不许说"可以复用"，否则会把查询失败当成"会话已在"
+            return false;
+        }
+
+        var targets = query.ForUser(userName);
+        if (targets.Count != 1 || !targets[0].IsUsable)
+        {
+            return false;
+        }
+
+        session = new RdpSessionInfo
+        {
+            Id = targets[0].SessionId,
+            UserName = targets[0].UserName,
+            Domain = targets[0].Domain,
+            AccountSid = targets[0].Sid,
+            State = targets[0].State,
+        };
+        return true;
     }
 
     /// <summary>
@@ -287,22 +422,91 @@ public static class RdpSessionService
 
     private static string QuerySessionString(uint sessionId, int infoClass)
     {
+        TryQuerySessionString(sessionId, infoClass, out var value);
+        return value;
+    }
+
+    /// <summary>
+    /// 查一条会话的字符串信息，并<b>如实区分「查不到」与「查到了但是空的」</b>。
+    ///
+    /// <para>系统服务会话（Session 0、Listen 会话）本来就没有用户名 —— 查询成功、内容为空，
+    /// 这不是失败。只有 Win32 调用失败才算失败。旧实现把两者都返回 <c>string.Empty</c>，
+    /// 于是「读不出来」被当成了「没有用户」，会话唯一性判断就失去了依据。</para>
+    /// </summary>
+    private static bool TryQuerySessionString(uint sessionId, int infoClass, out string value)
+    {
+        value = string.Empty;
         if (!NativeMethods.WTSQuerySessionInformationW(
                 NativeMethods.WtsCurrentServerHandle, sessionId, infoClass, out var buffer, out _)
             || buffer == IntPtr.Zero)
         {
-            return string.Empty;
+            return false;
         }
 
         try
         {
-            return Marshal.PtrToStringUni(buffer) ?? string.Empty;
+            value = Marshal.PtrToStringUni(buffer) ?? string.Empty;
+            return true;
         }
         finally
         {
             NativeMethods.WTSFreeMemory(buffer);
         }
     }
+
+    // ---------------- 账户 SID ----------------
+
+    /// <summary>
+    /// 「域\账户」→ SID 的缓存。解析一次几毫秒，而准入判定每条会话都要问，
+    /// 且会话枚举本身是 1Hz 级别的调用，缓存是必要的。
+    /// </summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> SidCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 把「域 + 账户」翻成 SID。解析不出来返回空串（<b>不抛异常</b>）——
+    /// 调用方必须把空串当成「身份不可证明」处理，而不是当成「没有这个账户」。
+    /// </summary>
+    public static string TryResolveAccountSid(string? domain, string? user)
+    {
+        var name = (user ?? string.Empty).Trim();
+        if (name.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        var dom = (domain ?? string.Empty).Trim();
+        var key = dom.Length > 0 ? dom + "\\" + name : name;
+        if (SidCache.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        string sid;
+        try
+        {
+            var account = dom.Length > 0
+                ? new NTAccount(dom, name)
+                : new NTAccount(name);
+            sid = (account.Translate(typeof(SecurityIdentifier)) as SecurityIdentifier)?.Value ?? string.Empty;
+        }
+        catch
+        {
+            // 账户在当前机器 / 域上解析不出来（跨域、已删除、权限不足）
+            sid = string.Empty;
+        }
+
+        // 只缓存成功结果：临时性失败（DC 不可达）不该被永久记住。
+        if (sid.Length > 0)
+        {
+            SidCache[key] = sid;
+        }
+
+        return sid;
+    }
+
+    /// <summary>清空 SID 缓存（账户改名 / 换域后由诊断入口触发）。</summary>
+    public static void ClearSidCache() => SidCache.Clear();
 
     // ---------------- 远程桌面开关 ----------------
 
@@ -804,6 +1008,98 @@ public static class RdpSessionService
 
         message = $"注销会话 {sessionId} 失败（可能需要管理员权限）。";
         return false;
+    }
+
+    /// <summary>
+    /// 注销并<b>回读确认</b>（计划书 P2）。
+    ///
+    /// <para>为什么必须回读：<c>WTSLogoffSession(wait=false)</c> 的返回值只代表
+    /// 「请求被接受」，不代表会话真的没了。注销是异步的，可能因为进程不响应、
+    /// 权限不足、会话正在切换而失败，而调用方只看返回值就会以为成功。
+    /// 更麻烦的是 SessionId 会被复用 —— 不确认就可能在下一轮把别人的会话当成自己的。</para>
+    ///
+    /// <para>安全约束：控制台会话（0）、本进程所在会话、以及主控账户自己的会话一律不碰。
+    /// 这些保护不依赖任何"看起来空闲"的判断。</para>
+    /// </summary>
+    public static bool LogoffSessionConfirmed(
+        uint sessionId,
+        out string message,
+        int timeoutSeconds = 15,
+        CancellationToken token = default)
+    {
+        message = string.Empty;
+
+        if (sessionId == 0)
+        {
+            message = "拒绝注销：控制台会话不允许被本程序注销。";
+            return false;
+        }
+
+        var current = TryGetCurrentSessionId();
+        if (current is uint mine && mine == sessionId)
+        {
+            message = $"拒绝注销：会话 {sessionId} 是本程序自己所在的会话。";
+            return false;
+        }
+
+        var before = QuerySessions();
+        if (!before.Usable)
+        {
+            message = $"注销前无法枚举会话（{before.Error}），已停止操作。";
+            return false;
+        }
+
+        var victim = before.Sessions.FirstOrDefault(s => s.SessionId == sessionId);
+        if (victim is null)
+        {
+            message = $"会话 {sessionId} 已不存在（无需注销）。";
+            return true;
+        }
+
+        if (string.Equals(victim.UserName, Environment.UserName, StringComparison.OrdinalIgnoreCase))
+        {
+            message = $"拒绝注销：会话 {sessionId} 属于当前运行账户「{Environment.UserName}」。";
+            return false;
+        }
+
+        if (!NativeMethods.WTSLogoffSession(NativeMethods.WtsCurrentServerHandle, sessionId, false))
+        {
+            message = $"注销会话 {sessionId} 失败（可能需要管理员权限）。";
+            return false;
+        }
+
+        var deadline = DateTime.UtcNow.AddSeconds(Math.Max(1, timeoutSeconds));
+        while (DateTime.UtcNow < deadline)
+        {
+            if (token.IsCancellationRequested)
+            {
+                message = $"注销会话 {sessionId} 的请求已发出，但等待确认被取消。";
+                return false;
+            }
+
+            var now = QuerySessions();
+            if (now.Usable && now.Sessions.All(s => s.SessionId != sessionId))
+            {
+                message = $"已注销会话 {sessionId}（已回读确认）。";
+                return true;
+            }
+
+            Thread.Sleep(500);
+        }
+
+        message = $"已发出注销会话 {sessionId} 的请求，但 {timeoutSeconds} 秒内没有确认它消失。";
+        return false;
+    }
+
+    /// <summary>本进程所在的 WTS 会话 id（取不到返回 null）。</summary>
+    public static uint? TryGetCurrentSessionId()
+    {
+        if (NativeMethods.ProcessIdToSessionId((uint)Environment.ProcessId, out var sessionId))
+        {
+            return sessionId;
+        }
+
+        return null;
     }
 
     // ---------------- Agent 部署 ----------------

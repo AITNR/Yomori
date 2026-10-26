@@ -79,6 +79,21 @@ public static class AgentHost
     private const int AgentBridgeFailureLimit = 30;
 
     /// <summary>
+    /// 本代理实例的标识。进程启动时生成、进程内不变，写进每一条 status.json。
+    ///
+    /// <para>为什么需要它：同账户多条会话时会有多个代理往同一份 status.json 里写。
+    /// 没有实例标识，主控端与代理自己都分不清"这条 running 是谁写的"，
+    /// 于是空闲心跳可以合法地覆盖别人的执行状态。</para>
+    /// </summary>
+    private static readonly string InstanceId = Guid.NewGuid().ToString("N")[..12];
+
+    /// <summary>本进程所在的 WTS 会话 id（取不到为 0）。</summary>
+    private static readonly uint OwnSessionId = RdpSessionService.TryGetCurrentSessionId() ?? 0;
+
+    /// <summary>本进程账户的 SID（取不到为空串 —— 表示身份不可证明）。</summary>
+    private static readonly string OwnSid = RdpSessionGuard.ResolveSid(null, Environment.UserName);
+
+    /// <summary>
     /// 启动代理进程。<b>阻塞</b>到进程退出为止，调用方（<c>Program.Main</c>）拿到控制权时进程已结束。
     ///
     /// 绝不返回：正常情况下靠 <see cref="ExitAgent"/> 直接结束进程；
@@ -145,19 +160,62 @@ public static class AgentHost
         // 立刻写一拍，主控端不用等满一个心跳周期才看到 idle。
         var lastHeartbeatAt = DateTime.MinValue;
 
+        // 领导者锁。拿不到就只做"待命"，不读指令也不写心跳（计划书 P1）。
+        AgentLeadership? leadership = null;
+        var followerNoted = false;
+
         while (true)
         {
-            if (bridge.TryReadCommand(out var command) && command is not null)
+            if (leadership is null)
+            {
+                leadership = AgentLeadership.TryAcquire(bridge.BridgeDir);
+                if (leadership is null)
+                {
+                    // 跟随者：不消费指令、不写心跳。这样同账户多会话时任务只执行一次。
+                    // 仍然留在循环里重试 —— 领导者进程退出（句柄释放）后本实例立刻接手。
+                    if (!followerNoted)
+                    {
+                        followerNoted = true;
+                        AppPaths.WriteStartupError(new InvalidOperationException(
+                            $"同一座桥已存在代理领导者，本实例（{InstanceId}，会话 {OwnSessionId}）作为跟随者待命：" +
+                            $"{bridge.BridgeDir}"));
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(AgentPollIntervalSeconds)).ConfigureAwait(false);
+                    continue;
+                }
+
+                followerNoted = false;
+            }
+
+            // 领导者身份校验：锁文件被别人抢走后本实例必须让位，不能继续消费指令。
+            if (!leadership.IsLeader)
+            {
+                leadership.Dispose();
+                leadership = null;
+                continue;
+            }
+
+            if (bridge.TryClaimCommand(InstanceId, out var command) && command is not null)
             {
                 bridgeFailures = 0;
 
-                // 立刻删掉指令，防止代理被再次拉起时重复执行同一批任务
-                bridge.ConsumeCommand();
+                // 归属校验：这条指令是不是发给"我这个会话 / 这个账户"的。
+                // 拒收时写一条明确的 error 状态 + Finished 事件，主控端才不会一直干等。
+                if (!AcceptsCommand(command, out var rejection))
+                {
+                    RejectCommand(bridge, command, rejection);
+                    bridge.ReleaseClaim(InstanceId);
+                    continue;
+                }
 
                 // 注意：这里【不挂】Completed → ExitAgent。
                 // 常驻代理执行完必须回到等待状态继续待命，而不是退出。
                 var runner = new RdpAgentRunner(command);
                 await runner.RunAsync(CancellationToken.None).ConfigureAwait(false);
+
+                // 认领文件用完就删，免得桥目录里越积越多
+                bridge.ReleaseClaim(InstanceId);
                 continue;
             }
 
@@ -180,20 +238,24 @@ public static class AgentHost
             if (lastHeartbeatAt == DateTime.MinValue ||
                 now - lastHeartbeatAt >= TimeSpan.FromSeconds(AgentHeartbeatIntervalSeconds))
             {
-                var alive = bridge.UpdateStatus(status =>
+                // 带实例条件写：桥里若已经有【另一个实例】写的 running，本次故意不写，
+                // 否则会把别人正在跑的任务显示成空闲。
+                var outcome = bridge.WriteIdleHeartbeat(InstanceId, status =>
                 {
                     status.Phase = "idle";
                     status.LiveLogProtocol = RdpLiveLogProtocol.Current;
                     status.LiveLogError = string.Empty;
                     status.StatusText = "代理在线，等待指令。";
                     status.AgentUser = Environment.UserName;
+                    status.AgentSessionId = OwnSessionId;
+                    status.AgentSid = OwnSid;
                     status.CurrentTask = string.Empty;
                     return status;
                 });
 
                 lastHeartbeatAt = now;
 
-                if (alive)
+                if (outcome != RdpBridge.HeartbeatOutcome.Failed)
                 {
                     bridgeFailures = 0;
                 }
@@ -214,6 +276,76 @@ public static class AgentHost
 
             await Task.Delay(TimeSpan.FromSeconds(AgentPollIntervalSeconds)).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// 这条指令该不该由本代理执行。
+    ///
+    /// <para>三条判据（计划书 P1）：</para>
+    /// <list type="number">
+    /// <item>指令带了目标 SessionId，而本进程不在那个会话里 → 拒收；</item>
+    /// <item>指令带了目标 SID，而本账户 SID 与之不符 → 拒收（防同名账户冒用）；</item>
+    /// <item>本账户当前有多条会话 → 拒收（无法证明本会话就是主控端选中的那条）。</item>
+    /// </list>
+    ///
+    /// <para>旧主控端不写 <c>TargetSid</c> / <c>TargetSessionId</c>（协议 1）：
+    /// 前两条自动放行，行为与升级前一致 —— 这是刻意的安全降级方向。</para>
+    /// </summary>
+    private static bool AcceptsCommand(RdpCommand command, out string rejection)
+    {
+        rejection = string.Empty;
+
+        if (command.TargetSessionId != 0 && OwnSessionId != 0 && command.TargetSessionId != OwnSessionId)
+        {
+            rejection =
+                $"指令目标是会话 {command.TargetSessionId}，本代理在会话 {OwnSessionId}，拒收以免两个会话各跑一遍。";
+            return false;
+        }
+
+        if (command.TargetSid.Length > 0 && OwnSid.Length > 0
+            && !string.Equals(command.TargetSid, OwnSid, StringComparison.OrdinalIgnoreCase))
+        {
+            rejection = $"指令目标 SID 是 {command.TargetSid}，本账户 SID 是 {OwnSid}，拒收（防同名账户冒用）。";
+            return false;
+        }
+
+        var sessions = RdpSessionService.FindSessions(Environment.UserName);
+        if (sessions.Count > 1)
+        {
+            rejection =
+                $"账户「{Environment.UserName}」当前有 {sessions.Count} 条会话，无法证明本会话就是主控端选中的那条，拒收。" +
+                "请先注销多余会话，或开启「单账户单会话」策略。";
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// 拒收一条指令：写一条明确的 error 状态 + Finished 事件。
+    ///
+    /// <para>必须写 Finished —— 主控端是靠它判定"这一轮结束了"的。
+    /// 只写 error 不写事件，主控端会一直显示"等待代理接管"直到超时。</para>
+    /// </summary>
+    private static void RejectCommand(RdpBridge bridge, RdpCommand command, string reason)
+    {
+        bridge.UpdateStatus(status =>
+        {
+            status.CommandId = command.Id;
+            status.AgentUser = Environment.UserName;
+            status.AgentInstanceId = InstanceId;
+            status.AgentSessionId = OwnSessionId;
+            status.AgentSid = OwnSid;
+            status.Phase = "error";
+            status.StatusText = reason;
+            status.CurrentTask = string.Empty;
+            status.Events.Add(RdpBridge.MakeEvent(
+                status, RdpEventKinds.Finished, reason, abnormal: true));
+            return status;
+        });
+
+        AppPaths.WriteStartupError(new InvalidOperationException(
+            $"代理拒收指令 {command.Id}（实例 {InstanceId}，会话 {OwnSessionId}）：{reason}"));
     }
 
     /// <summary>

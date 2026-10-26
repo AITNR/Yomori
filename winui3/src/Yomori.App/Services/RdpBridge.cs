@@ -714,6 +714,132 @@ public sealed class RdpBridge
         }
     }
 
+    // ---------------- Agent：原子认领指令 ----------------
+
+    /// <summary>
+    /// 认领文件的路径（每个代理实例一个，认领后指令就从 <c>command.json</c> 消失）。
+    /// </summary>
+    public string ClaimPath(string instanceId) =>
+        Path.Combine(BridgeDir, $"command.claim-{SafeFilePart(instanceId)}.json");
+
+    /// <summary>
+    /// <b>原子认领</b>：把当前指令搬成"我的"，只有搬成功的那个代理才执行。
+    ///
+    /// <para>旧做法是「先读 command.json，再删掉它」（<see cref="TryReadCommand"/> +
+    /// <see cref="ConsumeCommand"/>）。读和删之间有一整段窗口，同账户多会话时
+    /// 两个代理可以同时读到同一份指令、各自删一次（第二次删的是空），然后各跑一遍任务。
+    /// 改名（<c>File.Move</c>）在 NTFS 上是原子的：同一个源文件只有一个调用能成功。</para>
+    ///
+    /// <para>跨账户时改名可能被 ACL 拦（文件是主控端账户建的）。这时<b>退化为旧的
+    /// 读 + 清空</b>，而不是直接放弃 —— 放弃等于让远程 / 跨账户场景彻底不能执行任务。
+    /// 退化路径会在 <see cref="LastError"/> 里留痕，便于排障时知道"这一轮没有原子保障"。</para>
+    /// </summary>
+    /// <returns>true = 本实例拿到了指令（<paramref name="command"/> 非空）。</returns>
+    public bool TryClaimCommand(string instanceId, out RdpCommand? command)
+    {
+        command = null;
+        var claimPath = ClaimPath(instanceId);
+
+        try
+        {
+            if (!File.Exists(CommandPath))
+            {
+                return false;
+            }
+
+            try
+            {
+                // 覆盖式改名：上一次异常退出留下的认领文件不会挡住新一轮
+                File.Move(CommandPath, claimPath, overwrite: true);
+                LastError = string.Empty;
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+                // 退化路径：读出来再清空源文件
+                LastError = $"原子认领失败，退化为读取后清空：{ex.GetType().Name}";
+                if (!TryReadCommand(out var fallback) || fallback is null)
+                {
+                    return false;
+                }
+
+                ConsumeCommand();
+                command = fallback;
+                return true;
+            }
+
+            var text = ReadTextWithRetry(claimPath);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            command = JsonSerializer.Deserialize<RdpCommand>(text, ReadOptions);
+            return command is not null;
+        }
+        catch (Exception ex)
+        {
+            LastError = ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>释放认领（执行完或拒收时调用）：删掉本实例的认领文件。</summary>
+    public void ReleaseClaim(string instanceId) => TryDeleteQuietly(ClaimPath(instanceId));
+
+    // ---------------- Agent：带实例条件的心跳 ----------------
+
+    /// <summary>心跳写入的三种结局 —— 必须分开，否则"拒绝覆盖"会被当成"写盘失败"而误退出。</summary>
+    public enum HeartbeatOutcome
+    {
+        /// <summary>写成功。</summary>
+        Written = 0,
+
+        /// <summary>桥里已有另一个实例写的 running 状态，本次<b>故意不写</b>。</summary>
+        Skipped = 1,
+
+        /// <summary>写盘真的失败了（共享目录不可用）。</summary>
+        Failed = 2,
+    }
+
+    /// <summary>
+    /// 写 idle 心跳，但**不覆盖另一个实例正在执行的状态**。
+    ///
+    /// <para>为什么这一条必须做：<c>UpdateStatus</c> 是「读回来 → 改字段 → 写回去」。
+    /// 同账户两个代理时，A 正在写 running，B 的 idle 心跳读到的可能是 A 那句，
+    /// 改成 idle 再写回 —— 主控端立刻看到"任务结束/没在跑"，而实际上 A 还在跑。
+    /// 判定只看 <c>Phase</c> 与 <c>AgentInstanceId</c>，不猜时间戳。</para>
+    /// </summary>
+    public HeartbeatOutcome WriteIdleHeartbeat(string instanceId, Func<RdpStatus, RdpStatus> mutator)
+    {
+        lock (_statusWriteGate)
+        {
+            try
+            {
+                var existing = TryReadStatus();
+                if (existing is not null
+                    && existing.AgentInstanceId.Length > 0
+                    && !string.Equals(existing.AgentInstanceId, instanceId, StringComparison.Ordinal)
+                    && string.Equals(existing.Phase, "running", StringComparison.OrdinalIgnoreCase))
+                {
+                    return HeartbeatOutcome.Skipped;
+                }
+            }
+            catch
+            {
+                // 读不到就按"可以写"处理：读失败本身会在写的时候暴露
+            }
+
+            return UpdateStatusCore(status =>
+            {
+                var updated = mutator(status);
+                updated.AgentInstanceId = instanceId;
+                return updated;
+            })
+                ? HeartbeatOutcome.Written
+                : HeartbeatOutcome.Failed;
+        }
+    }
+
     // ---------------- 内部实现 ----------------
 
     /// <summary>
@@ -820,8 +946,7 @@ public sealed class RdpBridge
     /// 桥目录是跨账户通信用的，两个账户都要能读写对方的文件，默认 ACL 不够。
     /// 授权失败不抛异常 —— 同账户场景本来就不需要，不该因此阻断写入。
     /// </summary>
-    private static void GrantUsersFullControl(string path)
-    {
+    internal static void GrantUsersFullControl(string path)    {
         try
         {
             if (!File.Exists(path))

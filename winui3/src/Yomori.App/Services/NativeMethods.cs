@@ -156,6 +156,14 @@ internal static class NativeMethods
         uint sessionId,
         [MarshalAs(UnmanagedType.Bool)] bool bWait);
 
+    /// <summary>
+    /// 进程 id → 所属 WTS 会话 id。用于「不许注销本进程自己所在会话」这条保护 ——
+    /// 不靠猜、也不靠比较账户名。
+    /// </summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
+
     // ---------------- Toolhelp32：一次快照拿全系统的 PID / 父 PID / 镜像名 ----------------
     //
     // 为什么必须自己拿父子关系：.NET 的 Process.Kill(entireProcessTree: true) **实测会漏掉后代** ——

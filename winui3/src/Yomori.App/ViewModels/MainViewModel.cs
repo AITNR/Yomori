@@ -2660,10 +2660,7 @@ public sealed class MainViewModel : ObservableObject
 
         if (readiness.IsLocal)
         {
-            var session = RdpSessionService.FindSession(channel.User);
-            ChannelSessionSummary = session is null
-                ? "目标账户当前没有会话"
-                : $"会话 {session.Id} · {session.UserName} · {session.StateText}";
+            ChannelSessionSummary = DescribeSessionSummary(channel.User);
         }
         else
         {
@@ -3428,6 +3425,23 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
+        // 手动「连接目标账户」也要过同一道准入 —— 它同样能凭空多出一条会话，
+        // 只是这条路径不下发任务，所以不需要串行闸门（不存在两条并发连接的问题）。
+        if (isLocal)
+        {
+            var admission = RdpSessionGuard.Evaluate(host, RdpSettings.TargetUser);
+            LogSessionAdmissionEntries(admission, line => AppendLog("[设置页] " + line));
+            if (!admission.Allowed)
+            {
+                _ = DialogHelper.ShowMessageAsync("连接已阻断",
+                    $"{admission.Reason}\n\n" +
+                    (admission.Admission == RdpSessionAdmission.BlockMultiSession
+                        ? RdpSessionAdmissionPlanner.SingleSessionPolicyHint
+                        : "本次没有改动任何现有会话。"));
+                return;
+            }
+        }
+
         IsRdpBusy = true;
         RdpStatusText = "正在连接目标会话…";
 
@@ -3527,14 +3541,13 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        var session = RdpSessionService.FindSession(RdpSettings.TargetUser);
-        if (session is null)
+        if (!TryPickSingleSession(RdpSettings.TargetUser, out var session, out var pickError))
         {
-            _ = DialogHelper.ShowMessageAsync("提示", "找不到目标账户的会话，可能尚未连接或已注销。");
+            _ = DialogHelper.ShowMessageAsync("无法断开", pickError);
             return;
         }
 
-        RdpSessionService.DisconnectSession(session.Id, out var message);
+        RdpSessionService.DisconnectSession(session!.SessionId, out var message);
         RdpStatusText = "已请求断开目标会话";
         AppendLog($"[远程桌面] {message}");
         RefreshRdpReadiness();
@@ -4715,10 +4728,7 @@ public sealed class MainViewModel : ObservableObject
 
         if (readiness.IsLocal)
         {
-            var session = RdpSessionService.FindSession(RdpSettings.TargetUser);
-            RdpSessionSummary = session is null
-                ? "目标账户当前没有会话"
-                : $"会话 {session.Id} · {session.UserName} · {session.StateText}";
+            RdpSessionSummary = DescribeSessionSummary(RdpSettings.TargetUser);
         }
         else
         {
@@ -4902,14 +4912,13 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        var session = RdpSessionService.FindSession(RdpSettings.TargetUser);
-        if (session is null)
+        if (!TryPickSingleSession(RdpSettings.TargetUser, out var session, out var pickError))
         {
-            _ = DialogHelper.ShowMessageAsync("提示", "找不到目标账户的会话，可能尚未连接或已注销。");
+            _ = DialogHelper.ShowMessageAsync("无法断开", pickError);
             return;
         }
 
-        RdpSessionService.DisconnectSession(session.Id, out var message);
+        RdpSessionService.DisconnectSession(session!.SessionId, out var message);
         AppendLog(message);
         RefreshRdpReadiness();
     }
@@ -4923,22 +4932,21 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        var session = RdpSessionService.FindSession(RdpSettings.TargetUser);
-        if (session is null)
-        {
-            _ = DialogHelper.ShowMessageAsync("提示", "找不到目标账户的会话，可能尚未连接或已注销。");
-            return;
-        }
-
         // 【防护】注销会销毁会话，会话里的代理和脚本进程会被系统一起终止。
         // 这个按钮紧挨着「连接并执行」，正在跑任务时误点的代价很大，所以先确认。
-        if (RdpIsActive || IsRdpBusy)
+        if (!TryPickSingleSession(RdpSettings.TargetUser, out var session, out var pickError))
         {
-            _ = ConfirmLogoffWhileRunningAsync(session.Id);
+            _ = DialogHelper.ShowMessageAsync("无法注销", pickError);
             return;
         }
 
-        RdpSessionService.LogoffSession(session.Id, out var message);
+        if (RdpIsActive || IsRdpBusy)
+        {
+            _ = ConfirmLogoffWhileRunningAsync(session!.SessionId);
+            return;
+        }
+
+        RdpSessionService.LogoffSessionConfirmed(session!.SessionId, out var message);
         AppendLog(message);
         RefreshRdpReadiness();
     }
@@ -4964,7 +4972,9 @@ public sealed class MainViewModel : ObservableObject
                 return;
             }
 
-            RdpSessionService.LogoffSession(sessionId, out var message);
+            // 注销是异步请求，返回值只代表"请求被接受"。必须回读确认会话真的没了，
+            // 否则界面上说"已注销"而实际还在，下一轮就可能又连进同一个僵尸会话。
+            RdpSessionService.LogoffSessionConfirmed(sessionId, out var message);
             AppendLog(message);
             RefreshRdpReadiness();
         }
@@ -5174,112 +5184,367 @@ public sealed class MainViewModel : ObservableObject
             NotifyOnAllDone = false,
         };
 
-        bridge.EnsureDirectory();
-        if (!bridge.WriteCommand(command))
+        // ================= 准入门闸（计划书 P0 第 2 / 3 / 4 条） =================
+        //
+        // 顺序被刻意固定成：先串行化 → 再判唯一性 → 再连接 → 再复核 → 最后才下发指令。
+        // 旧顺序是「先写 command.json，再去连」，于是"连接这一步做错了"完全不影响
+        // 指令已经躺在桥里的事实：目标会话里的代理一上线就把它捡走执行了 ——
+        // 这正是"任务可能在错误的会话里跑过"的原因，也是本次必须调换顺序的理由。
+        //
+        // 闸门按「主机 + 账户 SID」串行化所有入口（内嵌 / mstsc / 自动重连 / 多通道并行）。
+        // 两条通道同时判定"没有会话"再同时新建，是重复会话最典型的来源。
+        IDisposable? gate = null;
+        try
         {
-            AppendLog($"[通道：{tag}] ✗ 指令下发失败：{bridge.LastError}");
-            _ = DialogHelper.ShowMessageAsync("下发失败",
-                $"通道「{tag}」无法写入共享指令文件：{bridge.CommandPath}\n\n" +
-                "请以管理员身份运行Yomori，或把程序放在所有用户都有写权限的目录。");
+            gate = await RdpSessionGuard.TryAcquireAsync(host, user).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[通道：{tag}] 获取会话闸门失败：{ex.Message}");
+            gate = null;
+        }
 
-            // 这条通道不再等结果：标记收尾，让整轮计数能正常归零
-            session.MarkCompletionReported();
-            FinishRunPart();
+        if (gate is null)
+        {
+            await AbortChannelBeforeDispatchAsync(
+                session,
+                "连接已取消：会话闸门被其他连接占用",
+                $"通道「{tag}」的会话闸门在超时时间内没有让出（另一个连接正在进行）。本次没有下发任何指令，请稍后重试。");
             return;
         }
 
-        // 复位桥里的状态并记下本指令的归属与下发时刻 ——
-        // 之后的每次轮询都用它校验 status.json 是不是本指令写的，并从此刻起算启动宽限期。
-        bridge.ResetStatus(command.Id);
-        session.Begin(command.Id, tasks.Count, DateTimeOffset.Now);
-        session.SetStatusText("正在连接目标会话…");
-        MirrorSessionIfActive(session);
-
-        AppendLog($"[通道：{tag}] 已下发远程执行指令 {command.Id}，共 {tasks.Count} 个任务，目标：{host} / {user}。");
-
-        // 目标账户已经登录着就不再新建连接（仅 mstsc 模式）。
-        // Windows 客户端版同时只允许一个交互式会话，重复连接会把目标账户
-        // 正在用的那个桌面接管过来（当前桌面则被踢到锁屏），
-        // 而这对"把任务跑起来"毫无帮助 —— 代理直接在那个已有会话里跑就行。
-        // 内嵌模式例外：画面要嵌进窗口就必须真正建立连接（重连会接回同一会话，无副作用）。
-        RdpSessionInfo? reusableSession = null;
-        var hasReusableSession = !IsEmbeddedMode
-            && isLocal
-            && RdpSessionService.TryGetReusableSession(user, out reusableSession);
-
-        // M6：内嵌画面按通道分家 —— 每条通道各有各的 client，不再限制"只有第一条能内嵌"。
-        // 已连上的通道直接复用，未连的才新建（原生侧上限 YCN_MAX_SESSIONS = 8，与并发上限一致）。
-        var usesEmbedded = IsEmbeddedMode && !HasSurface(channel.Id);
-        var reuseEmbedded = IsEmbeddedMode && HasSurface(channel.Id);
-
-        if (reuseEmbedded)
+        using (gate)
         {
-            AppendChannelLog(session, "内嵌画面已连接，直接复用（该通道的画面在它自己的通道页上）。");
-        }
-        else if (hasReusableSession)
-        {
-            AppendLog(
-                $"[{tag}] 检测到账户「{user}」已经登录（会话 {reusableSession!.Id}，{reusableSession.StateText}），" +
-                "直接复用它，本次不再新建远程桌面连接。");
-        }
-        else if (usesEmbedded)
-        {
-            // 内嵌模式：FreeRDP 连接，画面嵌入窗口；会话建立后代理照常接管（桥/心跳零改动）
-            if (!TryStartEmbeddedConnect(channel.Id, host, user, channel.DesktopWidth, channel.DesktopHeight, out var embedMessage))
+            RdpSessionAdmissionResult admission;
+            try
             {
-                _ = DialogHelper.ShowMessageAsync("连接失败", embedMessage);
-                session.SetStatusText("连接失败");
-                MirrorSessionIfActive(session);
-                session.MarkCompletionReported();
-                FinishRunPart();
+                admission = await Task.Run(() => RdpSessionGuard.Evaluate(host, user)).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                await AbortChannelBeforeDispatchAsync(
+                    session,
+                    "连接已取消：会话身份无法确认",
+                    $"通道「{tag}」在枚举目标账户会话时出错：{ex.Message}。本次没有下发任何指令。");
                 return;
             }
 
-            AppendChannelLog(session, "内嵌模式下任务画面显示在该通道页里；也可以随时点全屏接管键盘操作。");
-            AppendChannelLog(session, "提示：任务跑在目标会话里，断开内嵌连接等于「断开连接」——会话与进程保留，任务继续跑。");
-        }
-        else
-        {
-            // 用系统自带的远程桌面（mstsc）打开独立窗口。
-            // .rdp 文件名带通道 id —— 否则两条通道会互相覆盖同一份会话文件。
-            var started = RdpSessionService.Connect(
-                host, out var connectMessage, channel.DesktopWidth, channel.DesktopHeight, channel.Id);
+            LogSessionAdmission(session, admission);
 
-            if (!started)
+            if (!admission.Allowed)
             {
-                _ = DialogHelper.ShowMessageAsync("连接失败", connectMessage);
-                session.SetStatusText("连接失败");
-                MirrorSessionIfActive(session);
-                session.MarkCompletionReported();
-                FinishRunPart();
+                await AbortChannelBeforeDispatchAsync(
+                    session,
+                    $"连接已阻断：{admission.Code}",
+                    $"通道「{tag}」本次连接已停止。\n\n{admission.Reason}\n\n" +
+                    (admission.Admission == RdpSessionAdmission.BlockMultiSession
+                        ? RdpSessionAdmissionPlanner.SingleSessionPolicyHint
+                        : "本次没有下发任何指令，也没有改动任何现有会话。"));
                 return;
             }
 
-            AppendLog($"[通道：{tag}] {connectMessage}");
-            if (isLocal)
+            // 指令带上目标身份：代理侧据此判断"这条指令是不是发给我的"。
+            command.TargetSid = RdpSessionGuard.ResolveSid(host, user);
+            command.TargetSessionId = admission.Target?.SessionId ?? 0;
+
+            bridge.EnsureDirectory();
+
+            // 目标账户已经登录着就不再新建连接（仅 mstsc 模式）。
+            // Windows 客户端版同时只允许一个交互式会话，重复连接会把目标账户
+            // 正在用的那个桌面接管过来（当前桌面则被踢到锁屏），
+            // 而这对"把任务跑起来"毫无帮助 —— 代理直接在那个已有会话里跑就行。
+            // 内嵌模式例外：画面要嵌进窗口就必须真正建立连接（重连会接回同一会话，无副作用）。
+            RdpSessionInfo? reusableSession = null;
+            var hasReusableSession = !IsEmbeddedMode
+                && isLocal
+                && admission.Admission == RdpSessionAdmission.AllowReuse
+                && RdpSessionService.TryGetReusableSession(user, out reusableSession);
+
+            // M6：内嵌画面按通道分家 —— 每条通道各有各的 client，不再限制"只有第一条能内嵌"。
+            // 已连上的通道直接复用，未连的才新建（原生侧上限 YCN_MAX_SESSIONS = 8，与并发上限一致）。
+            var usesEmbedded = IsEmbeddedMode && !HasSurface(channel.Id);
+            var reuseEmbedded = IsEmbeddedMode && HasSurface(channel.Id);
+
+            if (reuseEmbedded)
             {
-                AppendLog($"[通道：{tag}] 提示：Windows 客户端版同时只允许一个交互式会话，连接后当前桌面会被锁定，任务在目标账户中执行。");
-                AppendLog($"[通道：{tag}] 任务跑在目标会话里：关闭远程桌面窗口时请选「断开连接」（会话和进程会保留，任务继续跑），不要选「注销」—— 注销会销毁会话，代理与脚本会被系统一并终止。");
+                AppendChannelLog(session, "内嵌画面已连接，直接复用（该通道的画面在它自己的通道页上）。");
+            }
+            else if (hasReusableSession)
+            {
+                AppendLog(
+                    $"[{tag}] 检测到账户「{user}」只有一条会话（会话 {reusableSession!.Id}，{reusableSession.StateText}），" +
+                    "直接复用它，本次不再新建远程桌面连接。");
+            }
+            else if (usesEmbedded)
+            {
+                // 内嵌模式：FreeRDP 连接，画面嵌入窗口；会话建立后代理照常接管（桥/心跳零改动）
+                if (!TryStartEmbeddedConnect(channel.Id, host, user, channel.DesktopWidth, channel.DesktopHeight, out var embedMessage))
+                {
+                    await AbortChannelBeforeDispatchAsync(session, "连接失败", $"通道「{tag}」连接失败：{embedMessage}");
+                    return;
+                }
+
+                AppendChannelLog(session, "内嵌模式下任务画面显示在该通道页里；也可以随时点全屏接管键盘操作。");
+                AppendChannelLog(session, "提示：任务跑在目标会话里，断开内嵌连接等于「断开连接」——会话与进程保留，任务继续跑。");
             }
             else
             {
-                AppendLog($"[通道：{tag}] 提示：远程目标需要一个双方都能读写的共享目录来传递指令与进度，Agent 会在对方机器上自动接管任务。");
+                // 用系统自带的远程桌面（mstsc）打开独立窗口。
+                // .rdp 文件名带通道 id —— 否则两条通道会互相覆盖同一份会话文件。
+                var started = RdpSessionService.Connect(
+                    host, out var connectMessage, channel.DesktopWidth, channel.DesktopHeight, channel.Id);
+
+                if (!started)
+                {
+                    await AbortChannelBeforeDispatchAsync(session, "连接失败", $"通道「{tag}」连接失败：{connectMessage}");
+                    return;
+                }
+
+                AppendLog($"[通道：{tag}] {connectMessage}");
+                if (isLocal)
+                {
+                    AppendLog($"[通道：{tag}] 提示：Windows 客户端版同时只允许一个交互式会话，连接后当前桌面会被锁定，任务在目标账户中执行。");
+                    AppendLog($"[通道：{tag}] 任务跑在目标会话里：关闭远程桌面窗口时请选「断开连接」（会话和进程会保留，任务继续跑），不要选「注销」—— 注销会销毁会话，代理与脚本会被系统一并终止。");
+                }
+                else
+                {
+                    AppendLog($"[通道：{tag}] 提示：远程目标需要一个双方都能读写的共享目录来传递指令与进度，Agent 会在对方机器上自动接管任务。");
+                }
             }
+
+            IsRdpBusy = true;
+            MirrorSessionIfActive(session);
+
+            // 会话 + 代理握手：只有这一步返回 true，才说明"目标会话里确实有人在等着接活"。
+            var ready = await WaitForChannelReadyAsync(session, isLocal, hasReusableSession, reusableSession);
+
+            if (!ready)
+            {
+                await AbortChannelBeforeDispatchAsync(session, "未就绪，已停止（未下发指令）", null);
+                return;
+            }
+
+            // ================= 连接后身份复核（计划书 P0 第 4 条后半） =================
+            //
+            // 准入只能证明"连接之前是干净的"。服务端策略、Wrapper、客户端参数任何一处
+            // 让我们的估算落空，会话就会在连接过程中变多 —— 而这一步正是抓它的地方。
+            // 抓到之后只断开【本次】客户端：不注销、不迁移、不杀别的会话。
+            if (isLocal)
+            {
+                var verification = await Task.Run(
+                    () => RdpSessionGuard.VerifyAfterConnect(admission, host, user)).ConfigureAwait(false);
+
+                if (!verification.Ok)
+                {
+                    await RunOnUiThreadAsync(() =>
+                    {
+                        foreach (var line in verification.Observed.Select(o => "  · " + o.Describe()))
+                        {
+                            AppendLog($"[通道：{tag}] 复核现场：{line.TrimStart()}");
+                        }
+                    });
+
+                    await DisconnectOwnClientOnlyAsync(session, verification);
+                    await AbortChannelBeforeDispatchAsync(
+                        session,
+                        $"连接后复核未通过：{verification.Verdict}",
+                        $"通道「{tag}」连接后核对会话身份没有通过。\n\n{verification.Reason}\n\n" +
+                        "已只断开本次客户端连接，没有注销、迁移或终止任何现有会话。本次没有下发任何指令。");
+                    return;
+                }
+
+                AppendChannelLog(session, $"连接后复核通过：{verification.Reason}");
+            }
+
+            // ================= 握手完成，才允许下发 =================
+            if (!bridge.WriteCommand(command))
+            {
+                await AbortChannelBeforeDispatchAsync(
+                    session,
+                    "下发失败",
+                    $"通道「{tag}」无法写入共享指令文件：{bridge.CommandPath}\n\n" +
+                    "请以管理员身份运行Yomori，或把程序放在所有用户都有写权限的目录。");
+                return;
+            }
+
+            // 复位桥里的状态并记下本指令的归属与下发时刻 ——
+            // 之后的每次轮询都用它校验 status.json 是不是本指令写的，并从此刻起算启动宽限期。
+            bridge.ResetStatus(command.Id);
+            await RunOnUiThreadAsync(() =>
+            {
+                session.Begin(command.Id, tasks.Count, DateTimeOffset.Now);
+                session.SetStatusText("已下发指令，等待会话代理接管…");
+                MirrorSessionIfActive(session);
+            });
+
+            AppendLog($"[通道：{tag}] 已下发远程执行指令 {command.Id}，共 {tasks.Count} 个任务，目标：{host} / {user}" +
+                      (command.TargetSessionId > 0 ? $"（会话 {command.TargetSessionId}）" : string.Empty) + "。");
         }
 
-        IsRdpBusy = true;
-        MirrorSessionIfActive(session);
-
-        await WaitForChannelReadyAsync(session, isLocal, hasReusableSession, reusableSession);
-
         RefreshRdpReadiness();
+    }
+
+    /// <summary>
+    /// 把准入结论写进运行日志：先打可审计清单，再打判定与警告。
+    /// 清单里每条会话都带「主机 + 域 + 账户 + SID + SessionId + 状态 + 时刻」，
+    /// 事后对齐时间线只靠这几行就够（计划书 §三 的采证要求）。
+    /// </summary>
+    private void LogSessionAdmission(RdpChannelSession session, RdpSessionAdmissionResult admission) =>
+        LogSessionAdmissionEntries(admission, line => AppendChannelLog(session, line));
+
+    /// <inheritdoc cref="LogSessionAdmission"/>
+    private void LogSessionAdmissionEntries(RdpSessionAdmissionResult admission, Action<string> write)
+    {
+        foreach (var line in admission.AuditLines)
+        {
+            write(line);
+        }
+
+        foreach (var warning in admission.Warnings)
+        {
+            write("⚠ " + warning);
+        }
+    }
+
+    /// <summary>
+    /// 一句会话现状（给设置页 / 通道页的状态行用）。
+    ///
+    /// <para>多会话时不再只报「第一条」：那会让人以为一切正常，而界面上看不到
+    /// 第二条的存在 —— 排障时最误导的就是这种"看起来只有一个"。</para>
+    /// </summary>
+    private static string DescribeSessionSummary(string? user)
+    {
+        // 展示路径不解析 SID：域环境里首次解析可能要走域控，别把界面卡在那里。
+        var query = RdpSessionService.QuerySessions(resolveSid: false);
+
+        if (!query.Usable)
+        {
+            return query.Status == SessionQueryStatus.PartialFailure
+                ? "会话枚举部分失败，当前状态不可信"
+                : $"会话枚举失败：{(query.Error.Length > 0 ? query.Error : "原因未知")}";
+        }
+
+        var list = query.ForUser(user);
+        if (list.Count == 0)
+        {
+            return "目标账户当前没有会话";
+        }
+
+        if (list.Count == 1)
+        {
+            return $"会话 {list[0].SessionId} · {list[0].UserName} · {list[0].StateText}";
+        }
+
+        return $"⚠ 同账户 {list.Count} 条会话：" +
+               string.Join("、", list.Select(s => $"{s.SessionId}（{s.StateText}）"));
+    }
+
+    /// <summary>
+    /// 单条会话操作（断开 / 注销）的定位。
+    ///
+    /// <para>多于一条时<b>不挑</b>：注销与断开都是不可逆的，挑错就把别人的会话毁了。
+    /// 返回 false 时 <paramref name="error"/> 里是完整清单。</para>
+    /// </summary>
+    private static bool TryPickSingleSession(string? user, out RdpSessionTarget? target, out string error)
+    {
+        target = null;
+        error = string.Empty;
+
+        // 这里只用 SessionId 做事，不需要 SID。
+        var query = RdpSessionService.QuerySessions(resolveSid: false);
+        if (!query.Usable)
+        {
+            error = query.Status == SessionQueryStatus.PartialFailure
+                ? "会话枚举只成功了一部分，无法确定要操作哪一条，已停止。"
+                : $"会话枚举失败：{(query.Error.Length > 0 ? query.Error : "原因未知")}，已停止。";
+            return false;
+        }
+
+        var list = query.ForUser(user);
+        if (list.Count == 0)
+        {
+            error = "找不到目标账户的会话，可能尚未连接或已注销。";
+            return false;
+        }
+
+        if (list.Count > 1)
+        {
+            error = $"账户「{user}」当前有 {list.Count} 条会话，本操作不会替你挑一条：\n\n" +
+                    string.Join("\n", list.Select(s => "  · " + s.Describe())) +
+                    "\n\n请先在系统里明确你要操作的那一条。";
+            return false;
+        }
+
+        target = list[0];
+        return true;
+    }
+
+    /// <summary>
+    /// 连接后复核不通过时，只断开<b>本次</b>客户端连接。
+    ///
+    /// <para>为什么不顺手注销多余会话：注销会连带杀掉那个会话里的所有进程与未保存数据，
+    /// 而我们此刻并不能证明"多出来的那条一定是本次连接造成的"（可能是别人刚登录的）。
+    /// 这种不可逆动作必须由用户看过清单后自己决定（计划书 P2）。</para>
+    /// </summary>
+    private async Task DisconnectOwnClientOnlyAsync(RdpChannelSession session, RdpSessionVerificationResult verification)
+    {
+        var tag = session.DisplayName;
+
+        if (IsEmbeddedMode && HasSurface(session.Channel!.Id))
+        {
+            await RunOnUiThreadAsync(() =>
+            {
+                GetOrCreateConnection(session.Channel!.Id).UserDisconnect = true;
+                DisposeSurface(session.Channel!.Id);
+                AppendLog($"[通道：{tag}] 已断开本次内嵌连接（其余会话未受影响）。");
+            });
+            return;
+        }
+
+        AppendLog($"[通道：{tag}] 独立窗口模式无法从进程内关闭远程桌面窗口；" +
+                  "请自行关闭该窗口并选「断开连接」，不要选「注销」。");
+        if (verification.NewSessionIds.Count > 0)
+        {
+            AppendLog($"[通道：{tag}] 预期外新增的会话：{string.Join("、", verification.NewSessionIds)}（未做任何处置）。");
+        }
+    }
+
+    /// <summary>
+    /// 还没下发指令就中止：状态文案、完成标记、整轮计数一起收口。
+    ///
+    /// <para>为什么必须走 UI 线程：本方法的所有调用点都在 <c>await</c> 之后，
+    /// 续体不保证回到 UI 线程 —— 而 <see cref="RdpChannelSession.SetStatusText"/> 会触发
+    /// x:Bind 重新求值（见 <see cref="MirrorSessionIfActive"/> 的崩溃记录）。</para>
+    /// </summary>
+    /// <param name="dialogBody">非空则在 UI 线程上弹一次说明；传 null 表示不弹（调用方已自行提示）。</param>
+    private Task AbortChannelBeforeDispatchAsync(
+        RdpChannelSession session, string statusText, string? dialogBody)
+    {
+        return RunOnUiThreadAsync(() =>
+        {
+            session.SetStatusText(statusText);
+            MirrorSessionIfActive(session);
+            // 没有下发过指令就不会有 status.json 反馈，直接标记收尾，免得整轮计数卡住
+            session.MarkCompletionReported();
+            FinishRunPart();
+
+            if (!string.IsNullOrEmpty(dialogBody))
+            {
+                _ = DialogHelper.ShowMessageAsync("本次连接未执行", dialogBody);
+            }
+        });
     }
 
     /// <summary>
     /// 等这条通道"可执行"：本机目标先等会话建立，再等目标会话里的代理上线；
     /// 远程目标等不到（会话不在本机），交给 status.json 轮询反映真实进度。
     /// </summary>
-    private async Task WaitForChannelReadyAsync(
+    /// <returns>
+    /// true = 会话与代理都已在位，可以下发指令。
+    /// false = 没就绪 —— <b>调用方必须因此放弃下发</b>（计划书 P0 第 4 条：
+    /// 先握手、后下发；以前是"先下发、再等就绪"，代理一旦上线就会把指令捡走执行）。
+    /// </returns>
+    private async Task<bool> WaitForChannelReadyAsync(
         RdpChannelSession session, bool isLocal, bool hasReusableSession, RdpSessionInfo? reusableSession)
     {
         var tag = session.DisplayName;
@@ -5292,7 +5557,7 @@ public sealed class MainViewModel : ObservableObject
             session.SetStatusText($"已连接 {channel.Host}，等待对方会话代理接管…");
             MirrorSessionIfActive(session);
             AppendLog($"[通道：{tag}] 远程目标无法在本机枚举会话，以下方回传的 status.json 为准；若长时间无进展，请检查对方是否已部署会话代理并指向同一共享目录。");
-            return;
+            return true;
         }
 
         var timeout = RdpSettings.ConnectTimeoutSeconds;
@@ -5309,7 +5574,7 @@ public sealed class MainViewModel : ObservableObject
             session.SetStatusText("等待目标会话超时");
             MirrorSessionIfActive(session);
             AppendLog($"[通道：{tag}] 等待目标会话超时（{timeout} 秒）。请确认凭据正确、目标账户允许远程登录，或手动在远程桌面窗口里完成登录。");
-            return;
+            return false;
         }
 
         var created = reusableSession ?? RdpSessionService.FindSession(user);
@@ -5332,10 +5597,10 @@ public sealed class MainViewModel : ObservableObject
 
         if (online)
         {
-            session.SetStatusText("会话代理已上线，等待接管任务…");
+            session.SetStatusText("会话代理已上线，准备下发任务…");
             MirrorSessionIfActive(session);
             AppendLog($"[通道：{tag}] 已确认会话代理在线，任务将自动交接给它。");
-            return;
+            return true;
         }
 
         session.SetStatusText("目标账户已登录，但会话代理没有上线");
@@ -5343,6 +5608,7 @@ public sealed class MainViewModel : ObservableObject
         AppendLog($"[通道：{tag}] 等待会话代理上线超时（{timeout} 秒）：目标账户虽然在会话里，但代理没有随之启动。");
         AppendLog($"[通道：{tag}] 原因：代理只在目标账户「登录」那一刻由启动项拉起；账户本来就登录着时，启动项不会重跑，代理也就不在。");
         _ = PromptLogoffAndReconnectAsync(user);
+        return false;
     }
     /// <summary>
     /// 代理没上线时的可操作引导：把「注销目标账户 → 重新连接」这条正解摆到用户面前。
@@ -5371,14 +5637,30 @@ public sealed class MainViewModel : ObservableObject
                 return;
             }
 
-            var session = RdpSessionService.FindSession(targetUser ?? RdpSettings.TargetUser);
-            if (session is null)
+            var user = targetUser ?? RdpSettings.TargetUser;
+            var sessions = RdpSessionService.FindSessions(user);
+            if (sessions.Count == 0)
             {
                 AppendLog("注销目标账户失败：找不到目标账户的会话，可能已经断开或注销。");
                 return;
             }
 
-            if (RdpSessionService.LogoffSession(session.Id, out var message))
+            if (sessions.Count > 1)
+            {
+                // 多会话时"注销哪一个"没有正确答案，而且注销是不可逆的 ——
+                // 按要求只把清单摆出来，不代替用户做决定（计划书 P2）。
+                AppendLog($"账户「{user}」当前有 {sessions.Count} 条会话，本功能不会自动挑一条注销：");
+                foreach (var item in sessions)
+                {
+                    AppendLog("  · " + item.Describe());
+                }
+
+                AppendLog("请先在「会话通道」页用「断开」逐个处理，或手动在系统里注销后再重试。");
+                RefreshRdpReadiness();
+                return;
+            }
+
+            if (RdpSessionService.LogoffSessionConfirmed(sessions[0].SessionId, out var message))
             {
                 AppendLog($"{message}请重新点击「连接并执行」——目标账户登录时启动项会自动拉起代理。");
             }

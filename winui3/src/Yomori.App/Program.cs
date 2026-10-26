@@ -231,6 +231,14 @@ public static class Program
             Environment.Exit(RdpDiagnoseCli.Run());
         }
 
+        // 会话诊断（计划书 P0 / P2）：只读打印会话清单 + 单账户单会话策略状态；
+        // 带 --enable-single-session / --restore-single-session 才写注册表。
+        // 与 --rdp-diagnose 同样放在单实例之前：它是显式的运维动作，不该被"程序已经开着"挡回来。
+        if (RdpSessionCli.IsInvocation(args))
+        {
+            Environment.Exit(RdpSessionCli.Run(args));
+        }
+
         // 任务栏身份要在第一个窗口创建之前定下来，代理模式不涉及窗口、跳过。
         if (!isAgent)
         {

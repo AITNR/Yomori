@@ -857,6 +857,22 @@ public sealed class RdpCommand
     public string CreatedAt { get; set; } = DateTimeOffset.Now.ToString("o");
     public string ControllerUser { get; set; } = Environment.UserName;
 
+    // ---------------- 归属信息（计划书 P1：命令必须携带目标身份） ----------------
+    //
+    // 为什么要写进指令文件而不是靠"目录/用户名"隐式约定：
+    //   同账户可能出现多个会话，多个代理会抢读同一个 command.json。
+    //   代理侧只有拿到「这条指令是发给哪个 SID、哪个 SessionId」才能判断自己该不该执行，
+    //   否则"同名账户"和"同账户多会话"两种串台都拦不住。
+
+    /// <summary>目标账户 SID（主控端算出来的那份）。空串 = 主控端拿不到身份，代理应按旧行为放行。</summary>
+    public string TargetSid { get; set; } = string.Empty;
+
+    /// <summary>目标会话 id。0 = 不限（老版本主控端不写这个字段）。</summary>
+    public uint TargetSessionId { get; set; }
+
+    /// <summary>指令协议版本，见 <see cref="RdpCommandProtocol"/>。</summary>
+    public int ProtocolVersion { get; set; } = RdpCommandProtocol.Current;
+
     public List<TaskConfig> Tasks { get; set; } = new();
 
     public bool ShutdownAfterDone { get; set; }
@@ -900,6 +916,19 @@ public sealed class RdpStopRequest
 public static class RdpLiveLogProtocol
 {
     public const int Current = 1;
+}
+
+/// <summary>
+/// 指令协议的版本号。
+///
+/// <para>2 = 起加入了 <c>TargetSid</c> / <c>TargetSessionId</c> 归属信息，以及代理侧的原子认领。
+/// 旧代理读到新指令不会看这些字段（JSON 反序列化忽略未知键），行为与以前一致 ——
+/// 这正是安全的降级方向：<b>旧代理照常跑，新代理额外校验</b>，不会因为升级顺序把人卡死。</para>
+/// </summary>
+public static class RdpCommandProtocol
+{
+    public const int Legacy = 1;
+    public const int Current = 2;
 }
 
 /// <summary>独立 NDJSON 流中的一条外部脚本日志。</summary>
@@ -962,7 +991,22 @@ public sealed class RdpStatus
     public string AgentUser { get; set; } = string.Empty;
     public string AgentVersion { get; set; } = "v2.0 WinUI";
 
-    /// <summary>idle / running / done / stopped / error</summary>
+    // ---------------- 归属信息（计划书 P1：心跳必须带实例与会话条件） ----------------
+    //
+    // 同账户多代理时，几个代理会往同一份 status.json 里写。
+    // 没有这三项的话，"A 会话在跑任务"可以被"B 会话的 idle 心跳"直接覆写成空闲，
+    // 主控端就会误判任务已结束/未开始。写入方必须带上自己是谁。
+
+    /// <summary>代理实例标识（进程启动时生成，进程内不变）。</summary>
+    public string AgentInstanceId { get; set; } = string.Empty;
+
+    /// <summary>代理所在的 WTS 会话 id。</summary>
+    public uint AgentSessionId { get; set; }
+
+    /// <summary>代理所在账户的 SID。</summary>
+    public string AgentSid { get; set; } = string.Empty;
+
+    /// <summary>idle / running / done / stopped / error / rejected</summary>
     public string Phase { get; set; } = "idle";
 
     public string StatusText { get; set; } = string.Empty;
