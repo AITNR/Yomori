@@ -404,6 +404,11 @@ public static class RdpUnlockService
             if (request.RestartService)
             {
                 Report(progress, 8, "重启远程桌面服务");
+
+                // 先落盘再动手：万一停到一半崩溃，账本里要已经写着「动过它」
+                manifest.ServiceTouched = true;
+                RdpTransactionStore.Save(manifest);
+
                 var (restartOk, restartMessage, touched) = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
                 foreach (var service in touched)
                 {
@@ -863,12 +868,21 @@ public static class RdpUnlockService
             }
         }
 
-        // 服务：停过的就重新拉起来。TermService 是本流程唯一必然碰到的主服务，
-        // 依赖服务的恢复在 RdpServiceControl.Restart 内部按「本来在跑」的清单处理。
-        var (serviceOk, serviceMessage, _) = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
-        if (!serviceOk)
+        // 服务：**只有真的动过才恢复**。失败发生在「更新 INI」这种更早的步骤时，
+        // TermService 一直好好地跑着，停它一次既没必要也有破坏性（会打断远程会话）。
+        if (manifest.ServiceTouched)
         {
-            notes.Add("服务恢复：" + serviceMessage);
+            // 依赖服务的恢复在 Restart 内部按「本来在跑」的清单处理
+            var (serviceOk, serviceMessage, _) = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
+            if (!serviceOk)
+            {
+                allOk = false;
+                notes.Add("服务恢复：" + serviceMessage);
+            }
+        }
+        else
+        {
+            notes.Add("本轮没有动过远程桌面服务，跳过重启");
         }
 
         // 刚装的 Wrapper：执行经核实的卸载补偿

@@ -174,6 +174,18 @@ public sealed class RdpTransactionManifest
     [JsonPropertyName("services_touched")]
     public List<string> ServicesTouched { get; set; } = new();
 
+    /// <summary>
+    /// 本轮有没有**真的动过** TermService（停或启）。
+    /// </summary>
+    /// <remarks>
+    /// 补偿流程原先是无条件 <c>Restart("TermService")</c>：即使失败发生在「更新 INI」这一步、
+    /// 服务根本没被碰过，也会停一次再起一次。后果不只是多余：停服务是有破坏性的动作
+    /// （会打断远程会话、清掉监听），而且它正是 2026-10-26 那次崩溃的入口。
+    /// 所以判据改成「动过才恢复」。
+    /// </remarks>
+    [JsonPropertyName("service_touched")]
+    public bool ServiceTouched { get; set; }
+
     [JsonPropertyName("steps")]
     public List<string> Steps { get; set; } = new();
 

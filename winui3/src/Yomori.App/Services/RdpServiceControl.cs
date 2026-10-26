@@ -49,7 +49,8 @@ public static class RdpServiceControl
                         service,
                         Native.SC_STATUS_PROCESS_INFO,
                         out var status,
-                        (uint)Marshal.SizeOf<Native.SERVICE_STATUS_PROCESS>()))
+                        (uint)Marshal.SizeOf<Native.SERVICE_STATUS_PROCESS>(),
+                        out _))
                 {
                     return (RdpServiceState.Unknown, 0, $"QueryServiceStatusEx 失败：Win32 {Marshal.GetLastWin32Error()}");
                 }
@@ -70,13 +71,23 @@ public static class RdpServiceControl
     /// <summary>
     /// 列出依赖 <paramref name="serviceName"/> 的服务里**当前正在运行**的那些。
     /// </summary>
-    public static IReadOnlyList<string> RunningDependents(string serviceName)
+    public static IReadOnlyList<string> RunningDependents(string serviceName) =>
+        QueryRunningDependents(serviceName).Names;
+
+    /// <summary>
+    /// 同 <see cref="RunningDependents"/>，但把失败原因带出来。
+    /// </summary>
+    /// <remarks>
+    /// 枚举失败**不能**当成「没有依赖服务」：那会让调用方以为不用恢复任何东西，
+    /// 而实际上可能漏掉了 UmRdpService 这类必须跟着起来的服务。
+    /// </remarks>
+    public static (IReadOnlyList<string> Names, string Error) QueryRunningDependents(string serviceName)
     {
         var result = new List<string>();
         var scm = Native.OpenSCManagerW(null, null, Native.SC_MANAGER_CONNECT);
         if (scm == IntPtr.Zero)
         {
-            return result;
+            return (result, $"OpenSCManager 失败：Win32 {Marshal.GetLastWin32Error()}");
         }
 
         try
@@ -85,16 +96,26 @@ public static class RdpServiceControl
                 scm, serviceName, Native.SERVICE_QUERY_STATUS | Native.SERVICE_ENUMERATE_DEPENDENTS);
             if (service == IntPtr.Zero)
             {
-                return result;
+                return (result, $"OpenService 失败：Win32 {Marshal.GetLastWin32Error()}");
             }
 
             try
             {
                 // 先问需要多大缓冲，再按需分配 —— 依赖服务的数量不确定
-                _ = Native.EnumDependentServicesW(service, Native.SERVICE_STATE_ALL, IntPtr.Zero, 0, out var needed, out _);
+                // 首次调用必然失败并要求给缓冲区；只有结果真的是「没有依赖」时 needed 才是 0
+                if (Native.EnumDependentServicesW(
+                        service, Native.SERVICE_STATE_ALL, IntPtr.Zero, 0, out var needed, out _))
+                {
+                    return (result, "");
+                }
+
+                var probe = Marshal.GetLastWin32Error();
                 if (needed == 0)
                 {
-                    return result;
+                    // 122 = ERROR_INSUFFICIENT_BUFFER 才是正常路径；别的错误码说明这次查询不可信
+                    return probe == 122
+                        ? (result, "")
+                        : (result, $"{serviceName} 的依赖服务枚举失败：Win32 {probe}");
                 }
 
                 var buffer = Marshal.AllocHGlobal((int)needed);
@@ -103,7 +124,7 @@ public static class RdpServiceControl
                     if (!Native.EnumDependentServicesW(
                             service, Native.SERVICE_STATE_ALL, buffer, needed, out _, out var count))
                     {
-                        return result;
+                        return (result, $"{serviceName} 的依赖服务读取失败：Win32 {Marshal.GetLastWin32Error()}");
                     }
 
                     var size = Marshal.SizeOf<Native.ENUM_SERVICE_STATUSW>();
@@ -138,7 +159,7 @@ public static class RdpServiceControl
             Native.CloseServiceHandle(scm);
         }
 
-        return result;
+        return (result, "");
     }
 
     /// <summary>停止服务并等它真的停下。</summary>
@@ -276,7 +297,14 @@ public static class RdpServiceControl
         var touched = new List<string>();
         var notes = new List<string>();
 
-        var dependents = RunningDependents(serviceName);
+        var (dependents, dependentError) = QueryRunningDependents(serviceName);
+        if (dependentError.Length > 0)
+        {
+            // 查不出依赖时继续停启（用户要的是把服务拉回来），但必须留下这句，
+            // 否则「依赖没恢复」会变成事后无从解释的谜
+            notes.Add($"依赖服务没查出来：{dependentError}");
+        }
+
         foreach (var dependent in dependents)
         {
             touched.Add(dependent);
@@ -331,7 +359,13 @@ public static class RdpServiceControl
         public const uint SERVICE_QUERY_STATUS = 0x0004;
         public const uint SERVICE_START = 0x0010;
         public const uint SERVICE_STOP = 0x0020;
-        public const uint SERVICE_ENUMERATE_DEPENDENTS = 0x0001;
+        /// <summary>
+        /// 0x0008。这个值踩过两次：写过 0x0001（SERVICE_QUERY_CONFIG）、也写过 0x0080
+        /// （SERVICE_INTERROGATE），两次都让 EnumDependentServices 以 Win32 5（拒绝访问）失败，
+        /// 而代码把「调用失败」当成「没有依赖服务」，于是补偿永远不会恢复 UmRdpService。
+        /// 2026-10-26 实测：TermService 确实有依赖 UmRdpService（运行中），枚举却返回 0 个。
+        /// </summary>
+        public const uint SERVICE_ENUMERATE_DEPENDENTS = 0x0008;
         public const uint SERVICE_CONTROL_STOP = 0x00000001;
         public const uint SERVICE_STATE_ALL = 0x00000003;
         public const int SC_STATUS_PROCESS_INFO = 0;
@@ -380,10 +414,24 @@ public static class RdpServiceControl
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CloseServiceHandle(IntPtr handle);
 
+        /// <summary>
+        /// 查服务状态。
+        /// </summary>
+        /// <remarks>
+        /// ⚠️ <c>QueryServiceStatusEx</c> 是 **5 个参数**，最后一个 <c>pcbBytesNeeded</c>
+        /// （<c>LPDWORD</c>）不能省：原生实现会通过它写回实际字节数。
+        /// 少声明这一个参数时，它写的是栈上一个随机值当指针 —— 进程就地
+        /// <c>AccessViolationException</c>，而且是**第一次调用就炸**，
+        /// 不是「跑几次才坏」那种堆损坏。2026-10-26 真机点解锁即死就是这个原因。
+        /// </remarks>
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool QueryServiceStatusEx(
-            IntPtr service, int infoLevel, out SERVICE_STATUS_PROCESS buffer, uint bufferSize);
+            IntPtr service,
+            int infoLevel,
+            out SERVICE_STATUS_PROCESS buffer,
+            uint bufferSize,
+            out uint bytesNeeded);
 
         [DllImport("advapi32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
