@@ -140,8 +140,7 @@ public static class RdpUninstallService
                 Key = "precheck",
                 Title = "检查当前安装状态",
                 Outcome = RdpStepOutcome.Ok,
-                Detail = $"ServiceDll={before.ServiceDllPath}；TermService={RdpProbeText.ServiceLabel(before.ServiceState)}；"
-                         + $"当前 {before.SessionCount} 个会话。",
+                Detail = $"ServiceDll={before.ServiceDllPath}；TermService={RdpProbeText.ServiceLabel(before.ServiceState)}",
             });
 
             // ---- 2. 事务 + 卸载前快照 ----
@@ -274,7 +273,7 @@ public static class RdpUninstallService
                     : RdpStepOutcome.Warn,
                 Detail = run.TimedOut
                     ? $"卸载器 {ToolTimeout.TotalSeconds:0} 秒未退出，但 ServiceDll 已回到 {after.ServiceDllPath} —— 按状态判定为已卸载。"
-                    : $"退出码 {run.ExitCode}。{run.OutputTail}",
+                    : $"退出码 {run.ExitCode}",
             });
 
             // ---- 5. 回读：只看 ServiceDll ----
@@ -283,8 +282,8 @@ public static class RdpUninstallService
 
             // 专业版卸载后原生 RDP 仍在监听 3389，这不算失败；家庭版没有监听器也是正常的
             var listenerNote = after.Tcp3389Listening
-                ? "3389 仍在监听（专业版卸载后属原生 RDP，正常）"
-                : "3389 无监听（家庭版卸载后属正常）";
+                ? "3389 仍在监听（专业版属正常）"
+                : "3389 无监听（家庭版属正常）";
 
             steps.Add(new RdpStepRecord
             {
@@ -333,10 +332,7 @@ public static class RdpUninstallService
                     Key = "leftover",
                     Title = "目录残留",
                     Outcome = RdpStepOutcome.Warn,
-                    Detail = $"卸载已完成，但 {after.InstallDirectory} 里还剩：{leftover}。"
-                             + "这些是卸载当时正在运行、删不掉的文件（CnC 界面最典型）。"
-                             + "可以直接删除该目录；如果删不掉，重启后再删。"
-                             + "不要再双击里面的程序 —— 组件已经卸掉了，它没有可管理的东西。",
+                    Detail = $"{after.InstallDirectory} 里还剩：{leftover}（卸载当时被占用）；重启后可直接删除。",
                 });
             }
 
@@ -348,8 +344,7 @@ public static class RdpUninstallService
                     Key = "legacy",
                     Title = "遗留安装说明",
                     Outcome = RdpStepOutcome.Warn,
-                    Detail = "本机这份解锁组件不是由 Yomori 安装的，没有安装前基线："
-                             + "本次只做官方卸载与现状验证，无法保证重建安装前的历史状态。",
+                    Detail = "本机组件不是 Yomori 安装的，没有安装前基线；本次只做官方卸载与现状验证。",
                 });
             }
 
@@ -358,8 +353,8 @@ public static class RdpUninstallService
             return new RdpOperationResult
             {
                 Success = true,
-                Summary = "已卸载 RDP 解锁组件。Windows 用户、Yomori 通道与凭据都保留着。"
-                          + "注册表配置快照仍保留在本机，需要恢复解锁前的注册表请点「还原注册表」。",
+                Summary = "已卸载 RDP 解锁组件；账户、通道配置与凭据都保留。"
+                          + "要恢复解锁前的注册表请点「还原注册表」。",
                 Detail = RdpUnlockDiagnostics.FormatDetail(after),
                 Steps = steps,
                 Final = after,
@@ -425,11 +420,8 @@ public static class RdpUninstallService
                 localTool,
                 FromRecord: recorded.Found,
                 Detail: recorded.Found
-                    ? $"使用安装目录里的控制台工具：{localTool.LocalPath}"
-                      + $"（与安装事务记录的发布 {recordedTag} 同源；不会弹出任何界面）"
-                    : $"使用安装目录里的控制台工具：{localTool.LocalPath}（不会弹出任何界面）。"
-                      + "注意：本机没有 Yomori 的安装事务记录，无法证明这份工具与当前已装组件同版本；"
-                      + "如果卸载失败，请按诊断从发布页取配套版本。",
+                    ? $"使用安装目录里的 RDPWInst.exe（与已装发布 {recordedTag} 配套，无窗口）"
+                    : "使用安装目录里的 RDPWInst.exe（无窗口）；本机没有安装事务记录，无法证明它与已装组件同版本。",
                 Error: "",
                 ReleaseId: recorded.Id,
                 ReleaseTag: recordedTag);

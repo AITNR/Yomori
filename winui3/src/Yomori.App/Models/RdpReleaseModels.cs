@@ -246,18 +246,19 @@ public sealed class RdpStepRecord
     public string ErrorCode { get; init; } = "";
     public DateTimeOffset At { get; init; } = DateTimeOffset.Now;
 
+    /// <summary>
+    /// 界面用的短行：只有等级与标题。
+    /// </summary>
+    /// <remarks>
+    /// 步骤说明动辄两三句（校验能力、备份路径、工具输出），十几步铺在设置页里就是一面绿墙，
+    /// 反而看不出"走到第几步、有没有出事"。所以界面上只留骨架，完整行
+    /// （<see cref="ToLine"/>）写进运行日志与诊断报告。
+    /// </remarks>
+    public string BriefLine() => $"[{Mark()}] {Title}";
+
     public string ToLine()
     {
-        var mark = Outcome switch
-        {
-            RdpStepOutcome.Ok => "通过",
-            RdpStepOutcome.Warn => "注意",
-            RdpStepOutcome.Fail => "失败",
-            RdpStepOutcome.Skipped => "跳过",
-            _ => "未执行",
-        };
-
-        var sb = new StringBuilder($"[{mark}] {Title}");
+        var sb = new StringBuilder($"[{Mark()}] {Title}");
         if (Detail.Length > 0)
         {
             sb.Append(" —— ").Append(Detail);
@@ -270,6 +271,15 @@ public sealed class RdpStepRecord
 
         return sb.ToString();
     }
+
+    private string Mark() => Outcome switch
+    {
+        RdpStepOutcome.Ok => "通过",
+        RdpStepOutcome.Warn => "注意",
+        RdpStepOutcome.Fail => "失败",
+        RdpStepOutcome.Skipped => "跳过",
+        _ => "未执行",
+    };
 }
 
 /// <summary>给界面用的进度。</summary>

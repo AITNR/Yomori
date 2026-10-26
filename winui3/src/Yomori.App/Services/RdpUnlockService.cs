@@ -87,7 +87,7 @@ public static class RdpUnlockService
                 + $"Service={RdpProbeText.ServiceLabel(before.ServiceState)}，"
                 + $"Listener={RdpProbeText.ListenerLabel(before.ListenerState)}，"
                 + $"Support={RdpProbeText.SupportLabel(before.SupportState)}"
-                + (before.SessionCount > 0 ? $"；当前 {before.SessionCount} 个会话（{before.SessionSummary}）" : ""));
+                + (before.SessionCount > 0 ? $"；{before.SessionCount} 个会话" : ""));
 
             if (!before.IsElevated)
             {
@@ -153,8 +153,7 @@ public static class RdpUnlockService
                 var releaseSource = resolved.Source.Length > 0 ? resolved.Source : "官方接口";
                 Add(steps, "release", "锁定发布",
                     resolved.Id > 0 ? RdpStepOutcome.Ok : RdpStepOutcome.Warn,
-                    $"{resolved.Tag}（release {(resolved.Id > 0 ? resolved.Id.ToString() : "未知")}，"
-                    + $"安装器 {installerAsset.Name} / 卸载器 {uninstallerAsset.Name}）；来源：{releaseSource}");
+                    $"{resolved.Tag}（release {(resolved.Id > 0 ? resolved.Id.ToString() : "未知")}）；来源：{releaseSource}");
 
                 // ---- 安装器：手动指定的优先，其次官方下载 ----
                 if (request.ManualInstallerPath.Length > 0)
@@ -170,7 +169,7 @@ public static class RdpUnlockService
                     installer = manual;
                     Add(steps, "manual", "使用手动指定的安装包", RdpStepOutcome.Warn,
                         $"{Path.GetFileName(request.ManualInstallerPath)}（{manual.SizeBytes} 字节，"
-                        + $"sha256={Short(manual.Sha256)}）。来源由用户提供，未与官方摘要比对。" + manual.Limits);
+                        + $"sha256={Short(manual.Sha256)}）；来源由用户提供，未与官方摘要比对。");
                 }
                 else
                 {
@@ -205,22 +204,21 @@ public static class RdpUnlockService
                     // 手动模式下继续：装完之后安装目录里会有 RDPWInst.exe，「卸载」按钮就靠它。
                     // 代价是这一步失败时无法自动回滚，所以必须写成「注意」而不是「通过」。
                     Add(steps, "uninstaller", "下载配套卸载器", RdpStepOutcome.Warn,
-                        $"{uninstallerError}。本轮继续安装：装完后可用安装目录里的 RDPWInst.exe 卸载；"
-                        + "但如果本次安装中途失败，将无法自动回滚。");
+                        $"未取到卸载器：{uninstallerError}（本轮继续安装，中途失败将无法自动回滚）");
                 }
                 else
                 {
                     uninstaller = downloadedUninstaller;
 
                     Add(steps, "download", "下载与校验", RdpStepOutcome.Ok,
-                        $"{installer.Asset.Name} {installer.SizeBytes} 字节 sha256={Short(installer.Sha256)}；"
-                        + $"{uninstaller.Asset.Name} sha256={Short(uninstaller.Sha256)}。" + installer.Limits);
+                        $"安装器 {installer.SizeBytes} 字节 sha256={Short(installer.Sha256)}，卸载器同批下载；"
+                        + "上游无官方摘要与签名");
                 }
             }
             else
             {
                 Add(steps, "reuse", "复用已有安装", RdpStepOutcome.Ok,
-                    $"本机已有解锁组件（{before.ServiceDllPath}），本轮只更新配置，不重装。");
+                    "已有解锁组件，本轮只更新配置，不重装。");
             }
 
             // ---- 建事务 + 安装前快照 ----
@@ -303,7 +301,7 @@ public static class RdpUnlockService
 
             Add(steps, "snapshot", "安装前快照", RdpStepOutcome.Ok,
                 $"事务 {manifest.Id}；{manifest.Registry.Count} 个键值；"
-                + (manifest.IniBackup.Length > 0 ? $"INI 已备份（{manifest.IniBackup}）" : "INI 尚不存在"));
+                + (manifest.IniBackup.Length > 0 ? "INI 已备份" : "INI 尚不存在"));
 
             // ---- 5. 调安装器 ----
             var installDir = before.InstallDirectory;
@@ -355,8 +353,7 @@ public static class RdpUnlockService
                         if (stillRunning)
                         {
                             Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                                $"安装器 {ToolTimeout.TotalSeconds:0} 秒内没接管 ServiceDll，而且它还在运行"
-                                + $"（{runningDetail}），结果不明。");
+                                $"超时 {ToolTimeout.TotalSeconds:0} 秒，ServiceDll 未被接管，安装器仍在运行，结果不明。");
 
                             RdpTransactionStore.AppendStep(
                                 manifest, $"结论：安装器仍在运行（{runningDetail}），事务保持未完成");
@@ -370,8 +367,7 @@ public static class RdpUnlockService
                         }
 
                         Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                            $"安装器在隐藏桌面上 {ToolTimeout.TotalSeconds:0} 秒内未完成，ServiceDll 仍未被接管；"
-                            + "已确认它的进程树全部退出。");
+                            $"超时 {ToolTimeout.TotalSeconds:0} 秒，ServiceDll 未被接管，安装器已退出。");
 
                         // 到这里才有结论：进程树确实退出了，系统不会再被它继续改写。
                         RdpTransactionStore.AppendStep(manifest, "结论：安装器已退出且未生效，事务记为失败");
@@ -386,7 +382,7 @@ public static class RdpUnlockService
                     }
 
                     Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok,
-                        "已在隐藏桌面上完成安装 —— 那个图形安装器的窗口不会出现在你屏幕上。");
+                        "已在隐藏桌面完成，没有弹出任何窗口。");
 
                     // 上游安装器按官方 install.bat 的做法会拉起 RDP_CnC.exe 并常驻。
                     // 这不是我们启动的，也没有开关能拒绝；如实报告，别假装它不存在
@@ -397,7 +393,7 @@ public static class RdpUnlockService
                 {
                     // 隐藏桌面建不出来（会话异常 / 权限被改，极少见）→ 退回可见启动，并如实说明会弹窗
                     Add(steps, "install", "运行官方安装器", RdpStepOutcome.Warn,
-                        $"无法在隐藏桌面上启动（{hidden.Error}），改为普通启动；此时会弹出第三方安装界面。");
+                        $"隐藏桌面启动失败（{hidden.Error}），改为普通启动，会弹出安装界面。");
 
                     run = await RdpToolRunner
                         .RunAsync(installer.LocalPath, RdpToolRunner.InstallArguments, ToolTimeout, cancellationToken)
@@ -414,8 +410,8 @@ public static class RdpUnlockService
                         {
                             var (toolRunning, toolDetail) = RdpToolRunner.DescribeRunning(run, "安装器");
                             Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                                $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍未被接管。"
-                                + (toolRunning ? $"它还在运行（{toolDetail}），事务保持未完成。" : ""));
+                                $"超时 {ToolTimeout.TotalSeconds:0} 秒，ServiceDll 未被接管"
+                                + (toolRunning ? "，安装器仍在运行" : "") + "，结果不明。");
                             return Fail(steps, "安装器超时，结果不明：",
                                 "没有强制结束安装器。请等它自行结束后重新检测；若一直不结束，重启电脑后再来。",
                                 before, manifest.Id);
@@ -432,7 +428,7 @@ public static class RdpUnlockService
                     {
                         Add(steps, "install", "运行官方安装器", RdpStepOutcome.Warn,
                             $"退出码 {run.ExitCode}{(run.TimedOut ? "、超时" : "")}，"
-                            + "但 ServiceDll 已被接管 —— 按状态判定为已安装，继续后续步骤。");
+                            + "但 ServiceDll 已被接管，按已安装继续。");
                     }
                     else
                     {
@@ -465,7 +461,7 @@ public static class RdpUnlockService
             else
             {
                 Report(progress, 5, "跳过安装（已有安装）");
-                Add(steps, "install", "运行官方安装器", RdpStepOutcome.Skipped, "本机已有有效安装，按计划书 4.1 不强制重装。");
+                Add(steps, "install", "运行官方安装器", RdpStepOutcome.Skipped, "本机已有有效安装，不重装。");
             }
 
             // ---- 6. 注册表事务 ----
@@ -520,8 +516,7 @@ public static class RdpUnlockService
             {
                 Report(progress, 7, "INI 已覆盖当前版本");
                 Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped,
-                    $"本机 rdpwrap.ini 已含与 termsrv.dll {termsrvVersion} 对应的补丁段（按文件内容判定），"
-                    + "无需在线更新（-w 会去 GitHub 下载 INI，断网时必然失败）。");
+                    $"rdpwrap.ini 已含 [{termsrvVersion}] 段，无需在线更新。");
             }
             else
             {
@@ -561,8 +556,7 @@ public static class RdpUnlockService
                         iniUpdated = true;
 
                         Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn,
-                            $"{acquired.Message}　已回读确认：本机 INI 现在含 [{termsrvVersion}] 段，"
-                            + "Support 可正常判定，继续后续步骤。");
+                            $"{acquired.Message}；已回读确认含 [{termsrvVersion}] 段。");
                     }
                     else
                     {
@@ -623,9 +617,7 @@ public static class RdpUnlockService
                 if (restartOk && !restart.DependentsOk)
                 {
                     Add(steps, "service-dependents", "依赖服务恢复", RdpStepOutcome.Warn,
-                        "远程桌面服务已重启，但上面列出的依赖服务没能恢复。"
-                        + "受影响的是设备/驱动器重定向这类功能，远程连接本身可用；"
-                        + "重启电脑可以一次性恢复它们。");
+                        "依赖服务未能恢复；设备/驱动器重定向可能失效，重启电脑可恢复。");
                 }
 
                 if (!restartOk)
@@ -661,8 +653,7 @@ public static class RdpUnlockService
             if (needsReboot)
             {
                 Add(steps, "reboot", "需要重启电脑", RdpStepOutcome.Warn,
-                    "解锁组件已安装，但 WinStation 里还没有 RDP-Tcp 监听 —— 钩子尚未生效。"
-                    + "请重启电脑，开机后回本页点「重新检测」。");
+                    "组件已安装，但还没有 RDP-Tcp 监听；请重启电脑后点「重新检测」。");
             }
 
             var nothingChanged = before.WrapperState == RdpWrapperState.Installed
@@ -695,7 +686,7 @@ public static class RdpUnlockService
             if (reminder)
             {
                 Add(steps, "protect", "安全防护提醒", RdpStepOutcome.Warn,
-                    "本轮下载前您确认过关闭了杀毒软件。操作已结束，请及时重新开启安全防护（Yomori 不检测也未修改其状态）。");
+                    "下载前您关闭过杀毒软件，请现在重新开启安全防护。");
             }
 
             Report(progress, 10, "完成");
@@ -823,7 +814,7 @@ public static class RdpUnlockService
 
                 if (!RdpRegistryService.HasConflict(delta.Before, current))
                 {
-                    Add(steps, "skip", $"{delta.Label}", RdpStepOutcome.Skipped, "当前值与备份一致，无需恢复。");
+                    Add(steps, "skip", delta.Before.Name, RdpStepOutcome.Skipped, "已是备份中的值");
                     continue;
                 }
 
@@ -832,8 +823,8 @@ public static class RdpUnlockService
                     && !RdpRegistryService.Matches(delta.Before, current))
                 {
                     conflicts++;
-                    Add(steps, "conflict", $"{delta.Label}", RdpStepOutcome.Warn,
-                        $"备份原值 {delta.Before.ToDisplay()}；当前值 {current.ToDisplay()}（已被第三方或策略改动，未覆盖）");
+                    Add(steps, "conflict", delta.Before.Name, RdpStepOutcome.Warn,
+                        $"原值 {delta.Before.ToDisplay()}，当前 {current.ToDisplay()}；已被第三方改动，未覆盖");
                     restoreTx.Registry.Add(new RdpRegistryDelta
                     {
                         Before = current,
@@ -847,7 +838,7 @@ public static class RdpUnlockService
                 var (writeOk, writeError) = RdpRegistryService.Write(delta.Before);
                 if (!writeOk)
                 {
-                    Add(steps, "write", $"{delta.Label}", RdpStepOutcome.Fail, writeError);
+                    Add(steps, "write", delta.Before.Name, RdpStepOutcome.Fail, writeError);
                     restoreTx.Registry.Add(new RdpRegistryDelta
                     {
                         Before = current, After = delta.Before, Note = "写入失败：" + writeError,
@@ -859,7 +850,7 @@ public static class RdpUnlockService
                 var verified = RdpRegistryService.Matches(delta.Before, readBack);
                 restored++;
 
-                Add(steps, "restore", $"{delta.Label}", verified ? RdpStepOutcome.Ok : RdpStepOutcome.Fail,
+                Add(steps, "restore", delta.Before.Name, verified ? RdpStepOutcome.Ok : RdpStepOutcome.Fail,
                     verified
                         ? $"已恢复为 {delta.Before.ToDisplay()}"
                         : $"回读不符：期望 {delta.Before.ToDisplay()}，实际 {readBack.ToDisplay()}");
@@ -902,8 +893,7 @@ public static class RdpUnlockService
                 if (serviceOk && !restart.DependentsOk)
                 {
                     Add(steps, "service-dependents", "依赖服务恢复", RdpStepOutcome.Warn,
-                        "远程桌面服务已重启，但有依赖服务没能恢复（设备/驱动器重定向可能失效）；"
-                        + "重启电脑可以一次性恢复。");
+                        "依赖服务未能恢复；设备/驱动器重定向可能失效，重启电脑可恢复。");
                 }
             }
 
@@ -981,7 +971,7 @@ public static class RdpUnlockService
         var policy = RdpRegistryService.ReadPolicyValue();
         if (policy.Kind != RdpRegistryKind.NotFound)
         {
-            notes.Add($"策略键已存在（{policy.ToDisplay()}），按计划书 5.1 只报告不绕过。");
+            notes.Add($"策略键已存在（{policy.ToDisplay()}），未改动。");
         }
 
         foreach (var delta in manifest.Registry)
@@ -1009,7 +999,7 @@ public static class RdpUnlockService
 
             if (RdpRegistryService.Matches(delta.Before, target))
             {
-                notes.Add($"{delta.Label} 已是 DWORD 0，无需修改。");
+                notes.Add($"{delta.Before.Name} 已是 DWORD 0，无需修改。");
                 delta.Applied = true;
                 delta.Verified = true;
                 continue;
@@ -1054,7 +1044,7 @@ public static class RdpUnlockService
                 continue;
             }
 
-            notes.Add($"{delta.Label} 已改为 DWORD 0（原 {delta.Before.ToDisplay()}）。");
+            notes.Add($"{delta.Before.Name} 已改为 DWORD 0（原 {delta.Before.ToDisplay()}）。");
         }
 
         // 「无需修改」的项也要把 After 落到盘上：账本要能解释本轮到底想改什么
@@ -1279,10 +1269,7 @@ public static class RdpUnlockService
 
         if (run.ExitCode != 0)
         {
-            return (false,
-                $"-w 退出码 {run.ExitCode}（该命令会去 GitHub 下载最新 INI，"
-                + $"失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}",
-                false);
+            return (false, $"-w 退出码 {run.ExitCode}（该步需联网访问 GitHub）", false);
         }
 
         // 成功退出不等于已更新：回读正文，确认它真的含当前构建的段。
@@ -1296,9 +1283,9 @@ public static class RdpUnlockService
             var restored = RestoreIniIfBetter(manifest, version);
 
             return (false,
-                $"-w 退出码 0，但它写进来的 INI 只有 {IniSectionCount(text)} 个段、不含 [{version}] 段 —— "
-                + "这是 RDPWInst 下载失败后回落的内置样本文件，不是最新全量 INI。"
-                + (restored ? "已把安装前那份换回来。" : ""),
+                $"-w 退出码 0，写入的 INI 只有 {IniSectionCount(text)} 个段、不含 [{version}] 段"
+                + "（下载失败后回落的内置样本）"
+                + (restored ? "；已换回安装前那份" : ""),
                 false);
         }
 
@@ -1456,7 +1443,7 @@ public static class RdpUnlockService
                       + (consoleRun.TimedOut ? "（超时）" : ""));
 
             Add(steps, "compensate-uninstall", "卸载补偿", RdpStepOutcome.Ok,
-                $"用安装目录里的 {Path.GetFileName(consoleTool)} -u 完成，不会弹出任何界面。");
+                $"用安装目录里的 {Path.GetFileName(consoleTool)} -u 完成。");
         }
         else
         {
@@ -1537,10 +1524,7 @@ public static class RdpUnlockService
         }
 
         Add(steps, "residue", "第三方界面进程仍在运行", RdpStepOutcome.Warn,
-            $"上游安装器按官方 install.bat 的做法拉起了 {string.Join("、", pids)}。"
-            + "它的窗口开在隐藏桌面上（你看不到），进程会一直留着。"
-            + "这是上游安装器的行为，Yomori 没有拒绝它的开关；不影响解锁与远程连接，"
-            + "重启电脑后它会消失。");
+            $"安装器拉起了 {string.Join("、", pids)}，窗口在隐藏桌面；不影响使用，重启后消失。");
     }
 
     /// <summary>读文本文件；读不出来返回空串。</summary>
@@ -1603,8 +1587,7 @@ public static class RdpUnlockService
             Add(steps, "ini-restore", "恢复安装前的 INI",
                 ok ? RdpStepOutcome.Warn : RdpStepOutcome.Fail,
                 ok
-                    ? $"安装器自带的 INI 盖掉了原来的文件（新的一份只有 {IniSectionCount(current)} 个段、"
-                      + $"不含 [{version}] 段），已换回安装前那份（{IniSectionCount(backup)} 个段）。"
+                    ? $"安装器自带的 INI 不含 [{version}] 段，已换回安装前那份（{IniSectionCount(backup)} 个段）"
                     : "安装器覆盖了 INI，且恢复备份失败：" + message);
             return;
         }
@@ -1621,8 +1604,7 @@ public static class RdpUnlockService
             File.Copy(older, iniPath, overwrite: true);
             Add(steps, "ini-restore", "恢复历史 INI 备份",
                 RdpStepOutcome.Warn,
-                $"安装器自带的 INI 只有 {IniSectionCount(current)} 个段、不含 [{version}] 段；"
-                + $"已从历史事务（{Path.GetFileName(Path.GetDirectoryName(older))}）里换回一份含该段的 INI。");
+                $"安装器自带的 INI 不含 [{version}] 段，已从历史事务换回一份含该段的 INI。");
         }
         catch (Exception ex)
         {
@@ -1753,9 +1735,8 @@ public static class RdpUnlockService
     /// <c>rdpwrap.ini</c> 放到安装目录 —— 比让用户去猜「为什么更新不了」有用。
     /// </remarks>
     private static string IniManualHint(string installDir) =>
-        "　组件已回滚到安装前状态。拿到能覆盖本机版本的 rdpwrap.ini 后，"
-        + "点「指定 INI」选中它，再点一次「解锁 RDP」即可（不会重复下载安装器）。"
-        + (installDir.Length == 0 ? "" : $"　文件也可以直接覆盖 {Path.Combine(installDir, "rdpwrap.ini")}。");
+        "；拿到能覆盖本机版本的 INI 后点「指定 INI」，再解锁一次即可"
+        + (installDir.Length == 0 ? "" : $"（也可直接覆盖 {Path.Combine(installDir, "rdpwrap.ini")}）");
 
     /// <summary>下载失败时附在后面的出口：告诉用户「还可以手动给一个安装包」。</summary>
     private const string ManualHint =
@@ -1789,7 +1770,7 @@ public static class RdpUnlockService
         }
 
         Add(steps, "retry", $"重新下载{label}", RdpStepOutcome.Warn,
-            $"第一次拿到的内容不可用（{error}），正在重试一次。");
+            $"首次下载不可用（{error}），正在重试。");
 
         await Task.Delay(600, cancellationToken).ConfigureAwait(false);
 
