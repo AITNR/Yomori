@@ -5244,8 +5244,10 @@ public sealed class MainViewModel : ObservableObject
             }
 
             // 指令带上目标身份：代理侧据此判断"这条指令是不是发给我的"。
+            // 会话 id 先留空，等连接后复核确定了「到底哪条会话在跑」再填 ——
+            // 重连可能接回旧会话、也可能新建一条，只有连完才知道。
             command.TargetSid = RdpSessionGuard.ResolveSid(host, user);
-            command.TargetSessionId = admission.Target?.SessionId ?? 0;
+            command.TargetSessionId = 0;
 
             bridge.EnsureDirectory();
 
@@ -5353,7 +5355,19 @@ public sealed class MainViewModel : ObservableObject
                     return;
                 }
 
-                AppendChannelLog(session, $"连接后复核通过：{verification.Reason}");
+                AppendChannelLog(session, verification.Verdict == RdpSessionVerification.Replaced
+                    ? $"连接后复核：{verification.Reason}"
+                    : $"连接后复核通过：{verification.Reason}");
+
+                // 复核后的目标：真的在跑的那条会话。派发就按它来 ——
+                // 重连可能接回旧会话、也可能新建一条，只有这一步之后才确定。
+                command.TargetSessionId = verification.TargetSessionId;
+            }
+
+            // 远程目标无法在本机枚举会话：只能用准入阶段的信息（通常为 0 = 不限）。
+            if (command.TargetSessionId == 0 && admission.Target is not null)
+            {
+                command.TargetSessionId = admission.Target.SessionId;
             }
 
             // ================= 握手完成，才允许下发 =================
@@ -5404,6 +5418,11 @@ public sealed class MainViewModel : ObservableObject
         {
             write("⚠ " + warning);
         }
+
+        // 把服务端策略状态一起打出来：同账户能不能"接回原会话"取决于它，
+        // 而它解释不了的时候，用户只能看到"又新建了一条会话"这种莫名现象。
+        var policy = RdpSingleSessionPolicy.Read();
+        write($"服务端策略 fSingleSessionPerUser：{policy.Describe()}（{policy.Detail}）");
     }
 
     /// <summary>
@@ -5578,11 +5597,20 @@ public sealed class MainViewModel : ObservableObject
         }
 
         var created = reusableSession ?? RdpSessionService.FindSession(user);
+
+        // 这一步很关键：确定「哪条会话才是本次的目标」。同账户可能有历史遗留的已断开会话，
+        // 它们里面的代理进程还活着、还在写心跳 —— 不指定会话去等，就会确认到那个陈旧代理。
+        var expectedSessionId = RdpSessionGuard.ResolveTargetSessionId(
+            RdpTargets.Normalize(channel.Host), user);
+
         session.SetStatusText($"目标会话已就绪（会话 {created?.Id}），正在等待会话代理上线…");
         MirrorSessionIfActive(session);
         AppendLog(hasReusableSession
             ? $"[{tag}] 复用已有会话 {created?.Id}，无需等待登录。"
             : $"[{tag}] 目标账户会话已建立。");
+        AppendLog(expectedSessionId != 0
+            ? $"[通道：{tag}] 本次任务将派发给会话 {expectedSessionId}；只接受该会话里的代理回传心跳。"
+            : $"[通道：{tag}] 目标账户当前有多条运行中的会话或查不到唯一目标，代理上线判定不限会话。");
         AppendLog($"[通道：{tag}] 会话代理会随目标账户登录自动启动并常驻等待指令，正在确认它是否在线…");
 
         // 【不再隔空拉起】代理随登录自启且常驻，主控端只负责确认它上线。
@@ -5591,7 +5619,8 @@ public sealed class MainViewModel : ObservableObject
             user,
             channel.BridgePath,
             timeout,
-            CancellationToken.None));
+            CancellationToken.None,
+            expectedSessionId));
 
         IsRdpBusy = false;
 

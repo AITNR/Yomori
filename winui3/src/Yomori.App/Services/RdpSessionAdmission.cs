@@ -242,7 +242,7 @@ public enum RdpSessionVerification
     /// <summary>会话集合符合预期。</summary>
     Ok = 0,
 
-    /// <summary>出现了预期外的会话（本次连接把会话数量搞多了）。</summary>
+    /// <summary>出现了预期外的会话（旧会话还在跑，同时又开了一条）。</summary>
     Duplicated = 1,
 
     /// <summary>复核时查不到会话（无法证明，按不安全处理）。</summary>
@@ -250,6 +250,15 @@ public enum RdpSessionVerification
 
     /// <summary>目标会话消失了（登录失败 / 已被注销）。</summary>
     TargetMissing = 3,
+
+    /// <summary>
+    /// 旧会话已被新会话<b>替换</b>：旧的变成「已断开」，新的接手，任何时刻只有一条在跑。
+    ///
+    /// <para>这与 <see cref="Duplicated"/> 是两回事：替换后目标仍然唯一，
+    /// 任务派发给新的那条即可；重复则是两条同时在跑，派给谁都不对。
+    /// 服务端没开单账户单会话时，重连就是这种「替换」形态 —— 它是环境行为，不是故障。</para>
+    /// </summary>
+    Replaced = 4,
 }
 
 public sealed class RdpSessionVerificationResult
@@ -261,10 +270,17 @@ public sealed class RdpSessionVerificationResult
     /// <summary>基线里没有、复核时冒出来的会话 id。</summary>
     public List<uint> NewSessionIds { get; } = new();
 
+    /// <summary>基线里有、复核时消失的会话 id。</summary>
+    public List<uint> GoneSessionIds { get; } = new();
+
     /// <summary>复核时的实际会话（审计用）。</summary>
     public List<RdpSessionTarget> Observed { get; set; } = new();
 
-    public bool Ok => Verdict == RdpSessionVerification.Ok;
+    /// <summary>可以继续下发（Ok 与 Replaced 都算通过，Replaced 另带说明）。</summary>
+    public bool Ok => Verdict is RdpSessionVerification.Ok or RdpSessionVerification.Replaced;
+
+    /// <summary>当前唯一在跑的会话 id（复核后的目标）；没有或不唯一时为 0。</summary>
+    public uint TargetSessionId { get; set; }
 }
 
 /// <summary>
@@ -357,49 +373,89 @@ public static class RdpSessionAdmissionPlanner
             return result;
         }
 
-        if (candidates.Count > 1)
+        // 2026-10-26 二次修正（真机日志驱动）：
+        // 「多会话」本身不等于风险，**目标不确定**才是风险。
+        // 之前的规则是 candidates.Count > 1 一律阻断，结果在
+        // 「每次连接都新建会话、旧会话留成已断开」的机器上（fSingleSessionPerUser=0）
+        // 第一次断了以后就再也连不上 —— 用户看到的是「重复打开连不上」。
+        //
+        // 现在按「有几条**正在跑**的会话」判歧义：
+        //   2 条以上 Active/Connected → 真歧义，阻断（可能是别人正在用，也可能真串台）
+        //   恰好 1 条 Active + 若干已断开 → 目标唯一，复用，残留会话列进清单
+        //   0 条 Active 且全部已断开 → 目标也唯一（就是那条/那批历史会话），按重连处理
+        var active = candidates.Where(c => c.IsUsable).ToList();
+        var stale = candidates.Where(c => !c.IsUsable).ToList();
+
+        if (active.Count > 1)
         {
             result.Admission = RdpSessionAdmission.BlockMultiSession;
             result.Reason =
-                $"账户「{bare}」在主机上有 {candidates.Count} 条会话（会话号 " +
-                string.Join("、", candidates.Select(c => c.SessionId)) +
-                "）。同账户多会话会让任务派发无法确定归属，本次连接已停止。";
-            result.AuditLines.Add("判定：阻断（同账户多会话）。" + SingleSessionPolicyHint);
+                $"账户「{bare}」同时有 {active.Count} 条运行中的会话（会话号 " +
+                string.Join("、", active.Select(c => c.SessionId)) +
+                "），无法确定该把任务交给哪一条，本次连接已停止。";
+            result.AuditLines.Add("判定：阻断（同账户多条运行中会话）。" + SingleSessionPolicyHint);
             return result;
         }
 
-        var only = candidates[0];
-        if (!only.IdentityVerified)
+        if (active.Count == 1)
         {
-            result.Admission = RdpSessionAdmission.BlockIdentityUnknown;
-            result.Reason = $"账户「{bare}」的会话 {only.SessionId} 无法解析出账户 SID，仅凭用户名不能证明身份唯一。";
-            result.AuditLines.Add("判定：阻断（SID 未知）。");
-            return result;
-        }
+            var live = active[0];
+            if (!live.IdentityVerified)
+            {
+                result.Admission = RdpSessionAdmission.BlockIdentityUnknown;
+                result.Reason = $"账户「{bare}」的会话 {live.SessionId} 无法解析出账户 SID，仅凭用户名不能证明身份唯一。";
+                result.AuditLines.Add("判定：阻断（SID 未知）。");
+                return result;
+            }
 
-        if (only.IsUsable)
-        {
             result.Admission = RdpSessionAdmission.AllowReuse;
-            result.Target = only;
-            result.Reason = $"复用已有会话 {only.SessionId}（{only.StateText}）。";
-            result.AuditLines.Add($"判定：允许复用（会话 {only.SessionId}）。");
+            result.Target = live;
+            result.Reason = $"复用已有会话 {live.SessionId}（{live.StateText}）。";
+            result.AuditLines.Add($"判定：允许复用（会话 {live.SessionId}）。");
+
+            if (stale.Count > 0)
+            {
+                // 这些是历史遗留的已断开会话。它们不妨碍把任务交给唯一那条运行中的会话，
+                // 但它们的代理进程必须让出领导权（见 AgentHost 的让位规则），
+                // 否则主控端会确认到"陈旧会话里的代理在线"。
+                result.Warnings.Add(
+                    $"另有 {stale.Count} 条已断开的历史会话（会话号 " +
+                    string.Join("、", stale.Select(c => c.SessionId)) +
+                    "），本次不使用它们；任务只派发给会话 " + live.SessionId + "。");
+            }
+
             return result;
         }
 
-        if (only.State == SessionConnectState.Disconnected)
+        // 0 条运行中：全部是已断开 / 异常状态的历史会话。
+        var disconnected = candidates.Where(c => c.State == SessionConnectState.Disconnected).ToList();
+        if (disconnected.Count == candidates.Count)
         {
+            var newest = disconnected.OrderByDescending(c => c.SessionId).First();
+            if (!newest.IdentityVerified)
+            {
+                result.Admission = RdpSessionAdmission.BlockIdentityUnknown;
+                result.Reason = $"账户「{bare}」的会话 {newest.SessionId} 无法解析出账户 SID，无法确认身份。";
+                result.AuditLines.Add("判定：阻断（SID 未知）。");
+                return result;
+            }
+
             result.Admission = RdpSessionAdmission.AllowReconnect;
-            result.Target = only;
-            result.Reason = $"账户「{bare}」只有一条已断开的会话 {only.SessionId}，按重连处理。";
+            result.Target = newest;
+            result.Reason = candidates.Count == 1
+                ? $"账户「{bare}」只有一条已断开的会话 {newest.SessionId}，按重连处理。"
+                : $"账户「{bare}」有 {candidates.Count} 条已断开的历史会话，按重连处理（参考会话 {newest.SessionId}）。";
+            result.AuditLines.Add($"判定：允许重连（参考会话 {newest.SessionId}，共 {candidates.Count} 条已断开）。");
             result.Warnings.Add(
-                "该会话处于「已断开」：重连能否回到同一条会话，取决于服务端的单账户单会话策略。" +
+                "重连能否回到原会话取决于服务端的单账户单会话策略；不能回到时系统会新建一条，" +
+                "旧会话会留在「已断开」状态。本次任务只派发给届时真正建立的那一条会话。" +
                 SingleSessionPolicyHint);
-            result.AuditLines.Add($"判定：允许重连（会话 {only.SessionId}，已断开）。");
             return result;
         }
 
+        var odd = candidates.First(c => c.State != SessionConnectState.Disconnected);
         result.Admission = RdpSessionAdmission.BlockUnusableState;
-        result.Reason = $"账户「{bare}」的会话 {only.SessionId} 处于「{only.StateText}」，此刻连接既不能复用也无法确认会落到哪条会话。";
+        result.Reason = $"账户「{bare}」的会话 {odd.SessionId} 处于「{odd.StateText}」，既不能复用也无法确认连接会落到哪条会话。";
         result.AuditLines.Add("判定：阻断（会话状态不可用）。");
         return result;
     }
@@ -436,7 +492,8 @@ public static class RdpSessionAdmissionPlanner
             return verification;
         }
 
-        var baseline = admission.Snapshot.ForUser(bare).Select(s => s.SessionId).ToHashSet();
+        var baselineTargets = admission.Snapshot.ForUser(bare);
+        var baseline = baselineTargets.Select(s => s.SessionId).ToHashSet();
         var now = current.Select(s => s.SessionId).ToHashSet();
 
         foreach (var id in now.Where(id => !baseline.Contains(id)))
@@ -444,34 +501,115 @@ public static class RdpSessionAdmissionPlanner
             verification.NewSessionIds.Add(id);
         }
 
-        if (admission.ExpectsSameSessions && verification.NewSessionIds.Count > 0)
+        foreach (var id in baseline.Where(id => !now.Contains(id)))
         {
-            verification.Verdict = RdpSessionVerification.Duplicated;
-            verification.Reason =
-                $"本次连接在预期之外新增了会话 {string.Join("、", verification.NewSessionIds)}；" +
-                "准入时要求保持原有会话集合不变。";
-            return verification;
+            verification.GoneSessionIds.Add(id);
         }
 
-        if (admission.ExpectsNewSession && verification.NewSessionIds.Count > 1)
-        {
-            verification.Verdict = RdpSessionVerification.Duplicated;
-            verification.Reason =
-                $"本次连接一次性新增了 {verification.NewSessionIds.Count} 条会话（{string.Join("、", verification.NewSessionIds)}），只应有一条。";
-            return verification;
-        }
+        // 复核后的目标：当前唯一在跑的那条。
+        var live = current.Where(c => c.IsUsable).ToList();
+        verification.TargetSessionId = live.Count == 1 ? live[0].SessionId : 0;
 
-        if (admission.ExpectsNewSession && verification.NewSessionIds.Count == 0)
+        var allCurrentActive = live.Count;
+        var baselineActive = baselineTargets.Where(s => s.IsUsable).ToList();
+
+        switch (admission.Admission)
         {
-            // 新建路径下会话还没出现：既可能仍在登录，也可能落进了旧会话。
-            // 交给调用方按超时处理，这里判为缺失而不是重复。
-            verification.Verdict = RdpSessionVerification.TargetMissing;
-            verification.Reason = "新建连接后没有观察到新会话（可能仍在登录，或落回了已有会话）。";
-            return verification;
+            case RdpSessionAdmission.AllowCreate:
+                if (verification.NewSessionIds.Count > 1)
+                {
+                    verification.Verdict = RdpSessionVerification.Duplicated;
+                    verification.Reason =
+                        $"本次连接一次性新增了 {verification.NewSessionIds.Count} 条会话（{string.Join("、", verification.NewSessionIds)}），只应有一条。";
+                    return verification;
+                }
+
+                if (verification.NewSessionIds.Count == 0)
+                {
+                    // 新建路径下会话还没出现：既可能仍在登录，也可能落进了旧会话。
+                    // 交给调用方按超时处理，这里判为缺失而不是重复。
+                    verification.Verdict = RdpSessionVerification.TargetMissing;
+                    verification.Reason = "新建连接后没有观察到新会话（可能仍在登录，或落回了已有会话）。";
+                    return verification;
+                }
+
+                break;
+
+            case RdpSessionAdmission.AllowReuse:
+                if (verification.NewSessionIds.Count > 1)
+                {
+                    verification.Verdict = RdpSessionVerification.Duplicated;
+                    verification.Reason =
+                        $"本次连接新增了 {verification.NewSessionIds.Count} 条会话（{string.Join("、", verification.NewSessionIds)}）。";
+                    return verification;
+                }
+
+                if (verification.NewSessionIds.Count == 1)
+                {
+                    // 新增一条时看旧的怎么样了：
+                    //   旧的那条已经不在跑（已断开/消失）→ 是替换，目标唯一，可以继续；
+                    //   旧的那条还在跑 → 两条同时在跑，这才叫重复。
+                    if (allCurrentActive <= 1)
+                    {
+                        verification.Verdict = RdpSessionVerification.Replaced;
+                        verification.Reason =
+                            $"原会话已让位，新会话 {string.Join("、", verification.NewSessionIds)} 接手（当前在跑 {allCurrentActive} 条）。";
+                        return verification;
+                    }
+
+                    verification.Verdict = RdpSessionVerification.Duplicated;
+                    verification.Reason =
+                        $"新增了会话 {string.Join("、", verification.NewSessionIds)}，而原有会话仍在运行（当前在跑 {allCurrentActive} 条）；" +
+                        "准入时要求保持原有会话集合不变。";
+                    return verification;
+                }
+
+                break;
+
+            case RdpSessionAdmission.AllowReconnect:
+                // 两种结果都正常：接回原会话（新增 0 条），或系统新建一条替掉旧的（新增 1 条）。
+                if (verification.NewSessionIds.Count > 1)
+                {
+                    verification.Verdict = RdpSessionVerification.Duplicated;
+                    verification.Reason =
+                        $"本次重连一次新增了 {verification.NewSessionIds.Count} 条会话（{string.Join("、", verification.NewSessionIds)}），只应有一条。";
+                    return verification;
+                }
+
+                if (verification.NewSessionIds.Count == 1 && allCurrentActive > 1)
+                {
+                    // 新的冒出来了，旧的那条却还在跑 —— 这是真的重复，不是替换。
+                    verification.Verdict = RdpSessionVerification.Duplicated;
+                    verification.Reason =
+                        $"重连新增了会话 {string.Join("、", verification.NewSessionIds)}，而原有会话仍在运行（当前在跑 {allCurrentActive} 条）。";
+                    return verification;
+                }
+
+                if (verification.NewSessionIds.Count == 0 && baselineActive.Count == 0 && allCurrentActive == 0)
+                {
+                    verification.Verdict = RdpSessionVerification.TargetMissing;
+                    verification.Reason = "重连后既没有接回原会话，也没有建立新会话。";
+                    return verification;
+                }
+
+                if (verification.NewSessionIds.Count == 1)
+                {
+                    verification.Verdict = RdpSessionVerification.Replaced;
+                    verification.Reason =
+                        $"原会话未能接回，系统新建了会话 {string.Join("、", verification.NewSessionIds)} 接手" +
+                        (verification.GoneSessionIds.Count > 0
+                            ? $"（原会话 {string.Join("、", verification.GoneSessionIds)} 已消失）。"
+                            : "（原会话仍在「已断开」，不影响本次派发）。");
+                    return verification;
+                }
+
+                break;
         }
 
         verification.Verdict = RdpSessionVerification.Ok;
-        verification.Reason = $"会话集合符合预期（当前 {now.Count} 条：{string.Join("、", now)}）。";
+        verification.Reason = allCurrentActive == 1
+            ? $"会话集合符合预期（当前在跑 1 条：{live[0].SessionId}，历史会话 {now.Count - 1} 条不影响派发）。"
+            : $"会话集合符合预期（当前 {now.Count} 条：{string.Join("、", now)}）。";
         return verification;
     }
 }

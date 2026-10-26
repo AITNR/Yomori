@@ -152,6 +152,25 @@ public static class RdpSessionGuard
     }
 
     /// <summary>
+    /// 当前「唯一在跑」的那条会话 id；没有或不止一条时返回 0。
+    ///
+    /// <para>用途有二：① 告诉主控端该等<b>哪条会话</b>里的代理上线（否则会确认到
+    /// 历史遗留会话里的陈旧代理）；② 写进 <c>command.json</c> 的
+    /// <c>TargetSessionId</c>，让代理自己判断"这条指令是不是给我的"。</para>
+    /// </summary>
+    public static uint ResolveTargetSessionId(string? host, string? user)
+    {
+        var query = RdpSessionService.QuerySessions(host, resolveSid: false);
+        if (!query.Usable)
+        {
+            return 0;
+        }
+
+        var live = query.ForUser(user).Where(s => s.IsUsable).ToList();
+        return live.Count == 1 ? live[0].SessionId : 0;
+    }
+
+    /// <summary>
     /// 连接后的会话身份复核。返回结论 + 完整观测快照，调用方据此决定是否断开本次客户端。
     /// </summary>
     public static RdpSessionVerificationResult VerifyAfterConnect(

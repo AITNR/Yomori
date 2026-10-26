@@ -2463,7 +2463,16 @@ public static class RdpSessionService
     /// <param name="status">桥里的状态快照（通常来自 RdpBridge.TryReadStatus）。</param>
     /// <param name="targetUser">目标账户名，支持 "Player2" / "Machine\Player2"。</param>
     /// <param name="now">当前时刻，便于测试注入。</param>
-    public static bool IsAgentOnline(RdpStatus? status, string? targetUser, DateTimeOffset now)
+    /// <param name="expectedSessionId">
+    /// 期望的心跳来源会话。非 0 时，只有 <c>AgentSessionId</c> 等于它才算在线。
+    ///
+    /// <para>为什么必须能限定：同账户有历史遗留的已断开会话时，那条会话里的<b>陈旧代理</b>
+    /// 仍在往同一座桥写 idle 心跳。不限定来源的话，主控端会在连上 2 秒后就宣布
+    /// 「代理已在线」，而真正接手任务的（新会话里的）代理其实还没起来 ——
+    /// 2026-10-26 真机日志里就是这个现象（23:43:31 连接，23:43:33 就报在线）。</para>
+    /// </param>
+    public static bool IsAgentOnline(
+        RdpStatus? status, string? targetUser, DateTimeOffset now, uint expectedSessionId = 0)
     {
         if (status is null)
         {
@@ -2477,6 +2486,13 @@ public static class RdpSessionService
 
         // 只有"运行中 / 空闲"算在线；done / stopped / error 是终态，不算。
         if (status.Phase is not ("running" or "idle"))
+        {
+            return false;
+        }
+
+        // 限定来源会话：不是那条会话里的代理，一律不算"已就绪"。
+        if (expectedSessionId != 0 && status.AgentSessionId != 0
+            && status.AgentSessionId != expectedSessionId)
         {
             return false;
         }
@@ -2496,7 +2512,8 @@ public static class RdpSessionService
     ///   这时只能引导用户注销后重新连接，让登录动作把代理带起来。
     /// </summary>
     public static bool WaitForAgentOnline(
-        string? targetUser, string? bridgePath, int timeoutSeconds, CancellationToken token)
+        string? targetUser, string? bridgePath, int timeoutSeconds, CancellationToken token,
+        uint expectedSessionId = 0)
     {
         var bridge = RdpBridge.For(RdpChannelPaths.Resolve(bridgePath, targetUser));
         var deadline = DateTime.UtcNow.AddSeconds(Math.Max(1, timeoutSeconds));
@@ -2508,7 +2525,7 @@ public static class RdpSessionService
                 return false;
             }
 
-            if (IsAgentOnline(bridge.TryReadStatus(), targetUser, DateTimeOffset.Now))
+            if (IsAgentOnline(bridge.TryReadStatus(), targetUser, DateTimeOffset.Now, expectedSessionId))
             {
                 return true;
             }

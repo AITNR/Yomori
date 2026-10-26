@@ -168,6 +168,24 @@ public static class AgentHost
         {
             if (leadership is null)
             {
+                // 让位规则（2026-10-26 真机日志驱动）：
+                // 本会话已断开、而同账户另有工作会话在跑时，领导权必须归那条会话。
+                // 不这么做的话，历史遗留会话里的陈旧代理会一直占着领导权 + 写 idle 心跳，
+                // 主控端就会"确认到一个不在正确会话里的代理"，新会话的代理永远是跟随者。
+                if (ShouldDeferToOtherSession())
+                {
+                    if (!followerNoted)
+                    {
+                        followerNoted = true;
+                        AppPaths.WriteStartupError(new InvalidOperationException(
+                            $"本会话（{OwnSessionId}，{Environment.UserName}）已断开且账户另有工作会话，" +
+                            $"本实例（{InstanceId}）让出领导权并待命。"));
+                    }
+
+                    await Task.Delay(TimeSpan.FromSeconds(AgentPollIntervalSeconds)).ConfigureAwait(false);
+                    continue;
+                }
+
                 leadership = AgentLeadership.TryAcquire(bridge.BridgeDir);
                 if (leadership is null)
                 {
@@ -188,11 +206,12 @@ public static class AgentHost
                 followerNoted = false;
             }
 
-            // 领导者身份校验：锁文件被别人抢走后本实例必须让位，不能继续消费指令。
-            if (!leadership.IsLeader)
+            // 领导者身份校验：锁文件被别人抢走、或本会话该让位时，必须交出去。
+            if (!leadership.IsLeader || ShouldDeferToOtherSession())
             {
                 leadership.Dispose();
                 leadership = null;
+                followerNoted = false;
                 continue;
             }
 
@@ -208,6 +227,18 @@ public static class AgentHost
                     bridge.ReleaseClaim(InstanceId);
                     continue;
                 }
+
+                // 先把身份写进 status，再交给 Runner ——
+                // 主控端的"等代理上线"要按会话核对来源，第一条指令跑起来之前
+                // 状态里若没有 AgentSessionId，核对就只能放行（等于没核对）。
+                bridge.UpdateStatus(status =>
+                {
+                    status.AgentUser = Environment.UserName;
+                    status.AgentInstanceId = InstanceId;
+                    status.AgentSessionId = OwnSessionId;
+                    status.AgentSid = OwnSid;
+                    return status;
+                });
 
                 // 注意：这里【不挂】Completed → ExitAgent。
                 // 常驻代理执行完必须回到等待状态继续待命，而不是退出。
@@ -279,17 +310,62 @@ public static class AgentHost
     }
 
     /// <summary>
+    /// 本实例是否该把领导权让给同账户的另一条会话。
+    ///
+    /// <para>判据只有一条：<b>本会话不是「正在跑」的那条，而账户另有「正在跑」的会话。</b></para>
+    ///
+    /// <para>典型现场（2026-10-26 真机）：服务端 <c>fSingleSessionPerUser=0</c>，
+    /// 每次连接都新建会话，旧的留成「已断开」。旧会话里的代理进程还活着、还占着领导权，
+    /// 于是新会话的代理拿不到领导权 → 不消费指令；而主控端又因为旧代理的心跳足够新鲜
+    /// 而认为"代理已在线"，结果是任务永远不执行。</para>
+    ///
+    /// <para>查询失败时不表态（返回 false）：宁可维持现状，也不要在接口抖动时来回抢锁。</para>
+    /// </summary>
+    private static bool ShouldDeferToOtherSession()
+    {
+        if (OwnSessionId == 0)
+        {
+            return false;
+        }
+
+        var query = RdpSessionService.QuerySessions(resolveSid: false);
+        if (!query.Usable)
+        {
+            return false;
+        }
+
+        var mine = query.Sessions.FirstOrDefault(s => s.SessionId == OwnSessionId);
+        if (mine is null)
+        {
+            // 自己的会话在枚举里都找不到了：不据此让位（可能是查询抖动），继续当领导者。
+            return false;
+        }
+
+        if (mine.IsUsable)
+        {
+            return false;
+        }
+
+        return query.Sessions.Any(s =>
+            s.SessionId != OwnSessionId
+            && s.IsUsable
+            && string.Equals(s.UserName, Environment.UserName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
     /// 这条指令该不该由本代理执行。
     ///
-    /// <para>三条判据（计划书 P1）：</para>
+    /// <para>判据（计划书 P1，2026-10-26 按真机日志放宽过一次）：</para>
     /// <list type="number">
-    /// <item>指令带了目标 SessionId，而本进程不在那个会话里 → 拒收；</item>
+    /// <item>指令带了目标 SessionId，而本进程不在那个会话里 → 拒收（这是最精确的判据）；</item>
     /// <item>指令带了目标 SID，而本账户 SID 与之不符 → 拒收（防同名账户冒用）；</item>
-    /// <item>本账户当前有多条会话 → 拒收（无法证明本会话就是主控端选中的那条）。</item>
+    /// <item>指令<b>没有</b>目标 SessionId（旧主控端），而本账户有多条会话 → 拒收
+    ///（无法证明本会话就是主控端选中的那条）。</item>
     /// </list>
     ///
-    /// <para>旧主控端不写 <c>TargetSid</c> / <c>TargetSessionId</c>（协议 1）：
-    /// 前两条自动放行，行为与升级前一致 —— 这是刻意的安全降级方向。</para>
+    /// <para>⚠️ 第 3 条只在"旧主控端 + 多会话"时生效。新主控端一定会写 TargetSessionId，
+    /// 所以同账户有历史遗留的已断开会话时不再拒收 —— 那种情况下目标其实是确定的，
+    /// 一律拒收只会让"重连后新建了一条会话"的正常路径永远跑不起来。</para>
     /// </summary>
     private static bool AcceptsCommand(RdpCommand command, out string rejection)
     {
@@ -309,13 +385,16 @@ public static class AgentHost
             return false;
         }
 
-        var sessions = RdpSessionService.FindSessions(Environment.UserName);
-        if (sessions.Count > 1)
+        if (command.TargetSessionId == 0)
         {
-            rejection =
-                $"账户「{Environment.UserName}」当前有 {sessions.Count} 条会话，无法证明本会话就是主控端选中的那条，拒收。" +
-                "请先注销多余会话，或开启「单账户单会话」策略。";
-            return false;
+            var sessions = RdpSessionService.FindSessions(Environment.UserName);
+            if (sessions.Count > 1)
+            {
+                rejection =
+                    $"指令没有指定目标会话，而账户「{Environment.UserName}」当前有 {sessions.Count} 条会话，" +
+                    "无法证明本会话就是主控端选中的那条，拒收。请升级主控端到会写 TargetSessionId 的版本。";
+                return false;
+            }
         }
 
         return true;
