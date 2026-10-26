@@ -123,6 +123,8 @@
                         <Button x:Name="RdpBackupButton" Content="历史备份" Click="OnRdpBackups" />
                         <Button x:Name="RdpPickInstallerButton" Content="指定安装包" Click="OnRdpPickInstaller"
                                 ToolTipService.ToolTip="网络拿不到 GitHub 附件时，用浏览器手动下载 RDPW_Installer.exe 后在这里选中它" />
+                        <Button x:Name="RdpPickIniButton" Content="指定 INI" Click="OnRdpPickIni"
+                                ToolTipService.ToolTip="在线取不到 rdpwrap.ini 时，手动下载最新 INI 后在这里选中它（会先校验是否含当前系统版本的补丁段）" />
                     </StackPanel>
 
                     <!-- GitHub 访问令牌：只进 Windows 凭据管理器，不进 config.json。

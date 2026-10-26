@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Linq;
 using System.Text;
 using System.Threading;
@@ -275,6 +276,7 @@ public static class RdpUnlockService
 
             // ---- 5. 调安装器 ----
             var installDir = before.InstallDirectory;
+            var installedThisRun = false;
 
             if (needsDownload && installer is not null)
             {
@@ -370,6 +372,9 @@ public static class RdpUnlockService
                 // 安装目录落定（后续 INI 更新要靠它定位 RDPWInst.exe）
                 var afterInstall = RdpReadOnlyDetector.Detect();
                 installDir = afterInstall.InstallDirectory;
+
+                // 本轮真的装了组件 —— 后面「要不要重启服务」「INI 判据用哪份状态」都靠它
+                installedThisRun = afterInstall.WrapperState == RdpWrapperState.Installed;
             }
             else
             {
@@ -395,56 +400,57 @@ public static class RdpUnlockService
 
             // ---- 7. 备份 INI + Update INI ----
             var iniUpdated = false;
+            var iniFailure = "";
+
+            // ⚠️ 判据用**安装之后**的状态，不是安装之前那个 before：
+            // 全新机器上 before 是「未知」（那时还没有 INI 文件），拿它判必然要走一次在线更新；
+            // 而安装包自带一份 rdpwrap.ini，装完很可能已经覆盖当前构建 —— 白跑一趟还会因为
+            // 上不了 GitHub 把整轮判死（2026-10-26 真机就是这么把刚装好的组件又卸掉的）。
+            var iniProbe = installedThisRun ? RdpReadOnlyDetector.Detect() : before;
+            var iniPathNow = iniProbe.IniPath.Length > 0 ? iniProbe.IniPath : before.IniPath;
+            var termsrvVersion = before.TermsrvVersion.Length > 0 ? before.TermsrvVersion : iniProbe.TermsrvVersion;
 
             if (!request.UpdateIni)
             {
                 Report(progress, 7, "跳过 INI 更新");
                 Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped, "本轮请求没有要求更新 INI。");
             }
-            else if (before.SupportState == RdpSupportState.FullySupported)
+            else if (iniProbe.SupportState == RdpSupportState.FullySupported)
             {
-                // ⚠️ `RDPWInst.exe -w` 的真实行为是「去 GitHub 下载最新 INI」，不是重写本地文件
-                // （2026-10-26 实测输出：[*] Checking for updates... / [-] Failed to download
-                //  latest INI from GitHub.，退出码 5）。本地 INI 已经覆盖当前构建时，
-                // 这一步除了依赖外网没有任何收益 —— 断网环境下必然失败，还会连带触发补偿。
                 Report(progress, 7, "INI 已覆盖当前版本");
                 Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped,
-                    $"本机 rdpwrap.ini 已含与 termsrv.dll {before.TermsrvVersion} 对应的补丁段，"
+                    $"本机 rdpwrap.ini 已含与 termsrv.dll {termsrvVersion} 对应的补丁段，"
                     + "无需在线更新（-w 会去 GitHub 下载 INI，断网时必然失败）。");
             }
             else
             {
                 Report(progress, 7, "更新 INI");
-                var updateIni = await UpdateIniAsync(manifest, installDir, steps, cancellationToken).ConfigureAwait(false);
+                var acquired = await AcquireIniAsync(
+                    manifest, installDir, iniPathNow, termsrvVersion,
+                    request.ManualIniPath, steps, cancellationToken).ConfigureAwait(false);
 
-                if (!updateIni.Ok)
+                if (acquired.Ok)
                 {
-                    // 失败也回读一次：工具报错、但 INI 其实已被别的途径补齐时，不该把整轮判死
-                    var afterIni = RdpReadOnlyDetector.Detect();
-
-                    if (afterIni.SupportState == RdpSupportState.FullySupported)
-                    {
-                        Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn,
-                            $"{updateIni.Message}　但本机 INI 已能覆盖当前版本，继续后续步骤。");
-                    }
-                    else
-                    {
-                        var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
-                            .ConfigureAwait(false);
-                        return Fail(steps, "更新 INI 失败：",
-                            updateIni.Message + IniManualHint(installDir), before, manifest.Id, compensated);
-                    }
+                    iniUpdated = acquired.Changed;
                 }
                 else
                 {
-                    iniUpdated = true;
+                    // 不再因为取不到 INI 就把整轮判死并回滚：组件已经装好了，
+                    // 回滚等于让用户从头再下一遍、再装一遍（2026-10-26 真机就是这个后果，
+                    // 还顺带弹了个 CnC 的错）。
+                    // 取不到 INI 是「这个系统版本还没被覆盖」或「上不了 GitHub」，
+                    // 两种都不是回滚能解决的问题 —— 交给最后的内置检测如实说 Support 未覆盖。
+                    iniFailure = acquired.Message + IniManualHint(installDir);
+                    Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn, iniFailure);
                 }
             }
 
             // ---- 8. 显式重启 TermService ----
             // 只有本轮**真的改过**注册表或 INI 才需要重启：什么都没改还去停一次服务，
             // 除了打断远程会话、清掉监听以外没有任何作用。
-            if (request.RestartService && !registryChanged && !iniUpdated)
+            // 「本轮装过组件」同样是必须重启的理由：安装器换了 ServiceDll，正在跑的
+            // TermService 还是旧映像，不重启就不会有 RDP-Tcp 监听。
+            if (request.RestartService && !registryChanged && !iniUpdated && !installedThisRun)
             {
                 Report(progress, 8, "跳过服务重启");
                 Add(steps, "service", "重启远程桌面服务", RdpStepOutcome.Skipped,
@@ -508,12 +514,17 @@ public static class RdpUnlockService
             }
 
             var nothingChanged = before.WrapperState == RdpWrapperState.Installed
-                                 && !registryChanged && !iniUpdated;
+                                 && !registryChanged && !iniUpdated && !installedThisRun;
 
             var summary = finalOk
                 ? nothingChanged
                     ? "本机已经处于解锁状态，本轮没有需要改动的地方（注册表与 INI 都无需更新），服务也没有重启。"
                     : "成功，可以前往「设置 → 账户 → 其他用户」里添加新用户。添加完成后，在 Yomori 通道管理中保存该账户。"
+                : iniFailure.Length > 0
+                    ? "组件已安装，但本机 rdpwrap.ini 没能更新 —— 所以远程桌面暂时还用不了。"
+                      + "这一步失败通常是上不了 GitHub（该命令要联网）或这个系统版本还没被社区覆盖，"
+                      + "换 INI 也解决不了的情况只能等上游。"
+                      + "拿到能覆盖本机版本的 INI 后点「指定 INI」，再点一次「解锁 RDP」即可，不需要重装。"
                 : needsReboot
                     ? "解锁组件已安装，但远程桌面监听（RDP-Tcp）还没出现，所以现在还不能远程登录。"
                       + "请重启电脑，开机后再点「重新检测」——系统刚更新过时这一条尤其常见。"
@@ -805,6 +816,140 @@ public static class RdpUnlockService
     }
 
     /// <summary>
+    /// 取一份能覆盖当前构建的 INI：用户指定 → <c>RDPWInst.exe -w</c>。
+    /// </summary>
+    /// <remarks>
+    /// <para>只有这两条路。<c>-w</c> 用 RDPWInst 自己的 WinInet，不认本程序的代理；
+    /// 上不了 GitHub 时它以退出码 5 失败 —— 那属于网络/配额问题，**不再想办法绕**
+    /// （2026-10-26 用户明确要求：这种情况不要管）。用户手上有 INI 就用「指定 INI」给他。</para>
+    /// <para>拿不到也不让整轮失败：组件已经装好了，回滚只会让人从头再来一遍。
+    /// 所以调用方把失败降成「注意」，交给最后的内置检测说清「Support 未覆盖」。</para>
+    /// </remarks>
+    private static async Task<(bool Ok, string Message, bool Changed)> AcquireIniAsync(
+        RdpTransactionManifest manifest,
+        string installDir,
+        string iniPath,
+        string version,
+        string manualIniPath,
+        List<RdpStepRecord> steps,
+        CancellationToken cancellationToken)
+    {
+        if (iniPath.Length == 0)
+        {
+            return (false, "找不到 rdpwrap.ini 的位置：安装目录未知。", false);
+        }
+
+        var failures = new List<string>();
+
+        // ---- 1. 用户指定的 INI ----
+        if (manualIniPath.Length > 0)
+        {
+            var (ok, message) = ApplyIniFile(manifest, iniPath, manualIniPath, version);
+            if (ok)
+            {
+                Add(steps, "ini-manual", "使用指定的 INI", RdpStepOutcome.Ok, message);
+                return (true, message, true);
+            }
+
+            failures.Add("手动指定的 INI 不可用：" + message);
+            Add(steps, "ini-manual", "使用指定的 INI", RdpStepOutcome.Warn, message);
+        }
+
+        // ---- 2. 交给 RDPWInst -w ----
+        var update = await UpdateIniAsync(manifest, installDir, steps, cancellationToken).ConfigureAwait(false);
+        if (update.Ok)
+        {
+            return (true, update.Message, true);
+        }
+
+        failures.Add(update.Message);
+        return (false, string.Join("；", failures), false);
+    }
+
+    /// <summary>把一个本地 INI 文件应用到安装目录（先备份，再校验，最后原子替换）。</summary>
+    private static (bool Ok, string Message) ApplyIniFile(
+        RdpTransactionManifest manifest,
+        string iniPath,
+        string sourcePath,
+        string version)
+    {
+        try
+        {
+            if (!File.Exists(sourcePath))
+            {
+                return (false, $"文件不存在：{sourcePath}");
+            }
+
+            var text = File.ReadAllText(sourcePath);
+            return WriteIni(manifest, iniPath, text, version);
+        }
+        catch (Exception ex)
+        {
+            return (false, $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 校验并写入 INI。写之前先把现有文件备份进事务目录 —— 计划书 5.4 要求可回滚。
+    /// </summary>
+    private static (bool Ok, string Message) WriteIni(
+        RdpTransactionManifest manifest,
+        string iniPath,
+        string content,
+        string version)
+    {
+        try
+        {
+            if (version.Length > 0 && !content.Contains($"[{version}]", StringComparison.Ordinal))
+            {
+                return (false, $"这份 INI 里没有 [{version}] 段，换上去也不会生效。");
+            }
+
+            if (manifest.IniBackup.Length == 0 && File.Exists(iniPath))
+            {
+                manifest.IniSourcePath = iniPath;
+                manifest.IniBackup = RdpTransactionStore.BackupIni(manifest.Id, iniPath);
+            }
+
+            var dir = Path.GetDirectoryName(iniPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            // 先写临时文件再替换：半截的 INI 会让服务加载失败，比没有更糟
+            var temp = iniPath + ".yomori.tmp";
+            File.WriteAllText(temp, content);
+
+            if (File.Exists(iniPath))
+            {
+                File.Replace(temp, iniPath, null);
+            }
+            else
+            {
+                File.Move(temp, iniPath);
+            }
+
+            var updated = "";
+            foreach (var line in content.Split('\n'))
+            {
+                if (line.StartsWith("Updated=", StringComparison.OrdinalIgnoreCase))
+                {
+                    updated = line.Substring(8).Trim();
+                    break;
+                }
+            }
+
+            return (true, $"已覆盖 {iniPath}（{content.Length} 字符"
+                          + (updated.Length > 0 ? $"，Updated={updated}" : "") + "）");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
     /// 跑 <c>RDPWInst.exe -w</c> 更新 INI。
     /// </summary>
     /// <remarks>
@@ -858,7 +1003,7 @@ public static class RdpUnlockService
         {
             return (false,
                 $"-w 退出码 {run.ExitCode}（该命令会去 GitHub 下载最新 INI，"
-                + "失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}");
+                + $"失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}");
         }
 
         // 成功退出不等于已更新：回读 Updated 字段（计划书 6.2）
@@ -959,6 +1104,30 @@ public static class RdpUnlockService
         // 刚装的 Wrapper：执行经核实的卸载补偿
         if (manifest.InstalledByUs)
         {
+            // 先找安装目录里的控制台工具：`RDPWInst.exe -u` 不碰 GUI。
+            // 2026-10-26 真机：补偿跑的是 RDPW_Uninstaller.exe（图形包），它会按官方 bat 的流程
+            // 拉起 RDP_CnC.exe，而那时 TermService 正在切换 —— CnC 起不来，屏幕上留下一个
+            // 「应用程序无法正常启动(0x0000142)」的报错框。用户看到的是「又崩了」，
+            // 实际上那只是补偿时顺手弹出的第三方窗口。
+            var consoleTool = FindConsoleUninstaller();
+            if (consoleTool.Length > 0)
+            {
+                var consoleRun = await RdpToolRunner
+                    .RunAsync(consoleTool, RdpToolRunner.UninstallArguments, ToolTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+
+                notes.Add($"卸载补偿（控制台工具）退出码 {consoleRun.ExitCode}"
+                          + (consoleRun.TimedOut ? "（超时）" : ""));
+                Add(steps, "compensate-uninstall", "卸载补偿", RdpStepOutcome.Ok,
+                    $"用安装目录里的 {Path.GetFileName(consoleTool)} -u 完成，不会弹出任何界面。");
+
+                var consoleSummary = string.Join("；", notes);
+                Add(steps, "compensate", "失败补偿", allOk ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, consoleSummary);
+                RdpTransactionStore.AppendStep(manifest, "补偿：" + consoleSummary);
+                RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Compensated, consoleSummary);
+                return allOk;
+            }
+
             var uninstallPath = uninstaller?.LocalPath ?? manifest.UninstallerPath;
             if (uninstallPath.Length > 0 && File.Exists(uninstallPath))
             {
@@ -994,6 +1163,32 @@ public static class RdpUnlockService
         return allOk;
     }
 
+    /// <summary>
+    /// 安装目录里的控制台卸载工具（<c>RDPWInst.exe</c>）；没有就返回空串。
+    /// </summary>
+    /// <remarks>
+    /// 与图形卸载器同源、但不带 GUI —— 补偿时用它可以完全避免 CnC 弹窗与随之而来的
+    /// 「0x0000142 无法正常启动」。
+    /// </remarks>
+    private static string FindConsoleUninstaller()
+    {
+        try
+        {
+            var dir = RdpReadOnlyDetector.Detect().InstallDirectory;
+            if (dir.Length == 0)
+            {
+                return "";
+            }
+
+            var path = Path.Combine(dir, "RDPWInst.exe");
+            return File.Exists(path) ? path : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     private static bool ManifestTouchesServiceDll(RdpTransactionManifest manifest)
     {
         foreach (var delta in manifest.Registry)
@@ -1017,10 +1212,10 @@ public static class RdpUnlockService
     /// 国内网络下它经常直接失败（退出码 5）。这时唯一的办法是手工把最新的
     /// <c>rdpwrap.ini</c> 放到安装目录 —— 比让用户去猜「为什么更新不了」有用。
     /// </remarks>
-    private static string IniManualHint(string installDir) => installDir.Length == 0
-        ? "　可以打开 https://github.com/sebaxakerhtc/rdpwrap 手动下载 rdpwrap.ini 覆盖安装目录里的同名文件后重试。"
-        : $"　可以打开 https://github.com/sebaxakerhtc/rdpwrap 手动下载 rdpwrap.ini，"
-          + $"覆盖 {Path.Combine(installDir, "rdpwrap.ini")} 后重试。";
+    private static string IniManualHint(string installDir) =>
+        "　组件已回滚到安装前状态。拿到能覆盖本机版本的 rdpwrap.ini 后，"
+        + "点「指定 INI」选中它，再点一次「解锁 RDP」即可（不会重复下载安装器）。"
+        + (installDir.Length == 0 ? "" : $"　文件也可以直接覆盖 {Path.Combine(installDir, "rdpwrap.ini")}。");
 
     /// <summary>下载失败时附在后面的出口：告诉用户「还可以手动给一个安装包」。</summary>
     private const string ManualHint =

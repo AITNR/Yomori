@@ -298,6 +298,15 @@ public sealed class RdpUnlockRequest
     /// </remarks>
     public string ManualInstallerPath { get; init; } = "";
 
+    /// <summary>
+    /// 用户手动指定的 <c>rdpwrap.ini</c>。空串表示按「自己下载 → RDPWInst -w」的顺序取。
+    /// </summary>
+    /// <remarks>
+    /// 网络拿不到上游 INI 时（RDPWInst 的下载不认代理），这是唯一能救回来的输入。
+    /// 应用前会校验它确实含当前 <c>termsrv.dll</c> 版本对应的段，不含就不写入。
+    /// </remarks>
+    public string ManualIniPath { get; init; } = "";
+
     /// <summary>是否在安装后更新 INI（<c>RDPWInst -w</c>）。</summary>
     public bool UpdateIni { get; init; } = true;
 

@@ -34,6 +34,7 @@ public static class RdpReleaseResolver
 
     public static string ReleasesPageUrl => $"https://github.com/{Owner}/{Repo}/releases";
 
+
     /// <summary>缓存有效期。1 小时：既能挡住「连点几次」把配额烧光，也仍然接近「最新正式版」。</summary>
     private static readonly TimeSpan CacheTtl = TimeSpan.FromHours(1);
 

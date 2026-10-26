@@ -28,6 +28,9 @@ public sealed partial class SettingsPage : Page
     /// <summary>用户手动指定的安装包路径；空串表示按官方发布下载。</summary>
     private string _rdpManualInstaller = "";
 
+    /// <summary>用户手动指定的 rdpwrap.ini 路径；空串表示自己下载或交给 RDPWInst -w。</summary>
+    private string _rdpManualIni = "";
+
     /// <summary>上一次修改操作的完整报告（含逐步现场）。「查看诊断」优先把它带出来。</summary>
     private string _rdpLastReport = "";
 
@@ -944,8 +947,64 @@ public sealed partial class SettingsPage : Page
         RdpBackupButton.IsEnabled = !busy && hasAnyTransaction;
         RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
         RdpPickInstallerButton.IsEnabled = !busy;
+        RdpPickIniButton.IsEnabled = !busy;
         RdpGitHubTokenSaveButton.IsEnabled = !busy;
         RdpGitHubTokenClearButton.IsEnabled = !busy;
+    }
+
+    /// <summary>
+    /// 指定本地 rdpwrap.ini：在线取不到（RDPWInst 的下载不认代理）时的唯一可控来源。
+    /// </summary>
+    /// <remarks>
+    /// 选完就地校验两件事：像不像 INI、有没有当前 termsrv 版本对应的段。
+    /// 不含那一段的文件换上去也不会生效，当场拦住比装完再报「Support 未覆盖」有用。
+    /// </remarks>
+    private async void OnRdpPickIni(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        var path = await DialogHelper.PickOpenFileAsync(("INI 文件", ".ini"));
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        string text;
+        try
+        {
+            text = File.ReadAllText(path);
+        }
+        catch (Exception ex)
+        {
+            _rdpManualIni = "";
+            SetRdpAction($"读不了这个文件：{ex.GetType().Name}: {ex.Message}");
+            return;
+        }
+
+        if (!text.Contains("Updated=", StringComparison.OrdinalIgnoreCase))
+        {
+            _rdpManualIni = "";
+            SetRdpAction($"{Path.GetFileName(path)} 不像 rdpwrap.ini（没有 Updated 字段）。");
+            return;
+        }
+
+        // 有当前 termsrv 版本就顺手对一下段名，没有版本号就只做上面的粗检
+        var version = _rdpSnapshot?.TermsrvVersion ?? "";
+        if (version.Length > 0 && !text.Contains($"[{version}]", StringComparison.Ordinal))
+        {
+            _rdpManualIni = "";
+            SetRdpAction($"{Path.GetFileName(path)} 里没有 [{version}] 段 —— "
+                         + "这个文件覆盖不到本机的系统版本，换上去也不会生效。");
+            return;
+        }
+
+        _rdpManualIni = path;
+        SetRdpAction($"已指定 INI：{Path.GetFileName(path)}（{new FileInfo(path).Length} 字节"
+                     + (version.Length > 0 ? $"，含 [{version}] 段" : "") + "）。"
+                     + "下次点「解锁 RDP」会先用它。");
     }
 
     /// <summary>
@@ -1219,6 +1278,7 @@ public sealed partial class SettingsPage : Page
         {
             AntivirusConfirmed = antivirusConfirmed,
             ManualInstallerPath = _rdpManualInstaller,
+            ManualIniPath = _rdpManualIni,
         };
         var network = UpdateNetworkSettings.FromConfig(VM.Config);
 
