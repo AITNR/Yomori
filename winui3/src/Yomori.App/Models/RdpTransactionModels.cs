@@ -180,10 +180,41 @@ public sealed class RdpTransactionManifest
     [JsonPropertyName("failure")]
     public string Failure { get; set; } = "";
 
-    /// <summary>首次基线不得被第二次操作覆盖（计划书 5.2）：还原时优先选最早的那份 Unlock 事务。</summary>
+    /// <summary>
+    /// 这份事务能不能当「还原注册表」的基线。
+    /// </summary>
+    /// <remarks>
+    /// <para>判据只看两件事：是不是解锁事务、有没有记到注册表原值。<b>不看最终状态</b>。</para>
+    /// <para>理由：快照是在任何写入<b>之前</b>记下的，事务后来走完没走完、有没有补偿，都不改变
+    /// 「这一刻注册表长什么样」这个事实。恰恰相反 —— <see cref="RdpTransactionStatus.Running"/>
+    /// （装到一半崩了/超时）那份才是用户最需要拿来还原的：那时候系统已经被改过一部分了。</para>
+    /// <para>2026-10-26 真机事故：只把 Completed/Failed/Compensated 当候选，导致唯一那份
+    /// Running 事务既挡住重装、又挡住卸载、还不能当还原基线 —— 三条路全堵死，
+    /// 用户除了手工删 <c>%ProgramData%</c> 没有任何出口。</para>
+    /// </remarks>
     public bool IsBaselineCandidate =>
-        Kind == RdpTransactionKind.Unlock
-        && Status is RdpTransactionStatus.Completed or RdpTransactionStatus.Failed or RdpTransactionStatus.Compensated;
+        Kind == RdpTransactionKind.Unlock && Registry.Count > 0;
+}
+
+/// <summary>
+/// 对一条「没走完」的事务该怎么处理的结论。纯数据，不碰磁盘。
+/// </summary>
+/// <remarks>
+/// 抽成纯函数是为了能被断言：这段判据 2026-10-26 真机把三条出路全堵死过一次
+/// （解锁拦、卸载拦、还原找不到基线），而它出错时<strong>没有任何异常</strong>，
+/// 只是界面上一句「上一次操作没有收尾」。
+/// </remarks>
+public readonly record struct RdpStaleDecision(
+    bool Blocked,
+    string BlockReason,
+    RdpTransactionStatus CloseAs,
+    string Note)
+{
+    public static RdpStaleDecision Halt(string reason) =>
+        new(true, reason, RdpTransactionStatus.Running, "");
+
+    public static RdpStaleDecision Close(RdpTransactionStatus status, string note) =>
+        new(false, "", status, note);
 }
 
 /// <summary>事务目录里的一份备份（用于界面的「历史备份」列表）。</summary>

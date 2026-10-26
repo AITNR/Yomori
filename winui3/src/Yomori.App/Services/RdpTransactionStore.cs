@@ -191,10 +191,17 @@ public static class RdpTransactionStore
     /// <para>计划书 5.2 的原意是「子进程尚在运行时禁止同时回滚和新建操作」—— 那是真风险，必须拦住。
     /// 但 2026-10-26 真机出现过另一种：安装器其实已经装成功，只是没退出，于是事务停在 Running，
     /// 用户再点一次就被「上一次操作没有收尾」挡死，而系统其实已经是好的。</para>
-    /// <para>所以这里分两档：工具还在跑 → 拦；工具不在了、且**当前状态已经就是那笔事务的目标状态** →
-    /// 自动结案（标记完成并写明原因）后继续。目标状态对不上、或者账本损坏、或者是注册表还原事务
-    /// （中途崩了看不出做到哪）→ 一律拦，交给人看诊断。</para>
+    /// <para><b>结论：遗留事务一律放行并就地结案，只有工具进程真的还在跑时才拦。</b>
+    /// 早先的实现还要求「当前状态已达成该事务的目标状态」才放行，结果是装失败一次就永久卡死：
+    /// 用户既不能重装（解锁拦）、也不能卸载（卸载也调这里）、连还原注册表都找不到基线 ——
+    /// 三条路全堵，唯一出口是手工删 <c>%ProgramData%</c>。这违背了「失败要能退出」的基本要求。</para>
+    /// <para>放行的安全性来自两件事：① 账本与快照从不删除，历史基线一直在；
+    /// ② 每一步系统变更都写账本，失败会走补偿。所以「结案」只是停止把它当未完成，不是抹掉证据。</para>
     /// </remarks>
+    /// <returns>
+    /// <c>Blocked</c> 为真时 <c>Message</c> 说明为什么不能开始；否则 <c>Message</c> 非空表示
+    /// 已经替用户结掉了一些遗留事务，调用方应把它作为一条「注意」级步骤展示出来。
+    /// </returns>
     public static (bool Blocked, string Message) ResolveStale(RdpUnlockSnapshot current)
     {
         var incomplete = RdpTransactionStore.ListIncomplete();
@@ -203,48 +210,80 @@ public static class RdpTransactionStore
             return (false, "");
         }
 
-        if (RdpToolRunner.IsToolRunning())
+        // 唯一的硬拦：安装器/卸载器进程还活着，此时任何回滚都可能与它抢文件（计划书 5.2）。
+        var toolRunning = RdpToolRunner.IsToolRunning();
+        var gate = DecideStale(RdpTransactionKind.Unlock, current, toolRunning);
+        if (gate.Blocked)
         {
-            // 真正的危险场景：安装器/卸载器进程还活着，此时任何回滚都可能与它抢文件
-            return (true, "上一次的安装器/卸载器进程还在运行。请等它自己结束（不要去结束它），然后再试。");
+            return (true, gate.BlockReason);
         }
 
-        var closed = new List<string>();
+        var notes = new List<string>();
 
         foreach (var info in incomplete)
         {
             var manifest = RdpTransactionStore.Load(info.Id);
             if (manifest is null)
             {
-                return (true, $"事务 {info.Id} 的账本读不出来（文件损坏），无法判断它做到了哪一步。");
+                // 账本读不出来也要放行：拦住用户对他没有任何帮助，而快照文件本身还在
+                notes.Add($"事务 {info.Id} 的账本读不出来（文件损坏），已忽略；快照仍在 {RootDir} 下。");
+                continue;
             }
 
-            var reachedTarget = manifest.Kind switch
+            var decision = DecideStale(manifest.Kind, current, toolRunning);
+            if (decision.Blocked)
             {
-                RdpTransactionKind.Unlock => current.WrapperState == RdpWrapperState.Installed,
-                RdpTransactionKind.Uninstall => current.WrapperState != RdpWrapperState.Installed,
-                // 还原注册表：没有明确的"目标状态"可对照，保持拦截
-                _ => false,
-            };
-
-            if (!reachedTarget)
-            {
-                return (true, $"{info.SummaryText}（id={info.Id}）没有收尾，且当前状态不是它的目标状态。"
-                              + "请点「查看诊断」确认它做到哪一步，再决定是重试还是手工清理。");
+                return (true, decision.BlockReason);
             }
 
-            RdpTransactionStore.AppendStep(manifest, "自动结案：执行被中断，但本机状态已是该事务的目标状态");
-            RdpTransactionStore.Finish(
-                manifest,
-                RdpTransactionStatus.Completed,
-                "自动结案：执行中断（超时/崩溃），但目标状态已达成");
+            RdpTransactionStore.AppendStep(manifest, "自动结案：" + decision.Note);
+            RdpTransactionStore.Finish(manifest, decision.CloseAs, decision.Note);
 
-            closed.Add($"{info.Id}（{info.KindLabel}）");
+            notes.Add($"{info.Id}（{info.KindLabel}）{decision.Note}");
         }
 
-        return closed.Count == 0
-            ? (false, "")
-            : (false, "已自动结案：" + string.Join("、", closed) + "（执行被中断，但状态已达成目标）");
+        return (false, notes.Count == 0
+            ? ""
+            : "已收尾上一次未完成的操作：" + string.Join("；", notes) + "。");
+    }
+
+    /// <summary>
+    /// 一条没走完的事务该怎么收尾 —— 纯判据，不读盘、不写盘。
+    /// </summary>
+    /// <remarks>
+    /// <para>只有一种情况允许拦截：工具进程还在跑（可能与回滚抢文件）。其余一律放行并结案。</para>
+    /// <para>目标状态是否达成只影响<strong>记成完成还是失败</strong>，不影响<strong>放不放行</strong>。
+    /// 早先的实现把这两件事混在一起，于是「装失败」= 「以后永远不能再操作」——
+    /// 2026-10-26 真机就是这样把解锁、卸载、还原三条路一起堵死的。</para>
+    /// </remarks>
+    public static RdpStaleDecision DecideStale(
+        RdpTransactionKind kind,
+        RdpUnlockSnapshot current,
+        bool toolRunning)
+    {
+        if (toolRunning)
+        {
+            return RdpStaleDecision.Halt(
+                "上一次的安装器/卸载器进程还在运行（RDPWInst.exe 或 RDPW_Installer.exe）。"
+                + "请等它自行结束；如果它明显卡住不动，重启电脑是最稳妥的办法"
+                + "（不要手工结束它 —— 它正在往系统目录写文件）。");
+        }
+
+        var reachedTarget = kind switch
+        {
+            RdpTransactionKind.Unlock => current.WrapperState == RdpWrapperState.Installed,
+            RdpTransactionKind.Uninstall => current.WrapperState != RdpWrapperState.Installed,
+            // 还原注册表：没有「目标状态」可对照，按「没有可确认的残留」结案
+            _ => true,
+        };
+
+        return reachedTarget
+            ? RdpStaleDecision.Close(
+                RdpTransactionStatus.Completed,
+                "执行被中断，但本机状态已是该事务的目标状态，记为完成")
+            : RdpStaleDecision.Close(
+                RdpTransactionStatus.Failed,
+                "执行被中断且未达成目标状态，记为失败（快照保留，可用于还原注册表）");
     }
 
     /// <summary>把 INI 备份进事务目录。返回备份文件名（不含目录）；源文件不存在返回空串。</summary>

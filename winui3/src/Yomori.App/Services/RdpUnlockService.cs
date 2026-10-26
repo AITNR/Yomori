@@ -264,8 +264,16 @@ public static class RdpUnlockService
                     if (!reached)
                     {
                         Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                            $"安装器在隐藏桌面上 {ToolTimeout.TotalSeconds:0} 秒内未完成，ServiceDll 仍未被接管。"
-                            + "事务保持未完成状态。");
+                            $"安装器在隐藏桌面上 {ToolTimeout.TotalSeconds:0} 秒内未完成，ServiceDll 仍未被接管。");
+
+                        // 有结论就落状态：进程已不再写入（我们只是不等它），没有理由留在 Running。
+                        // 留在 Running 会让下一次操作走「收尾上一次」分支，白白多一层判断。
+                        RdpTransactionStore.AppendStep(manifest, "结论：安装器未生效，事务记为失败");
+                        RdpTransactionStore.Finish(
+                            manifest,
+                            RdpTransactionStatus.Failed,
+                            "安装器在隐藏桌面上未在超时内接管 ServiceDll");
+
                         return Fail(steps, "安装器没有生效：",
                             "它的窗口开在隐藏桌面上（你看不到），可能停在某个提示上。重启电脑后再试一次；"
                             + "仍然不行请点「查看诊断」把结果发出来。", before, manifest.Id);
