@@ -1021,7 +1021,15 @@ public sealed partial class SettingsPage : Page
         }
     }
 
-    private void CopyRdpDiagnostics(string text)
+    /// <summary>
+    /// 复制诊断文本。
+    /// </summary>
+    /// <remarks>
+    /// 整段经 <see cref="PostUi"/> 走界面线程：调用点在「诊断对话框关闭之后」，
+    /// 那里可能已经在别的线程上 —— 而剪贴板与 <c>VM.AppendLog</c>（改 ObservableCollection）
+    /// 都只能在界面线程上碰。
+    /// </remarks>
+    private void CopyRdpDiagnostics(string text) => PostUi(() =>
     {
         try
         {
@@ -1037,7 +1045,7 @@ public sealed partial class SettingsPage : Page
             // 剪贴板被别的进程独占时 SetContent 会抛 —— 这条路径是 async void 的上游，绝不能放出去
             SetRdpAction($"复制失败：{ex.GetType().Name}: {ex.Message}");
         }
-    }
+    });
 
     /// <summary>
     /// 打不开就直说。教程只在用户点的时候才开浏览器（计划书 3.4）。
@@ -1054,12 +1062,6 @@ public sealed partial class SettingsPage : Page
 
         SetRdpAction($"打不开浏览器，请手动访问：{url}");
         _ = DialogHelper.ShowMessageAsync("打不开浏览器", $"请手动访问：{Environment.NewLine}{url}");
-    }
-
-    private void SetRdpAction(string text)
-    {
-        RdpProbeActionText.Text = text;
-        RdpProbeActionText.Visibility = Visibility.Visible;
     }
 
     private static string Dash(string text) => string.IsNullOrWhiteSpace(text) ? "—" : text;
@@ -1083,9 +1085,11 @@ public sealed partial class SettingsPage : Page
 
         await EnsureRdpSnapshotAsync();
 
+        // 对话框必须在界面线程上创建（见 RunOnUiAsync 的说明），而这里已经在 await 之后
+        var queue = DispatcherQueue;
         var needDownload = _rdpSnapshot?.WrapperState != RdpWrapperState.Installed;
 
-        if (!await ConfirmUnlockRiskAsync(needDownload))
+        if (!await RunOnUiAsync(queue, () => ConfirmUnlockRiskAsync(needDownload)))
         {
             return;
         }
@@ -1093,7 +1097,7 @@ public sealed partial class SettingsPage : Page
         var antivirusConfirmed = false;
         if (needDownload)
         {
-            if (!await ConfirmAntivirusAsync())
+            if (!await RunOnUiAsync(queue, ConfirmAntivirusAsync))
             {
                 SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
                 return;
@@ -1199,7 +1203,7 @@ public sealed partial class SettingsPage : Page
         var antivirusConfirmed = false;
         if (!hasLocalTool)
         {
-            if (!await ConfirmAntivirusAsync())
+            if (!await RunOnUiAsync(DispatcherQueue, ConfirmAntivirusAsync))
             {
                 SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
                 return;
@@ -1289,13 +1293,13 @@ public sealed partial class SettingsPage : Page
             return;
         }
 
-        var confirmed = await DialogHelper.ShowMessageAsync(
+        var confirmed = await RunOnUiAsync(DispatcherQueue, () => DialogHelper.ShowMessageAsync(
             "还原注册表",
             $"将按 {selected.SummaryText} 恢复注册表。"
             + Environment.NewLine + Environment.NewLine
             + "这不会卸载解锁组件，也不会动 Windows 用户与通道凭据。",
             closeText: "取消",
-            primaryText: "确认还原");
+            primaryText: "确认还原"));
 
         if (confirmed != ContentDialogResult.Primary)
         {
@@ -1409,9 +1413,16 @@ public sealed partial class SettingsPage : Page
     /// 跑一次修改操作并渲染结果。
     /// </summary>
     /// <remarks>
-    /// 进度对象在 UI 线程上构造，所以 <see cref="Progress{T}"/> 的回调会回到 UI 线程 ——
-    /// 但结果渲染仍然走 <see cref="RunOnUi"/>：这个工程里"await 之后还在 UI 线程"
-    /// 已经被证明不能靠假设（见 OnCheckUpdate 的注释）。
+    /// <para>⛔ 这里**不能**用 <see cref="Progress{T}"/>。它把回调交给构造时捕获的
+    /// <see cref="System.Threading.SynchronizationContext"/>，而 WinUI 3 的界面线程上
+    /// <c>SynchronizationContext.Current</c> 是 <c>null</c> —— 于是 <c>Progress</c> 退回线程池：
+    /// 回调在后台线程直接写 <c>TextBlock.Text</c>，抛 COMException 0x8001010E（RPC_E_WRONG_THREAD），
+    /// 而这条回调没人接异常 → 未观察异常 → <b>直接掀进程</b>。</para>
+    /// <para>2026-10-26 真机实测：点「确定并开始下载」后立刻崩，栈就是
+    /// <c>Progress`1.InvokeHandlers → TextBlock.set_Text → SettingsPage.RunRdpOperationAsync</c>，
+    /// 而且一次连崩两个线程（两次进度回调同时在飞）。</para>
+    /// <para>所以进度一律走 <see cref="DispatcherProgress{T}"/>：显式投递到 DispatcherQueue 并吞掉异常；
+    /// 本方法开头那几行 UI 赋值同样不假设自己在界面线程上。</para>
     /// </remarks>
     private async Task RunRdpOperationAsync(
         string title,
@@ -1424,10 +1435,14 @@ public sealed partial class SettingsPage : Page
 
         var queue = DispatcherQueue;
         _rdpBusy = true;
-        SetRdpBusy(true);
-        RdpResultBar.IsOpen = false;
 
-        var progress = new Progress<RdpProgressInfo>(info =>
+        RunOnUi(queue, () =>
+        {
+            SetRdpBusy(true);
+            RdpResultBar.IsOpen = false;
+        });
+
+        var progress = new DispatcherProgress<RdpProgressInfo>(queue, info =>
         {
             if (_unloaded)
             {
@@ -1534,6 +1549,127 @@ public sealed partial class SettingsPage : Page
         });
 
         return panel;
+    }
+
+    /// <summary>
+    /// 把一行操作反馈写到本页。
+    /// </summary>
+    /// <remarks>
+    /// 调用点散落在多个 await 之后 —— 本工程没在界面线程上装 SynchronizationContext，
+    /// 续体可能落在**线程池**上（2026-10-26 那次崩溃就是这条链）。所以这里不假设自己在
+    /// 界面线程上，统一经 <see cref="PostUi"/> 投递。
+    /// </remarks>
+    private void SetRdpAction(string text) => PostUi(() =>
+    {
+        RdpProbeActionText.Text = text;
+        RdpProbeActionText.Visibility = Visibility.Visible;
+    });
+
+    /// <summary>
+    /// 把一个 UI 动作安全地送到界面线程。
+    /// </summary>
+    /// <remarks>
+    /// 三件事一起做：页面已卸载就丢弃；已在界面线程就地执行；否则投递。
+    /// 执行期异常一律吞掉并落 startup_error.log —— 这些调用点的上游多是 <c>async void</c>，
+    /// 放出去就是未观察异常，而"一行提示没显示出来"远不值得让进程消失。
+    /// </remarks>
+    private void PostUi(Action action)
+    {
+        if (_unloaded)
+        {
+            return;
+        }
+
+        var queue = DispatcherQueue;
+        if (queue is null || queue.HasThreadAccess)
+        {
+            SafeUiInvoke(action);
+            return;
+        }
+
+        queue.TryEnqueue(() => SafeUiInvoke(action));
+    }
+
+    /// <summary>
+    /// 在界面线程上跑一段返回 Task 的代码，并把结果带回调用方。
+    /// </summary>
+    /// <remarks>
+    /// 专给「对话框必须在界面线程上创建」用。调用点常常在某个 <c>await</c> 之后，
+    /// 而 WinUI 的 <see cref="ContentDialog"/> 从别的线程 new 出来会抛 RPC_E_WRONG_THREAD；
+    /// 更糟的是 <see cref="DialogHelper.ShowAsync"/> 会把异常吞掉并返回 <c>None</c> ——
+    /// 表现成"按钮点了没反应"，比崩溃还难查。
+    /// </remarks>
+    private static Task<T> RunOnUiAsync<T>(Microsoft.UI.Dispatching.DispatcherQueue? queue, Func<Task<T>> func)
+    {
+        if (queue is null || queue.HasThreadAccess)
+        {
+            return func();
+        }
+
+        var tcs = new TaskCompletionSource<T>();
+
+        if (!queue.TryEnqueue(async () =>
+            {
+                try
+                {
+                    tcs.TrySetResult(await func());
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+            }))
+        {
+            tcs.TrySetException(new InvalidOperationException("界面消息队列已关闭"));
+        }
+
+        return tcs.Task;
+    }
+
+    private static void SafeUiInvoke(Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            AppPaths.WriteStartupError(ex);
+        }
+    }
+
+    /// <summary>
+    /// 显式投递到 <see cref="Microsoft.UI.Dispatching.DispatcherQueue"/> 的 <see cref="IProgress{T}"/>。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么不直接用 <see cref="Progress{T}"/>（2026-10-26 血的教训）：
+    /// 它依赖构造时捕获的 <see cref="System.Threading.SynchronizationContext"/>，
+    /// 而 WinUI 3 的界面线程上它是 <c>null</c> —— <c>Progress</c> 于是退回线程池，
+    /// 回调里碰任何控件都是 RPC_E_WRONG_THREAD，而且回调没有异常接收方，一次进度更新就能掀进程。</para>
+    /// <para>为什么回调里要吞异常：进度的调用方是后台流程，它们<b>不</b>会在 Report 外面套 try。
+    /// 一条进度没画出来是可忽略的，进程消失不是。</para>
+    /// </remarks>
+    private sealed class DispatcherProgress<T> : IProgress<T>
+    {
+        private readonly Microsoft.UI.Dispatching.DispatcherQueue? _queue;
+        private readonly Action<T> _action;
+
+        public DispatcherProgress(Microsoft.UI.Dispatching.DispatcherQueue? queue, Action<T> action)
+        {
+            _queue = queue;
+            _action = action;
+        }
+
+        public void Report(T value)
+        {
+            if (_queue is null || _queue.HasThreadAccess)
+            {
+                SafeUiInvoke(() => _action(value));
+                return;
+            }
+
+            _queue.TryEnqueue(() => SafeUiInvoke(() => _action(value)));
+        }
     }
 
     /// <summary>结果条用 Warning 还是 Error：有「注意」级步骤时说明不是硬失败，别一律报红。</summary>
