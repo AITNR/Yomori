@@ -89,7 +89,57 @@ public sealed class RdpRegistryDelta
     [JsonPropertyName("note")]
     public string Note { get; set; } = "";
 
+    /// <summary>
+    /// 写入后回读到的实际值（序列化文本）。空串表示没回读或没写入。
+    /// </summary>
+    /// <remarks>
+    /// 为什么把它放进账本而不是只留在内存里：崩溃恢复时要能看出「这个值到底变成什么了」。
+    /// 只有 <see cref="Verified"/> 一个布尔时，恢复端只知道「不符」，不知道不符成了什么，
+    /// 于是既不敢覆盖也没法解释（2026-10-26 检查记录 P1）。
+    /// </remarks>
+    [JsonPropertyName("read_back")]
+    public string ReadBack { get; set; } = "";
+
     public string Label => $"{Before.KeyPath}\\{Before.Name}";
+}
+
+/// <summary>
+/// 由本程序启动的上游工具进程（安装器 / 卸载器 / RDPWInst），用于超时后判断「它还在不在写文件」。
+/// </summary>
+/// <remarks>
+/// <para>为什么必须记进账本而不是只在内存里留一个 PID：超时后进程会活过本次调用，
+/// 甚至活过本进程（用户关掉 Yomori 再开）。下一次操作要么放行、要么拦住，
+/// 只能靠账本里的记录判断 —— 按固定进程名全局扫描既会误拦同名进程，
+/// 也覆盖不到被改名的副本与子进程（2026-10-26 检查记录 P0）。</para>
+/// <para><see cref="StartTimeUtcTicks"/> 是防 PID 复用的：同一个 PID 被系统重新分配给别人时，
+/// 启动时间对不上，就不算「我们那个工具还活着」。</para>
+/// </remarks>
+public sealed class RdpToolProcessRecord
+{
+    [JsonPropertyName("pid")]
+    public int Pid { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("path")]
+    public string Path { get; set; } = "";
+
+    [JsonPropertyName("start_utc_ticks")]
+    public long StartTimeUtcTicks { get; set; }
+
+    /// <summary>
+    /// 这条记录的角色。<see cref="RoleBlocking"/> 的进程还在跑时禁止新的系统修改；
+    /// <see cref="RoleResidue"/> 只作报告（上游安装器拉起的 <c>RDP_CnC.exe</c> 会常驻）。
+    /// </summary>
+    [JsonPropertyName("role")]
+    public string Role { get; set; } = RoleBlocking;
+
+    /// <summary>会写系统文件的工具（阻塞后续操作）。</summary>
+    public const string RoleBlocking = "blocking";
+
+    /// <summary>不该拦流程、但要如实报告的残留（第三方界面进程）。</summary>
+    public const string RoleResidue = "residue";
 }
 
 /// <summary>事务种类。三件事各自独立记事务，绝不互相偷调（计划书 10）。</summary>
@@ -114,6 +164,16 @@ public enum RdpTransactionStatus
     Failed = 2,
     Compensated = 3,
     Abandoned = 4,
+
+    /// <summary>
+    /// 走了补偿，但补偿**没能证明**系统已回到安装前状态（卸载器退出码非零、或回读仍是 Wrapper）。
+    /// </summary>
+    /// <remarks>
+    /// 2026-10-26 检查记录 P1：原实现只要补偿代码跑过就记 <see cref="Compensated"/>，
+    /// 哪怕卸载器被安全软件拦下、ServiceDll 仍指向 rdpwrap.dll。界面于是显示「已补偿」，
+    /// 用户以为干净了，下一步操作踩在半截状态上。
+    /// </remarks>
+    CompensationFailed = 5,
 }
 
 /// <summary>
@@ -186,6 +246,32 @@ public sealed class RdpTransactionManifest
     [JsonPropertyName("service_touched")]
     public bool ServiceTouched { get; set; }
 
+    /// <summary>本轮由本程序启动的上游工具进程（见 <see cref="RdpToolProcessRecord"/>）。</summary>
+    [JsonPropertyName("tool_processes")]
+    public List<RdpToolProcessRecord> ToolProcesses { get; set; } = new();
+
+    /// <summary>
+    /// 事务目录的 ACL 是否已确认收紧到「只有 SYSTEM 与 Administrators 可写」。
+    /// </summary>
+    /// <remarks>
+    /// 2026-10-26 检查记录 P2：原实现调用收紧后把返回值丢掉。做不到「备份只有管理员能写」
+    /// 却照样改系统，等于把恢复材料放在一个别人能改的地方。这里记下来，
+    /// 由流程在**第一次系统修改之前**决定是否继续。
+    /// </remarks>
+    [JsonPropertyName("backup_acl_verified")]
+    public bool BackupAclVerified { get; set; }
+
+    /// <summary>
+    /// 恢复性账本写入是否失败过。为真时这次操作是「系统可能已动过、账本不完整」，
+    /// 不允许自动恢复覆盖，必须在界面上显式说明。
+    /// </summary>
+    /// <remarks>内存标记优先；能落盘时一并写进 JSON，供下次启动识别。</remarks>
+    [JsonPropertyName("ledger_incomplete")]
+    public bool LedgerIncomplete { get; set; }
+
+    [JsonPropertyName("ledger_failure")]
+    public string LedgerFailure { get; set; } = "";
+
     [JsonPropertyName("steps")]
     public List<string> Steps { get; set; } = new();
 
@@ -256,6 +342,7 @@ public sealed class RdpTransactionInfo
         RdpTransactionStatus.Completed => "已完成",
         RdpTransactionStatus.Failed => "失败",
         RdpTransactionStatus.Compensated => "已补偿",
+        RdpTransactionStatus.CompensationFailed => "补偿未完成（需人工处理）",
         RdpTransactionStatus.Abandoned => "已放弃",
         _ => "未知",
     };

@@ -82,6 +82,17 @@ public enum RdpSupportState
     /// 所以监听缺失时单独列一档：INI 覆盖了，但没生效，通常要重启电脑。
     /// </remarks>
     RuntimeNotApplied = 4,
+
+    /// <summary>
+    /// INI 静态上覆盖了当前构建号，但运行期状态读不出来（WinStation 枚举失败 / 状态值异常）。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么单列一档而不是直接报 <see cref="FullySupported"/>：枚举会话失败时我们**没有**
+    /// 运行期证据，报「通过」等于把「不知道」写成「没问题」（2026-10-26 检查记录 P2）。</para>
+    /// <para>为什么也不直接报 <see cref="Unknown"/>：INI 那份静态证据是真实存在的，
+    /// 抹掉它会让用户以为连 INI 都不对。这一档的文案必须同时写出「INI 已覆盖」和「运行期未知」。</para>
+    /// </remarks>
+    RuntimeUnknown = 5,
 }
 
 /// <summary>四项之外的补充证据：从 ServiceDll 路径推出 Wrapper 的安装位置。</summary>
@@ -179,6 +190,19 @@ public sealed class RdpUnlockSnapshot
     public string TcpDetail { get; init; } = "";
 
     // ---- Support ----
+    /// <summary>
+    /// <b>静态</b>结论：本机 rdpwrap.ini 是否覆盖当前 termsrv.dll 版本。只看文件，不看监听器。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么要和 <see cref="SupportState"/> 分开存：决定「要不要再跑一次
+    /// <c>RDPWInst -w</c>」只能依据静态事实。混进运行期监听会出两种相反的错
+    /// （2026-10-26 检查记录 P1）：监听暂时缺失 → 已覆盖的 INI 被判成「要更新」，
+    /// 白跑一次联网；监听读不出来 → 仍显示已覆盖 → 跳过更新。</para>
+    /// <para>界面仍显示合并后的 <see cref="SupportState"/>，这个字段只服务流程判据与诊断。</para>
+    /// </remarks>
+    public RdpSupportState IniState { get; init; } = RdpSupportState.Unknown;
+
+    /// <summary>静态结论 × 运行期监听合并后的展示结论。</summary>
     public RdpSupportState SupportState { get; init; } = RdpSupportState.Unknown;
 
     /// <summary>比对用的版本号：取 DLL 的**固定文件信息**（与 RDPWrap 一致）。</summary>
@@ -250,15 +274,72 @@ public sealed class RdpUnlockSnapshot
 /// 把「INI 静态覆盖」与「运行时监听」合成 Support 的最终结论。
 /// </summary>
 /// <remarks>
-/// 抽成纯函数是为了能离线断言这条规则：它是「我们显示已覆盖、RDPConf 显示 not supported」
-/// 这个矛盾的唯一出口。规则很简单 —— INI 说覆盖、但监听器没起来，就不能算通过。
+/// <para>抽成纯函数是为了能离线断言这条规则：它是「我们显示已覆盖、RDPConf 显示 not supported」
+/// 这个矛盾的唯一出口。规则很简单 —— INI 说覆盖、但拿不到运行期证据，就不能算通过。</para>
+/// <para>2026-10-26 检查记录 P2：只有「明确没有监听」才降为
+/// <see cref="RdpSupportState.RuntimeNotApplied"/>；监听**读不出来**时不能保持
+/// <see cref="RdpSupportState.FullySupported"/>（那会让精简系统/权限不足的机器显示「通过」），
+/// 而是降到 <see cref="RdpSupportState.RuntimeUnknown"/>。</para>
 /// </remarks>
 public static class RdpSupportVerdict
 {
-    public static RdpSupportState Combine(RdpSupportState iniState, RdpListenerState listener) =>
-        iniState == RdpSupportState.FullySupported && listener == RdpListenerState.Absent
-            ? RdpSupportState.RuntimeNotApplied
-            : iniState;
+    public static RdpSupportState Combine(RdpSupportState iniState, RdpListenerState listener)
+    {
+        // INI 本身没覆盖（或读不到）：运行期怎样都改变不了这个结论
+        if (iniState != RdpSupportState.FullySupported)
+        {
+            return iniState;
+        }
+
+        return listener switch
+        {
+            RdpListenerState.Listening => RdpSupportState.FullySupported,
+            RdpListenerState.Absent => RdpSupportState.RuntimeNotApplied,
+            _ => RdpSupportState.RuntimeUnknown,
+        };
+    }
+}
+
+/// <summary>
+/// 「要不要再跑一次在线更新 INI」的判据。
+/// </summary>
+/// <remarks>
+/// 只接受静态结论：运行期监听与这件事无关 —— <c>-w</c> 改的是文件内容，
+/// 监听器缺失是有没有生效的问题，不是文件缺不缺段的问题。
+/// </remarks>
+public static class RdpIniUpdatePolicy
+{
+    /// <summary>静态分析已覆盖当前构建号时，不需要联网更新。</summary>
+    public static bool NeedsOnlineUpdate(RdpSupportState iniState) =>
+        iniState != RdpSupportState.FullySupported;
+}
+
+/// <summary>
+/// 监听器判定的纯规则：名字命中 <b>且</b> 会话状态是 Listen（6）才算正在监听。
+/// </summary>
+/// <remarks>
+/// <para>2026-10-26 检查记录 P2：原实现只要在 WinStation 里找到同名条目就判「正在监听」，
+/// 完全没用已经读到的 <c>State</c>。同名但处于 Active/Disconnected 的条目会把它顶成通过。</para>
+/// <para>同名但状态不是 6 时返回 <see cref="RdpListenerState.Unknown"/> 而不是「无监听」：
+/// 条目存在这件事本身说明我们看见了一个真实存在的会话，只是它不是监听态 ——
+/// 报 Unknown 才是「看见了但看不懂」，报 Absent 会在诊断里丢掉这个线索。</para>
+/// </remarks>
+public static class RdpListenerVerdict
+{
+    /// <summary><c>WINSTATIONSTATECLASS.State_Listen</c>。</summary>
+    public const int ListenState = 6;
+
+    public static RdpListenerState Classify(bool found, int sessionState)
+    {
+        if (!found)
+        {
+            return RdpListenerState.Absent;
+        }
+
+        return sessionState == ListenState
+            ? RdpListenerState.Listening
+            : RdpListenerState.Unknown;
+    }
 }
 
 /// <summary>状态与等级的中文文案。界面与诊断详情共用，避免两处各写一套。</summary>
@@ -302,6 +383,7 @@ public static class RdpProbeText
         RdpSupportState.NotSupported => "未覆盖当前版本",
         RdpSupportState.Ambiguous => "存疑",
         RdpSupportState.RuntimeNotApplied => "INI 已覆盖 · 运行期未生效",
+        RdpSupportState.RuntimeUnknown => "INI 已覆盖 · 运行期未知",
         _ => "未知",
     };
 

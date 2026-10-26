@@ -49,10 +49,13 @@ public static class RdpReleaseResolver
     /// <remarks>
     /// <para>三层降级，为的是不在 GitHub 的匿名配额（60 次/小时）上撞墙：</para>
     /// <list type="number">
-    /// <item>本地缓存还新鲜（<see cref="CacheTtl"/> 内）→ 直接用，不发请求；</item>
+    /// <item>本地缓存还新鲜（<see cref="CacheTtl"/> 内）→ 直接用，不发请求
+    /// （<paramref name="forceRefresh"/> 为真时跳过这一层）；</item>
     /// <item>调官方接口，成功则刷新缓存；</item>
-    /// <item>接口被限流或不可用 → 过期缓存可用就用它，否则去发布页读 tag 再拼附件地址。</item>
+    /// <item>接口被限流或不可用 → 过期缓存可用就用它（标明「离线降级」），否则去发布页读 tag 再拼附件地址。</item>
     /// </list>
+    /// <para><b>要下载东西时必须传 <c>forceRefresh: true</c></b>：缓存命中意味着「可能落后于官方最新」，
+    /// 而计划书 4.1 要求每次真正需要下载时重新解析 latest（2026-10-26 检查记录 P1）。</para>
     /// <para>第三层的「拼地址」不是猜名称：<c>RDPW_Installer.exe</c> /
     /// <c>RDPW_Uninstaller.exe</c> 是上游固定的两个附件名，拼错会在下载时报 404 而不是静默装错东西。
     /// 而且这条路径拿不到大小与官方摘要，<see cref="RdpAsset.Size"/> 为 0、
@@ -60,11 +63,16 @@ public static class RdpReleaseResolver
     /// </remarks>
     public static async Task<(RdpReleaseInfo? Release, string Error)> ResolveLatestAsync(
         UpdateNetworkSettings network,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool forceRefresh = false)
     {
         // ---- 1. 新鲜缓存：连请求都不发 ----
+        // ⚠️ forceRefresh=true 时**跳过**这一层：真正要下载东西的时候，
+        // 一小时内的缓存可能已经落后于官方发布（2026-10-26 检查记录 P1）。
+        // 缓存只保留给「用户点重新检测 / 诊断」这类不下载的场合，
+        // 以及接口彻底不可用时的离线降级（下面第 2 层）。
         var cached = TryReadCache();
-        if (cached.Json.Length > 0 && cached.Age <= CacheTtl)
+        if (!forceRefresh && cached.Json.Length > 0 && cached.Age <= CacheTtl)
         {
             var (cachedRelease, cachedError) = Parse(cached.Json);
             if (cachedRelease is not null)
@@ -141,8 +149,11 @@ public static class RdpReleaseResolver
             var (staleRelease, _) = Parse(cached.Json);
             if (staleRelease is not null)
             {
+                // 离线降级必须说清楚：这不是「最新」，是「上一次解析到的」。
+                // 界面与步骤里会把它原样显示出来（2026-10-26 检查记录 P1）。
                 staleRelease.Source =
-                    $"本地缓存（{cached.Age.TotalHours:0.#} 小时前的解析，接口暂不可用：{apiFailure}）";
+                    $"离线降级：本地缓存（{cached.Age.TotalHours:0.#} 小时前的解析，"
+                    + $"官方接口暂不可用：{apiFailure}）";
                 return (staleRelease, "");
             }
         }

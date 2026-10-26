@@ -7,6 +7,24 @@ using Yomori.Models;
 namespace Yomori.Services;
 
 /// <summary>
+/// 一次「停启」的结果。
+/// </summary>
+/// <param name="CoreOk">TermService 本身是否回到了运行状态。</param>
+/// <param name="DependentsOk">本轮被连带停掉的依赖服务是否都恢复成功。</param>
+/// <param name="Message">逐条说明（含每次停/起的结果，以及失败时的恢复尝试）。</param>
+/// <param name="Touched">本轮动过的服务名，调用方要写进事务账本。</param>
+/// <remarks>
+/// 为什么把「依赖服务」单独一个标志：TermService 起来了、但 UmRdpService 没起来时，
+/// 远程桌面能用而设备重定向失效 —— 这是需要告诉用户的差别，
+/// 但它不该把「刚装好的解锁组件」整体判失败并回滚。
+/// </remarks>
+public readonly record struct RdpServiceRestartResult(
+    bool CoreOk,
+    bool DependentsOk,
+    string Message,
+    IReadOnlyList<string> Touched);
+
+/// <summary>
 /// TermService 的停止/启动/重启（属于「修改模块」，检测不走这里）。
 /// </summary>
 /// <remarks>
@@ -20,7 +38,6 @@ namespace Yomori.Services;
 public static class RdpServiceControl
 {
     public const string TermServiceName = "TermService";
-
     /// <summary>计划书 6.2 的实施初值：每段服务等待 45 秒，经 VM 实测后调整。</summary>
     public static readonly TimeSpan DefaultWait = TimeSpan.FromSeconds(45);
 
@@ -329,11 +346,17 @@ public static class RdpServiceControl
     /// 停 + 起一轮，并恢复本轮被连带停掉、原本在运行的依赖服务。
     /// </summary>
     /// <remarks>
-    /// 返回的说明会逐条列出「停过谁 / 起了谁」，因为计划书 5.4 要求
-    /// 「服务状态只还原本次改变的项」，用户要能看到到底动了什么。
+    /// <para>返回的说明会逐条列出「停过谁 / 起了谁」，因为计划书 5.4 要求
+    /// 「服务状态只还原本次改变的项」，用户要能看到到底动了什么。</para>
+    /// <para><b>中途失败也必须把已停掉的依赖服务拉回来</b>（2026-10-26 检查记录 P2）：
+    /// 原实现停依赖 → 停宿主 → 起宿主，任一环失败就直接返回，
+    /// 于是「本来在跑的 UmRdpService 被停着」没人管，用户会话/重定向随后出问题。</para>
+    /// <para><see cref="RdpServiceRestartResult.CoreOk"/> 只管 TermService 本身；
+    /// 依赖服务没恢复成功单独用 <see cref="RdpServiceRestartResult.DependentsOk"/> 表示 ——
+    /// 把它混进 CoreOk 会让「刚装好的解锁组件因为一个依赖服务被整体回滚」，
+    /// 那不是用户想要的。</para>
     /// </remarks>
-    public static (bool Ok, string Message, IReadOnlyList<string> Touched) Restart(
-        string serviceName, TimeSpan? wait = null)
+    public static RdpServiceRestartResult Restart(string serviceName, TimeSpan? wait = null)
     {
         var touched = new List<string>();
         var notes = new List<string>();
@@ -378,25 +401,57 @@ public static class RdpServiceControl
                 notes.Add($"仍被依赖服务挡着：{string.Join("、", dependents)}");
             }
 
-            return (false, string.Join("；", notes), touched);
+            // 宿主停不下去 → 我们停掉的那些依赖服务必须原样拉起来
+            notes.AddRange(RestoreDependents(stoppedDependents, wait));
+            return new RdpServiceRestartResult(false, true, string.Join("；", notes), touched);
         }
 
         var (startOk, startMessage) = Start(serviceName, wait);
         notes.Add(startMessage);
         if (!startOk)
         {
-            return (false, string.Join("；", notes), touched);
+            // 宿主起不来 → 依赖同样起不来，但**必须试一遍**：
+            // 有的依赖服务并不真依赖宿主的运行状态，能起来就该起来
+            notes.AddRange(RestoreDependents(stoppedDependents, wait));
+            return new RdpServiceRestartResult(false, true, string.Join("；", notes), touched);
         }
 
         // 依赖服务要宿主先起来才能起，所以放在 TermService 之后
+        var dependentsOk = true;
         foreach (var dependent in dependents)
         {
             var (depOk, depMessage) = Start(dependent, wait);
             notes.Add(depOk ? $"已恢复依赖服务 {dependent}" : $"依赖服务 {dependent} 恢复失败：{depMessage}");
+
+            if (!depOk)
+            {
+                dependentsOk = false;
+            }
         }
 
-        _ = stoppedDependents;
-        return (true, string.Join("；", notes), touched);
+        return new RdpServiceRestartResult(true, dependentsOk, string.Join("；", notes), touched);
+    }
+
+    /// <summary>按**逆序**把停掉的依赖服务拉回来，并逐条给出结果。</summary>
+    private static IReadOnlyList<string> RestoreDependents(IReadOnlyList<string> stopped, TimeSpan? wait)
+    {
+        var notes = new List<string>();
+
+        if (stopped.Count == 0)
+        {
+            return notes;
+        }
+
+        notes.Add("现在把刚才停掉的依赖服务拉回来");
+
+        // 逆序：停的时候按枚举顺序，起的时候反过来，尽量还原原来的启动次序
+        for (var i = stopped.Count - 1; i >= 0; i--)
+        {
+            var (ok, message) = Start(stopped[i], wait);
+            notes.Add(ok ? $"已恢复依赖服务 {stopped[i]}" : $"依赖服务 {stopped[i]} 恢复失败：{message}");
+        }
+
+        return notes;
     }
 
     /// <summary>轮询直到进入目标状态或超时。不强制杀进程（计划书 6.2：不直接强杀正在写文件的工具）。</summary>

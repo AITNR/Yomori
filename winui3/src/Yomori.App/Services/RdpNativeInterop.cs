@@ -11,13 +11,24 @@ using System.Runtime.InteropServices;
 namespace Yomori.Services
 {
     /// <summary>连接参数（ycn_rdp_params，平铺布局，与 C 端 StructLayout 对齐）。</summary>
+    /// <remarks>
+    /// <para>⚠️ 每个 <c>string</c> 字段都必须显式声明 <see cref="UnmanagedType.LPUTF8Str"/>。</para>
+    /// <para>C 侧声明是 <c>const char*</c>、注释约定 UTF-8；而 .NET 默认按**ANSI 代码页**封送
+    /// 字符串（中文系统上是 GBK）。非 ASCII 的主机名、用户名、域、密码会因此变成另一串字节，
+    /// 表现是「认证失败」而不是「编码错误」，极难查（2026-10-26 检查记录 P2）。</para>
+    /// <para>声明成 LPUTF8Str 不改变结构体大小（仍是一个指针），所以 ABI 断言不受影响。</para>
+    /// </remarks>
     [StructLayout(LayoutKind.Sequential)]
     internal struct YcnRdpParams
     {
+        [MarshalAs(UnmanagedType.LPUTF8Str)]
         public string Host;            /* "127.0.0.1" */
         public ushort Port;            /* 0 = 3389 */
+        [MarshalAs(UnmanagedType.LPUTF8Str)]
         public string Username;
+        [MarshalAs(UnmanagedType.LPUTF8Str)]
         public string Domain;          /* 可 null */
+        [MarshalAs(UnmanagedType.LPUTF8Str)]
         public string Password;        /* 来自 RdpCredentialStore.CredRead */
         public uint DesktopWidth;      /* 0 = 1280 */
         public uint DesktopHeight;     /* 0 = 720 */
@@ -29,13 +40,17 @@ namespace Yomori.Services
     }
 
     /// <summary>回调委托（命名空间级，供 interop 与消费方共用；Cdecl 必须与 C 端一致）。</summary>
+    /// <remarks>
+    /// 带 <c>string</c> 的两个回调同样要写明 UTF-8：原生层给的是 <c>const char*</c>（UTF-8），
+    /// 不声明的话中文错误详情会按 ANSI 解出来变成乱码。
+    /// </remarks>
     internal static class YcnCallbacks
     {
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnConnected(IntPtr user, int session, uint width, uint height);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnFrameReady(IntPtr user, int session, uint width, uint height, uint stride);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnDesktopResize(IntPtr user, int session, uint width, uint height);
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnDisconnected(IntPtr user, int session, int reason, string detail);
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnError(IntPtr user, int session, int code, string message);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnDisconnected(IntPtr user, int session, int reason, [MarshalAs(UnmanagedType.LPUTF8Str)] string detail);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void OnError(IntPtr user, int session, int code, [MarshalAs(UnmanagedType.LPUTF8Str)] string message);
     }
 
     /// <summary>回调表（ycn_rdp_callbacks）。全部可为 null。</summary>

@@ -84,7 +84,38 @@ public static class RdpUninstallService
                 });
             }
 
-            if (before.WrapperState != RdpWrapperState.Installed)
+            if (before.WrapperState == RdpWrapperState.ThirdParty)
+            {
+                steps.Add(new RdpStepRecord
+                {
+                    Key = "precheck",
+                    Title = "检查当前安装状态",
+                    Outcome = RdpStepOutcome.Fail,
+                    Detail = $"ServiceDll 指向 {before.ServiceDllPath}：远程桌面服务由第三方组件接管，不是 RDP Wrapper。",
+                });
+
+                return Fail(steps, "本机的远程桌面服务由第三方组件接管，本功能不处理：",
+                    "卸载只针对 RDP Wrapper（ServiceDll 指向 rdpwrap.dll）。"
+                    + "现在 ServiceDll 指向别的东西，Yomori 不会去卸别人的组件。请先确认那是谁装的。",
+                    before);
+            }
+
+            if (before.WrapperState == RdpWrapperState.Unknown)
+            {
+                steps.Add(new RdpStepRecord
+                {
+                    Key = "precheck",
+                    Title = "检查当前安装状态",
+                    Outcome = RdpStepOutcome.Fail,
+                    Detail = "读不到 ServiceDll，无法判断是否装了 RDP Wrapper。",
+                });
+
+                // 「读不出来」不等于「没装」：把它当成无需卸载会让用户以为已经干净了
+                return Fail(steps, "读不到远程桌面服务的接管状态，无法判断要不要卸载：",
+                    "请以管理员身份重新点「重新检测」；仍读不到时点「查看诊断」把结果发出来。", before);
+            }
+
+            if (before.WrapperState == RdpWrapperState.NotInstalled)
             {
                 steps.Add(new RdpStepRecord
                 {
@@ -125,6 +156,16 @@ public static class RdpUninstallService
             {
                 return Fail(steps, "无法创建事务账本，未做任何修改：",
                     $"{ex.GetType().Name}: {ex.Message}", before);
+            }
+
+            // 备份目录权限不做到达标就不动系统（与解锁流程同一条门槛，检查记录 P2）
+            if (!manifest.BackupAclVerified)
+            {
+                RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Failed, "备份目录权限未能收紧");
+                return Fail(steps, "备份目录的权限没能收紧，未做任何修改：",
+                    $"无法确认 {RdpTransactionStore.DirectoryFor(manifest.Id)} 只有管理员与 SYSTEM 可写。"
+                    + "请确认 %ProgramData%\\Yomori 的权限没被放宽，或以管理员身份重试。",
+                    before, manifest.Id);
             }
 
             foreach (var (keyPath, name) in RdpRegistryService.Whitelist)
@@ -200,23 +241,28 @@ public static class RdpUninstallService
             RdpTransactionStore.AppendStep(
                 manifest, $"卸载器（{RdpToolRunner.UninstallArguments}）退出码 {run.ExitCode}：{run.OutputTail}");
 
-            // 退出码只作参考，最终认 ServiceDll
+            // 退出码只作参考，最终认 ServiceDll；而且只有**明确回到未安装**才算卸掉了
+            // （2026-10-26 检查记录 P1：Unknown / ThirdParty 都不等于「接管已解除」）
             var after = RdpReadOnlyDetector.Detect();
-            var uninstalledNow = after.WrapperState != RdpWrapperState.Installed;
+            var uninstalledNow = after.WrapperState == RdpWrapperState.NotInstalled;
 
             if (run.TimedOut && !uninstalledNow)
             {
                 // 不杀进程、不补偿、事务保持未完成，交给下次识别（计划书 6.2）
+                var (toolRunning, toolDetail) = RdpToolRunner.DescribeRunning(run, "卸载器");
+
                 steps.Add(new RdpStepRecord
                 {
                     Key = "run",
                     Title = "运行官方卸载器",
                     Outcome = RdpStepOutcome.Fail,
-                    Detail = $"卸载器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍为 {after.ServiceDllPath}。",
+                    Detail = $"卸载器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍为 {after.ServiceDllPath}。"
+                             + (toolRunning ? $"它还在运行（{toolDetail}），结果不明。" : ""),
                 });
 
                 return Fail(steps, "卸载器超时，结果不明：",
-                    "没有强制结束卸载器。请等它自行结束后重新检测。", before, manifest.Id);
+                    "没有强制结束卸载器。请等它自行结束后重新检测；在此之前不要再点解锁或卸载。",
+                    before, manifest.Id);
             }
 
             steps.Add(new RdpStepRecord
@@ -233,7 +279,7 @@ public static class RdpUninstallService
 
             // ---- 5. 回读：只看 ServiceDll ----
             Report(progress, 5, "验证接管已解除");
-            var uninstalled = after.WrapperState != RdpWrapperState.Installed;
+            var uninstalled = after.WrapperState == RdpWrapperState.NotInstalled;
 
             // 专业版卸载后原生 RDP 仍在监听 3389，这不算失败；家庭版没有监听器也是正常的
             var listenerNote = after.Tcp3389Listening
@@ -247,15 +293,31 @@ public static class RdpUninstallService
                 Outcome = uninstalled ? RdpStepOutcome.Ok : RdpStepOutcome.Fail,
                 Detail = uninstalled
                     ? $"ServiceDll 已回到 {after.ServiceDllPath}；{listenerNote}。"
-                    : $"ServiceDll 仍指向 {after.ServiceDllPath}，卸载未生效。",
+                    : $"ServiceDll 为 {after.ServiceDllPath}"
+                      + $"（{RdpProbeText.WrapperLabel(after.WrapperState)}），不能判定接管已解除。",
             });
 
             if (!uninstalled)
             {
-                RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Failed, "卸载后 ServiceDll 仍指向 Wrapper");
-                return Fail(steps, "卸载没有生效：",
-                    "ServiceDll 仍指向 rdpwrap.dll。常见原因：文件被占用（有远程会话正在用）、"
-                    + "或安全软件拦截了卸载器。注销所有远程会话后重试；必要时重启再试。", after, manifest.Id);
+                // 「读不出来」和「第三方接管」都不能算卸载成功：它们只是「不是 rdpwrap.dll」
+                var reason = after.WrapperState switch
+                {
+                    RdpWrapperState.ThirdParty =>
+                        $"卸载器跑完了，但 ServiceDll 现在指向 {after.ServiceDllPath} —— 那是另一个组件接管，不是回到原版。"
+                        + "这不算卸载成功：Yomori 只负责卸 RDP Wrapper，接管方是别人得由别人处理。",
+                    RdpWrapperState.Unknown =>
+                        "读不到 ServiceDll，无法证明接管已解除（也不等于还装着）。"
+                        + "请以管理员身份点「重新检测」；仍读不到时把「查看诊断」的结果发出来。",
+                    _ =>
+                        "ServiceDll 仍指向 rdpwrap.dll。常见原因：文件被占用（有远程会话正在用）、"
+                        + "或安全软件拦截了卸载器。注销所有远程会话后重试；必要时重启再试。",
+                };
+
+                RdpTransactionStore.Finish(
+                    manifest,
+                    RdpTransactionStatus.Failed,
+                    "卸载后 Wrapper 状态为 " + after.WrapperState);
+                return Fail(steps, "卸载没有生效：", reason, after, manifest.Id);
             }
 
             // ---- 6. 收尾 ----
@@ -346,22 +408,32 @@ public static class RdpUninstallService
         string installDirectory,
         CancellationToken cancellationToken)
     {
+        // 先取「本项目记录的安装版本」：判断本地工具与已装组件是否配套全靠它
+        var recorded = FindRecordedUnlockRelease();
+        var recordedTag = recorded.Tag;
+        var recordedReleaseId = recorded.Id;
+
         // 0) 安装目录里的控制台工具 —— 最优解：它就是官方 install.bat 用的那个 RDPWInst.exe，
         //    跑起来没有任何窗口，不需要下载，也与当前已装版本天然同源。
         var localTool = FindLocalConsoleTool(installDirectory);
         if (localTool is not null)
         {
+            // 2026-10-26 检查记录 P2：本地工具原先无条件当成「与记录匹配」。
+            // 手工装过、目录残留或工具被替换时，这条标签就是假的 ——
+            // 文件哈希只能证明「当前文件没被改」，证不出「它与已装组件配套」。
             return new UninstallerLookup(
                 localTool,
-                FromRecord: true,
-                Detail: $"使用安装目录里的控制台工具：{localTool.LocalPath}（不会弹出任何界面）",
+                FromRecord: recorded.Found,
+                Detail: recorded.Found
+                    ? $"使用安装目录里的控制台工具：{localTool.LocalPath}"
+                      + $"（与安装事务记录的发布 {recordedTag} 同源；不会弹出任何界面）"
+                    : $"使用安装目录里的控制台工具：{localTool.LocalPath}（不会弹出任何界面）。"
+                      + "注意：本机没有 Yomori 的安装事务记录，无法证明这份工具与当前已装组件同版本；"
+                      + "如果卸载失败，请按诊断从发布页取配套版本。",
                 Error: "",
-                ReleaseId: 0,
-                ReleaseTag: "");
+                ReleaseId: recorded.Id,
+                ReleaseTag: recordedTag);
         }
-
-        var recordedTag = "";
-        var recordedReleaseId = 0L;
 
         // 1) 账本里记录过的（与当初安装用的同一份发布，天然版本匹配）
         foreach (var info in RdpTransactionStore.List())
@@ -376,9 +448,6 @@ public static class RdpUninstallService
             {
                 continue;
             }
-
-            recordedTag = manifest.ReleaseTag;
-            recordedReleaseId = manifest.ReleaseId;
 
             if (manifest.UninstallerPath.Length == 0 || !File.Exists(manifest.UninstallerPath))
             {
@@ -424,7 +493,7 @@ public static class RdpUninstallService
         }
 
         var (release, resolveError) = await RdpReleaseResolver
-            .ResolveLatestAsync(network, cancellationToken)
+            .ResolveLatestAsync(network, cancellationToken, forceRefresh: true)
             .ConfigureAwait(false);
 
         if (release is null)
@@ -505,6 +574,34 @@ public static class RdpUninstallService
 
         detail = "本机没有卸载器，需要从官方 Releases 重新下载";
         return false;
+    }
+
+    /// <summary>
+    /// 本项目记录的安装发布：最近一次带 release tag 的解锁事务。
+    /// </summary>
+    /// <remarks>
+    /// 用途只有一个 —— 给「卸载器与已装组件是否配套」提供可查的证据。
+    /// 没有记录就如实说「无法证明」，不要用「本地工具天然同源」这句话糊过去。
+    /// </remarks>
+    private static (long Id, string Tag, bool Found) FindRecordedUnlockRelease()
+    {
+        foreach (var info in RdpTransactionStore.List())
+        {
+            if (info.Kind != RdpTransactionKind.Unlock)
+            {
+                continue;
+            }
+
+            var manifest = RdpTransactionStore.Load(info.Id);
+            if (manifest is null || manifest.ReleaseTag.Length == 0)
+            {
+                continue;
+            }
+
+            return (manifest.ReleaseId, manifest.ReleaseTag, true);
+        }
+
+        return (0, "", false);
     }
 
     /// <summary>

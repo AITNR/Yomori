@@ -170,6 +170,7 @@ public static class RdpReadOnlyDetector
             Tcp3389Listening = tcp.Listening,
             TcpDetail = tcp.Detail,
             SupportState = supportState,
+            IniState = ini.State,
             TermsrvVersion = version,
             TermsrvVersionRaw = versions.Raw,
             TermsrvVersionText = string.Equals(versions.Text, version, StringComparison.OrdinalIgnoreCase)
@@ -574,6 +575,7 @@ public static class RdpReadOnlyDetector
             var size = Marshal.SizeOf<Native.SESSIONIDW>();
             var listenerId = 0;
             var listenerState = 0;
+            var listenerFound = false;
             var entries = new List<string>();
 
             for (var i = 0; i < count && i < 4096; i++)
@@ -587,21 +589,26 @@ public static class RdpReadOnlyDetector
 
                 entries.Add($"{name}({item.SessionId}/{item.State})");
 
-                if (listenerId == 0 && name.Equals(ListenerStationName, StringComparison.OrdinalIgnoreCase))
+                if (!listenerFound && name.Equals(ListenerStationName, StringComparison.OrdinalIgnoreCase))
                 {
+                    listenerFound = true;
                     listenerId = (int)item.SessionId;
                     listenerState = item.State;
                 }
             }
 
+            // 名字命中还要看状态：同名但处于 Active/Disconnected 的条目不是监听器
+            // （2026-10-26 检查记录 P2：原实现只用 listenerId > 0 就判「正在监听」）
+            var state = RdpListenerVerdict.Classify(listenerFound, listenerState);
+
+            if (listenerFound && state == RdpListenerState.Unknown)
+            {
+                errors.Add($"{ListenerStationName} 存在但会话状态是 {listenerState}"
+                           + $"（{RdpProbeText.SessionStateLabel(listenerState)}），不是 Listen，按未知处理");
+            }
+
             var summary = entries.Count == 0 ? "" : string.Join(", ", entries);
-            return new SessionProbe(
-                listenerId > 0 ? RdpListenerState.Listening : RdpListenerState.Absent,
-                listenerId,
-                listenerState,
-                (int)count,
-                summary,
-                "");
+            return new SessionProbe(state, listenerId, listenerState, (int)count, summary, "");
         }
         catch (Exception ex)
         {
@@ -1010,6 +1017,8 @@ public static class RdpReadOnlyDetector
         RdpSupportState.NotSupported => RdpProbeLevel.Fail,
         RdpSupportState.Ambiguous => RdpProbeLevel.Warn,
         RdpSupportState.RuntimeNotApplied => RdpProbeLevel.Warn,
+        // 运行期读不出来：既不能报通过（没有证据），也不能报失败（INI 那份证据是真的）
+        RdpSupportState.RuntimeUnknown => RdpProbeLevel.Unknown,
         _ => RdpProbeLevel.Unknown,
     };
 
@@ -1076,6 +1085,10 @@ public static class RdpReadOnlyDetector
             "INI 已覆盖当前构建号，但运行期没有 RDP-Tcp 监听，钩子很可能没生效。"
             + "先重启电脑（系统刚更新过时尤其如此），重启后点「重新检测」；"
             + "仍无监听再查安全软件是否拦截了 rdpwrap.dll 的加载。",
+        RdpSupportState.RuntimeUnknown =>
+            "INI 静态上覆盖了当前构建号，但运行期状态读不出来（会话枚举失败，或 RDP-Tcp 的状态不是 Listen）。"
+            + "这一项既不能说通过也不能说不通过 —— 请以管理员身份重新检测；"
+            + "仍读不出来时用 qwinsta 看一眼 rdp-tcp 那一行的状态。",
         RdpSupportState.Unknown => "读不到 INI 或版本号，无法比对 —— 这是「不知道」，不是「不支持」。",
         _ => "",
     };
@@ -1106,6 +1119,11 @@ public static class RdpReadOnlyDetector
         {
             text += "。INI 覆盖了该构建号，但运行时没有 RDP-Tcp 监听 —— "
                     + "RDPConf 的 Support level 反映的是运行期，此时它多半显示 not supported";
+        }
+        else if (state == RdpSupportState.RuntimeUnknown)
+        {
+            text += "。INI 覆盖了该构建号，但运行期状态读不出来 —— "
+                    + "这一项按「未知」呈现，不代表 RDPConf 会显示 not supported";
         }
 
         return text;

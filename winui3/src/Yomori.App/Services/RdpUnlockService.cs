@@ -94,11 +94,31 @@ public static class RdpUnlockService
                 return Fail(steps, "需要管理员权限：", "本进程不是管理员。重启程序并通过 UAC 后再试。", before);
             }
 
+            // ---- 1b. Wrapper 状态门禁 ----
+            // 只有**明确**「未安装」才允许下载安装，明确「已安装」才允许复用。
+            // ThirdParty / Unknown 一律停在诊断，不进下载与安装分支（2026-10-26 检查记录 P0）：
+            // 前者会覆盖别人的接管，后者是把「读不出来」当成「没装」。
+            if (before.WrapperState == RdpWrapperState.ThirdParty)
+            {
+                return Fail(steps, "本机的远程桌面服务已被别的组件接管，本次没有做任何修改：",
+                    $"ServiceDll 指向 {before.ServiceDllPath}（既不是原版 termsrv.dll，也不是 rdpwrap.dll）。"
+                    + "Yomori 不会自动覆盖别人的接管。请先确认那个组件是什么、由谁装的；"
+                    + "确认要换成 RDP Wrapper 之后，手工卸掉它再回来点「解锁 RDP」。", before);
+            }
+
+            if (before.WrapperState == RdpWrapperState.Unknown)
+            {
+                return Fail(steps, "读不到远程桌面服务的接管状态，本次没有做任何修改：",
+                    "无法确认本机是否已经装了解锁组件，因此既不敢安装也不敢跳过。"
+                    + "请以管理员身份重新点「重新检测」；若仍读不到，点「查看诊断」把结果发出来 ——"
+                    + "常见原因是 TermService\\Parameters 被策略限制，或该键被安全软件拦读。", before);
+            }
+
             // ---- 2 / 3 / 4：需要下载时才有这两步 ----
             RdpReleaseInfo? release = null;
             RdpDownloadedTool? installer = null;
             RdpDownloadedTool? uninstaller = null;
-            var needsDownload = before.WrapperState != RdpWrapperState.Installed;
+            var needsDownload = before.WrapperState == RdpWrapperState.NotInstalled;
 
             if (needsDownload)
             {
@@ -112,7 +132,7 @@ public static class RdpUnlockService
 
                 Report(progress, 2, "解析官方最新正式版");
                 var (resolved, resolveError) = await RdpReleaseResolver
-                    .ResolveLatestAsync(network, cancellationToken)
+                    .ResolveLatestAsync(network, cancellationToken, forceRefresh: true)
                     .ConfigureAwait(false);
 
                 if (resolved is null)
@@ -218,6 +238,17 @@ public static class RdpUnlockService
                     $"{ex.GetType().Name}: {ex.Message}（{RdpTransactionStore.RootDir}）", before);
             }
 
+            // 备份目录权限：做不到「只有 SYSTEM 与 Administrators 可写」就不动系统
+            // （2026-10-26 检查记录 P2：原实现把收紧结果丢掉，照常改系统）
+            if (!manifest.BackupAclVerified)
+            {
+                RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Failed, "备份目录权限未能收紧");
+                return Fail(steps, "备份目录的权限没能收紧，未做任何修改：",
+                    $"无法确认 {RdpTransactionStore.DirectoryFor(manifest.Id)} 只有管理员与 SYSTEM 可写，"
+                    + "所以不开始修改系统 —— 备份是恢复的唯一依据，它不能放在别人能改的位置。"
+                    + "请确认 %ProgramData%\\Yomori 的权限没被放宽，或以管理员身份重试。", before, manifest.Id);
+            }
+
             manifest.InstalledByUs = needsDownload;
             if (release is not null)
             {
@@ -291,12 +322,24 @@ public static class RdpUnlockService
                 // 上游这个「安装器」是一键图形程序：装完会照官方 install.bat 的做法把 RDP_CnC.exe
                 // 拉起来当状态窗口 —— 既挡屏幕，又让我们永远等不到"进程退出"（2026-10-26 真机）。
                 // 所以优先在隐藏桌面上启动：窗口照建，但不会出现在用户屏幕上，句柄也不继承。
-                var hidden = RdpHiddenProcess.Start(installer.LocalPath, RdpToolRunner.InstallArguments);
+                var hidden = RdpHiddenProcess.StartTracked(installer.LocalPath, RdpToolRunner.InstallArguments);
                 var run = new RdpToolRunResult(0, false, "（隐藏桌面启动，无输出）");
 
-                if (hidden.Ok)
+                if (hidden.Record is not null)
                 {
-                    RdpTransactionStore.AppendStep(manifest, $"安装器在隐藏桌面上启动，pid={hidden.ProcessId}");
+                    // 先落盘再等：超时/崩溃之后要靠这条记录判断它还在不在写系统文件。
+                    // 落不下去就不许开跑 —— 打开一个我们无法跟踪的安装器等于放弃并发保护
+                    // （2026-10-26 检查记录 P0）。
+                    manifest.ToolProcesses.Add(hidden.Record);
+                    if (!RdpTransactionStore.TrySaveCritical(manifest, out var ledgerError))
+                    {
+                        return Fail(steps, "事务账本写不进磁盘，已停止，未启动安装器：",
+                            $"{ledgerError}（{RdpTransactionStore.DirectoryFor(manifest.Id)}）。"
+                            + "账本写不下去就没法在超时或崩溃后判断安装器做到哪一步，所以不开始安装。"
+                            + "请检查磁盘空间与 %ProgramData% 权限后重试。", before, manifest.Id);
+                    }
+
+                    RdpTransactionStore.AppendStep(manifest, $"安装器在隐藏桌面上启动，pid={hidden.Record.Pid}");
 
                     var reached = await WaitUntilAsync(
                         () => RdpReadOnlyDetector.Detect().WrapperState == RdpWrapperState.Installed,
@@ -305,16 +348,37 @@ public static class RdpUnlockService
 
                     if (!reached)
                     {
-                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                            $"安装器在隐藏桌面上 {ToolTimeout.TotalSeconds:0} 秒内未完成，ServiceDll 仍未被接管。");
+                        // 关键：超时只是「我们不等了」，不代表安装器停了。
+                        // 它还在写文件时必须让事务停在 Running（结果不明），绝不能说「失败」了事。
+                        var (stillRunning, runningDetail) = RdpToolProcessTree.Check(hidden.Record);
 
-                        // 有结论就落状态：进程已不再写入（我们只是不等它），没有理由留在 Running。
-                        // 留在 Running 会让下一次操作走「收尾上一次」分支，白白多一层判断。
-                        RdpTransactionStore.AppendStep(manifest, "结论：安装器未生效，事务记为失败");
+                        if (stillRunning)
+                        {
+                            Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
+                                $"安装器 {ToolTimeout.TotalSeconds:0} 秒内没接管 ServiceDll，而且它还在运行"
+                                + $"（{runningDetail}），结果不明。");
+
+                            RdpTransactionStore.AppendStep(
+                                manifest, $"结论：安装器仍在运行（{runningDetail}），事务保持未完成");
+                            RdpTransactionStore.Save(manifest);
+
+                            return Fail(steps, "安装器还没结束，结果不明：",
+                                "它仍在运行（很可能停在隐藏桌面的某个提示上），所以现在既不能说成功也不能说失败，"
+                                + "事务保持「未完成」。不要在这个时候点解锁或卸载 —— 两边会抢同一个服务文件。"
+                                + "等它自行结束后点「重新检测」；明显卡住就重启电脑。"
+                                + "如果重启后仍挡住操作，点「查看诊断」把结果发出来。", before, manifest.Id);
+                        }
+
+                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
+                            $"安装器在隐藏桌面上 {ToolTimeout.TotalSeconds:0} 秒内未完成，ServiceDll 仍未被接管；"
+                            + "已确认它的进程树全部退出。");
+
+                        // 到这里才有结论：进程树确实退出了，系统不会再被它继续改写。
+                        RdpTransactionStore.AppendStep(manifest, "结论：安装器已退出且未生效，事务记为失败");
                         RdpTransactionStore.Finish(
                             manifest,
                             RdpTransactionStatus.Failed,
-                            "安装器在隐藏桌面上未在超时内接管 ServiceDll");
+                            "安装器在隐藏桌面上未在超时内接管 ServiceDll，进程树已退出");
 
                         return Fail(steps, "安装器没有生效：",
                             "它的窗口开在隐藏桌面上（你看不到），可能停在某个提示上。重启电脑后再试一次；"
@@ -323,6 +387,11 @@ public static class RdpUnlockService
 
                     Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok,
                         "已在隐藏桌面上完成安装 —— 那个图形安装器的窗口不会出现在你屏幕上。");
+
+                    // 上游安装器按官方 install.bat 的做法会拉起 RDP_CnC.exe 并常驻。
+                    // 这不是我们启动的，也没有开关能拒绝；如实报告，别假装它不存在
+                    // （2026-10-26 检查记录 P1）。
+                    ReportCnCResidue(manifest, steps);
                 }
                 else
                 {
@@ -343,8 +412,10 @@ public static class RdpUnlockService
                     {
                         if (run.TimedOut)
                         {
+                            var (toolRunning, toolDetail) = RdpToolRunner.DescribeRunning(run, "安装器");
                             Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                                $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍未被接管。事务保持未完成状态。");
+                                $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍未被接管。"
+                                + (toolRunning ? $"它还在运行（{toolDetail}），事务保持未完成。" : ""));
                             return Fail(steps, "安装器超时，结果不明：",
                                 "没有强制结束安装器。请等它自行结束后重新检测；若一直不结束，重启电脑后再来。",
                                 before, manifest.Id);
@@ -399,18 +470,29 @@ public static class RdpUnlockService
 
             // ---- 6. 注册表事务 ----
             Report(progress, 6, "应用注册表变更");
-            var registryOk = ApplyRegistry(manifest, steps, out var registryMessage);
+            var registry = ApplyRegistry(manifest);
 
             // 「无需修改」也算通过，但**不算改动** —— 后面决定要不要重启服务靠这个区分
             var registryChanged = manifest.Registry.Any(d => !RdpRegistryService.Matches(d.Before, d.After));
 
-            Add(steps, "registry", "注册表变更", registryOk ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, registryMessage);
+            Add(steps, "registry", "注册表变更", registry.Ok ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, registry.Message);
 
-            if (!registryOk)
+            // 账本写不进去：「系统已动过、但没留下恢复证据」。这时候再补偿就是**没有依据地**改系统，
+            // 所以直接停手，并把话说到底（2026-10-26 检查记录 P0）。
+            if (registry.LedgerError.Length > 0)
+            {
+                return Fail(steps, "系统已经改过，但事务账本写不进磁盘，已停止且未自动回滚：",
+                    $"{registry.LedgerError}（{RdpTransactionStore.DirectoryFor(manifest.Id)}）。"
+                    + "记账失败意味着无法可靠执行逆序补偿，所以这次没有自动恢复。"
+                    + "请先检查磁盘空间与 %ProgramData% 权限，再把「查看诊断」的结果发出来核对当前状态。",
+                    before, manifest.Id);
+            }
+
+            if (!registry.Ok)
             {
                 var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
                     .ConfigureAwait(false);
-                return Fail(steps, "注册表变更失败：", registryMessage, before, manifest.Id, compensated);
+                return Fail(steps, "注册表变更失败：", registry.Message, before, manifest.Id, compensated);
             }
 
             // ---- 7. 备份 INI + Update INI ----
@@ -421,6 +503,10 @@ public static class RdpUnlockService
             // 全新机器上 before 是「未知」（那时还没有 INI 文件），拿它判必然要走一次在线更新；
             // 而安装包自带一份 rdpwrap.ini，装完很可能已经覆盖当前构建 —— 白跑一趟还会因为
             // 上不了 GitHub 把整轮判死（2026-10-26 真机就是这么把刚装好的组件又卸掉的）。
+            //
+            // ⚠️ 而且只认**静态**结论（IniState）：监听器在不在是「有没有生效」的问题，
+            // 不是「文件缺不缺段」的问题。混进来会让运行态暂时不可用触发一次重复联网
+            // （2026-10-26 检查记录 P1）。
             var iniProbe = installedThisRun ? RdpReadOnlyDetector.Detect() : before;
             var iniPathNow = iniProbe.IniPath.Length > 0 ? iniProbe.IniPath : before.IniPath;
             var termsrvVersion = before.TermsrvVersion.Length > 0 ? before.TermsrvVersion : iniProbe.TermsrvVersion;
@@ -430,11 +516,11 @@ public static class RdpUnlockService
                 Report(progress, 7, "跳过 INI 更新");
                 Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped, "本轮请求没有要求更新 INI。");
             }
-            else if (iniProbe.SupportState == RdpSupportState.FullySupported)
+            else if (!RdpIniUpdatePolicy.NeedsOnlineUpdate(iniProbe.IniState))
             {
                 Report(progress, 7, "INI 已覆盖当前版本");
                 Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped,
-                    $"本机 rdpwrap.ini 已含与 termsrv.dll {termsrvVersion} 对应的补丁段，"
+                    $"本机 rdpwrap.ini 已含与 termsrv.dll {termsrvVersion} 对应的补丁段（按文件内容判定），"
                     + "无需在线更新（-w 会去 GitHub 下载 INI，断网时必然失败）。");
             }
             else
@@ -443,6 +529,19 @@ public static class RdpUnlockService
                 var acquired = await AcquireIniAsync(
                     manifest, installDir, iniPathNow, termsrvVersion,
                     request.ManualIniPath, steps, cancellationToken).ConfigureAwait(false);
+
+                if (acquired.Unknown)
+                {
+                    // 结果不明：不能当成普通「注意」继续往下重启服务。
+                    // 工具可能还在写 INI，重启后的检测与实际落盘时序会对不上（检查记录 P1）。
+                    Add(steps, "ini", "更新 INI", RdpStepOutcome.Fail, acquired.Message);
+                    RdpTransactionStore.AppendStep(manifest, "结论：INI 更新结果不明，事务保持未完成");
+                    RdpTransactionStore.Save(manifest);
+
+                    return Fail(steps, "INI 更新结果不明，流程停在这里：",
+                        acquired.Message + "　没有强制结束它，事务保持「未完成」。"
+                        + "等它自行结束后点「重新检测」；在此之前不要再点解锁或卸载。", before, manifest.Id);
+                }
 
                 if (acquired.Ok)
                 {
@@ -456,7 +555,7 @@ public static class RdpUnlockService
                     // 否则界面会劝用户去手工找文件，而他机器上已经是对的了。
                     var afterIni = RdpReadOnlyDetector.Detect();
 
-                    if (afterIni.SupportState == RdpSupportState.FullySupported)
+                    if (!RdpIniUpdatePolicy.NeedsOnlineUpdate(afterIni.IniState))
                     {
                         // 文件确实被换过 → 后面该重启服务
                         iniUpdated = true;
@@ -495,10 +594,18 @@ public static class RdpUnlockService
 
                 // 先落盘再动手：万一停到一半崩溃，账本里要已经写着「动过它」
                 manifest.ServiceTouched = true;
-                RdpTransactionStore.Save(manifest);
 
-                var (restartOk, restartMessage, touched) = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
-                foreach (var service in touched)
+                // 这条写不下去就不动服务：停启服务是有破坏性的动作（打断远程会话），
+                // 事后必须能在账本里查到「谁停过它」（2026-10-26 检查记录 P0）
+                if (!RdpTransactionStore.TrySaveCritical(manifest, out var serviceLedgerError))
+                {
+                    return Fail(steps, "事务账本写不进磁盘，已停止，没有动远程桌面服务：",
+                        $"{serviceLedgerError}（{RdpTransactionStore.DirectoryFor(manifest.Id)}）。"
+                        + "请检查磁盘空间与 %ProgramData% 权限后重试。", before, manifest.Id);
+                }
+
+                var restart = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
+                foreach (var service in restart.Touched)
                 {
                     if (!manifest.ServicesTouched.Contains(service))
                     {
@@ -506,8 +613,20 @@ public static class RdpUnlockService
                     }
                 }
 
+                var restartOk = restart.CoreOk;
+                var restartMessage = restart.Message;
+
                 RdpTransactionStore.AppendStep(manifest, "重启服务：" + restartMessage);
                 Add(steps, "service", "重启远程桌面服务", restartOk ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, restartMessage);
+
+                // 宿主起来了但依赖服务没起来：不算失败，但必须说出来（设备重定向会失效）
+                if (restartOk && !restart.DependentsOk)
+                {
+                    Add(steps, "service-dependents", "依赖服务恢复", RdpStepOutcome.Warn,
+                        "远程桌面服务已重启，但上面列出的依赖服务没能恢复。"
+                        + "受影响的是设备/驱动器重定向这类功能，远程连接本身可用；"
+                        + "重启电脑可以一次性恢复它们。");
+                }
 
                 if (!restartOk)
                 {
@@ -673,6 +792,16 @@ public static class RdpUnlockService
                     $"{ex.GetType().Name}: {ex.Message}", before);
             }
 
+            // 同解锁流程：做不到「备份只有管理员能写」就不开始改系统（检查记录 P2）
+            if (!restoreTx.BackupAclVerified)
+            {
+                RdpTransactionStore.Finish(restoreTx, RdpTransactionStatus.Failed, "备份目录权限未能收紧");
+                return Fail(steps, "备份目录的权限没能收紧，未做任何修改：",
+                    $"无法确认 {RdpTransactionStore.DirectoryFor(restoreTx.Id)} 只有管理员与 SYSTEM 可写。"
+                    + "请确认 %ProgramData%\\Yomori 的权限没被放宽，或以管理员身份重试。",
+                    before, restoreTx.Id);
+            }
+
             var restored = 0;
             var conflicts = 0;
 
@@ -737,38 +866,94 @@ public static class RdpUnlockService
 
                 restoreTx.Registry.Add(new RdpRegistryDelta
                 {
-                    Before = current, After = delta.Before, Applied = true, Verified = verified,
+                    Before = current,
+                    After = delta.Before,
+                    Applied = true,
+                    Verified = verified,
+                    ReadBack = readBack.ToDisplay(),
                 });
+
+                // 每写一项就落盘：崩溃后要能看出「恢复到哪一个值了」
+                if (!RdpTransactionStore.TrySaveCritical(restoreTx, out var restoreLedgerError))
+                {
+                    return Fail(steps, "系统已经改过，但事务账本写不进磁盘，已停止：",
+                        $"{restoreLedgerError}（{RdpTransactionStore.DirectoryFor(restoreTx.Id)}）。"
+                        + "请检查磁盘空间与 %ProgramData% 权限后重新点「还原注册表」。",
+                        before, restoreTx.Id);
+                }
             }
 
             RdpTransactionStore.AppendStep(restoreTx, $"从 {manifest.Id} 恢复 {restored} 个值，冲突 {conflicts} 个");
 
             // 需要服务重新加载时提示并按受控流程重启（计划书 5.3 第 5 条）
+            var serviceOk = true;
             if (restored > 0)
             {
                 Report(progress, 2, "重启远程桌面服务");
-                var (ok, message, _) = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
-                Add(steps, "service", "重启远程桌面服务", ok ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, message);
+                var restart = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
+                serviceOk = restart.CoreOk;
+
+                // 重启失败是**失败**，不是「注意」：注册表改完了但服务没重新加载，
+                // 用户看到的仍然是旧行为，界面却显示绿色完成（2026-10-26 检查记录 P0）。
+                Add(steps, "service", "重启远程桌面服务",
+                    serviceOk ? RdpStepOutcome.Ok : RdpStepOutcome.Fail,
+                    serviceOk ? restart.Message : restart.Message + "　改动要等服务重新启动后才生效。");
+
+                if (serviceOk && !restart.DependentsOk)
+                {
+                    Add(steps, "service-dependents", "依赖服务恢复", RdpStepOutcome.Warn,
+                        "远程桌面服务已重启，但有依赖服务没能恢复（设备/驱动器重定向可能失效）；"
+                        + "重启电脑可以一次性恢复。");
+                }
             }
 
             var final = RdpReadOnlyDetector.Detect();
-            var success = steps.TrueForAll(s => s.Outcome != RdpStepOutcome.Fail);
+            var stepFailed = steps.Exists(s => s.Outcome == RdpStepOutcome.Fail);
+
+            // 成功条件不能只看「有没有红」，还要看结果本身：没覆盖掉的冲突、
+            // 没重启成功的服务，都是「部分恢复」，不是成功（2026-10-26 检查记录 P0）。
+            var success = !stepFailed && conflicts == 0 && serviceOk;
+
+            var problems = new List<string>();
+            if (conflicts > 0)
+            {
+                problems.Add($"{conflicts} 项因第三方改动未覆盖（原值未恢复）");
+            }
+
+            if (!serviceOk)
+            {
+                problems.Add("TermService 重启失败，改动尚未生效");
+            }
+
+            if (stepFailed)
+            {
+                problems.Add("有写入或回读失败项，详见步骤");
+            }
+
+            Add(steps, "result", "恢复结果",
+                success ? RdpStepOutcome.Ok : RdpStepOutcome.Fail,
+                success
+                    ? $"已恢复 {restored} 项，没有遗留项。"
+                    : $"部分恢复：已恢复 {restored} 项；{string.Join("；", problems)}。");
 
             RdpTransactionStore.Finish(
                 restoreTx,
                 success ? RdpTransactionStatus.Completed : RdpTransactionStatus.Failed,
-                success ? "" : "部分恢复失败");
+                success ? "" : "部分恢复：" + string.Join("；", problems));
+
+            var summary = restored == 0
+                ? (conflicts > 0
+                    ? "注册表已是备份里的状态，但存在被第三方改动、因而未覆盖的项（见下方诊断）。"
+                    : "注册表已经是备份里的状态，无需恢复。")
+                : $"注册表已恢复 {restored} 项"
+                  + (conflicts > 0 ? $"，{conflicts} 项因第三方改动未覆盖" : "")
+                  + (serviceOk ? "" : "；TermService 重启失败，改动要等服务重新启动后才生效")
+                  + $"（事务 {restoreTx.Id}）。注册表已还原，Wrapper 仍安装 —— 需要彻底移除请用「卸载 RDP 解锁」。";
 
             return new RdpOperationResult
             {
                 Success = success,
-                Summary = restored == 0
-                    ? (conflicts > 0
-                        ? "注册表已是最初状态，没有需要恢复的值（存在被第三方改动的项，未覆盖）。"
-                        : "注册表已经是备份里的状态，无需恢复。")
-                    : $"注册表已恢复 {restored} 项"
-                      + (conflicts > 0 ? $"，{conflicts} 项因第三方改动未覆盖" : "")
-                      + "。注册表已还原，Wrapper 仍安装 —— 需要彻底移除请用「卸载 RDP 解锁」。",
+                Summary = summary,
                 Detail = RdpUnlockDiagnostics.FormatDetail(final),
                 Steps = steps,
                 Final = final,
@@ -779,7 +964,15 @@ public static class RdpUnlockService
 
     // ==================== 内部步骤 ====================
 
-    private static bool ApplyRegistry(RdpTransactionManifest manifest, List<RdpStepRecord> steps, out string message)
+    /// <summary>
+    /// 逐项应用注册表变更，**每一项都先落盘再写系统、写完立刻落盘回读结果**。
+    /// </summary>
+    /// <remarks>
+    /// 为什么不是「全部写完后统一保存」：进程在「值已写入、账本还没更新」之间崩溃时，
+    /// 磁盘上的账本仍然写着 <c>After == Before</c>，恢复端就完全看不出这个值被改过
+    /// （2026-10-26 检查记录 P1）。
+    /// </remarks>
+    private static RegistryApplyOutcome ApplyRegistry(RdpTransactionManifest manifest)
     {
         var notes = new List<string>();
         var allOk = true;
@@ -822,10 +1015,20 @@ public static class RdpUnlockService
                 continue;
             }
 
+            // ⚠️ 写入**之前**先把目标值落盘（2026-10-26 检查记录 P1）：
+            // 只有 Before 的账本在崩溃后无法判断「这个值到底写没写过」，
+            // 所谓「逆序补偿」也就失去了依据。
+            if (!RdpTransactionStore.TrySaveCritical(manifest, out var ledgerErrorBeforeWrite))
+            {
+                return new RegistryApplyOutcome(
+                    false, $"{delta.Label} 未写入：账本写不进磁盘", ledgerErrorBeforeWrite);
+            }
+
             var (ok, error) = RdpRegistryService.Write(target);
             if (!ok)
             {
                 allOk = false;
+                delta.Note = "写入失败：" + error;
                 notes.Add($"{delta.Label} 写入失败：{error}");
                 continue;
             }
@@ -833,6 +1036,16 @@ public static class RdpUnlockService
             var readBack = RdpRegistryService.Read(target.KeyPath, target.Name);
             delta.Verified = RdpRegistryService.Matches(target, readBack);
             delta.Applied = true;
+            delta.ReadBack = readBack.ToDisplay();
+
+            // 写入后立刻落盘「已应用 / 是否验证 / 回读到的值」
+            if (!RdpTransactionStore.TrySaveCritical(manifest, out var ledgerErrorAfterWrite))
+            {
+                return new RegistryApplyOutcome(
+                    false,
+                    $"{delta.Label} 已写入（回读 {(delta.Verified ? "相符" : "不符")}），但账本写不进磁盘",
+                    ledgerErrorAfterWrite);
+            }
 
             if (!delta.Verified)
             {
@@ -844,9 +1057,17 @@ public static class RdpUnlockService
             notes.Add($"{delta.Label} 已改为 DWORD 0（原 {delta.Before.ToDisplay()}）。");
         }
 
-        message = string.Join("；", notes);
-        return allOk;
+        // 「无需修改」的项也要把 After 落到盘上：账本要能解释本轮到底想改什么
+        if (!RdpTransactionStore.TrySaveCritical(manifest, out var ledgerErrorAtEnd))
+        {
+            return new RegistryApplyOutcome(allOk, string.Join("；", notes), ledgerErrorAtEnd);
+        }
+
+        return new RegistryApplyOutcome(allOk, string.Join("；", notes), "");
     }
+
+    /// <summary>注册表应用结果。<see cref="LedgerError"/> 非空表示账本写不进去，调用方必须停手。</summary>
+    private readonly record struct RegistryApplyOutcome(bool Ok, string Message, string LedgerError);
 
     /// <summary>
     /// 取一份能覆盖当前构建的 INI：用户指定 → <c>RDPWInst.exe -w</c>。
@@ -858,7 +1079,7 @@ public static class RdpUnlockService
     /// <para>拿不到也不让整轮失败：组件已经装好了，回滚只会让人从头再来一遍。
     /// 所以调用方把失败降成「注意」，交给最后的内置检测说清「Support 未覆盖」。</para>
     /// </remarks>
-    private static async Task<(bool Ok, string Message, bool Changed)> AcquireIniAsync(
+    private static async Task<IniAcquisition> AcquireIniAsync(
         RdpTransactionManifest manifest,
         string installDir,
         string iniPath,
@@ -869,7 +1090,7 @@ public static class RdpUnlockService
     {
         if (iniPath.Length == 0)
         {
-            return (false, "找不到 rdpwrap.ini 的位置：安装目录未知。", false);
+            return new IniAcquisition(false, "找不到 rdpwrap.ini 的位置：安装目录未知。", false, false);
         }
 
         var failures = new List<string>();
@@ -881,7 +1102,7 @@ public static class RdpUnlockService
             if (ok)
             {
                 Add(steps, "ini-manual", "使用指定的 INI", RdpStepOutcome.Ok, message);
-                return (true, message, true);
+                return new IniAcquisition(true, message, true, false);
             }
 
             failures.Add("手动指定的 INI 不可用：" + message);
@@ -895,19 +1116,25 @@ public static class RdpUnlockService
         {
             failures.Add("安装目录里没有 RDPWInst.exe —— 上游的 Release 安装器不带这个控制台工具，"
                          + "所以在这里没法在线更新 INI（CnC 的「Update ini」按钮同样会报 not found）。");
-            return (false, string.Join("；", failures), false);
+            return new IniAcquisition(false, string.Join("；", failures), false, false);
         }
 
         var update = await UpdateIniAsync(manifest, installDir, version, steps, cancellationToken)
             .ConfigureAwait(false);
         if (update.Ok)
         {
-            return (true, update.Message, true);
+            return new IniAcquisition(true, update.Message, true, false);
         }
 
         failures.Add(update.Message);
-        return (false, string.Join("；", failures), false);
+        return new IniAcquisition(false, string.Join("；", failures), false, update.Unknown);
     }
+
+    /// <summary>
+    /// 取 INI 的结果。<see cref="Unknown"/> 为真表示工具结果不明（超时且进程可能还在写文件），
+    /// 调用方必须停手，而不是当成普通「注意」继续重启服务。
+    /// </summary>
+    private readonly record struct IniAcquisition(bool Ok, string Message, bool Changed, bool Unknown);
 
     /// <summary>把一个本地 INI 文件应用到安装目录（先备份，再校验，最后原子替换）。</summary>
     private static (bool Ok, string Message) ApplyIniFile(
@@ -1007,7 +1234,7 @@ public static class RdpUnlockService
     /// 所以在受限网络下这一步失败只说明「上不了 GitHub」，不说明本机 INI 有问题。
     /// 因此调用方只在「本地 INI 确实不覆盖当前版本」时才该跑它。
     /// </remarks>
-    private static async Task<(bool Ok, string Message)> UpdateIniAsync(
+    private static async Task<(bool Ok, string Message, bool Unknown)> UpdateIniAsync(
         RdpTransactionManifest manifest,
         string installDir,
         string version,
@@ -1016,13 +1243,13 @@ public static class RdpUnlockService
     {
         if (string.IsNullOrWhiteSpace(installDir))
         {
-            return (false, "不知道安装目录，无法定位 RDPWInst.exe");
+            return (false, "不知道安装目录，无法定位 RDPWInst.exe", false);
         }
 
         var tool = Path.Combine(installDir, "RDPWInst.exe");
         if (!File.Exists(tool))
         {
-            return (false, $"安装目录里没有 RDPWInst.exe：{installDir}");
+            return (false, $"安装目录里没有 RDPWInst.exe：{installDir}", false);
         }
 
         // 更新前的 INI 再备份一次：安装器可能已经动过它
@@ -1040,14 +1267,22 @@ public static class RdpUnlockService
 
         if (run.TimedOut)
         {
-            return (false, $"-w 在 {IniTimeout.TotalSeconds:0} 秒内未结束，结果不明（未强制结束）");
+            // 超时不是「失败」，是「不知道」：工具可能还在写 INI。
+            // 这时候再往下重启服务，最终检测读到的文件与实际落盘时序对不上（检查记录 P1）。
+            var (toolRunning, toolDetail) = RdpToolRunner.DescribeRunning(run, "RDPWInst.exe");
+
+            return (false,
+                $"-w 在 {IniTimeout.TotalSeconds:0} 秒内未结束，结果不明（未强制结束）"
+                + (toolRunning ? $"；它还在运行（{toolDetail}）" : ""),
+                true);
         }
 
         if (run.ExitCode != 0)
         {
             return (false,
                 $"-w 退出码 {run.ExitCode}（该命令会去 GitHub 下载最新 INI，"
-                + $"失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}");
+                + $"失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}",
+                false);
         }
 
         // 成功退出不等于已更新：回读正文，确认它真的含当前构建的段。
@@ -1063,7 +1298,8 @@ public static class RdpUnlockService
             return (false,
                 $"-w 退出码 0，但它写进来的 INI 只有 {IniSectionCount(text)} 个段、不含 [{version}] 段 —— "
                 + "这是 RDPWInst 下载失败后回落的内置样本文件，不是最新全量 INI。"
-                + (restored ? "已把安装前那份换回来。" : ""));
+                + (restored ? "已把安装前那份换回来。" : ""),
+                false);
         }
 
         var updated = ReadIniUpdated(iniPath);
@@ -1071,7 +1307,7 @@ public static class RdpUnlockService
             $"已写入含 [{version}] 段的 INI（{IniSectionCount(text)} 个段"
             + (updated.Length > 0 ? $"，Updated={updated}" : "") + "）");
 
-        return (true, "");
+        return (true, "", false);
     }
 
     private static string ReadIniUpdated(string iniPath)
@@ -1149,11 +1385,11 @@ public static class RdpUnlockService
         if (manifest.ServiceTouched)
         {
             // 依赖服务的恢复在 Restart 内部按「本来在跑」的清单处理
-            var (serviceOk, serviceMessage, _) = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
-            if (!serviceOk)
+            var service = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
+            if (!service.CoreOk)
             {
                 allOk = false;
-                notes.Add("服务恢复：" + serviceMessage);
+                notes.Add("服务恢复：" + service.Message);
             }
         }
         else
@@ -1161,33 +1397,69 @@ public static class RdpUnlockService
             notes.Add("本轮没有动过远程桌面服务，跳过重启");
         }
 
-        // 刚装的 Wrapper：执行经核实的卸载补偿
+        // 刚装的 Wrapper：执行卸载补偿，并**回读确认**它真的不再接管
         if (manifest.InstalledByUs)
         {
-            // 先找安装目录里的控制台工具：`RDPWInst.exe -u` 不碰 GUI。
-            // 2026-10-26 真机：补偿跑的是 RDPW_Uninstaller.exe（图形包），它会按官方 bat 的流程
-            // 拉起 RDP_CnC.exe，而那时 TermService 正在切换 —— CnC 起不来，屏幕上留下一个
-            // 「应用程序无法正常启动(0x0000142)」的报错框。用户看到的是「又崩了」，
-            // 实际上那只是补偿时顺手弹出的第三方窗口。
-            var consoleTool = FindConsoleUninstaller();
-            if (consoleTool.Length > 0)
+            var (removed, removalNote) = await RunUninstallCompensationAsync(
+                manifest, uninstaller, steps, cancellationToken).ConfigureAwait(false);
+
+            notes.Add(removalNote);
+            if (!removed)
             {
-                var consoleRun = await RdpToolRunner
-                    .RunAsync(consoleTool, RdpToolRunner.UninstallArguments, ToolTimeout, cancellationToken)
-                    .ConfigureAwait(false);
-
-                notes.Add($"卸载补偿（控制台工具）退出码 {consoleRun.ExitCode}"
-                          + (consoleRun.TimedOut ? "（超时）" : ""));
-                Add(steps, "compensate-uninstall", "卸载补偿", RdpStepOutcome.Ok,
-                    $"用安装目录里的 {Path.GetFileName(consoleTool)} -u 完成，不会弹出任何界面。");
-
-                var consoleSummary = string.Join("；", notes);
-                Add(steps, "compensate", "失败补偿", allOk ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, consoleSummary);
-                RdpTransactionStore.AppendStep(manifest, "补偿：" + consoleSummary);
-                RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Compensated, consoleSummary);
-                return allOk;
+                allOk = false;
             }
+        }
 
+        var summary = notes.Count == 0 ? "无需要补偿的项" : string.Join("；", notes);
+        Add(steps, "compensate", "失败补偿", allOk ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, summary);
+
+        RdpTransactionStore.AppendStep(manifest, "补偿：" + summary);
+
+        // 补偿跑过 ≠ 补偿成功：没证明系统回到安装前状态就记 CompensationFailed，
+        // 界面上必须是「需要人工处理」而不是「已补偿」（2026-10-26 检查记录 P1）
+        RdpTransactionStore.Finish(
+            manifest,
+            allOk ? RdpTransactionStatus.Compensated : RdpTransactionStatus.CompensationFailed,
+            allOk ? summary : summary + "　补偿未完成：系统可能仍处于接管状态，请按诊断人工处理。");
+
+        return allOk;
+    }
+
+    /// <summary>
+    /// 卸载补偿：优先用安装目录里的控制台工具，其次用下载的卸载器；最后**按状态**判定是否真的解除接管。
+    /// </summary>
+    /// <remarks>
+    /// <para>先找控制台工具的原因：<c>RDPWInst.exe -u</c> 不碰 GUI。2026-10-26 真机补偿跑的是
+    /// 图形卸载器，它会按官方 bat 的流程拉起 <c>RDP_CnC.exe</c>，而那时 TermService 正在切换 ——
+    /// CnC 起不来，屏幕上留下一个「应用程序无法正常启动(0x0000142)」的报错框。</para>
+    /// <para>为什么退出码不能当结论：卸载器被安全软件拦下、或文件被远程会话占用时，
+    /// 它可能照样返回 0，而 ServiceDll 一点没变。唯一可信的判据是回读。</para>
+    /// </remarks>
+    private static async Task<(bool Removed, string Note)> RunUninstallCompensationAsync(
+        RdpTransactionManifest manifest,
+        RdpDownloadedTool? uninstaller,
+        List<RdpStepRecord> steps,
+        CancellationToken cancellationToken)
+    {
+        var notes = new List<string>();
+        var ran = false;
+
+        var consoleTool = FindConsoleUninstaller();
+        if (consoleTool.Length > 0)
+        {
+            var consoleRun = await RdpToolRunner
+                .RunAsync(consoleTool, RdpToolRunner.UninstallArguments, ToolTimeout, cancellationToken)
+                .ConfigureAwait(false);
+
+            ran = true;
+            notes.Add($"卸载补偿（控制台工具 {Path.GetFileName(consoleTool)}）退出码 {consoleRun.ExitCode}"
+                      + (consoleRun.TimedOut ? "（超时）" : ""));
+
+            Add(steps, "compensate-uninstall", "卸载补偿", RdpStepOutcome.Ok,
+                $"用安装目录里的 {Path.GetFileName(consoleTool)} -u 完成，不会弹出任何界面。");
+        }
+        else
+        {
             var uninstallPath = uninstaller?.LocalPath ?? manifest.UninstallerPath;
             if (uninstallPath.Length > 0 && File.Exists(uninstallPath))
             {
@@ -1196,7 +1468,6 @@ public static class RdpUnlockService
 
                 if (!verify.Ok)
                 {
-                    allOk = false;
                     notes.Add("卸载补偿跳过：卸载器二次核对失败（" + verify.Message + "）");
                 }
                 else
@@ -1204,23 +1475,72 @@ public static class RdpUnlockService
                     var run = await RdpToolRunner
                         .RunAsync(uninstallPath, RdpToolRunner.UninstallArguments, ToolTimeout, cancellationToken)
                         .ConfigureAwait(false);
-                    notes.Add($"卸载补偿退出码 {run.ExitCode}");
+
+                    ran = true;
+                    notes.Add($"卸载补偿（{Path.GetFileName(uninstallPath)}）退出码 {run.ExitCode}"
+                              + (run.TimedOut ? "（超时）" : ""));
                 }
             }
             else
             {
-                allOk = false;
-                notes.Add("卸载补偿不可用：找不到配套卸载器，请按诊断手工处理");
+                notes.Add("卸载补偿不可用：找不到配套卸载器");
             }
         }
 
-        var summary = notes.Count == 0 ? "无需要补偿的项" : string.Join("；", notes);
-        Add(steps, "compensate", "失败补偿", allOk ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, summary);
+        // 判据只认回读
+        var after = RdpReadOnlyDetector.Detect();
+        var removed = after.WrapperState == RdpWrapperState.NotInstalled;
 
-        RdpTransactionStore.AppendStep(manifest, "补偿：" + summary);
-        RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Compensated, summary);
+        var verdict = removed
+            ? $"回读确认：ServiceDll 已回到 {after.ServiceDllPath}，接管已解除"
+            : $"回读确认：ServiceDll 仍为 {after.ServiceDllPath}"
+              + $"（Wrapper={RdpProbeText.WrapperLabel(after.WrapperState)}），接管尚未解除";
 
-        return allOk;
+        notes.Add(verdict);
+        Add(steps, "compensate-verify", "补偿后回读", removed ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, verdict);
+
+        if (!removed && !ran)
+        {
+            notes.Add("请按诊断手工卸载，或重启电脑后再点「卸载 RDP 解锁」");
+        }
+
+        return (removed, string.Join("；", notes));
+    }
+
+    /// <summary>
+    /// 报告上游安装器拉起的 <c>RDP_CnC.exe</c> 残留。
+    /// </summary>
+    /// <remarks>
+    /// 官方 <c>install.bat</c> 最后一句就是 <c>start "" RDP_CnC.exe</c>，安装器照做了。
+    /// 隐藏桌面只让窗口不可见，不改变「它被启动了」这件事，也没有开关能拒绝
+    /// （2026-10-26 检查记录 P1）。所以我们只做两件事：如实报告，并记成 residue ——
+    /// 不写进阻塞型记录，否则一个常驻 GUI 会把以后每次解锁/卸载都拦下来。
+    /// </remarks>
+    private static void ReportCnCResidue(RdpTransactionManifest manifest, List<RdpStepRecord> steps)
+    {
+        var running = RdpToolProcessTree.FindByName("RDP_CnC");
+        if (running.Count == 0)
+        {
+            return;
+        }
+
+        var pids = new List<string>();
+        foreach (var (pid, name) in running)
+        {
+            pids.Add($"{name}(pid {pid})");
+            manifest.ToolProcesses.Add(new RdpToolProcessRecord
+            {
+                Pid = pid,
+                Name = name,
+                Role = RdpToolProcessRecord.RoleResidue,
+            });
+        }
+
+        Add(steps, "residue", "第三方界面进程仍在运行", RdpStepOutcome.Warn,
+            $"上游安装器按官方 install.bat 的做法拉起了 {string.Join("、", pids)}。"
+            + "它的窗口开在隐藏桌面上（你看不到），进程会一直留着。"
+            + "这是上游安装器的行为，Yomori 没有拒绝它的开关；不影响解锁与远程连接，"
+            + "重启电脑后它会消失。");
     }
 
     /// <summary>读文本文件；读不出来返回空串。</summary>

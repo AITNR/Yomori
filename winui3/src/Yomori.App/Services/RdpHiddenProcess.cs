@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using Yomori.Models;
 
 namespace Yomori.Services;
 
@@ -33,9 +34,23 @@ public static class RdpHiddenProcess
     /// </remarks>
     public static (bool Ok, int ProcessId, string Error) Start(string path, string arguments)
     {
+        var (record, error) = StartTracked(path, arguments);
+        return record is null ? (false, 0, error) : (true, record.Pid, "");
+    }
+
+    /// <summary>
+    /// 同 <see cref="Start"/>，但返回可写进事务账本的进程记录（PID + 启动时间）。
+    /// </summary>
+    /// <remarks>
+    /// 2026-10-26 检查记录 P0：只回一个 PID 不够 —— 调用方超时后没有任何办法判断
+    /// 「它还在不在写文件」，于是要么盲目继续、要么永远拦着用户。启动时间是为了防 PID 复用。
+    /// </remarks>
+    public static (RdpToolProcessRecord? Record, string Error) StartTracked(
+        string path, string arguments, string role = RdpToolProcessRecord.RoleBlocking)
+    {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
-            return (false, 0, $"文件不存在：{path}");
+            return (null, $"文件不存在：{path}");
         }
 
         var desktopName = "YomoriRdp-" + Guid.NewGuid().ToString("N").Substring(0, 12);
@@ -43,7 +58,7 @@ public static class RdpHiddenProcess
 
         if (desktop == IntPtr.Zero)
         {
-            return (false, 0, $"CreateDesktop 失败：Win32 {Marshal.GetLastWin32Error()}");
+            return (null, $"CreateDesktop 失败：Win32 {Marshal.GetLastWin32Error()}");
         }
 
         try
@@ -74,7 +89,7 @@ public static class RdpHiddenProcess
             {
                 var code = Marshal.GetLastWin32Error();
                 Native.CloseDesktop(desktop);
-                return (false, 0, $"CreateProcess 失败：Win32 {code}");
+                return (null, $"CreateProcess 失败：Win32 {code}");
             }
 
             Native.CloseHandle(processInfo.hThread);
@@ -82,12 +97,16 @@ public static class RdpHiddenProcess
 
             var pid = processInfo.dwProcessId;
             WatchAndCloseDesktop(pid, desktop);
-            return (true, pid, "");
+
+            var record = RdpToolProcessTree.Capture(pid, role, path);
+            return record is not null
+                ? (record, "")
+                : (new RdpToolProcessRecord { Pid = pid, Name = Path.GetFileName(path), Path = path, Role = role }, "");
         }
         catch (Exception ex)
         {
             Native.CloseDesktop(desktop);
-            return (false, 0, $"{ex.GetType().Name}: {ex.Message}");
+            return (null, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 

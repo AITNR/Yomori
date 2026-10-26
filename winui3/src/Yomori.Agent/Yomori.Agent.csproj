@@ -42,8 +42,20 @@
        那种文件不属于代理。 -->
   <ItemGroup>
     <Compile Include="..\Yomori.App\Models\**\*.cs" LinkBase="Models" />
+    <!-- Services 按「链接 + 排除」共享，排除项分两类：
+
+         ① 界面/渲染：代理不开窗，这些文件会拖进 WinUI、Direct3D、WindowsAppSDK。
+         ② RDP 解锁的**系统修改与下载链**（2026-10-26 检查记录 P2）：
+            RdpUnlockService / RdpUninstallService / RdpReleaseResolver / RdpToolDownloader /
+            RdpToolRunner / RdpHiddenProcess / RdpRegistryService / RdpServiceControl /
+            RdpTransactionStore / RdpToolProcessTree / RdpDiagnoseCli。
+
+         为什么第 ② 类必须排除：代理是「每个目标账户一份、全天常驻」的进程，
+         它只需要执行外部脚本，没有任何理由携带「改注册表 / 换 ServiceDll / 下载并运行 exe」
+         这些能力。留在编译范围里，将来一次误引用就会把高风险动作带进常驻进程；
+         而排除之后一旦有人引用，代理工程会直接 CS0246 编译失败 —— 这正是我们要的提醒。 -->
     <Compile Include="..\Yomori.App\Services\**\*.cs" LinkBase="Services"
-             Exclude="..\Yomori.App\Services\NotificationService.cs;..\Yomori.App\Services\RdpD3DRenderer.cs;..\Yomori.App\Services\SingleInstance.cs" />
+             Exclude="..\Yomori.App\Services\NotificationService.cs;..\Yomori.App\Services\RdpD3DRenderer.cs;..\Yomori.App\Services\SingleInstance.cs;..\Yomori.App\Services\RdpUnlockService.cs;..\Yomori.App\Services\RdpUninstallService.cs;..\Yomori.App\Services\RdpReleaseResolver.cs;..\Yomori.App\Services\RdpToolDownloader.cs;..\Yomori.App\Services\RdpToolRunner.cs;..\Yomori.App\Services\RdpHiddenProcess.cs;..\Yomori.App\Services\RdpRegistryService.cs;..\Yomori.App\Services\RdpServiceControl.cs;..\Yomori.App\Services\RdpTransactionStore.cs;..\Yomori.App\Services\RdpToolProcessTree.cs;..\Yomori.App\Services\RdpDiagnoseCli.cs" />
     <Compile Include="..\Yomori.App\Helpers\**\*.cs" LinkBase="Helpers"
              Exclude="..\Yomori.App\Helpers\DialogHelper.cs;..\Yomori.App\Helpers\WindowHelper.cs" />
   </ItemGroup>

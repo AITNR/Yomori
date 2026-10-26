@@ -9,7 +9,18 @@ using System.Threading.Tasks;
 namespace Yomori.Services;
 
 /// <summary>外部工具的运行结果。</summary>
-public readonly record struct RdpToolRunResult(int ExitCode, bool TimedOut, string OutputTail);
+/// <remarks>
+/// <see cref="ProcessId"/> 只在工具真的启动过之后才有值：调用方超时后要靠它
+/// （连同启动时间）判断「这个东西还在不在写文件」，而不是按固定进程名全局扫。
+/// </remarks>
+public readonly record struct RdpToolRunResult(int ExitCode, bool TimedOut, string OutputTail)
+{
+    /// <summary>工具进程 PID；0 表示没能启动或没记录。</summary>
+    public int ProcessId { get; init; }
+
+    /// <summary>工具进程的启动时间（UTC ticks）；0 表示没记录。</summary>
+    public long StartTimeUtcTicks { get; init; }
+}
 
 /// <summary>
 /// 跑上游工具（安装器 / 卸载器 / RDPWInst）的公共实现。
@@ -113,6 +124,19 @@ public static class RdpToolRunner
                 return new RdpToolRunResult(-1, false, "进程无法启动");
             }
 
+            // 记下 PID 与启动时间：超时后调用方要用它判断工具树是否还活着
+            var pid = 0;
+            var startTicks = 0L;
+            try
+            {
+                pid = process.Id;
+                startTicks = process.StartTime.ToUniversalTime().Ticks;
+            }
+            catch
+            {
+                // 读不到就留 0：调用方会退回「按进程树快照 + 名字」的判据
+            }
+
             // 立刻关掉 stdin：工具若在等按键，读到 EOF 就会返回，而不是卡满整个超时窗口
             try
             {
@@ -133,18 +157,57 @@ public static class RdpToolRunner
             {
                 await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
                 process.WaitForExit();   // 等异步输出读完
-                return new RdpToolRunResult(process.ExitCode, false, Tail(output.ToString()));
+                return new RdpToolRunResult(process.ExitCode, false, Tail(output.ToString()))
+                {
+                    ProcessId = pid,
+                    StartTimeUtcTicks = startTicks,
+                };
             }
             catch (OperationCanceledException)
             {
                 // 不 Kill：让工具自己把文件写完，调用方按"结果不明"处理
-                return new RdpToolRunResult(-1, true, Tail(output.ToString()));
+                return new RdpToolRunResult(-1, true, Tail(output.ToString()))
+                {
+                    ProcessId = pid,
+                    StartTimeUtcTicks = startTicks,
+                };
             }
         }
         catch (Exception ex)
         {
             return new RdpToolRunResult(-1, false, $"{ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 上一次工具调用超时后，那个进程（连同子进程）是否还在跑。
+    /// </summary>
+    /// <remarks>
+    /// 判据顺序：账本/结果里记下的 PID + 启动时间 → 退回按固定进程名扫一遍。
+    /// 后者只作兜底（用户可能手工跑过同名工具），所以要能说出「是按名字判的」。
+    /// </remarks>
+    public static (bool Running, string Detail) DescribeRunning(RdpToolRunResult run, string label)
+    {
+        if (run.ProcessId > 0)
+        {
+            var record = new Models.RdpToolProcessRecord
+            {
+                Pid = run.ProcessId,
+                Name = label,
+                StartTimeUtcTicks = run.StartTimeUtcTicks,
+                Role = Models.RdpToolProcessRecord.RoleBlocking,
+            };
+
+            var (alive, detail) = RdpToolProcessTree.Check(record);
+            if (alive && detail.Length > 0)
+            {
+                return (true, detail);
+            }
+        }
+
+        return IsToolRunning()
+            ? (true, $"本机还有同名的上游工具进程在跑（按进程名判定：{label}）")
+            : (false, "");
     }
 
     private static string Tail(string text)

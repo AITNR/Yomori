@@ -44,6 +44,11 @@ public static class RdpTransactionStore
         "Yomori", "rdp", "tools");
 
     /// <summary>新建一个事务并立刻落盘（状态 Running）。</summary>
+    /// <remarks>
+    /// ACL 收紧的结果记进账本而不是丢掉（2026-10-26 检查记录 P2）：
+    /// 由调用方在**第一次系统修改之前**决定要不要继续 ——
+    /// 「备份放在谁都能改的目录里」不能靠一句注释就算合规。
+    /// </remarks>
     public static RdpTransactionManifest Begin(RdpTransactionKind kind)
     {
         var manifest = new RdpTransactionManifest
@@ -56,10 +61,52 @@ public static class RdpTransactionStore
 
         var dir = DirectoryFor(manifest.Id);
         Directory.CreateDirectory(dir);
-        TryHardenDirectory(dir);
+        manifest.BackupAclVerified = TryHardenDirectory(dir);
 
         Save(manifest);
         return manifest;
+    }
+
+    /// <summary>
+    /// 恢复性写入：**失败必须让调用方知道**。
+    /// </summary>
+    /// <remarks>
+    /// <para>与 <see cref="AppendStep"/> 的差别就是「诊断日志」与「恢复证据」的差别
+    /// （2026-10-26 检查记录 P0）：追加一行说明写不进去可以忍，但「目标值已写入」
+    /// 「这一步已验证」这类信息写不进去，崩溃后就再也没人知道系统被改成了什么样。</para>
+    /// <para>失败时同时把标记打进内存里的 manifest：即使盘上一片空白，
+    /// 本次操作的结果也能如实告诉用户「系统可能已动过、账本不完整」。</para>
+    /// </remarks>
+    public static bool TrySaveCritical(RdpTransactionManifest manifest, out string error)
+    {
+        try
+        {
+            Save(manifest);
+            error = "";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"{ex.GetType().Name}: {ex.Message}";
+            MarkLedgerIncomplete(manifest, error);
+            return false;
+        }
+    }
+
+    /// <summary>在内存里记下「账本已不完整」，并尽力再写一次（可能同样失败）。</summary>
+    private static void MarkLedgerIncomplete(RdpTransactionManifest manifest, string error)
+    {
+        manifest.LedgerIncomplete = true;
+        manifest.LedgerFailure = error;
+
+        try
+        {
+            Save(manifest);
+        }
+        catch
+        {
+            // 连标记都写不下去：只能靠内存里的状态把话说给用户听
+        }
     }
 
     /// <summary>
@@ -211,11 +258,14 @@ public static class RdpTransactionStore
         }
 
         // 唯一的硬拦：安装器/卸载器进程还活着，此时任何回滚都可能与它抢文件（计划书 5.2）。
-        var toolRunning = RdpToolRunner.IsToolRunning();
+        // 判据先按**账本记过的 PID + 启动时间**走（能覆盖被改名的副本与子进程），
+        // 再退回按固定进程名扫一遍兜底（2026-10-26 检查记录 P0）。
+        var recordedAlive = AnyRecordedToolAlive(incomplete, out var recordedDetail);
+        var toolRunning = recordedAlive || RdpToolRunner.IsToolRunning();
         var gate = DecideStale(RdpTransactionKind.Unlock, current, toolRunning);
         if (gate.Blocked)
         {
-            return (true, gate.BlockReason);
+            return (true, recordedAlive ? gate.BlockReason + "　正在运行：" + recordedDetail : gate.BlockReason);
         }
 
         var notes = new List<string>();
@@ -227,6 +277,16 @@ public static class RdpTransactionStore
             {
                 // 账本读不出来也要放行：拦住用户对他没有任何帮助，而快照文件本身还在
                 notes.Add($"事务 {info.Id} 的账本读不出来（文件损坏），已忽略；快照仍在 {RootDir} 下。");
+                continue;
+            }
+
+            // 账本本身不完整（写盘失败过）：知道系统被改过，却不知道改到哪一步。
+            // 这种事务不自动恢复、也不重复拦人，只如实结案并留下原因（检查记录 P0）。
+            if (manifest.LedgerIncomplete)
+            {
+                var reason = $"账本记录不完整（{manifest.LedgerFailure}），未做任何自动恢复";
+                RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Failed, reason);
+                notes.Add($"{info.Id}（{info.KindLabel}）{reason}；系统可能已被修改过一部分，请按诊断人工核对");
                 continue;
             }
 
@@ -245,6 +305,31 @@ public static class RdpTransactionStore
         return (false, notes.Count == 0
             ? ""
             : "已收尾上一次未完成的操作：" + string.Join("；", notes) + "。");
+    }
+
+    /// <summary>
+    /// 未完成事务里记录的**阻塞型**工具进程是否还有活着的。读不出账本的一律不计（放行优先）。
+    /// </summary>
+    private static bool AnyRecordedToolAlive(IReadOnlyList<RdpTransactionInfo> incomplete, out string detail)
+    {
+        var alive = new List<string>();
+
+        foreach (var info in incomplete)
+        {
+            var manifest = RdpTransactionStore.Load(info.Id);
+            if (manifest is null)
+            {
+                continue;
+            }
+
+            if (RdpToolProcessTree.AnyBlockingAlive(manifest.ToolProcesses, out var text) && text.Length > 0)
+            {
+                alive.Add($"事务 {info.Id}：{text}");
+            }
+        }
+
+        detail = string.Join("；", alive);
+        return detail.Length > 0;
     }
 
     /// <summary>
@@ -272,7 +357,9 @@ public static class RdpTransactionStore
         var reachedTarget = kind switch
         {
             RdpTransactionKind.Unlock => current.WrapperState == RdpWrapperState.Installed,
-            RdpTransactionKind.Uninstall => current.WrapperState != RdpWrapperState.Installed,
+            // 卸载：只有**明确**回到「未安装」才算达成。Unknown/ThirdParty 都不算 ——
+            // 读不出 ServiceDll 与「已经解除接管」是两件事（2026-10-26 检查记录 P1）。
+            RdpTransactionKind.Uninstall => current.WrapperState == RdpWrapperState.NotInstalled,
             // 还原注册表：没有「目标状态」可对照，按「没有可确认的残留」结案
             _ => true,
         };
@@ -425,9 +512,12 @@ public static class RdpTransactionStore
     /// 追加一步到账本并立刻落盘。
     /// </summary>
     /// <remarks>
-    /// 这里**吞掉**写盘异常：账本是诊断记录，写到一半时磁盘满了不该把一次已经动了注册表的
+    /// <para>这里**不抛**写盘异常：账本是诊断记录，写到一半时磁盘满了不该把一次已经动了注册表的
     /// 操作中途打断 —— 那会跳过补偿，留下比"少一行日志"严重得多的后果。
-    /// 与之相对，流程开始前的 <see cref="Begin"/> 必须严格失败（备份失败不得开始系统变更）。
+    /// 与之相对，流程开始前的 <see cref="Begin"/> 必须严格失败（备份失败不得开始系统变更）。</para>
+    /// <para>但「不抛」不等于「不管」：失败会打在 manifest 上
+    /// （<see cref="RdpTransactionManifest.LedgerIncomplete"/>），由调用方在下一步系统修改之前
+    /// 用 <see cref="TrySaveCritical"/> 判定到底能不能继续（2026-10-26 检查记录 P0）。</para>
     /// </remarks>
     public static void AppendStep(RdpTransactionManifest manifest, string line)
     {
@@ -437,9 +527,10 @@ public static class RdpTransactionStore
         {
             Save(manifest);
         }
-        catch
+        catch (Exception ex)
         {
             // 见上面的说明：账本写不下去也得让流程继续，否则补偿链会被一个 IO 错误掐断
+            MarkLedgerIncomplete(manifest, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -454,9 +545,10 @@ public static class RdpTransactionStore
         {
             Save(manifest);
         }
-        catch
+        catch (Exception ex)
         {
             // 同上
+            MarkLedgerIncomplete(manifest, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -515,12 +607,15 @@ public static class RdpTransactionStore
     };
 
     /// <summary>
-    /// 目录权限收紧到「只有 SYSTEM 与 Administrators 可写」（计划书 5.2）。
+    /// 目录权限收紧到「只有 SYSTEM 与 Administrators 可写」（计划书 5.2），并**回读校验**。
     /// </summary>
     /// <remarks>
-    /// 尽力而为：ProgramData 下的子目录默认就只有管理员能写，这里把继承断掉再显式给两条规则，
-    /// 是为了防止将来有人把 Yomori 目录的 ACL 放宽之后备份跟着裸奔。
-    /// 失败不抛 —— 权限收紧失败不该阻断「先备份再改系统」这件更重要的事，但要留痕（见返回值调用方的日志）。
+    /// <para>返回值不是「SetAccessControl 有没有抛异常」，而是「这个目录现在是不是只有管理员能写」。
+    /// 两件事不一样：ProgramData 下新建的子目录本来就不继承「创建文件夹」这类写字权限，
+    /// 这时收紧动作失败也照样是安全的；反过来收紧成功也可能还有别的 Allow 规则在放权
+    /// （2026-10-26 检查记录 P2）。</para>
+    /// <para>判据只读有效的 Allow 规则：只要有任何非 SYSTEM / 非 Administrators 的主体
+    /// 拿到写入类权限，就返回 false —— 由调用方在第一次系统修改之前停下。</para>
     /// </remarks>
     public static bool TryHardenDirectory(string dir)
     {
@@ -542,10 +637,61 @@ public static class RdpTransactionStore
                 FileSystemRights.FullControl, inherit, PropagationFlags.None, AccessControlType.Allow));
 
             info.SetAccessControl(security);
+        }
+        catch
+        {
+            // 收紧动作本身失败不要紧，下面按「实际 ACL」判定
+        }
+
+        return DirectoryIsRestricted(dir);
+    }
+
+    /// <summary>只读判定：这个目录是不是「只有 SYSTEM / Administrators 能写」。</summary>
+    public static bool DirectoryIsRestricted(string dir)
+    {
+        try
+        {
+            const FileSystemRights writeLike =
+                FileSystemRights.Write
+                | FileSystemRights.WriteData
+                | FileSystemRights.AppendData
+                | FileSystemRights.Delete
+                | FileSystemRights.DeleteSubdirectoriesAndFiles
+                | FileSystemRights.ChangePermissions
+                | FileSystemRights.TakeOwnership;
+
+            var security = new DirectoryInfo(dir).GetAccessControl(AccessControlSections.Access);
+
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(
+                         includeExplicit: true, includeInherited: true, targetType: typeof(SecurityIdentifier)))
+            {
+                if (rule.AccessControlType != AccessControlType.Allow)
+                {
+                    continue;
+                }
+
+                if (rule.IdentityReference is not SecurityIdentifier sid)
+                {
+                    continue;
+                }
+
+                if (sid.IsWellKnown(WellKnownSidType.LocalSystemSid)
+                    || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid))
+                {
+                    continue;
+                }
+
+                if ((rule.FileSystemRights & writeLike) != 0)
+                {
+                    return false;
+                }
+            }
+
             return true;
         }
         catch
         {
+            // 连 ACL 都读不出来：不能证明「只有管理员能写」，按未达标处理
             return false;
         }
     }
