@@ -384,6 +384,12 @@ public static class RdpUnlockService
                 var inventory = CheckInstallFiles(installDir);
                 Add(steps, "files", "安装文件清点",
                     inventory.AllCore ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, inventory.Summary);
+
+                // 安装器会用它自带的 rdpwrap.ini 无条件覆盖现有文件，而且不问你。
+                // 2026-10-26 真机：覆盖进来的是一份 31 KB / 67 个段、段名全是 10.0.10240.x 的
+                // 残本（Updated 却写着 2026-10-07），把本来覆盖当前构建的那份顶掉了。
+                // 备份在快照那一步已经留好，这里发现「新不如旧」就换回来。
+                RestoreIniIfInstallMadeItWorse(manifest, installDir, before.TermsrvVersion, steps);
             }
             else
             {
@@ -874,7 +880,8 @@ public static class RdpUnlockService
             return (false, string.Join("；", failures), false);
         }
 
-        var update = await UpdateIniAsync(manifest, installDir, steps, cancellationToken).ConfigureAwait(false);
+        var update = await UpdateIniAsync(manifest, installDir, version, steps, cancellationToken)
+            .ConfigureAwait(false);
         if (update.Ok)
         {
             return (true, update.Message, true);
@@ -985,6 +992,7 @@ public static class RdpUnlockService
     private static async Task<(bool Ok, string Message)> UpdateIniAsync(
         RdpTransactionManifest manifest,
         string installDir,
+        string version,
         List<RdpStepRecord> steps,
         CancellationToken cancellationToken)
     {
@@ -1024,10 +1032,26 @@ public static class RdpUnlockService
                 + $"失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}");
         }
 
-        // 成功退出不等于已更新：回读 Updated 字段（计划书 6.2）
+        // 成功退出不等于已更新：回读正文，确认它真的含当前构建的段。
+        // ⚠️ `-w` 下载失败时会**静默回落到程序内置的那份 INI**，退出码仍是 0 ——
+        // 2026-10-26 真机就是这样：界面显示「-w 已完成，Updated=2026-10-07」，
+        // 而磁盘上那份只有 67 个段、全是 10.0.10240.x，当前构建根本没有。
+        var text = ReadText(iniPath);
+
+        if (!IniCovers(text, version))
+        {
+            var restored = RestoreIniIfBetter(manifest, version);
+
+            return (false,
+                $"-w 退出码 0，但它写进来的 INI 只有 {IniSectionCount(text)} 个段、不含 [{version}] 段 —— "
+                + "这是 RDPWInst 下载失败后回落的内置样本文件，不是最新全量 INI。"
+                + (restored ? "已把安装前那份换回来。" : ""));
+        }
+
         var updated = ReadIniUpdated(iniPath);
         Add(steps, "ini", "更新 INI", RdpStepOutcome.Ok,
-            updated.Length > 0 ? $"-w 已完成，本机 INI Updated={updated}" : "-w 已完成，但读不到 Updated 字段");
+            $"已写入含 [{version}] 段的 INI（{IniSectionCount(text)} 个段"
+            + (updated.Length > 0 ? $"，Updated={updated}" : "") + "）");
 
         return (true, "");
     }
@@ -1179,6 +1203,111 @@ public static class RdpUnlockService
         RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Compensated, summary);
 
         return allOk;
+    }
+
+    /// <summary>读文本文件；读不出来返回空串。</summary>
+    private static string ReadText(string path)
+    {
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path) : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    /// <summary>这份 INI 正文有没有当前构建号对应的段。</summary>
+    /// <remarks>
+    /// 判据只用「段名存在」：一份不含 <c>[10.0.26100.9549]</c> 的 INI 换上去，
+    /// 无论 Updated 写得多新都不会生效。
+    /// </remarks>
+    private static bool IniCovers(string text, string version) =>
+        text.Length > 0 && (version.Length == 0 || text.Contains($"[{version}]", StringComparison.Ordinal));
+
+    /// <summary>数一下 INI 有多少个 section —— 用来识别「内置样本文件」（几十个段）与全量文件（上千个段）。</summary>
+    private static int IniSectionCount(string text) =>
+        text.Length == 0 ? 0 : text.Split('\n').Count(line => line.TrimStart().StartsWith("[", StringComparison.Ordinal));
+
+    /// <summary>
+    /// 安装器覆盖 INI 之后，如果新的那份反而不覆盖当前构建，而备份覆盖 —— 换回备份。
+    /// </summary>
+    /// <remarks>
+    /// 安装器释放文件时是无条件的：它不管磁盘上那份是不是比自己的新、是不是已经覆盖当前构建。
+    /// 2026-10-26 真机：它把一份 31 KB / 67 个段（全是 10.0.10240.x）的残本盖上来，
+    /// Updated 还写着 2026-10-07，看起来像新的。结果本来能用的机器变成「Support 未覆盖」。
+    /// </remarks>
+    private static void RestoreIniIfInstallMadeItWorse(
+        RdpTransactionManifest manifest,
+        string installDir,
+        string version,
+        List<RdpStepRecord> steps)
+    {
+        if (installDir.Length == 0 || version.Length == 0 || manifest.IniBackup.Length == 0)
+        {
+            return;
+        }
+
+        var iniPath = Path.Combine(installDir, "rdpwrap.ini");
+        var current = ReadText(iniPath);
+
+        if (current.Length == 0 || IniCovers(current, version))
+        {
+            return;
+        }
+
+        var backup = RdpTransactionStore.ReadIniBackup(manifest);
+
+        if (IniCovers(backup, version))
+        {
+            var (ok, message) = RdpTransactionStore.RestoreIni(manifest);
+            Add(steps, "ini-restore", "恢复安装前的 INI",
+                ok ? RdpStepOutcome.Warn : RdpStepOutcome.Fail,
+                ok
+                    ? $"安装器自带的 INI 盖掉了原来的文件（新的一份只有 {IniSectionCount(current)} 个段、"
+                      + $"不含 [{version}] 段），已换回安装前那份（{IniSectionCount(backup)} 个段）。"
+                    : "安装器覆盖了 INI，且恢复备份失败：" + message);
+            return;
+        }
+
+        // 本轮备份也是残本（说明上一轮已经被盖过）：去历史事务里找一份还含该段的。
+        var older = RdpTransactionStore.FindIniBackupCovering(version);
+        if (older.Length == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            File.Copy(older, iniPath, overwrite: true);
+            Add(steps, "ini-restore", "恢复历史 INI 备份",
+                RdpStepOutcome.Warn,
+                $"安装器自带的 INI 只有 {IniSectionCount(current)} 个段、不含 [{version}] 段；"
+                + $"已从历史事务（{Path.GetFileName(Path.GetDirectoryName(older))}）里换回一份含该段的 INI。");
+        }
+        catch (Exception ex)
+        {
+            Add(steps, "ini-restore", "恢复历史 INI 备份", RdpStepOutcome.Fail,
+                $"从 {older} 复制到 {iniPath} 失败：{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>把备份换回来；成功返回 true。供 <c>-w</c> 分支复用。</summary>
+    private static bool RestoreIniIfBetter(RdpTransactionManifest manifest, string version)
+    {
+        if (manifest.IniBackup.Length == 0)
+        {
+            return false;
+        }
+
+        var backup = RdpTransactionStore.ReadIniBackup(manifest);
+        if (!IniCovers(backup, version))
+        {
+            return false;
+        }
+
+        return RdpTransactionStore.RestoreIni(manifest).Ok;
     }
 
     /// <summary>装完之后清点关键文件，并把缺了哪些说出来。</summary>

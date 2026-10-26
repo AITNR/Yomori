@@ -307,6 +307,79 @@ public static class RdpTransactionStore
     }
 
     /// <summary>
+    /// 读事务里的 INI 备份正文（只读，不改动）。空串表示没有备份或读不出来。
+    /// </summary>
+    /// <remarks>
+    /// 用途：安装器会用它自带的 INI 覆盖现有文件，覆盖之后需要判断
+    /// 「新的这份是不是比备份更差」—— 那就得把备份内容读出来比对。
+    /// </remarks>
+    public static string ReadIniBackup(RdpTransactionManifest manifest)
+    {
+        if (manifest.IniBackup.Length == 0)
+        {
+            return "";
+        }
+
+        try
+        {
+            var backup = Path.Combine(DirectoryFor(manifest.Id), Path.GetFileName(manifest.IniBackup));
+            return File.Exists(backup) ? File.ReadAllText(backup) : "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    /// <summary>
+    /// 在所有历史事务里找一份**含指定构建段**的 INI 备份，返回其完整路径（找不到返回空串）。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么要在历史事务里找：安装器会用自带的残本 INI 覆盖磁盘上那份更好的，
+    /// 而「本轮快照」备份的可能只是刚被覆盖前的那份 —— 也就是好的那份只在**上一轮**事务里。</para>
+    /// <para>2026-10-26 真机：17:45 那轮留下的好 INI 被 18:04 那轮盖成了 67 段的残本，
+    /// 于是「本轮备份」也是残本，只看本轮就救不回来。</para>
+    /// <para>按目录名倒序（目录名就是 <c>yyyyMMdd-HHmmss-xxxx</c>），取最新的一份。</para>
+    /// </remarks>
+    public static string FindIniBackupCovering(string version)
+    {
+        if (version.Length == 0 || !Directory.Exists(RootDir))
+        {
+            return "";
+        }
+
+        try
+        {
+            foreach (var dir in Directory.GetDirectories(RootDir).OrderByDescending(d => d))
+            {
+                var backup = Path.Combine(dir, IniBackupFileName);
+                if (!File.Exists(backup))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (File.ReadAllText(backup).Contains($"[{version}]", StringComparison.Ordinal))
+                    {
+                        return backup;
+                    }
+                }
+                catch
+                {
+                    // 单份读不出来不影响继续找
+                }
+            }
+        }
+        catch
+        {
+            // 目录都列不出来就当作没有
+        }
+
+        return "";
+    }
+
+    /// <summary>
     /// 把事务里的 INI 备份写回原处。返回 (是否成功, 说明)。
     /// </summary>
     public static (bool Ok, string Message) RestoreIni(RdpTransactionManifest manifest)
