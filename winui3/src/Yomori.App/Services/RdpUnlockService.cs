@@ -450,13 +450,31 @@ public static class RdpUnlockService
                 }
                 else
                 {
-                    // 不再因为取不到 INI 就把整轮判死并回滚：组件已经装好了，
-                    // 回滚等于让用户从头再下一遍、再装一遍（2026-10-26 真机就是这个后果，
-                    // 还顺带弹了个 CnC 的错）。
-                    // 取不到 INI 是「这个系统版本还没被覆盖」或「上不了 GitHub」，
-                    // 两种都不是回滚能解决的问题 —— 交给最后的内置检测如实说 Support 未覆盖。
-                    iniFailure = acquired.Message + IniManualHint(installDir);
-                    Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn, iniFailure);
+                    // 失败后必须再回读一次：取 INI 失败时我们已经尝试把好的那份换回来了
+                    // （本轮备份 / 历史事务备份）。换回来的那份如果确实覆盖当前构建，
+                    // 这一项就是**可用**的 —— 不能因为「-w 失败」就报成「INI 没能更新」，
+                    // 否则界面会劝用户去手工找文件，而他机器上已经是对的了。
+                    var afterIni = RdpReadOnlyDetector.Detect();
+
+                    if (afterIni.SupportState == RdpSupportState.FullySupported)
+                    {
+                        // 文件确实被换过 → 后面该重启服务
+                        iniUpdated = true;
+
+                        Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn,
+                            $"{acquired.Message}　已回读确认：本机 INI 现在含 [{termsrvVersion}] 段，"
+                            + "Support 可正常判定，继续后续步骤。");
+                    }
+                    else
+                    {
+                        // 不再因为取不到 INI 就把整轮判死并回滚：组件已经装好了，
+                        // 回滚等于让用户从头再下一遍、再装一遍（2026-10-26 真机就是这个后果，
+                        // 还顺带弹了个 CnC 的错）。
+                        // 取不到 INI 是「上不了 GitHub」或「这个系统版本还没被覆盖」，
+                        // 两种都不是回滚能解决的问题 —— 交给最后的内置检测如实说 Support 未覆盖。
+                        iniFailure = acquired.Message + IniManualHint(installDir);
+                        Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn, iniFailure);
+                    }
                 }
             }
 
