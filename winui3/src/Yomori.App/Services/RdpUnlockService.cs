@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -373,6 +374,10 @@ public static class RdpUnlockService
             // ---- 6. 注册表事务 ----
             Report(progress, 6, "应用注册表变更");
             var registryOk = ApplyRegistry(manifest, steps, out var registryMessage);
+
+            // 「无需修改」也算通过，但**不算改动** —— 后面决定要不要重启服务靠这个区分
+            var registryChanged = manifest.Registry.Any(d => !RdpRegistryService.Matches(d.Before, d.After));
+
             Add(steps, "registry", "注册表变更", registryOk ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, registryMessage);
 
             if (!registryOk)
@@ -383,25 +388,63 @@ public static class RdpUnlockService
             }
 
             // ---- 7. 备份 INI + Update INI ----
-            if (request.UpdateIni)
-            {
-                Report(progress, 7, "更新 INI");
-                var updateIni = await UpdateIniAsync(manifest, installDir, steps, cancellationToken).ConfigureAwait(false);
-                if (!updateIni.Ok)
-                {
-                    var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
-                        .ConfigureAwait(false);
-                    return Fail(steps, "更新 INI 失败：", updateIni.Message, before, manifest.Id, compensated);
-                }
-            }
-            else
+            var iniUpdated = false;
+
+            if (!request.UpdateIni)
             {
                 Report(progress, 7, "跳过 INI 更新");
                 Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped, "本轮请求没有要求更新 INI。");
             }
+            else if (before.SupportState == RdpSupportState.FullySupported)
+            {
+                // ⚠️ `RDPWInst.exe -w` 的真实行为是「去 GitHub 下载最新 INI」，不是重写本地文件
+                // （2026-10-26 实测输出：[*] Checking for updates... / [-] Failed to download
+                //  latest INI from GitHub.，退出码 5）。本地 INI 已经覆盖当前构建时，
+                // 这一步除了依赖外网没有任何收益 —— 断网环境下必然失败，还会连带触发补偿。
+                Report(progress, 7, "INI 已覆盖当前版本");
+                Add(steps, "ini", "更新 INI", RdpStepOutcome.Skipped,
+                    $"本机 rdpwrap.ini 已含与 termsrv.dll {before.TermsrvVersion} 对应的补丁段，"
+                    + "无需在线更新（-w 会去 GitHub 下载 INI，断网时必然失败）。");
+            }
+            else
+            {
+                Report(progress, 7, "更新 INI");
+                var updateIni = await UpdateIniAsync(manifest, installDir, steps, cancellationToken).ConfigureAwait(false);
+
+                if (!updateIni.Ok)
+                {
+                    // 失败也回读一次：工具报错、但 INI 其实已被别的途径补齐时，不该把整轮判死
+                    var afterIni = RdpReadOnlyDetector.Detect();
+
+                    if (afterIni.SupportState == RdpSupportState.FullySupported)
+                    {
+                        Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn,
+                            $"{updateIni.Message}　但本机 INI 已能覆盖当前版本，继续后续步骤。");
+                    }
+                    else
+                    {
+                        var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
+                            .ConfigureAwait(false);
+                        return Fail(steps, "更新 INI 失败：",
+                            updateIni.Message + IniManualHint(installDir), before, manifest.Id, compensated);
+                    }
+                }
+                else
+                {
+                    iniUpdated = true;
+                }
+            }
 
             // ---- 8. 显式重启 TermService ----
-            if (request.RestartService)
+            // 只有本轮**真的改过**注册表或 INI 才需要重启：什么都没改还去停一次服务，
+            // 除了打断远程会话、清掉监听以外没有任何作用。
+            if (request.RestartService && !registryChanged && !iniUpdated)
+            {
+                Report(progress, 8, "跳过服务重启");
+                Add(steps, "service", "重启远程桌面服务", RdpStepOutcome.Skipped,
+                    "本轮注册表与 INI 都没有变化，无需重启服务。");
+            }
+            else if (request.RestartService)
             {
                 Report(progress, 8, "重启远程桌面服务");
 
@@ -458,8 +501,13 @@ public static class RdpUnlockService
                     + "请重启电脑，开机后回本页点「重新检测」。");
             }
 
+            var nothingChanged = before.WrapperState == RdpWrapperState.Installed
+                                 && !registryChanged && !iniUpdated;
+
             var summary = finalOk
-                ? "成功，可以前往「设置 → 账户 → 其他用户」里添加新用户。添加完成后，在 Yomori 通道管理中保存该账户。"
+                ? nothingChanged
+                    ? "本机已经处于解锁状态，本轮没有需要改动的地方（注册表与 INI 都无需更新），服务也没有重启。"
+                    : "成功，可以前往「设置 → 账户 → 其他用户」里添加新用户。添加完成后，在 Yomori 通道管理中保存该账户。"
                 : needsReboot
                     ? "解锁组件已安装，但远程桌面监听（RDP-Tcp）还没出现，所以现在还不能远程登录。"
                       + "请重启电脑，开机后再点「重新检测」——系统刚更新过时这一条尤其常见。"
@@ -750,6 +798,21 @@ public static class RdpUnlockService
         return allOk;
     }
 
+    /// <summary>
+    /// 跑 <c>RDPWInst.exe -w</c> 更新 INI。
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ <c>-w</c> 的语义是「**去 GitHub 下载最新 INI**」，不是「按当前构建号重写本地文件」。
+    /// 2026-10-26 实测输出：
+    /// <code>
+    /// [*] Checking for updates...
+    /// [*] Current update date: 2026.10.03
+    /// [-] Failed to download latest INI from GitHub.
+    /// </code>
+    /// 退出码 5。它走 RDPWInst 自己的 WinInet，**不认本程序配置的代理**，
+    /// 所以在受限网络下这一步失败只说明「上不了 GitHub」，不说明本机 INI 有问题。
+    /// 因此调用方只在「本地 INI 确实不覆盖当前版本」时才该跑它。
+    /// </remarks>
     private static async Task<(bool Ok, string Message)> UpdateIniAsync(
         RdpTransactionManifest manifest,
         string installDir,
@@ -787,7 +850,9 @@ public static class RdpUnlockService
 
         if (run.ExitCode != 0)
         {
-            return (false, $"-w 退出码 {run.ExitCode}。{run.OutputTail}");
+            return (false,
+                $"-w 退出码 {run.ExitCode}（该命令会去 GitHub 下载最新 INI，"
+                + "失败通常表示这一步上不了网，不代表本机 INI 有问题）。{run.OutputTail}");
         }
 
         // 成功退出不等于已更新：回读 Updated 字段（计划书 6.2）
@@ -937,6 +1002,19 @@ public static class RdpUnlockService
     }
 
     private static string Short(string sha) => sha.Length > 12 ? sha.Substring(0, 12) : sha;
+
+    /// <summary>
+    /// INI 在线更新失败时给出的手工出口。
+    /// </summary>
+    /// <remarks>
+    /// <c>-w</c> 走的是 RDPWInst 自己的 WinInet 下载，不认本程序的代理设置；
+    /// 国内网络下它经常直接失败（退出码 5）。这时唯一的办法是手工把最新的
+    /// <c>rdpwrap.ini</c> 放到安装目录 —— 比让用户去猜「为什么更新不了」有用。
+    /// </remarks>
+    private static string IniManualHint(string installDir) => installDir.Length == 0
+        ? "　可以打开 https://github.com/sebaxakerhtc/rdpwrap 手动下载 rdpwrap.ini 覆盖安装目录里的同名文件后重试。"
+        : $"　可以打开 https://github.com/sebaxakerhtc/rdpwrap 手动下载 rdpwrap.ini，"
+          + $"覆盖 {Path.Combine(installDir, "rdpwrap.ini")} 后重试。";
 
     /// <summary>下载失败时附在后面的出口：告诉用户「还可以手动给一个安装包」。</summary>
     private const string ManualHint =
