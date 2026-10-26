@@ -64,17 +64,22 @@ public static class RdpUnlockService
 
         using (lease)
         {
-            // 半截事务：既不能当成功，也不能直接覆盖（计划书 5.2）
-            var incomplete = RdpTransactionStore.ListIncomplete();
-            if (incomplete.Count > 0)
-            {
-                return Fail(steps, "上一次操作没有收尾，先处理它：",
-                    $"{incomplete[0].SummaryText}。请点「查看诊断」看它做到哪一步，必要时手工收尾后再来一次。");
-            }
-
             // ---- 1. 只读预检 ----
             Report(progress, 1, "本机只读预检");
             var before = RdpReadOnlyDetector.Detect();
+
+            // 半截事务：既不能当成功，也不能直接覆盖（计划书 5.2）。
+            // 但"上次装成功了只是没退出"这种半截不能把用户卡死 —— 现状已是目标状态就自动结案。
+            var stale = RdpTransactionStore.ResolveStale(before);
+            if (stale.Blocked)
+            {
+                return Fail(steps, "上一次操作没有收尾，先处理它：", stale.Message, before);
+            }
+
+            if (stale.Message.Length > 0)
+            {
+                Add(steps, "stale", "收尾上一次未完成的事务", RdpStepOutcome.Warn, stale.Message);
+            }
             Add(steps, "precheck", "只读预检", before.AllPass ? RdpStepOutcome.Ok : RdpStepOutcome.Warn,
                 $"Wrapper={RdpProbeText.WrapperLabel(before.WrapperState)}，"
                 + $"Service={RdpProbeText.ServiceLabel(before.ServiceState)}，"
@@ -241,32 +246,47 @@ public static class RdpUnlockService
                     return Fail(steps, "安装器在下载后被改动过，已停止：", verify.Message, before);
                 }
 
-                var run = await RdpToolRunner.RunAsync(installer.LocalPath, "", ToolTimeout, cancellationToken).ConfigureAwait(false);
-                RdpTransactionStore.AppendStep(manifest, $"安装器退出码 {run.ExitCode}：{run.OutputTail}");
+                // ⚠️ 必须带 -i：无参运行是交互式菜单（等着按键），会一直挂着不退出
+                var run = await RdpToolRunner
+                    .RunAsync(installer.LocalPath, RdpToolRunner.InstallArguments, ToolTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+                RdpTransactionStore.AppendStep(
+                    manifest, $"安装器（{RdpToolRunner.InstallArguments}）退出码 {run.ExitCode}：{run.OutputTail}");
+
+                // 退出码只作参考，最终认 ServiceDll（计划书 4.3：不认退出码，认回读状态）
+                var afterInstall = RdpReadOnlyDetector.Detect();
+                var installed = afterInstall.WrapperState == RdpWrapperState.Installed;
+                installDir = afterInstall.InstallDirectory;
 
                 if (run.TimedOut)
                 {
-                    // 结果不明：不杀进程、不补偿、事务保持 Running 供下次识别（计划书 6.2）
-                    Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
-                        $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，结果不明。事务保持未完成状态，下次操作前会先提示。");
-                    return Fail(steps, "安装器超时，结果不明：",
-                        "没有强制结束安装器。请等它自行结束后重新检测；若一直不结束，重启电脑后再来。", before,
-                        manifest.Id);
+                    if (installed)
+                    {
+                        // 2026-10-26 真机就是这一种：装成功了、工具没退出（无参菜单）。
+                        // 状态到了就继续，报"注意"而不是"失败" —— 用户要的是能远程登录，不是退出码。
+                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Warn,
+                            $"安装器 {ToolTimeout.TotalSeconds:0} 秒未退出，但 ServiceDll 已指向 "
+                            + $"{afterInstall.ServiceDllPath} —— 按状态判定为已安装，继续后续步骤。");
+                    }
+                    else
+                    {
+                        // 结果不明且没达成：不杀进程、不补偿、事务保持 Running 供下次识别（计划书 6.2）
+                        Add(steps, "install", "运行官方安装器", RdpStepOutcome.Fail,
+                            $"安装器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍为 "
+                            + $"{afterInstall.ServiceDllPath}。事务保持未完成状态。");
+                        return Fail(steps, "安装器超时，结果不明：",
+                            "没有强制结束安装器。请等它自行结束后重新检测；若一直不结束，重启电脑后再来。", before,
+                            manifest.Id);
+                    }
                 }
-
-                if (run.ExitCode != 0)
+                else if (run.ExitCode != 0)
                 {
                     var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
                         .ConfigureAwait(false);
                     return Fail(steps, "安装器返回失败：", $"退出码 {run.ExitCode}。{run.OutputTail}", before, manifest.Id,
                         compensated);
                 }
-
-                // 回读真实安装状态：不认退出码，认 ServiceDll
-                var afterInstall = RdpReadOnlyDetector.Detect();
-                installDir = afterInstall.InstallDirectory;
-
-                if (afterInstall.WrapperState != RdpWrapperState.Installed)
+                else if (!installed)
                 {
                     var compensated = await CompensateAsync(manifest, uninstaller, steps, cancellationToken)
                         .ConfigureAwait(false);
@@ -274,9 +294,11 @@ public static class RdpUnlockService
                         $"ServiceDll 仍为 {afterInstall.ServiceDllPath}。可能是安全软件拦截，或系统版本不被该版本支持。",
                         afterInstall, manifest.Id, compensated);
                 }
-
-                Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok,
-                    $"退出码 0；ServiceDll 已指向 {afterInstall.ServiceDllPath}");
+                else
+                {
+                    Add(steps, "install", "运行官方安装器", RdpStepOutcome.Ok,
+                        $"退出码 0；ServiceDll 已指向 {afterInstall.ServiceDllPath}");
+                }
             }
             else
             {
@@ -684,7 +706,9 @@ public static class RdpUnlockService
             manifest.IniBackup = RdpTransactionStore.BackupIni(manifest.Id, iniPath);
         }
 
-        var run = await RdpToolRunner.RunAsync(tool, "-w", IniTimeout, cancellationToken).ConfigureAwait(false);
+        var run = await RdpToolRunner
+            .RunAsync(tool, RdpToolRunner.UpdateIniArguments, IniTimeout, cancellationToken)
+            .ConfigureAwait(false);
         RdpTransactionStore.AppendStep(manifest, $"INI 更新退出码 {run.ExitCode}：{run.OutputTail}");
 
         if (run.TimedOut)
@@ -799,7 +823,9 @@ public static class RdpUnlockService
                 }
                 else
                 {
-                    var run = await RdpToolRunner.RunAsync(uninstallPath, "", ToolTimeout, cancellationToken).ConfigureAwait(false);
+                    var run = await RdpToolRunner
+                        .RunAsync(uninstallPath, RdpToolRunner.UninstallArguments, ToolTimeout, cancellationToken)
+                        .ConfigureAwait(false);
                     notes.Add($"卸载补偿退出码 {run.ExitCode}");
                 }
             }

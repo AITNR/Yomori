@@ -63,15 +63,25 @@ public static class RdpUninstallService
 
         using (lease)
         {
-            var incomplete = RdpTransactionStore.ListIncomplete();
-            if (incomplete.Count > 0)
-            {
-                return Fail(steps, "上一次操作没有收尾，先处理它：", incomplete[0].SummaryText);
-            }
-
             // ---- 1. 只读检测：到底有没有东西可卸 ----
             Report(progress, 1, "检查当前安装状态");
             var before = RdpReadOnlyDetector.Detect();
+
+            // 半截事务：能结案就结案（原因见 RdpUnlockService.ResolveStaleTransactions）
+            var stale = RdpTransactionStore.ResolveStale(before);
+            if (stale.Blocked)
+            {
+                return Fail(steps, "上一次操作没有收尾，先处理它：", stale.Message, before);
+            }
+
+            if (stale.Message.Length > 0)
+            {
+                steps.Add(new RdpStepRecord
+                {
+                    Key = "stale", Title = "收尾上一次未完成的事务",
+                    Outcome = RdpStepOutcome.Warn, Detail = stale.Message,
+                });
+            }
 
             if (before.WrapperState != RdpWrapperState.Installed)
             {
@@ -180,12 +190,19 @@ public static class RdpUninstallService
                 return Fail(steps, "卸载器在下载后被改动过，已停止：", verify.Message, before, manifest.Id);
             }
 
-            var run = await RdpToolRunner.RunAsync(tool.LocalPath, "", ToolTimeout, cancellationToken)
+            // ⚠️ 必须带 -u：无参运行是交互式菜单，会一直挂着不退出（与安装器同一个坑）
+            var run = await RdpToolRunner
+                .RunAsync(tool.LocalPath, RdpToolRunner.UninstallArguments, ToolTimeout, cancellationToken)
                 .ConfigureAwait(false);
 
-            RdpTransactionStore.AppendStep(manifest, $"卸载器退出码 {run.ExitCode}：{run.OutputTail}");
+            RdpTransactionStore.AppendStep(
+                manifest, $"卸载器（{RdpToolRunner.UninstallArguments}）退出码 {run.ExitCode}：{run.OutputTail}");
 
-            if (run.TimedOut)
+            // 退出码只作参考，最终认 ServiceDll
+            var after = RdpReadOnlyDetector.Detect();
+            var uninstalledNow = after.WrapperState != RdpWrapperState.Installed;
+
+            if (run.TimedOut && !uninstalledNow)
             {
                 // 不杀进程、不补偿、事务保持未完成，交给下次识别（计划书 6.2）
                 steps.Add(new RdpStepRecord
@@ -193,7 +210,7 @@ public static class RdpUninstallService
                     Key = "run",
                     Title = "运行官方卸载器",
                     Outcome = RdpStepOutcome.Fail,
-                    Detail = $"卸载器 {ToolTimeout.TotalSeconds:0} 秒未结束，结果不明。事务保持未完成状态。",
+                    Detail = $"卸载器 {ToolTimeout.TotalSeconds:0} 秒未结束，且 ServiceDll 仍为 {after.ServiceDllPath}。",
                 });
 
                 return Fail(steps, "卸载器超时，结果不明：",
@@ -204,13 +221,16 @@ public static class RdpUninstallService
             {
                 Key = "run",
                 Title = "运行官方卸载器",
-                Outcome = run.ExitCode == 0 ? RdpStepOutcome.Ok : RdpStepOutcome.Warn,
-                Detail = $"退出码 {run.ExitCode}。{run.OutputTail}",
+                Outcome = uninstalledNow
+                    ? (run.TimedOut ? RdpStepOutcome.Warn : RdpStepOutcome.Ok)
+                    : RdpStepOutcome.Warn,
+                Detail = run.TimedOut
+                    ? $"卸载器 {ToolTimeout.TotalSeconds:0} 秒未退出，但 ServiceDll 已回到 {after.ServiceDllPath} —— 按状态判定为已卸载。"
+                    : $"退出码 {run.ExitCode}。{run.OutputTail}",
             });
 
             // ---- 5. 回读：只看 ServiceDll ----
             Report(progress, 5, "验证接管已解除");
-            var after = RdpReadOnlyDetector.Detect();
             var uninstalled = after.WrapperState != RdpWrapperState.Installed;
 
             // 专业版卸载后原生 RDP 仍在监听 3389，这不算失败；家庭版没有监听器也是正常的

@@ -184,6 +184,69 @@ public static class RdpTransactionStore
         return found;
     }
 
+    /// <summary>
+    /// 处理上一次没走完的事务（崩溃 / 超时 / 强杀留下的 <see cref="RdpTransactionStatus.Running"/>）。
+    /// </summary>
+    /// <remarks>
+    /// <para>计划书 5.2 的原意是「子进程尚在运行时禁止同时回滚和新建操作」—— 那是真风险，必须拦住。
+    /// 但 2026-10-26 真机出现过另一种：安装器其实已经装成功，只是没退出，于是事务停在 Running，
+    /// 用户再点一次就被「上一次操作没有收尾」挡死，而系统其实已经是好的。</para>
+    /// <para>所以这里分两档：工具还在跑 → 拦；工具不在了、且**当前状态已经就是那笔事务的目标状态** →
+    /// 自动结案（标记完成并写明原因）后继续。目标状态对不上、或者账本损坏、或者是注册表还原事务
+    /// （中途崩了看不出做到哪）→ 一律拦，交给人看诊断。</para>
+    /// </remarks>
+    public static (bool Blocked, string Message) ResolveStale(RdpUnlockSnapshot current)
+    {
+        var incomplete = RdpTransactionStore.ListIncomplete();
+        if (incomplete.Count == 0)
+        {
+            return (false, "");
+        }
+
+        if (RdpToolRunner.IsToolRunning())
+        {
+            // 真正的危险场景：安装器/卸载器进程还活着，此时任何回滚都可能与它抢文件
+            return (true, "上一次的安装器/卸载器进程还在运行。请等它自己结束（不要去结束它），然后再试。");
+        }
+
+        var closed = new List<string>();
+
+        foreach (var info in incomplete)
+        {
+            var manifest = RdpTransactionStore.Load(info.Id);
+            if (manifest is null)
+            {
+                return (true, $"事务 {info.Id} 的账本读不出来（文件损坏），无法判断它做到了哪一步。");
+            }
+
+            var reachedTarget = manifest.Kind switch
+            {
+                RdpTransactionKind.Unlock => current.WrapperState == RdpWrapperState.Installed,
+                RdpTransactionKind.Uninstall => current.WrapperState != RdpWrapperState.Installed,
+                // 还原注册表：没有明确的"目标状态"可对照，保持拦截
+                _ => false,
+            };
+
+            if (!reachedTarget)
+            {
+                return (true, $"{info.SummaryText}（id={info.Id}）没有收尾，且当前状态不是它的目标状态。"
+                              + "请点「查看诊断」确认它做到哪一步，再决定是重试还是手工清理。");
+            }
+
+            RdpTransactionStore.AppendStep(manifest, "自动结案：执行被中断，但本机状态已是该事务的目标状态");
+            RdpTransactionStore.Finish(
+                manifest,
+                RdpTransactionStatus.Completed,
+                "自动结案：执行中断（超时/崩溃），但目标状态已达成");
+
+            closed.Add($"{info.Id}（{info.KindLabel}）");
+        }
+
+        return closed.Count == 0
+            ? (false, "")
+            : (false, "已自动结案：" + string.Join("、", closed) + "（执行被中断，但状态已达成目标）");
+    }
+
     /// <summary>把 INI 备份进事务目录。返回备份文件名（不含目录）；源文件不存在返回空串。</summary>
     public static string BackupIni(string id, string iniPath)
     {
