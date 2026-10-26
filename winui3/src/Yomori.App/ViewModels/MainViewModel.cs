@@ -3024,6 +3024,15 @@ public sealed class MainViewModel : ObservableObject
                         return;
                     }
 
+                    // 确认期间用户可能又改了通道：目标已经不是刚才确认的那个账户/机器，就别授了
+                    if (!IsStillConfirmedTarget(channelId, account))
+                    {
+                        const string changed = "通道账户在确认期间被修改，本次未做任何授权。";
+                        SetChannelGrantText(channelId, changed);
+                        AppendLog($"[账户授权] 「{displayName}」{changed}（确认对象：{account}）");
+                        return;
+                    }
+
                     SetChannelGrantText(channelId, "正在授予管理员权限…");
 
                     var result = await Task.Run(() =>
@@ -3066,6 +3075,35 @@ public sealed class MainViewModel : ObservableObject
             + "取消仅取消管理员授权；已经成功保存的凭据会保留。",
             closeText: "取消",
             primaryText: "确认设为管理员");
+    }
+
+    /// <summary>
+    /// 确认框关掉之后复核一次「要授权的对象还是刚才那个」。
+    /// </summary>
+    /// <remarks>
+    /// 用户在确认框弹着的这段时间里完全可能切到别的通道、改掉账户名或把主机改成远程地址。
+    /// 那时按旧快照继续授权，就是把管理员身份授给了"用户没确认过"的对象 ——
+    /// 计划书 §4.1 第 6 条要求重新核对 SID 与通道目标，这就是那一步。
+    /// </remarks>
+    private bool IsStillConfirmedTarget(string channelId, string account)
+    {
+        var channel = Config.Rdp.Channels.FirstOrDefault(
+            c => string.Equals(c.Id, channelId, StringComparison.Ordinal));
+
+        if (channel is null)
+        {
+            return false;   // 通道在确认期间被删掉了
+        }
+
+        if (!RdpTargets.IsLocal(channel.Host))
+        {
+            return false;
+        }
+
+        return string.Equals(
+            RdpGrantPlanner.BareAccountName(channel.User),
+            RdpGrantPlanner.BareAccountName(account),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
