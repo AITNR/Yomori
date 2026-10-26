@@ -71,6 +71,17 @@ public enum RdpSupportState
 
     /// <summary>版本号只出现在注释或说明文字里（上游子串匹配判真、严格 section 匹配判假）。</summary>
     Ambiguous = 3,
+
+    /// <summary>
+    /// INI 里有这个构建号的补丁段，但运行期根本没起来（没有 RDP-Tcp 监听）。
+    /// </summary>
+    /// <remarks>
+    /// 这个状态存在的理由：计划书里的 Support 是「本机 INI 是否覆盖当前版本」（静态），
+    /// 而 RDPConf 的 <c>Support level</c> 是**运行期**结论（hook 有没有真的挂上）。
+    /// 两者语义不同 —— 只报「已覆盖」会让用户拿着我们的界面去对 RDPConf 时看到相反的结论。
+    /// 所以监听缺失时单独列一档：INI 覆盖了，但没生效，通常要重启电脑。
+    /// </remarks>
+    RuntimeNotApplied = 4,
 }
 
 /// <summary>四项之外的补充证据：从 ServiceDll 路径推出 Wrapper 的安装位置。</summary>
@@ -235,6 +246,21 @@ public sealed class RdpUnlockSnapshot
     }
 }
 
+/// <summary>
+/// 把「INI 静态覆盖」与「运行时监听」合成 Support 的最终结论。
+/// </summary>
+/// <remarks>
+/// 抽成纯函数是为了能离线断言这条规则：它是「我们显示已覆盖、RDPConf 显示 not supported」
+/// 这个矛盾的唯一出口。规则很简单 —— INI 说覆盖、但监听器没起来，就不能算通过。
+/// </remarks>
+public static class RdpSupportVerdict
+{
+    public static RdpSupportState Combine(RdpSupportState iniState, RdpListenerState listener) =>
+        iniState == RdpSupportState.FullySupported && listener == RdpListenerState.Absent
+            ? RdpSupportState.RuntimeNotApplied
+            : iniState;
+}
+
 /// <summary>状态与等级的中文文案。界面与诊断详情共用，避免两处各写一套。</summary>
 public static class RdpProbeText
 {
@@ -275,6 +301,7 @@ public static class RdpProbeText
         RdpSupportState.FullySupported => "已覆盖当前版本",
         RdpSupportState.NotSupported => "未覆盖当前版本",
         RdpSupportState.Ambiguous => "存疑",
+        RdpSupportState.RuntimeNotApplied => "INI 已覆盖 · 运行期未生效",
         _ => "未知",
     };
 

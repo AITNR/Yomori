@@ -353,12 +353,29 @@ public static class RdpUnlockService
                 + $"Listener={RdpProbeText.ListenerLabel(final.ListenerState)}，"
                 + $"Support={RdpProbeText.SupportLabel(final.SupportState)}");
 
+            // 监听器没起来是"还没生效"而不是"装坏了"：这类情况最常见的原因是
+            // 系统刚更新过 termsrv.dll，正在跑的是旧映像，必须重启才能让钩子挂上。
+            // 所以单独给一条明确、可执行的建议，别让用户去猜。
+            var needsReboot = !finalOk
+                              && final.WrapperState == RdpWrapperState.Installed
+                              && final.ListenerState != RdpListenerState.Listening;
+
+            if (needsReboot)
+            {
+                Add(steps, "reboot", "需要重启电脑", RdpStepOutcome.Warn,
+                    "解锁组件已安装，但 WinStation 里还没有 RDP-Tcp 监听 —— 钩子尚未生效。"
+                    + "请重启电脑，开机后回本页点「重新检测」。");
+            }
+
             var summary = finalOk
                 ? "成功，可以前往「设置 → 账户 → 其他用户」里添加新用户。添加完成后，在 Yomori 通道管理中保存该账户。"
-                : final.SupportState == RdpSupportState.NotSupported
-                    ? "当前系统版本在本机 INI 中未找到完整支持项，可能是系统较新、社区暂未覆盖，也可能是 INI 更新未成功。"
-                      + "当前 FileVersion、INI 更新结果和版本匹配详情见下方诊断。"
-                    : "解锁流程已执行，但内置检测没有全部通过。逐项结果见下方诊断。";
+                : needsReboot
+                    ? "解锁组件已安装，但远程桌面监听（RDP-Tcp）还没出现，所以现在还不能远程登录。"
+                      + "请重启电脑，开机后再点「重新检测」——系统刚更新过时这一条尤其常见。"
+                    : final.SupportState == RdpSupportState.NotSupported
+                        ? "当前系统版本在本机 INI 中未找到完整支持项，可能是系统较新、社区暂未覆盖，也可能是 INI 更新未成功。"
+                          + "当前 FileVersion、INI 更新结果和版本匹配详情见下方诊断。"
+                        : "解锁流程已执行，但内置检测没有全部通过。逐项结果见下方诊断。";
 
             RdpTransactionStore.Finish(
                 manifest,

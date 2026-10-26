@@ -126,24 +126,27 @@ public static class RdpReadOnlyDetector
             ValueText = DescribeListenerValue(listenerProbe, tcp),
             ExpectedText = $"WinStation 里存在名为 {ListenerStationName} 的监听会话",
             ErrorCode = listenerProbe.ErrorCode,
-            Advice = ListenerAdvice(listenerProbe.State),
+            Advice = ListenerAdvice(listenerProbe.State, classification.State),
         };
 
         // ---- 4. Support：termsrv.dll 版本 × 本机 INI ----
         var versions = ReadTermsrvVersion(errors);
         var version = versions.Primary;
         var ini = ReadAndAnalyzeIni(iniPath, versions.Candidates, errors);
-        var supportLevel = SupportLevel(ini.State);
+        // INI 静态覆盖 ≠ 运行期生效：监听器没起来时降一档，否则界面说"已覆盖"
+        // 而 RDPConf 的 Support level 说 not supported，用户会以为其中一边在骗人。
+        var supportState = RdpSupportVerdict.Combine(ini.State, listenerProbe.State);
+        var supportLevel = SupportLevel(supportState);
         var supportItem = new RdpProbeItem
         {
             Key = "support",
             Title = "Support",
             Level = supportLevel,
-            StateText = RdpProbeText.SupportLabel(ini.State),
-            ValueText = DescribeSupportValue(version, versions, ini),
+            StateText = RdpProbeText.SupportLabel(supportState),
+            ValueText = DescribeSupportValue(version, versions, ini, supportState),
             ExpectedText = "本机 rdpwrap.ini 中存在与该 termsrv.dll 版本一致的补丁段",
             ErrorCode = ini.Found ? "" : "未找到 rdpwrap.ini",
-            Advice = SupportAdvice(ini.State),
+            Advice = SupportAdvice(supportState),
         };
 
         return new RdpUnlockSnapshot
@@ -166,7 +169,7 @@ public static class RdpReadOnlyDetector
             SessionSummary = listenerProbe.Summary,
             Tcp3389Listening = tcp.Listening,
             TcpDetail = tcp.Detail,
-            SupportState = ini.State,
+            SupportState = supportState,
             TermsrvVersion = version,
             TermsrvVersionRaw = versions.Raw,
             TermsrvVersionText = string.Equals(versions.Text, version, StringComparison.OrdinalIgnoreCase)
@@ -1006,6 +1009,7 @@ public static class RdpReadOnlyDetector
         RdpSupportState.FullySupported => RdpProbeLevel.Pass,
         RdpSupportState.NotSupported => RdpProbeLevel.Fail,
         RdpSupportState.Ambiguous => RdpProbeLevel.Warn,
+        RdpSupportState.RuntimeNotApplied => RdpProbeLevel.Warn,
         _ => RdpProbeLevel.Unknown,
     };
 
@@ -1047,9 +1051,19 @@ public static class RdpReadOnlyDetector
         _ => "",
     };
 
-    private static string ListenerAdvice(RdpListenerState state) => state switch
+    /// <summary>
+    /// Listener 一项的建议。装没装组件决定建议走哪条路 ——
+    /// 「装了但没监听」和「没装所以没监听」是两件完全不同的事。
+    /// </summary>
+    private static string ListenerAdvice(RdpListenerState state, RdpWrapperState wrapper) => state switch
     {
-        RdpListenerState.Absent => "WinStation 里没有 RDP-Tcp 监听：家庭版未解锁时属预期；专业版出现这一项要查 TermService 与 termsrv.dll 是否被替换。",
+        RdpListenerState.Absent when wrapper == RdpWrapperState.Installed =>
+            "解锁组件已安装，但 WinStation 里没有 RDP-Tcp 监听：钩子还没生效。"
+            + "先重启电脑（系统刚更新过 termsrv.dll 时尤其如此），开机后点「重新检测」；"
+            + "重启后仍无监听，再查安全软件是否拦截了 rdpwrap.dll 的加载。",
+        RdpListenerState.Absent =>
+            "WinStation 里没有 RDP-Tcp 监听：本机还没解锁时属预期（家庭版本来就没有服务端）；"
+            + "专业版出现这一项要查 TermService 与 termsrv.dll 是否被替换。",
         RdpListenerState.Unknown => "会话枚举失败。该 API 在部分精简系统上会被裁掉，属无法判定，不等于「不支持」。",
         _ => "",
     };
@@ -1058,11 +1072,16 @@ public static class RdpReadOnlyDetector
     {
         RdpSupportState.NotSupported => "本机 INI 没有当前构建号。可先更新 INI（RDPWInst -w）；更新后仍不命中说明社区尚未覆盖该版本。",
         RdpSupportState.Ambiguous => "INI 文本里提到该版本但没有对应的补丁段，多半是注释。请以 INI 的 Updated 日期与上游仓库为准。",
+        RdpSupportState.RuntimeNotApplied =>
+            "INI 已覆盖当前构建号，但运行期没有 RDP-Tcp 监听，钩子很可能没生效。"
+            + "先重启电脑（系统刚更新过时尤其如此），重启后点「重新检测」；"
+            + "仍无监听再查安全软件是否拦截了 rdpwrap.dll 的加载。",
         RdpSupportState.Unknown => "读不到 INI 或版本号，无法比对 —— 这是「不知道」，不是「不支持」。",
         _ => "",
     };
 
-    private static string DescribeSupportValue(string version, TermsrvVersions versions, RdpIniAnalysis ini)
+    private static string DescribeSupportValue(
+        string version, TermsrvVersions versions, RdpIniAnalysis ini, RdpSupportState state)
     {
         if (version.Length == 0)
         {
@@ -1079,6 +1098,14 @@ public static class RdpReadOnlyDetector
         {
             text += $"（文件属性里的版本字符串仍写作 {versions.Text} —— Windows 的 QS 更新"
                     + "只刷新固定文件信息，比对以固定信息为准，与 RDPWrap 一致）";
+        }
+
+        // INI 覆盖但运行期没起来：明确说清"覆盖"指的是 INI 静态覆盖，
+        // 免得拿本界面去对 RDPConf 的 Support level 时以为两边矛盾
+        if (state == RdpSupportState.RuntimeNotApplied)
+        {
+            text += "。INI 覆盖了该构建号，但运行时没有 RDP-Tcp 监听 —— "
+                    + "RDPConf 的 Support level 反映的是运行期，此时它多半显示 not supported";
         }
 
         return text;
