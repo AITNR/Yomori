@@ -375,6 +375,15 @@ public static class RdpUnlockService
 
                 // 本轮真的装了组件 —— 后面「要不要重启服务」「INI 判据用哪份状态」都靠它
                 installedThisRun = afterInstall.WrapperState == RdpWrapperState.Installed;
+
+                // 装完先清点文件。上游 Release 的安装器只带 rdpwrap.dll / rdpwrap.ini /
+                // RDP_CnC.exe，**不带 RDPWInst.exe**（v1.8.9.9 的说明只写了「给 CnC 加了
+                // Update ini 与 Restart TermService 两个按钮」，却没把那个控制台工具打进包），
+                // 所以「在线更新 INI」在新装的机器上很可能根本没有工具可跑 —— 提前说清，
+                // 不要等到调用时才发现，也别让用户以为下载缺了东西。
+                var inventory = CheckInstallFiles(installDir);
+                Add(steps, "files", "安装文件清点",
+                    inventory.AllCore ? RdpStepOutcome.Ok : RdpStepOutcome.Warn, inventory.Summary);
             }
             else
             {
@@ -856,6 +865,15 @@ public static class RdpUnlockService
         }
 
         // ---- 2. 交给 RDPWInst -w ----
+        // 先看工具在不在：上游 Release 安装器不带 RDPWInst.exe，
+        // 在这种机器上「在线更新」这条路根本不存在，直接说清楚，别让用户等一个必然的失败。
+        if (!File.Exists(Path.Combine(installDir, "RDPWInst.exe")))
+        {
+            failures.Add("安装目录里没有 RDPWInst.exe —— 上游的 Release 安装器不带这个控制台工具，"
+                         + "所以在这里没法在线更新 INI（CnC 的「Update ini」按钮同样会报 not found）。");
+            return (false, string.Join("；", failures), false);
+        }
+
         var update = await UpdateIniAsync(manifest, installDir, steps, cancellationToken).ConfigureAwait(false);
         if (update.Ok)
         {
@@ -1161,6 +1179,61 @@ public static class RdpUnlockService
         RdpTransactionStore.Finish(manifest, RdpTransactionStatus.Compensated, summary);
 
         return allOk;
+    }
+
+    /// <summary>装完之后清点关键文件，并把缺了哪些说出来。</summary>
+    /// <remarks>
+    /// <para>要清点的原因：上游安装包的文件集不是固定的。<c>RDPW_Installer.exe</c> 只保证
+    /// <c>rdpwrap.dll</c> 与 <c>rdpwrap.ini</c>；<c>RDPWInst.exe</c>（控制台工具）在 v1.8.9.9
+    /// 里没有随包提供，而 CnC 的「Update ini」按钮正是调它 —— 于是用户看到
+    /// 「RDPWInst.exe not found」。</para>
+    /// <para>这不是「下载少了一块」，是上游包装与按钮不匹配。我们能做的是：提前说清缺什么，
+    /// 以及哪些功能因此不可用（在线更新 INI / 用本地工具卸载）。</para>
+    /// </remarks>
+    private static (bool AllCore, string Summary) CheckInstallFiles(string installDir)
+    {
+        if (installDir.Length == 0)
+        {
+            return (false, "拿不到安装目录，无法清点文件。");
+        }
+
+        var core = new[] { "rdpwrap.dll", "rdpwrap.ini" };
+        var optional = new[] { "RDPWInst.exe", "RDP_CnC.exe", "RDPConf.exe" };
+
+        var missingCore = new List<string>();
+        var presentOptional = new List<string>();
+
+        foreach (var name in core)
+        {
+            if (!File.Exists(Path.Combine(installDir, name)))
+            {
+                missingCore.Add(name);
+            }
+        }
+
+        foreach (var name in optional)
+        {
+            if (File.Exists(Path.Combine(installDir, name)))
+            {
+                presentOptional.Add(name);
+            }
+        }
+
+        if (missingCore.Count > 0)
+        {
+            return (false, $"缺少关键文件：{string.Join("、", missingCore)}（目录 {installDir}）。");
+        }
+
+        var text = $"rdpwrap.dll / rdpwrap.ini 就位；同目录还有 {string.Join("、", presentOptional.DefaultIfEmpty("（无其它文件）"))}。";
+
+        if (!presentOptional.Contains("RDPWInst.exe"))
+        {
+            text += "　注意：没有 RDPWInst.exe（上游 Release 安装器不带它），"
+                    + "所以「在线更新 INI」与「用本地工具卸载」都不可用 —— "
+                    + "前者请用「指定 INI」，后者会自动改用下载的卸载器。";
+        }
+
+        return (true, text);
     }
 
     /// <summary>

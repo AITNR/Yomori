@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Yomori.Models;
@@ -259,6 +260,24 @@ public static class RdpUninstallService
 
             // ---- 6. 收尾 ----
             Report(progress, 6, "完成");
+
+            // 目录里可能还剩东西：卸载那一刻正在运行的程序（最典型是 RDP_CnC.exe）删不掉，
+            // 会留在原地。用户看到那个 exe 会以为「还装着」，双击后又报各种错 —— 说清楚。
+            var leftover = LeftoverFiles(after.InstallDirectory);
+            if (leftover.Length > 0)
+            {
+                steps.Add(new RdpStepRecord
+                {
+                    Key = "leftover",
+                    Title = "目录残留",
+                    Outcome = RdpStepOutcome.Warn,
+                    Detail = $"卸载已完成，但 {after.InstallDirectory} 里还剩：{leftover}。"
+                             + "这些是卸载当时正在运行、删不掉的文件（CnC 界面最典型）。"
+                             + "可以直接删除该目录；如果删不掉，重启后再删。"
+                             + "不要再双击里面的程序 —— 组件已经卸掉了，它没有可管理的东西。",
+                });
+            }
+
             var handMade = !WasInstalledByUs();
             if (handMade)
             {
@@ -284,6 +303,29 @@ public static class RdpUninstallService
                 Final = after,
                 TransactionId = manifest.Id,
             };
+        }
+    }
+
+    /// <summary>卸载后安装目录里还剩下什么（逗号分隔）；目录不存在或已空返回空串。</summary>
+    private static string LeftoverFiles(string installDir)
+    {
+        try
+        {
+            if (installDir.Length == 0 || !Directory.Exists(installDir))
+            {
+                return "";
+            }
+
+            var names = Directory.GetFileSystemEntries(installDir)
+                .Select(Path.GetFileName)
+                .Where(name => !string.IsNullOrEmpty(name))
+                .ToArray();
+
+            return names.Length == 0 ? "" : string.Join("、", names);
+        }
+        catch
+        {
+            return "";
         }
     }
 
