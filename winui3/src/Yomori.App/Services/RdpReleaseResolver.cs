@@ -86,6 +86,13 @@ public static class RdpReleaseResolver
             request.Headers.UserAgent.ParseAdd("Yomori-RdpUnlock");
             request.Headers.Accept.ParseAdd("application/vnd.github+json");
 
+            // 配了令牌就用：匿名 60 次/小时 → 认证 5000 次/小时（见 GitHubTokenStore）
+            var token = GitHubTokenStore.Read();
+            if (token is not null)
+            {
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+            }
+
             using var response = await client
                 .SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken)
                 .ConfigureAwait(false);
@@ -174,7 +181,8 @@ public static class RdpReleaseResolver
             text += $"，{when:HH:mm} 左右恢复";
         }
 
-        return text + "。可以等到恢复后再试，或用浏览器手动下载安装器后点「指定安装包」。";
+        return text + "。可以在本页填一个 GitHub 访问令牌（配额提到每小时 5000 次），"
+                      + "或等到恢复后再试，或用浏览器手动下载安装器后点「指定安装包」。";
     }
 
     /// <summary>

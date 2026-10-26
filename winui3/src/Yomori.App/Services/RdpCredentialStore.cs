@@ -98,6 +98,25 @@ internal static class RdpCredentialStore
     /// <summary>判断凭据是不是真的存在（比解析 cmdkey 的输出可靠）。</summary>
     public static bool Exists(string host, string? userName) => Read(host, userName) is not null;
 
+    /// <summary>
+    /// 写一条自定义 target 的秘密（例如 GitHub 访问令牌），复用同一套 CredWrite。
+    /// </summary>
+    /// <remarks>
+    /// 存在理由：秘密一律只进 Windows 凭据管理器，不进 config.json ——
+    /// 配置会被导出/备份/贴给别人看，凭据不会。这里把通道打开，让别的服务
+    /// 也能遵守同一条规则，而不是各自去写一个明文文件。
+    /// </remarks>
+    internal static bool WriteSecret(string target, string userName, string secret) =>
+        target.Length > 0 && userName.Length > 0 && secret.Length > 0
+        && WriteTarget(target, userName, secret);
+
+    /// <summary>读一条自定义 target 的秘密；不存在返回 null。</summary>
+    internal static string? ReadSecret(string target) => ReadTarget(target).Password;
+
+    /// <summary>删一条自定义 target 的秘密（不存在也算成功）。</summary>
+    internal static void DeleteSecret(string target) =>
+        CredDeleteW(target, CredTypeGeneric, 0);
+
     /// <summary>"机器名\账户" / "域\账户" 与裸账户名视为同一账户（机器名/域名不参与区分）。</summary>
     private static bool SameUser(string? left, string? right) =>
         string.Equals(BareName(left), BareName(right), StringComparison.OrdinalIgnoreCase);

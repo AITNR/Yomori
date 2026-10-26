@@ -753,7 +753,76 @@ public sealed partial class SettingsPage : Page
         }
 
         _rdpAutoDetectDone = true;
+
+        // 令牌状态在构造时读不出来（PasswordBox 还没进树），放在首次加载
+        RunOnUi(DispatcherQueue, RefreshGitHubTokenState);
         await RefreshRdpSectionAsync(announce: false);
+    }
+
+    /// <summary>把「令牌配没配」写到界面上。只显示掩码，绝不回显整串。</summary>
+    private void RefreshGitHubTokenState()
+    {
+        RdpGitHubTokenState.Text = GitHubTokenStore.DescribeState();
+    }
+
+    /// <summary>
+    /// 保存令牌并顺手验证一次。
+    /// </summary>
+    /// <remarks>
+    /// 顺序是「先落盘，再验证」：断网时用户仍然能把令牌存好，界面如实说「暂时无法验证」。
+    /// 唯一会回滚的情况是 <see cref="GitHubTokenProbe.Invalid"/> —— 401 或配额仍是 60/小时，
+    /// 说明这串东西根本不被认，留着只会让之后每次请求都失败。
+    /// </remarks>
+    private async void OnRdpSaveGitHubToken(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        var (ok, error) = GitHubTokenStore.Save(RdpGitHubTokenBox.Password);
+
+        if (!ok)
+        {
+            PostUi(() => RdpGitHubTokenState.Text = "没有保存：" + error);
+            return;
+        }
+
+        // 明文不留在控件里
+        PostUi(() =>
+        {
+            RdpGitHubTokenBox.Password = "";
+            RdpGitHubTokenState.Text = "已保存，正在向 GitHub 验证…";
+        });
+
+        var network = UpdateNetworkSettings.FromConfig(VM.Config);
+        var (state, message) = await GitHubTokenProbeRunner.ProbeAsync(network);
+
+        if (state == GitHubTokenProbe.Invalid)
+        {
+            GitHubTokenStore.Clear();
+            PostUi(() => RdpGitHubTokenState.Text = "验证失败，已清除：" + message);
+            return;
+        }
+
+        PostUi(() => RdpGitHubTokenState.Text =
+            message + (state == GitHubTokenProbe.Valid ? "" : "（令牌已保存）"));
+    }
+
+    /// <summary>清除令牌。</summary>
+    private void OnRdpClearGitHubToken(object sender, RoutedEventArgs e)
+    {
+        if (_rdpBusy || _rdpDetecting)
+        {
+            return;
+        }
+
+        GitHubTokenStore.Clear();
+        PostUi(() =>
+        {
+            RdpGitHubTokenBox.Password = "";
+            RdpGitHubTokenState.Text = "已清除。" + GitHubTokenStore.DescribeState();
+        });
     }
 
     private async void OnRdpRedetect(object sender, RoutedEventArgs e)
@@ -875,6 +944,8 @@ public sealed partial class SettingsPage : Page
         RdpBackupButton.IsEnabled = !busy && hasAnyTransaction;
         RdpDiagnoseButton.IsEnabled = !busy && _rdpSnapshot is not null;
         RdpPickInstallerButton.IsEnabled = !busy;
+        RdpGitHubTokenSaveButton.IsEnabled = !busy;
+        RdpGitHubTokenClearButton.IsEnabled = !busy;
     }
 
     /// <summary>
