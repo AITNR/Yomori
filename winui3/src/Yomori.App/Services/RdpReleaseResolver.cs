@@ -1,6 +1,8 @@
 // -*- coding: utf-8 -*-
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text.Json;
@@ -32,13 +34,49 @@ public static class RdpReleaseResolver
 
     public static string ReleasesPageUrl => $"https://github.com/{Owner}/{Repo}/releases";
 
+    /// <summary>缓存有效期。1 小时：既能挡住「连点几次」把配额烧光，也仍然接近「最新正式版」。</summary>
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromHours(1);
+
+    /// <summary>缓存文件：<c>%ProgramData%\Yomori\rdp\release-cache.json</c>。</summary>
+    public static string CachePath => Path.Combine(
+        Path.GetDirectoryName(RdpTransactionStore.RootDir) ?? RdpTransactionStore.RootDir,
+        "release-cache.json");
+
     /// <summary>
     /// 查最新正式版。失败返回 <c>(null, 原因)</c>，原因直接给用户看。
     /// </summary>
+    /// <remarks>
+    /// <para>三层降级，为的是不在 GitHub 的匿名配额（60 次/小时）上撞墙：</para>
+    /// <list type="number">
+    /// <item>本地缓存还新鲜（<see cref="CacheTtl"/> 内）→ 直接用，不发请求；</item>
+    /// <item>调官方接口，成功则刷新缓存；</item>
+    /// <item>接口被限流或不可用 → 过期缓存可用就用它，否则去发布页读 tag 再拼附件地址。</item>
+    /// </list>
+    /// <para>第三层的「拼地址」不是猜名称：<c>RDPW_Installer.exe</c> /
+    /// <c>RDPW_Uninstaller.exe</c> 是上游固定的两个附件名，拼错会在下载时报 404 而不是静默装错东西。
+    /// 而且这条路径拿不到大小与官方摘要，<see cref="RdpAsset.Size"/> 为 0、
+    /// digest 为空 —— 校验环节会如实说明，不会假装验过。</para>
+    /// </remarks>
     public static async Task<(RdpReleaseInfo? Release, string Error)> ResolveLatestAsync(
         UpdateNetworkSettings network,
         CancellationToken cancellationToken = default)
     {
+        // ---- 1. 新鲜缓存：连请求都不发 ----
+        var cached = TryReadCache();
+        if (cached.Json.Length > 0 && cached.Age <= CacheTtl)
+        {
+            var (cachedRelease, cachedError) = Parse(cached.Json);
+            if (cachedRelease is not null)
+            {
+                cachedRelease.Source = $"本地缓存（{cached.Age.TotalMinutes:0} 分钟前解析）";
+                return (cachedRelease, "");
+            }
+
+            _ = cachedError;   // 缓存坏了就当没有，往下走接口
+        }
+
+        string apiFailure;
+
         try
         {
             var client = UpdateService.NetworkClient(network);
@@ -59,25 +97,222 @@ public static class RdpReleaseResolver
 
             if (response.StatusCode == HttpStatusCode.Forbidden || response.StatusCode == (HttpStatusCode)429)
             {
-                return (null, "GitHub 接口被限流（403/429）。稍后再试，或先在「关于 → 检查更新」里确认网络可用。");
+                apiFailure = DescribeRateLimit(response);
             }
-
-            if (!response.IsSuccessStatusCode)
+            else if (!response.IsSuccessStatusCode)
             {
-                return (null, $"查询上游发布失败：HTTP {(int)response.StatusCode} {response.ReasonPhrase}");
+                apiFailure = $"查询上游发布失败：HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
             }
+            else
+            {
+                var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var (release, error) = Parse(json);
 
-            var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            return Parse(json);
+                if (release is not null)
+                {
+                    WriteCache(json);
+                    release.Source = "官方接口";
+                }
+
+                return (release, error);
+            }
         }
         catch (OperationCanceledException)
         {
-            return (null, "查询上游发布被取消或超时。");
+            apiFailure = "查询上游发布被取消或超时。";
         }
         catch (Exception ex)
         {
             // 断网/TLS/代理配错都到这里。不自动换镜像、不重试到别的源（计划书 4.1）
-            return (null, $"查询上游发布失败：{ex.GetType().Name}: {ex.Message}");
+            apiFailure = $"查询上游发布失败：{ex.GetType().Name}: {ex.Message}";
+        }
+
+        // ---- 2. 接口不通：过期缓存也比没有强 ----
+        if (cached.Json.Length > 0)
+        {
+            var (staleRelease, _) = Parse(cached.Json);
+            if (staleRelease is not null)
+            {
+                staleRelease.Source =
+                    $"本地缓存（{cached.Age.TotalHours:0.#} 小时前的解析，接口暂不可用：{apiFailure}）";
+                return (staleRelease, "");
+            }
+        }
+
+        // ---- 3. 最后一条路：不碰 api.github.com，直接读发布页跳转 ----
+        var (tag, tagError) = await TryResolveTagFromReleasePageAsync(network, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (tag.Length > 0)
+        {
+            var built = BuildReleaseFromTag(tag);
+            built.Source = $"发布页重定向（接口暂不可用：{apiFailure}）";
+            return (built, "");
+        }
+
+        return (null, apiFailure + "　也没能从发布页取到版本号：" + tagError
+                      + "　可以稍等到限流恢复后重试，或用浏览器手动下载安装器再点「指定安装包」。");
+    }
+
+    /// <summary>
+    /// 把 403/429 翻译成有用的信息：剩余配额、恢复时间、以及两条可走的路。
+    /// </summary>
+    private static string DescribeRateLimit(HttpResponseMessage response)
+    {
+        var text = "GitHub 接口限流（匿名每小时 60 次）";
+
+        if (response.Headers.TryGetValues("X-RateLimit-Remaining", out var remaining))
+        {
+            text += $"，剩余 {remaining.FirstOrDefault() ?? "0"} 次";
+        }
+
+        if (response.Headers.TryGetValues("X-RateLimit-Reset", out var reset)
+            && long.TryParse(reset.FirstOrDefault(), out var seconds)
+            && seconds > 0)
+        {
+            var when = DateTimeOffset.FromUnixTimeSeconds(seconds).ToLocalTime();
+            text += $"，{when:HH:mm} 左右恢复";
+        }
+
+        return text + "。可以等到恢复后再试，或用浏览器手动下载安装器后点「指定安装包」。";
+    }
+
+    /// <summary>
+    /// 走 <c>/releases/latest</c> 的 HTTP 重定向取 tag，**不经过 api.github.com**。
+    /// </summary>
+    /// <remarks>
+    /// 发布页是普通网页请求，不吃接口配额。HttpClient 默认跟随重定向，
+    /// 最终的请求地址形如 <c>/releases/tag/v1.8.9.9</c>，从里面取最后一段即可。
+    /// </remarks>
+    private static async Task<(string Tag, string Error)> TryResolveTagFromReleasePageAsync(
+        UpdateNetworkSettings network,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var client = UpdateService.NetworkClient(network);
+            var url = $"https://github.com/{Owner}/{Repo}/releases/latest";
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            // 不要求 HTML：只要跳转后的地址
+            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+            using var response = await client
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return ("", $"HTTP {(int)response.StatusCode}");
+            }
+
+            var finalUri = response.RequestMessage?.RequestUri?.ToString() ?? "";
+            var tag = TagFromUrl(finalUrl: finalUri);
+            return tag.Length > 0 ? (tag, "") : ("", "跳转后的地址里没有 tag：" + finalUri);
+        }
+        catch (Exception ex)
+        {
+            return ("", $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>从 <c>.../releases/tag/&lt;tag&gt;</c> 里取 tag。纯函数，供冒烟断言。</summary>
+    public static string TagFromUrl(string finalUrl)
+    {
+        const string Marker = "/releases/tag/";
+        var index = finalUrl.IndexOf(Marker, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+        {
+            return "";
+        }
+
+        var tag = finalUrl.Substring(index + Marker.Length).Trim().Trim('/');
+        var cut = tag.IndexOfAny(new[] { '?', '#' });
+        if (cut >= 0)
+        {
+            tag = tag.Substring(0, cut);
+        }
+
+        return tag;
+    }
+
+    /// <summary>
+    /// 只凭 tag 构造一份发布信息（拿不到大小与官方摘要）。
+    /// </summary>
+    /// <remarks>
+    /// 两个附件名是上游固定的，不是从候选里猜出来的；拼错会在下载阶段 404。
+    /// <see cref="RdpAsset.Size"/> 保持 0，于是「大小核对」这一步会被跳过 ——
+    /// 这是真实的能力损失，所以 <see cref="RdpReleaseInfo.Source"/> 必须如实标注来源。
+    /// </remarks>
+    public static RdpReleaseInfo BuildReleaseFromTag(string tag)
+    {
+        var baseUrl = $"https://github.com/{Owner}/{Repo}/releases/download/{tag}";
+
+        return new RdpReleaseInfo
+        {
+            Id = 0,
+            Tag = tag,
+            Name = tag,
+            PageUrl = $"https://github.com/{Owner}/{Repo}/releases/tag/{tag}",
+            Assets = new List<RdpAsset>
+            {
+                new() { Name = InstallerFileName, DownloadUrl = $"{baseUrl}/{InstallerFileName}" },
+                new() { Name = UninstallerFileName, DownloadUrl = $"{baseUrl}/{UninstallerFileName}" },
+            },
+        };
+    }
+
+    /// <summary>上游固定的安装器附件名。</summary>
+    public const string InstallerFileName = "RDPW_Installer.exe";
+
+    /// <summary>上游固定的卸载器附件名。</summary>
+    public const string UninstallerFileName = "RDPW_Uninstaller.exe";
+
+    private readonly record struct CachedRelease(string Json, TimeSpan Age);
+
+    private static CachedRelease TryReadCache()
+    {
+        try
+        {
+            var path = CachePath;
+            if (!File.Exists(path))
+            {
+                return new CachedRelease("", TimeSpan.MaxValue);
+            }
+
+            var json = File.ReadAllText(path);
+            using var document = JsonDocument.Parse(json);
+            var raw = document.RootElement.TryGetProperty("json", out var rawElement) ? rawElement.GetString() ?? "" : "";
+            var at = document.RootElement.TryGetProperty("cached_at", out var atElement)
+                     && DateTimeOffset.TryParse(atElement.GetString(), out var parsed)
+                ? parsed
+                : DateTimeOffset.MinValue;
+
+            var age = DateTimeOffset.Now - at;
+            return new CachedRelease(raw, age < TimeSpan.Zero ? TimeSpan.MaxValue : age);
+        }
+        catch
+        {
+            return new CachedRelease("", TimeSpan.MaxValue);
+        }
+    }
+
+    private static void WriteCache(string rawJson)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(CachePath)!);
+            var payload = JsonSerializer.Serialize(new Dictionary<string, string>
+            {
+                ["cached_at"] = DateTimeOffset.Now.ToString("O"),
+                ["json"] = rawJson,
+            });
+
+            File.WriteAllText(CachePath, payload);
+        }
+        catch
+        {
+            // 缓存写不进去只是下次多消耗一次配额，不该影响这次解锁
         }
     }
 

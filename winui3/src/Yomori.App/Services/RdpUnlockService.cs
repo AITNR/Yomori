@@ -126,8 +126,14 @@ public static class RdpUnlockService
                 }
 
                 release = resolved;
-                Add(steps, "release", "锁定发布", RdpStepOutcome.Ok,
-                    $"{resolved.Tag}（release {resolved.Id}，安装器 {installerAsset.Name} / 卸载器 {uninstallerAsset.Name}）");
+
+                // 来源必须写出来：官方接口 / 本地缓存 / 发布页重定向，三者的校验能力不一样
+                // （后两者拿不到官方大小与摘要）。
+                var releaseSource = resolved.Source.Length > 0 ? resolved.Source : "官方接口";
+                Add(steps, "release", "锁定发布",
+                    resolved.Id > 0 ? RdpStepOutcome.Ok : RdpStepOutcome.Warn,
+                    $"{resolved.Tag}（release {(resolved.Id > 0 ? resolved.Id.ToString() : "未知")}，"
+                    + $"安装器 {installerAsset.Name} / 卸载器 {uninstallerAsset.Name}）；来源：{releaseSource}");
 
                 // ---- 安装器：手动指定的优先，其次官方下载 ----
                 if (request.ManualInstallerPath.Length > 0)

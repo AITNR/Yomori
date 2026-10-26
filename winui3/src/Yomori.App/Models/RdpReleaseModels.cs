@@ -81,6 +81,16 @@ public sealed class RdpReleaseInfo
     [JsonPropertyName("assets")]
     public IReadOnlyList<RdpAsset> Assets { get; init; } = Array.Empty<RdpAsset>();
 
+    /// <summary>
+    /// 这份解析是从哪儿来的：官方接口 / 本地缓存 / 发布页重定向。
+    /// </summary>
+    /// <remarks>
+    /// 不是接口元数据，是给界面与诊断用的一句话。GitHub 匿名接口每小时只有 60 次，
+    /// 被限流时只能退到缓存或发布页 —— 用户有权知道自己拿到的是哪一种。
+    /// </remarks>
+    [JsonIgnore]
+    public string Source { get; set; } = "官方接口";
+
     /// <summary>按官方资产名挑出来的安装器；挑不出来为 null。</summary>
     public RdpAsset? Installer => PickSingle(a => IsInstallerName(a.Name));
 
