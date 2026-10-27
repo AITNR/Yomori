@@ -5,13 +5,16 @@
  *       UU 的 GameViewerService 按名字查这个函数拿到 NULL，无法得知控制台会话，
  *       于是退化成「随便挑一个活动会话」，导致远控进入通道账户的桌面而不是主控桌面。
  *
- * 做法：hook 目标进程里的 wtsapi32!WTSEnumerateSessionsW，在返回后把
- *       「非 console 且 Active」的会话标记为 Disconnected。控制台身份按
- *       WinStationName == "console" 判定，不依赖那个缺失的 API。
+ * 做法：hook 目标进程里的 wtsapi32!WTSEnumerateSessionsW，在返回后把 console 项
+ *       挪到表头、把返回条数裁成 1 —— 调用方只看得见控制台，于是只能选它。
+ *       控制台身份按 WinStationName == "console" 判定，不依赖那个缺失的 API。
  *
- * 边界：只改内存里返回结构体的 State 字段，不动任何文件、不增删数组元素
+ * 边界：只重排内存里返回的结构体、只改返回的条数，不动任何文件、不改数组长度
  *      （数组由 WTS 分配、由 WTSFreeMemory 释放，改长度会破坏释放语义）。
  *      进程重启即恢复，卸载导出也能恢复。
+ *
+ * 安全：安装段与 hook 段都套了 SEH，出异常一律退回原始结果（fail-closed）。
+ *      载荷跑在 UU 的 SYSTEM 服务里，崩一次的代价是远控彻底失联。
  *
  * 编译：cmake -S . -B build -G "Visual Studio 17 2022" -A x64
  *       cmake --build build --config Release
@@ -97,12 +100,126 @@ static volatile LONG g_installed = 0;
 static volatile LONG g_calls = 0;
 static volatile LONG g_rewritten = 0;
 
+/* 前向声明：实现在后面（InstallCore 附近的指针校验用同一套） */
+static BOOL IsReadable(const void *pointer, SIZE_T size);
+
+/* 统计：hook 内部发生过多少次异常。异常不致命，但要能被看见。 */
+static volatile LONG g_hookFaults = 0;
+
+/// 在返回的会话表里找「控制台」那一项。
+///
+/// 返回 (DWORD)-1 表示**不可判定**：表结构不像预期、或没有 console 项。
+/// 两种情况都必须原样放行，绝不能猜。
+///
+/// 这里是唯一会读目标进程内存的地方，所以每个假设都先验证：
+/// - 数组整体可读（长度来自 *pCount，先限幅）
+/// - 每一项的 SessionId / State 在合法范围内 —— 本机 wtsapi32 是多会话补丁的
+///   兼容层，结构体布局未必与官方头文件一致；范围不对就整批放弃
+/// - pWinStationName 指向的字符串可读
+static DWORD FindConsoleSession(UUFIX_SESSION_INFO **ppSessionInfo, DWORD *pCount)
+{
+    UUFIX_SESSION_INFO *items;
+    DWORD count;
+    DWORD i;
+
+    if (ppSessionInfo == NULL || pCount == NULL)
+    {
+        return (DWORD)-1;
+    }
+
+    items = *ppSessionInfo;
+    if (items == NULL)
+    {
+        return (DWORD)-1;
+    }
+
+    count = *pCount;
+    if (count == 0 || count > 512)
+    {
+        return (DWORD)-1;
+    }
+
+    if (!IsReadable(items, (SIZE_T)count * sizeof(UUFIX_SESSION_INFO)))
+    {
+        return (DWORD)-1;
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        /* 布局自检：这两个字段的取值范围是固定的，越界就说明结构体对不上 */
+        if (items[i].SessionId > 0xFFFFu || items[i].State > 6u)
+        {
+            return (DWORD)-1;
+        }
+
+        if (items[i].pWinStationName == NULL)
+        {
+            continue;
+        }
+
+        if (!IsReadable(items[i].pWinStationName, sizeof(WCHAR)))
+        {
+            return (DWORD)-1;
+        }
+
+        if (_wcsicmp(items[i].pWinStationName, L"console") == 0)
+        {
+            return items[i].SessionId;
+        }
+    }
+
+    return (DWORD)-1;
+}
+
+/// 把 console 项挪到数组前面，并把返回条数裁成「只有 console」。
+///
+/// 先数一遍再搬：数不出东西就直接返回，避免数组被改动一半。
+static void HideNonConsoleSessions(UUFIX_SESSION_INFO **ppSessionInfo, DWORD *pCount, DWORD consoleId)
+{
+    UUFIX_SESSION_INFO *items = *ppSessionInfo;
+    DWORD count = *pCount;
+    DWORD matches = 0;
+    DWORD write = 0;
+    DWORD i;
+
+    for (i = 0; i < count; i++)
+    {
+        if (items[i].SessionId == consoleId)
+        {
+            matches++;
+        }
+    }
+
+    if (matches == 0 || matches == count)
+    {
+        return; /* 没有可隐藏的，或全部都是它 */
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        if (items[i].SessionId == consoleId)
+        {
+            if (write != i)
+            {
+                UUFIX_SESSION_INFO temp = items[write];
+                items[write] = items[i];
+                items[i] = temp;
+            }
+
+            write++;
+        }
+    }
+
+    InterlockedIncrement(&g_rewritten);
+    UuFixTrace("hook: keep %lu of %lu session(s), console=%lu", write, count, consoleId);
+    *pCount = write;
+}
+
 static BOOL WINAPI Hook_WTSEnumerateSessionsW(HANDLE hServer, DWORD reserved, DWORD version,
                                               UUFIX_SESSION_INFO **ppSessionInfo, DWORD *pCount)
 {
     BOOL ok;
-    DWORD consoleId = (DWORD)-1;
-    DWORD i;
+    DWORD consoleId;
 
     if (g_original == NULL)
     {
@@ -110,70 +227,37 @@ static BOOL WINAPI Hook_WTSEnumerateSessionsW(HANDLE hServer, DWORD reserved, DW
     }
 
     ok = g_original(hServer, reserved, version, ppSessionInfo, pCount);
-    if (!ok || ppSessionInfo == NULL || *ppSessionInfo == NULL || pCount == NULL)
+    if (!ok)
     {
         return ok;
     }
 
-    if (*pCount == 0 || *pCount > 512)
-    {
-        return ok;
-    }
-
-    InterlockedIncrement(&g_calls);
-
-    /* 先找 console：WinStationName 为 "console" 的那一项就是物理控制台 */
-    for (i = 0; i < *pCount; i++)
-    {
-        LPWSTR name = (*ppSessionInfo)[i].pWinStationName;
-        if (name != NULL && _wcsicmp(name, L"console") == 0)
-        {
-            consoleId = (*ppSessionInfo)[i].SessionId;
-            break;
-        }
-    }
-
-    if (consoleId == (DWORD)-1)
-    {
-        /* 控制台未附着：不做任何改写，避免把全部会话标成断开 */
-        return ok;
-    }
-
-    /* 关键：**隐藏**而不是标记为 Disconnected。
+    /* 🔑 整段套 SEH。
      *
-     * 早先的实现把非 console 会话的 State 改成 WTSDisconnected，结果 UU 服务把它当成
-     * 「残留会话」去做清理 —— 直接把那些会话注销掉，连带把我们自己的内嵌 RDP 连接踢下线
-     * （0x00010001 initiated by an administrative tool in another session），
-     * 随后进入重连风暴并让主控崩在 WinUI 侧。
+     * 安装段一直有 SEH，hook 段却一直没有 —— 2026-10-27 21:02 的故障就是这么来的：
+     * GameViewerService 在 uu_session_fix.dll 里 0xC0000005 挂掉，SCM 重启它，
+     * hook 随之消失、投屏进程不再拉起，手机端显示「设备离线」，并留下多个
+     * GameViewerHealthd 残留。
      *
-     * 现在改成「让它们不出现在列表里」：把 console 项移到数组前面，返回时只报 console 的条数。
-     * 数组本身不动长度（仍由 WTSFreeMemory 释放，语义不变），UU 只是看不到别的会话，
-     * 没有「断开的会话」可清，也就不再动它们。
+     * 载荷跑在别人（SYSTEM）的服务里，任何一次越界读的代价都是「远控直接断掉」。
+     * 所以这里的原则是 fail-closed：出任何事都退化成「原样返回」，
+     * 宁可不修，也不能把服务带走。
      */
+    __try
     {
-        DWORD write = 0;
-
-        for (i = 0; i < *pCount; i++)
+        consoleId = FindConsoleSession(ppSessionInfo, pCount);
+        if (consoleId == (DWORD)-1)
         {
-            if ((*ppSessionInfo)[i].SessionId == consoleId)
-            {
-                if (write != i)
-                {
-                    UUFIX_SESSION_INFO temp = (*ppSessionInfo)[write];
-                    (*ppSessionInfo)[write] = (*ppSessionInfo)[i];
-                    (*ppSessionInfo)[i] = temp;
-                }
-
-                write++;
-            }
+            return ok;
         }
 
-        if (write > 0)
-        {
-            InterlockedIncrement(&g_rewritten);
-            UuFixTrace("hook: keep %lu of %lu session(s), console=%lu", write, *pCount, consoleId);
-            *pCount = write;
-        }
+        HideNonConsoleSessions(ppSessionInfo, pCount, consoleId);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        /* 数组只做过「重排」、没改过条数：即使搬到一半出事，调用方看到的仍是同一批会话 */
+        InterlockedIncrement(&g_hookFaults);
+        UuFixTrace("hook: fault captured, return original result");
     }
 
     return ok;
