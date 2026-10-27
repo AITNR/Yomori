@@ -72,9 +72,11 @@
   <ItemGroup Condition="'$(Platform)'=='x64'">
     <None Include="..\Yomori.RdpNative\build\Release\ycn_rdp.dll" Link="ycn_rdp.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
-  <!-- UuFix：注入到 UU 服务进程的会话判定修正载荷（仅 x64；构建见 Yomori.UuFix.Native/CMakeLists.txt） -->
+  <!-- UuFix：注入到 UU 服务进程的会话判定修正载荷（仅 x64；构建见 Yomori.UuFix.Native/CMakeLists.txt）
+       Condition 是给本地开发用的：没先构建载荷时不要连带主控编译一起失败。
+       CI 侧由 build.yml 的「构建 UU 修复载荷」步骤保证产物存在，并单独校验打包结果。 -->
   <ItemGroup Condition="'$(Platform)'=='x64'">
-    <None Include="..\Yomori.UuFix.Native\build\Release\uu_session_fix.dll" Link="uu_session_fix.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="..\Yomori.UuFix.Native\build\Release\uu_session_fix.dll" Link="uu_session_fix.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" Condition="Exists('..\Yomori.UuFix.Native\build\Release\uu_session_fix.dll')" />
   </ItemGroup>
 
   <Target Name="CopyRdpRuntimeDlls" AfterTargets="Build" Condition="'$(Platform)'=='x64'">

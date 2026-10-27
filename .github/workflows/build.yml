@@ -274,6 +274,25 @@ jobs:
           name: native-dlls
           path: winui3/src/Yomori.RdpNative/build/Release
 
+      # UU 修复载荷：一个零依赖的 C 文件，每次现编。
+      # 不进缓存，避免改了源码但缓存里还是旧 DLL（这个 DLL 会注入到别人进程里，
+      # 版本错配的代价比多编十秒高得多）。产物按 csproj 期望的路径放回去。
+      - name: 构建 UU 修复载荷
+        shell: pwsh
+        run: |
+          cmake -S winui3/src/Yomori.UuFix.Native -B .uufix-build -A x64
+          if ($LASTEXITCODE -ne 0) { throw "配置 UuFix 失败" }
+          cmake --build .uufix-build --config Release
+          if ($LASTEXITCODE -ne 0) { throw "构建 UuFix 失败" }
+
+          $dst = 'winui3/src/Yomori.UuFix.Native/build/Release'
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          Copy-Item '.uufix-build/Release/uu_session_fix.dll' $dst -Force
+
+          $dll = Join-Path $dst 'uu_session_fix.dll'
+          if (-not (Test-Path $dll)) { throw "UuFix 没有产出 uu_session_fix.dll" }
+          Get-ChildItem $dst | Select-Object Name, Length
+
       - name: 编译（Release / x64）
         shell: pwsh
         run: |
@@ -313,6 +332,20 @@ jobs:
           if (-not (Test-Path (Join-Path $pub 'Yomori.Agent.exe'))) { throw '代理载荷里没有 Yomori.Agent.exe' }
           $mb = ((Get-ChildItem $pub -Recurse -File | Measure-Object Length -Sum).Sum / 1MB)
           Write-Host ("代理载荷 {0:N1} MB（主控端整套约 228MB）" -f $mb)
+
+      - name: 校验 UU 修复载荷已进产物
+        shell: pwsh
+        run: |
+          # csproj 对载荷用了 Exists 条件（本地没编也能编主控），
+          # 所以必须在 CI 里单独确认它确实进了输出 —— 否则安装版点开关才报「找不到载荷」。
+          $targets = @(Join-Path $env:GITHUB_WORKSPACE 'ci-build\uu_session_fix.dll')
+          if ('${{ inputs.self_contained }}' -eq 'true') {
+            $targets += Join-Path $env:GITHUB_WORKSPACE 'ci-publish\uu_session_fix.dll'
+          }
+          foreach ($f in $targets) {
+            if (-not (Test-Path $f)) { throw "缺少 UU 修复载荷：$f" }
+          }
+          Get-ChildItem $targets | Select-Object FullName, Length
 
       - name: 打包（补齐 .pri / XBF / FreeRDP 运行库 / 图标 / 代理载荷 + 自检）
         id: pack
