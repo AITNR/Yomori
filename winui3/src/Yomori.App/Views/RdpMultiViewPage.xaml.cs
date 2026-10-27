@@ -135,6 +135,15 @@ public sealed partial class RdpMultiViewPage : Page
     /// </summary>
     private void LayoutSurfaces()
     {
+        // 定时器的一拍可能排在 OnNavigatedFrom 之后：那时页面已离开，再改画面元素的
+        // 尺寸 / 可见性 / tooltip 都是作用在脱离的树上。
+        // 这里只判 _pageAlive 而不判 IsLoaded —— OnNavigatedTo 里第一次调用时页面
+        // 还没上屏（IsLoaded 为 false），判 IsLoaded 会把首次布局也挡掉。
+        if (!_pageAlive)
+        {
+            return;
+        }
+
         var ids = VM.SurfaceGridChannelIds;
 
         var pageCount = Math.Max(1, (ids.Count + GridPageSize - 1) / GridPageSize);

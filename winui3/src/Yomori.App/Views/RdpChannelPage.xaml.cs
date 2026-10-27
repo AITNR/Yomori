@@ -231,6 +231,14 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
         _refreshTimer.IsRepeating = true;
         _refreshTimer.Tick += (_, _) =>
         {
+            // 页面已经离开（或正在被销毁）时不要再碰可视树：
+            // 定时器的 Tick 可能排在 OnNavigatedFrom 之后，那时再改 ToolTip / 文本
+            // 就是在已脱离的页面上做 XAML 操作（2026-10-27 21:47 就是这样崩的）。
+            if (!_pageAlive || !IsLoaded)
+            {
+                return;
+            }
+
             _session = VM.Sessions.FirstOrDefault(s =>
                 s.IsRemote && string.Equals(s.ChannelId, _channelId, StringComparison.OrdinalIgnoreCase));
             SyncExternalLogs();

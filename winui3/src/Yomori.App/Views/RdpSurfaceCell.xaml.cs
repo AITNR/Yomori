@@ -20,6 +20,28 @@ public sealed partial class RdpSurfaceCell : UserControl
     private RdpEmbeddedClient? _client;
     private string _channelId = string.Empty;
 
+    // 上一次设置过的 tooltip 文案。1Hz 刷新每秒都会走一遍 UpdateChrome，
+    // 而 ToolTipService.SetToolTip 每次都会重建 ToolTip 对象；指针恰好停在该按钮上时，
+    // 工具提示管理器会在重建过程中访问元素的子树 —— 栈上就是这样崩的：
+    //   SetToolTip → Microsoft.UI.Xaml → AccessViolationException
+    // （2026-10-27 21:47，RdpChannelPage 的 1Hz 定时器 → RefreshSurface → UpdateChrome）
+    // 文案没变就不要再设，既省掉每秒几次的对象重建，也避开那条路径。
+    private string? _muteTip;
+    private string? _lockTip;
+    private string? _fullScreenTip;
+
+    /// <summary>只在文案变化时才设 tooltip（见字段注释）。</summary>
+    private static void SetTipIfChanged(ref string? cache, DependencyObject target, string text)
+    {
+        if (string.Equals(cache, text, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        cache = text;
+        ToolTipService.SetToolTip(target, text);
+    }
+
     public RdpSurfaceCell()
     {
         InitializeComponent();
@@ -66,11 +88,9 @@ public sealed partial class RdpSurfaceCell : UserControl
         FullScreenIconEnter.Visibility = active ? Visibility.Collapsed : Visibility.Visible;
         FullScreenIconExit.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
 
-        ToolTipService.SetToolTip(
-            FullScreenButton,
-            active
-                ? "退出全屏：回到页面里的这一格（F11 亦可退出）"
-                : "全屏显示这一路画面（键盘一并接管；F11 退出）");
+        SetTipIfChanged(ref _fullScreenTip, FullScreenButton, active
+            ? "退出全屏：回到页面里的这一格（F11 亦可退出）"
+            : "全屏显示这一路画面（键盘一并接管；F11 退出）");
     }
 
     private static MainViewModel VM => App.ViewModel;
@@ -221,11 +241,9 @@ public sealed partial class RdpSurfaceCell : UserControl
 
         // 按钮上没文字了，tooltip 是唯一说明 —— 必须跟着状态走，
         // 否则悬停看到的永远是同一句、不知道现在是锁着还是没锁。
-        ToolTipService.SetToolTip(
-            LockButton,
-            locked
-                ? "已锁定：鼠标穿透与键盘映射已停用，点一下解锁"
-                : "锁定画面输入：停用鼠标穿透与键盘映射，防止误操作");
+        SetTipIfChanged(ref _lockTip, LockButton, locked
+            ? "已锁定：鼠标穿透与键盘映射已停用，点一下解锁"
+            : "锁定画面输入：停用鼠标穿透与键盘映射，防止误操作");
     }
 
     /// <summary>按静音状态切图标（有声 ↔ 静音）并给生效态加淡强调色底。</summary>
@@ -238,11 +256,9 @@ public sealed partial class RdpSurfaceCell : UserControl
         MuteButton.Foreground = muted ? AccentFg : NormalFg;
         MuteButton.BorderBrush = muted ? AccentBorder : null;
 
-        ToolTipService.SetToolTip(
-            MuteButton,
-            muted
-                ? "已静音：这台机器不放这条通道的声音（远端照常发声），点一下恢复"
-                : "本机静音：远端照常发声，只是这台机器不放这条通道的声音");
+        SetTipIfChanged(ref _muteTip, MuteButton, muted
+            ? "已静音：这台机器不放这条通道的声音（远端照常发声），点一下恢复"
+            : "本机静音：远端照常发声，只是这台机器不放这条通道的声音");
     }
 
     // ---- 图标按钮的配色 ----
