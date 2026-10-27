@@ -64,6 +64,16 @@ public sealed class MainViewModel : ObservableObject
     private readonly RuntimeStatsManager _statsManager;
     private readonly DispatcherQueue _dispatcher;
 
+    /// <summary>
+    /// 自动切回主控会话的闸门。字段初始化器即创建，因为它的构造没有副作用，
+    /// 而 Options 页在 Initialize 之前就可能读到状态。
+    /// </summary>
+    private readonly ControllerSessionReturnCoordinator _controllerSessionReturn =
+        new(new ControllerSessionReturnService());
+
+    /// <summary>正在跑「多通道任务启动」的嵌套计数；&gt;0 时手动连接回调不另起切回意图。</summary>
+    private int _channelRunDepth;
+
     private ScriptRunner? _runner;
     private Task? _runTask;
     private DispatcherQueueTimer? _memorySampleTimer;
@@ -1177,6 +1187,9 @@ public sealed class MainViewModel : ObservableObject
         rdp.NotifyOnChannelDone = source.NotifyOnChannelDone;
         rdp.NotifyOnAllDone = source.NotifyOnAllDone;
         rdp.NotifyLocalTaskDone = source.NotifyLocalTaskDone;
+
+        // 刻意不导入 AutoReturnToControllerSession：它决定「谁的桌面被接管」，
+        // 属于本机行为。跟着别人分享的配置文件走，等于让一份 json 把使用者的桌面顶掉。
         rdp.ConnectTimeoutSeconds = source.ConnectTimeoutSeconds;
         rdp.EmbedRemoteDesktop = source.EmbedRemoteDesktop;
         rdp.ClientMode = source.ClientMode;
@@ -1547,35 +1560,119 @@ public sealed class MainViewModel : ObservableObject
     private async Task RunChannelsAsync(IReadOnlyList<ChannelPlan> plans)
     {
         var jobs = new List<Task>();
+        var localChannels = 0;
 
-        foreach (var entry in plans)
+        Interlocked.Increment(ref _channelRunDepth);
+        try
         {
-            var session = _sessions.FirstOrDefault(s =>
-                s.IsRemote && string.Equals(s.ChannelId, entry.Channel.Id, StringComparison.OrdinalIgnoreCase));
-
-            if (session is null)
+            foreach (var entry in plans)
             {
-                continue;
+                var session = _sessions.FirstOrDefault(s =>
+                    s.IsRemote && string.Equals(s.ChannelId, entry.Channel.Id, StringComparison.OrdinalIgnoreCase));
+
+                if (session is null)
+                {
+                    continue;
+                }
+
+                // 预检（凭据 / 账户 / 远程桌面开关 / 共享目录）不通过就跳过这条通道 ——
+                // 但计数必须减掉，否则整轮永远不会判定结束。
+                if (!ValidateChannel(entry.Channel, entry.Tasks))
+                {
+                    AppendLog($"[通道：{entry.Channel.DisplayName}] 预检未通过，该通道本轮不执行（原因见上方提示）。");
+                    session.MarkCompletionReported();
+                    FinishRunPart();
+                    continue;
+                }
+
+                if (RdpTargets.IsLocal(entry.Channel.Host))
+                {
+                    localChannels++;
+                }
+
+                jobs.Add(RunChannelAsync(session, entry.Tasks));
             }
 
-            // 预检（凭据 / 账户 / 远程桌面开关 / 共享目录）不通过就跳过这条通道 ——
-            // 但计数必须减掉，否则整轮永远不会判定结束。
-            if (!ValidateChannel(entry.Channel, entry.Tasks))
+            if (jobs.Count > 0)
             {
-                AppendLog($"[通道：{entry.Channel.DisplayName}] 预检未通过，该通道本轮不执行（原因见上方提示）。");
-                session.MarkCompletionReported();
-                FinishRunPart();
-                continue;
+                await Task.WhenAll(jobs);
             }
-
-            jobs.Add(RunChannelAsync(session, entry.Tasks));
         }
-
-        if (jobs.Count > 0)
+        finally
         {
-            await Task.WhenAll(jobs);
+            Interlocked.Decrement(ref _channelRunDepth);
         }
+
+        // 批次收敛点：所有通道的准备流程都已返回（连接成功/失败/超时都算），
+        // 此时合并成一次切回，而不是每条通道各切一次。
+        await TriggerControllerSessionReturnAsync("任务启动", localChannels > 0);
     }
+
+    /// <summary>
+    /// 请求一次「把控制台切回主控会话」。调用点必须是连接批次收敛之后，
+    /// 不能放进原生 Connected 回调或批量按钮的循环体里。
+    ///
+    /// <para>失败只记录，不改写任务本身的结果：连接与任务成功与否，
+    /// 与「当前桌面归属」是两件事，混在一起会让排障失去判断依据。</para>
+    /// </summary>
+    private async Task TriggerControllerSessionReturnAsync(string source, bool hasLocalChannel)
+    {
+        if (!hasLocalChannel || !RdpSettings.AutoReturnToControllerSession)
+        {
+            return;
+        }
+
+        ControllerSessionReturnResult result;
+        try
+        {
+            result = await _controllerSessionReturn
+                .RequestAsync(source, enabled: true, hasLocalChannel: true, CancellationToken.None)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[切回] 请求异常：{(ex.Message.Length == 0 ? ex.GetType().Name : ex.Message)}");
+            return;
+        }
+
+        AppendLog(DescribeControllerSessionReturn(result));
+
+        if (!result.IsSuccess)
+        {
+            return;
+        }
+
+        // 状态栏只在确实做过动作时更新；AppendLog 自带编组，UI 属性必须 Post。
+        Post(() =>
+        {
+            if (result.Outcome == ControllerSessionReturnOutcome.Succeeded)
+            {
+                RdpStatusText = $"已切回主控会话（会话 {result.ControllerSessionId}）";
+            }
+        });
+    }
+
+    private static string DescribeControllerSessionReturn(ControllerSessionReturnResult result) =>
+        result.Outcome switch
+        {
+            ControllerSessionReturnOutcome.Succeeded =>
+                $"[切回] {result.Source}：控制台已从会话 {result.ConsoleSessionIdBefore} 切回主控会话 {result.ControllerSessionId}。",
+            ControllerSessionReturnOutcome.AlreadyConsole =>
+                $"[切回] {result.Source}：主控已在控制台上，无需切换。",
+            ControllerSessionReturnOutcome.Busy =>
+                "[切回] 已有一次切回在执行，本次请求已合并。",
+            ControllerSessionReturnOutcome.Cancelled =>
+                "[切回] 请求在提交前被取消（停止或退出）。",
+            ControllerSessionReturnOutcome.QueryFailed =>
+                "[切回] 未能确认会话归属，未执行命令：" + result.Detail,
+            ControllerSessionReturnOutcome.Timeout =>
+                "[切回] " + result.Detail,
+            ControllerSessionReturnOutcome.CommandFailed =>
+                "[切回] 切换失败：" + result.Detail,
+            ControllerSessionReturnOutcome.VerifyFailed =>
+                "[切回] 命令已执行但未确认切回：" + result.Detail,
+            _ => "[切回] " + result.Detail,
+        };
 
     public void Pause()
     {
@@ -1589,15 +1686,21 @@ public sealed class MainViewModel : ObservableObject
 
     public void Stop()
     {
+        // 停止时先作废尚未提交的切回请求：用户要的是「停下」，不是把桌面再抢一次。
+        _controllerSessionReturn.CancelPending();
         _runner?.RequestStop();
         RequestRemoteStop(emergency: false);
     }
 
     public void EmergencyStop()
     {
+        _controllerSessionReturn.CancelPending();
         _runner?.RequestEmergencyStop();
         RequestRemoteStop(emergency: true);
     }
+
+    /// <summary>程序退出前调用：抑制尚未提交的切回，避免退出流程与会话切换抢时序。</summary>
+    public void SuppressControllerSessionReturn() => _controllerSessionReturn.CancelPending();
 
     /// <summary>
     /// 请求**全部通道**的目标会话停止正在跑的任务。
@@ -4330,6 +4433,13 @@ public sealed class MainViewModel : ObservableObject
         // （直接设 RdpStatusText 会触发 x:Bind 跨线程 set_Text → RPC_E_WRONG_THREAD 崩溃）
         AppendSurfaceLog(conn.Key, $"连接建立：桌面 {e.Width}×{e.Height}，画面已嵌入窗口。");
         conn.AutoReconnects = 0; // 连接成功：清零自动重连计数
+
+        // 手动连接走这里：只有真正连上了才请求切回。
+        // 任务批次期间不在这里动手 —— RunChannelsAsync 会在所有通道收敛后统一切一次。
+        if (Volatile.Read(ref _channelRunDepth) == 0)
+        {
+            _ = TriggerControllerSessionReturnAsync("手动连接", true);
+        }
         Post(() =>
         {
             if (RdpStatusText.Contains("内嵌连接中", StringComparison.Ordinal) ||

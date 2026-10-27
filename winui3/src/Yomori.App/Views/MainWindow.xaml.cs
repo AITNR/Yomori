@@ -619,6 +619,17 @@ public sealed partial class MainWindow : Window
 
         _exiting = true;
 
+        // 退出流程一开始就掐掉「切回主控会话」的排队请求：再等窗口 Closed 才处理，
+        // 切换命令可能已经和关闭时序抢在一起了。
+        try
+        {
+            App.ViewModel?.SuppressControllerSessionReturn();
+        }
+        catch
+        {
+            // 退出路径不因为这一步失败而中断
+        }
+
         _autoExitTimer?.Stop();
         _autoExitTimer = null;
 

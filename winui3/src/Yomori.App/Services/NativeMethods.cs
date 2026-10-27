@@ -156,6 +156,17 @@ internal static class NativeMethods
         uint sessionId,
         [MarshalAs(UnmanagedType.Bool)] bool bWait);
 
+    /// <summary>尚未附着任何控制台会话时的返回值（微软文档：0xFFFFFFFF）。</summary>
+    public const uint WtsNoActiveConsoleSession = 0xFFFFFFFF;
+
+    /// <summary>
+    /// 取当前附着在物理控制台（显示器/键盘/鼠标）上的会话 ID。
+    /// 无控制台附着时返回 <see cref="WtsNoActiveConsoleSession"/>，调用方不得把它当成有效目标。
+    /// </summary>
+    [DllImport("wtsapi32.dll")]
+    public static extern uint WTSGetActiveConsoleSessionId();
+
+
     // ---------------- Toolhelp32：一次快照拿全系统的 PID / 父 PID / 镜像名 ----------------
     //
     // 为什么必须自己拿父子关系：.NET 的 Process.Kill(entireProcessTree: true) **实测会漏掉后代** ——

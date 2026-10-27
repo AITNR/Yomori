@@ -507,6 +507,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private bool _notifyOnChannelDone = true;
     private bool _notifyOnAllDone = true;
     private bool _notifyLocalTaskDone = true;
+    private bool _autoReturnToControllerSession;
     private int _connectTimeoutSeconds = 120;
     private bool _credentialSaved;
     private bool _embedRemoteDesktop;
@@ -586,6 +587,19 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     {
         get => _sessionFinish;
         set => SetProperty(ref _sessionFinish, SessionFinishModes.Normalize(value));
+    }
+
+    /// <summary>
+    /// 连接本机通道后，自动把主控进程所在会话切回物理控制台。
+    ///
+    /// <para>默认 <c>false</c>：这是会改变当前桌面归属的动作，必须由用户显式开启。
+    /// 开关语义是「本机行为」，不随配置导入导出走 —— 换台机器时不该被动把别人的桌面顶掉。</para>
+    /// </summary>
+    [JsonPropertyName("auto_return_to_controller_session")]
+    public bool AutoReturnToControllerSession
+    {
+        get => _autoReturnToControllerSession;
+        set => SetProperty(ref _autoReturnToControllerSession, value);
     }
 
     /// <summary>每完成一个任务都弹系统通知。</summary>
@@ -808,7 +822,9 @@ public sealed class RdpConfig : ObservableObject, ICloneable
                 case "notifylocaltaskdone":
                     NotifyLocalTaskDone = element.ValueKind == JsonValueKind.True;
                     break;
-                case "connecttimeoutseconds":
+                case "autoreturntocontrollersession":
+                    AutoReturnToControllerSession = element.ValueKind == JsonValueKind.True;
+                    break;                case "connecttimeoutseconds":
                     if (element.ValueKind == JsonValueKind.Number)
                     {
                         ConnectTimeoutSeconds = element.GetInt32();

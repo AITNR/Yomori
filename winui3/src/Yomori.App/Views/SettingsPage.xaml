@@ -42,6 +42,18 @@
 
                     <ToggleSwitch Header="Windows 开机自启动本程序"
                                   IsOn="{x:Bind VM.Config.WindowsStartup, Mode=TwoWay}" />
+
+                    <!-- 自动切回主控会话：目标固定为主控进程自己的 Windows 会话。
+                         只在「本机通道连上」之后执行，一次连接批次最多切一次。 -->
+                    <ToggleSwitch x:Name="AutoReturnSwitch"
+                                  Header="连接本机通道后自动切回主控会话"
+                                  IsOn="{x:Bind VM.RdpSettings.AutoReturnToControllerSession, Mode=OneWay}"
+                                  Toggled="OnAutoReturnToggled" />
+
+                    <TextBlock Text="把当前桌面切回本程序所在的账户会话，减少远控软件进入其他账户桌面的情况。开启后，本机内嵌通道连上时自动执行；当前占着桌面的会话会被断开（进程保留）。该设置只作用于本机，不随配置导入导出。"
+                               TextWrapping="Wrap"
+                               Opacity="0.7"
+                               FontSize="12" />
                 </StackPanel>
             </Border>
 

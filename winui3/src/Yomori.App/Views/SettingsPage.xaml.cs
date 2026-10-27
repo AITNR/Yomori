@@ -249,8 +249,47 @@ public sealed partial class SettingsPage : Page
             : "已关闭开发者模式：运行日志页不再显示带 embed 标签的内嵌画面诊断日志（日志文件里仍完整保留）。");
     }
 
-    private void OnSave(object sender, RoutedEventArgs e) => VM.SaveConfig();
+    /// <summary>
+    /// 自动切回主控会话开关。
+    ///
+    /// <para>与开发者模式同一套路：<c>OneWay</c> 绑定 + 手动写回 + 立刻落盘。
+    /// 原因不是风格问题 —— <c>TwoWay</c> 下 <c>Toggled</c> 早于绑定写回，
+    /// 在回调里读配置会读到旧值，判断「有没有变」就永远不成立。</para>
+    ///
+    /// <para>关闭时顺手作废排队中的请求：用户关掉开关的意思就是「别再动我的桌面」。</para>
+    /// </summary>
+    private void OnAutoReturnToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncing)
+        {
+            return;
+        }
 
+        if (sender is not ToggleSwitch toggle)
+        {
+            return;
+        }
+
+        var on = toggle.IsOn;
+        if (VM.RdpSettings.AutoReturnToControllerSession == on)
+        {
+            return;
+        }
+
+        VM.RdpSettings.AutoReturnToControllerSession = on;
+        VM.SaveConfig();
+
+        if (!on)
+        {
+            VM.SuppressControllerSessionReturn();
+        }
+
+        VM.AppendLog(on
+            ? "已开启「连接本机通道后自动切回主控会话」：本机内嵌通道连上后，控制台会切回本程序所在会话。"
+            : "已关闭「连接本机通道后自动切回主控会话」：之后不再自动切换桌面归属。");
+    }
+
+    private void OnSave(object sender, RoutedEventArgs e) => VM.SaveConfig();
     private async void OnExport(object sender, RoutedEventArgs e) => await VM.ExportConfigAsync();
 
     private async void OnImport(object sender, RoutedEventArgs e) => await VM.ImportConfigAsync();

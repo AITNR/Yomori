@@ -55,7 +55,7 @@
          这些能力。留在编译范围里，将来一次误引用就会把高风险动作带进常驻进程；
          而排除之后一旦有人引用，代理工程会直接 CS0246 编译失败 —— 这正是我们要的提醒。 -->
     <Compile Include="..\Yomori.App\Services\**\*.cs" LinkBase="Services"
-             Exclude="..\Yomori.App\Services\NotificationService.cs;..\Yomori.App\Services\RdpD3DRenderer.cs;..\Yomori.App\Services\SingleInstance.cs;..\Yomori.App\Services\RdpUnlockService.cs;..\Yomori.App\Services\RdpUninstallService.cs;..\Yomori.App\Services\RdpReleaseResolver.cs;..\Yomori.App\Services\RdpToolDownloader.cs;..\Yomori.App\Services\RdpToolRunner.cs;..\Yomori.App\Services\RdpHiddenProcess.cs;..\Yomori.App\Services\RdpRegistryService.cs;..\Yomori.App\Services\RdpServiceControl.cs;..\Yomori.App\Services\RdpTransactionStore.cs;..\Yomori.App\Services\RdpToolProcessTree.cs;..\Yomori.App\Services\RdpDiagnoseCli.cs" />
+             Exclude="..\Yomori.App\Services\NotificationService.cs;..\Yomori.App\Services\RdpD3DRenderer.cs;..\Yomori.App\Services\SingleInstance.cs;..\Yomori.App\Services\RdpUnlockService.cs;..\Yomori.App\Services\RdpUninstallService.cs;..\Yomori.App\Services\RdpReleaseResolver.cs;..\Yomori.App\Services\RdpToolDownloader.cs;..\Yomori.App\Services\RdpToolRunner.cs;..\Yomori.App\Services\RdpHiddenProcess.cs;..\Yomori.App\Services\RdpRegistryService.cs;..\Yomori.App\Services\RdpServiceControl.cs;..\Yomori.App\Services\RdpTransactionStore.cs;..\Yomori.App\Services\RdpToolProcessTree.cs;..\Yomori.App\Services\RdpDiagnoseCli.cs;..\Yomori.App\Services\ControllerSessionReturnService.cs;..\Yomori.App\Services\ControllerSessionReturnCoordinator.cs" />
     <Compile Include="..\Yomori.App\Helpers\**\*.cs" LinkBase="Helpers"
              Exclude="..\Yomori.App\Helpers\DialogHelper.cs;..\Yomori.App\Helpers\WindowHelper.cs" />
   </ItemGroup>
