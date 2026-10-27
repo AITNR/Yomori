@@ -1420,7 +1420,7 @@ public sealed partial class SettingsPage : Page
             "还原注册表",
             $"将把本功能改过的注册表值恢复成解锁前的状态。{Environment.NewLine}{Environment.NewLine}"
             + $"使用备份：{baseline.SummaryText}{Environment.NewLine}"
-            + "变更范围：仅 fDenyTSConnections 等白名单键值。"
+            + "变更范围：仅 fDenyTSConnections / fSingleSessionPerUser 等白名单键值。"
             + Environment.NewLine + Environment.NewLine
             + "注意：这**不会**卸载解锁组件，也不会删除 Windows 用户、Yomori 通道或凭据。"
             + "恢复可能需要重启远程桌面服务，正在连接的远程会话会断开。",
@@ -1606,8 +1606,10 @@ public sealed partial class SettingsPage : Page
         scope.AppendLine("这个操作会修改本机系统：");
         scope.AppendLine("1. " + (needDownload ? "下载并安装第三方 RDP Wrapper 解锁组件" : "复用本机已有的解锁组件（不重装）"));
         scope.AppendLine("2. 修改注册表：HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server 的 fDenyTSConnections 改为 0");
-        scope.AppendLine("3. 更新本机 rdpwrap.ini");
-        scope.AppendLine("4. 重启 Remote Desktop Services（TermService）");
+        scope.AppendLine("3. 修改注册表：fSingleSessionPerUser 改为 1（本机键；若策略键里已有该值也一并改为 1）");
+        scope.AppendLine("   这一项让同一账户只保留一条会话 —— 不设它，每连一次就会多一条「已断开」的历史会话。");
+        scope.AppendLine("4. 更新本机 rdpwrap.ini");
+        scope.AppendLine("5. 重启 Remote Desktop Services（TermService）");
         scope.AppendLine();
         scope.AppendLine("风险：");
         scope.AppendLine("· 精简版系统上可能无效；");

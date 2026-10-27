@@ -252,7 +252,7 @@ public sealed partial class RdpMultiViewPage : Page
     private void OnOpenChannelManagerClicked(object sender, RoutedEventArgs e) => VM.Navigate("channel-mgmt");
 
     /// <summary>给当前网格里还没画面的通道各建一条内嵌连接（只看画面，不下发任务）。</summary>
-    private void OnConnectAllClicked(object sender, RoutedEventArgs e)
+    private async void OnConnectAllClicked(object sender, RoutedEventArgs e)
     {
         var pending = VM.SurfaceGridChannelIds.Where(id => !VM.HasSurface(id)).ToList();
         if (pending.Count == 0)
@@ -261,9 +261,13 @@ public sealed partial class RdpMultiViewPage : Page
             return;
         }
 
+        // 批量连接只问一次「单会话策略」，然后逐条建连 ——
+        // 每条各问一次的话，用户会连着看到 N 个同样的对话框。
+        await VM.ConfirmSingleSessionBeforeConnectAsync($"「连接全部通道」（{pending.Count} 条）");
+
         foreach (var id in pending)
         {
-            VM.ConnectChannelSurface(id);
+            VM.ConnectChannelSurfaceNow(id);
         }
 
         VM.AppendLog($"[汇总] 正在为 {pending.Count} 条通道建立内嵌画面连接…");

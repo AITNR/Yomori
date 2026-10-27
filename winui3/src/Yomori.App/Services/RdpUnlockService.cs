@@ -967,22 +967,50 @@ public static class RdpUnlockService
         var notes = new List<string>();
         var allOk = true;
 
-        // 策略键只报告不写：把值写进 Policies 等于替管理员下策略，而且会和域策略打架
+        // 策略键里的远程桌面开关只报告不写：把值写进 Policies 等于替管理员下策略。
+        // 但 fSingleSessionPerUser 是例外，理由见下面的逐项处理。
         var policy = RdpRegistryService.ReadPolicyValue();
         if (policy.Kind != RdpRegistryKind.NotFound)
         {
-            notes.Add($"策略键已存在（{policy.ToDisplay()}），未改动。");
+            notes.Add($"策略键里的远程桌面开关已存在（{policy.ToDisplay()}），未改动。");
         }
 
         foreach (var delta in manifest.Registry)
         {
-            // 目标：远程桌面开关写成 DWORD 0（允许连接）
-            if (!delta.Before.Name.Equals("fDenyTSConnections", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
+            var name = delta.Before.Name;
+            var isPolicyKey = delta.Before.KeyPath.StartsWith(
+                RdpRegistryService.PolicyKeyPath, StringComparison.OrdinalIgnoreCase);
 
-            if (delta.Before.KeyPath.StartsWith(RdpRegistryService.PolicyKeyPath, StringComparison.OrdinalIgnoreCase))
+            // ---------------- 目标值 ----------------
+            //
+            // fDenyTSConnections → 0（允许远程桌面），只在非策略键上写。
+            // fSingleSessionPerUser → 1（同账户单会话）。
+            //   本机键：一律写 1。
+            //   策略键：**只在它已经有值时才写** —— 有值就说明有东西（RDP Wrapper 的安装脚本、
+            //   或域策略）在用 0 覆盖本机键，不把它改成 1 就等于没改。不存在时不去"创建"策略，
+            //   否则就成了替管理员下策略。
+            int? targetValue = null;
+
+            if (name.Equals("fDenyTSConnections", StringComparison.OrdinalIgnoreCase))
+            {
+                if (isPolicyKey)
+                {
+                    continue;
+                }
+
+                targetValue = 0;
+            }
+            else if (name.Equals("fSingleSessionPerUser", StringComparison.OrdinalIgnoreCase))
+            {
+                if (isPolicyKey && delta.Before.Kind == RdpRegistryKind.NotFound)
+                {
+                    notes.Add("策略键里没有 fSingleSessionPerUser，未新建（本机键写入即生效）。");
+                    continue;
+                }
+
+                targetValue = 1;
+            }
+            else
             {
                 continue;
             }
@@ -992,14 +1020,14 @@ public static class RdpUnlockService
                 KeyPath = delta.Before.KeyPath,
                 Name = delta.Before.Name,
                 Kind = RdpRegistryKind.Dword,
-                NumberValue = 0,
+                NumberValue = targetValue.Value,
             };
 
             delta.After = target;
 
             if (RdpRegistryService.Matches(delta.Before, target))
             {
-                notes.Add($"{delta.Before.Name} 已是 DWORD 0，无需修改。");
+                notes.Add($"{delta.Label} 已是 DWORD {targetValue.Value}，无需修改。");
                 delta.Applied = true;
                 delta.Verified = true;
                 continue;
@@ -1044,7 +1072,8 @@ public static class RdpUnlockService
                 continue;
             }
 
-            notes.Add($"{delta.Before.Name} 已改为 DWORD 0（原 {delta.Before.ToDisplay()}）。");
+            notes.Add($"{delta.Before.Name} 已改为 DWORD {targetValue.Value}（原 {delta.Before.ToDisplay()}）" +
+                      (isPolicyKey ? "（策略键：若该值由域策略下发，会在下次策略刷新时被改回）" : string.Empty) + "。");
         }
 
         // 「无需修改」的项也要把 After 落到盘上：账本要能解释本轮到底想改什么

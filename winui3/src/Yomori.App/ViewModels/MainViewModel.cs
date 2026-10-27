@@ -3356,7 +3356,38 @@ public sealed class MainViewModel : ObservableObject
     /// 内嵌模式：画面挂进该通道页的「内嵌画面」区；
     /// 独立窗口模式：画面在系统自带的 mstsc 窗口里，这里退化为常规连接入口。
     /// </summary>
-    public void ConnectChannelSurface(string channelId)
+    public void ConnectChannelSurface(string channelId) => _ = ConnectChannelSurfaceGuardedAsync(channelId);
+
+    /// <summary>
+    /// <see cref="ConnectChannelSurface"/> 的前置检查版本。
+    ///
+    /// <para>已经连着（只是复用）时<b>不弹</b>：没有新建会话的风险，问了只是打扰。
+    /// 批量入口（多画面页的「连接全部通道」）由页面自己先问一次，再循环调
+    /// <see cref="ConnectChannelSurfaceNow"/> —— 否则 N 条通道会弹 N 次。</para>
+    /// </summary>
+    private async Task ConnectChannelSurfaceGuardedAsync(string channelId)
+    {
+        if (IsRdpBusy)
+        {
+            return;
+        }
+
+        if (IsEmbeddedMode && HasSurface(channelId))
+        {
+            ConnectChannelSurfaceNow(channelId);
+            return;
+        }
+
+        if (!await ConfirmSingleSessionBeforeConnectAsync($"通道「{channelId}」"))
+        {
+            return;
+        }
+
+        ConnectChannelSurfaceNow(channelId);
+    }
+
+    /// <summary>真正的连接动作（<b>不做</b>单会话策略检查，调用方负责先确认）。</summary>
+    public void ConnectChannelSurfaceNow(string channelId)
     {
         var session = _sessions.FirstOrDefault(s =>
             s.IsRemote && string.Equals(s.ChannelId, channelId, StringComparison.OrdinalIgnoreCase));
@@ -3375,8 +3406,9 @@ public sealed class MainViewModel : ObservableObject
 
         if (!IsEmbeddedMode)
         {
-            // 独立窗口模式的画面不在应用里，走常规连接入口即可
-            ConnectSurface();
+            // 独立窗口模式的画面不在应用里，走常规连接入口即可。
+            // 用 Now 版：单会话策略已经在外面问过了，别再弹第二次。
+            ConnectSurfaceNow();
             return;
         }
 
@@ -3403,6 +3435,71 @@ public sealed class MainViewModel : ObservableObject
         _ = DialogHelper.ShowMessageAsync("连接失败", message);
     }
 
+    /// <summary>
+    /// 连接前的统一闸门：确认「同一账户只保留一条会话」（fSingleSessionPerUser=1）。
+    ///
+    /// <para>为什么连接前要问这一句：这个值是 0 时，每连一次都会新建一条会话、
+    /// 旧会话留成「已断开」，同一账户越攒越多 —— 任务派发也就没法确定该落到哪一条
+    /// （真机现场：RDP Wrapper 安装时把策略键里的这一项写成了 0）。
+    /// 值已经是 1 就什么都不问，直接连。</para>
+    ///
+    /// <para>只问一次、由用户决定：选「坚持连接」就照原样连，不改系统。</para>
+    /// </summary>
+    /// <param name="scope">弹窗里说明"是哪一次连接"用（通道名 / 批量 / 设置页）。</param>
+    /// <returns>true = 继续连接（永远为 true，保留返回值便于将来加入"取消"）。</returns>
+    public async Task<bool> ConfirmSingleSessionBeforeConnectAsync(string scope)
+    {
+        var state = RdpSingleSessionPolicy.Read();
+
+        if (state.Proven)
+        {
+            return true;
+        }
+
+        if (state.Status == SingleSessionPolicyStatus.ReadFailed)
+        {
+            // 读不到就不拦：既不能证明有问题，也不该凭空打断用户
+            AppendLog($"[连接前检查] 读不到 {RdpSingleSessionPolicy.ValueName}（{state.Error}），本次不做提示。");
+            return true;
+        }
+
+        var current = state.Effective is int value ? value.ToString() : "未设置";
+        var result = await DialogHelper.ShowMessageAsync(
+            "同一账户可能被开出多条会话",
+            $"{scope} 连接前检查到：{RdpSingleSessionPolicy.ValueName} 的生效值为 {current}"
+            + $"（{state.Detail}）。\n\n"
+            + "这一项控制「同一账户是否只保留一条远程桌面会话」。为 0 / 未设置时，"
+            + "每次连接都会新建一条会话，旧会话留在「已断开」，于是同一个账户会越攒越多会话，"
+            + "任务也就无法确定该交给哪一条。\n\n"
+            + "建议改为 1（同一账户只保留一条会话）。改动会记录到 "
+            + $"{RdpSingleSessionPolicy.LedgerPath}；若该值由域策略下发，会在策略刷新时被改回。",
+            closeText: "坚持连接",
+            primaryText: "修改为 1 并连接");
+
+        if (result != Microsoft.UI.Xaml.Controls.ContentDialogResult.Primary)
+        {
+            AppendLog($"[连接前检查] 生效值 {current}，用户选择坚持连接（未修改策略）。");
+            return true;
+        }
+
+        var change = RdpSingleSessionPolicy.Enable();
+        AppendLog($"[连接前检查] {change.Message}");
+
+        if (change.Ok)
+        {
+            // 注册表值对"新建会话"生效；万一服务端把它缓存在内存里，重启 TermService 才会读到新值。
+            // 这里只提示，不自动重启 —— 重启会打断所有远程会话。
+            AppendLog("[连接前检查] 该值对之后的连接生效；若这次仍然新建了会话，"
+                      + "请重启「远程桌面服务（TermService）」后再试一次。");
+        }
+        else
+        {
+            AppendLog("[连接前检查] ⚠ 修改没有成功，仍按「坚持连接」继续；这条连接可能又会新建一条会话。");
+        }
+
+        return true;
+    }
+
     /// <summary>「连接目标账户」按钮是否可用。</summary>
     public bool CanConnectSurface => !IsRdpBusy;
 
@@ -3410,7 +3507,29 @@ public sealed class MainViewModel : ObservableObject
     /// 只建立远程桌面会话（独立 mstsc 窗口），不下发任何任务。
     /// 目标账户在本机已经登录着的话直接复用，不再新建连接。
     /// </summary>
-    public void ConnectSurface()
+    public void ConnectSurface() => _ = ConnectSurfaceGuardedAsync();
+
+    /// <summary>
+    /// <see cref="ConnectSurface"/> 的前置检查版本：先确认单会话策略，再走原流程。
+    /// 所有界面入口都走这里，避免某一条路漏掉检查。
+    /// </summary>
+    private async Task ConnectSurfaceGuardedAsync()
+    {
+        if (IsRdpBusy)
+        {
+            return;
+        }
+
+        if (!await ConfirmSingleSessionBeforeConnectAsync("「连接目标账户」"))
+        {
+            return;
+        }
+
+        ConnectSurfaceNow();
+    }
+
+    /// <summary>真正的连接动作（<b>不做</b>单会话策略检查，调用方负责先确认）。</summary>
+    public void ConnectSurfaceNow()
     {
         if (IsRdpBusy)
         {

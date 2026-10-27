@@ -27,17 +27,24 @@ public static class RdpRegistryService
     private const string HivePrefix = "HKLM";
 
     /// <summary>
-    /// 最小写入候选集（计划书 5.1）。除这两项之外，本功能不碰任何注册表值。
+    /// 最小写入候选集（计划书 5.1）。除这几项之外，本功能不碰任何注册表值。
     /// </summary>
     /// <remarks>
-    /// 只收 <c>fDenyTSConnections</c>：它才是「关掉远程桌面」的总开关。
-    /// <c>fSingleSessionPerUser</c>、NLA、SecurityLayer、端口、时限等只检查不写 ——
-    /// 计划书要求「除非实测证明是必要条件并在确认清单中明确」，本轮没有这样的证据。
+    /// <para><c>fDenyTSConnections</c>：远程桌面总开关，写成 0 才允许连接。</para>
+    /// <para><c>fSingleSessionPerUser</c>：同账户是否只允许一条会话。
+    /// 2026-10-27 起纳入解锁流程 —— 真机证明 RDP Wrapper 安装时会把 <b>策略键</b>里的这一项
+    /// 写成 0（同一键下还有 <c>MaxInstanceCount=999999</c>），于是每次 RDP 登录都新建会话、
+    /// 旧的留成「已断开」。不修这一项，解锁装得再干净也会一直堆历史会话、
+    /// 任务派发永远要面对"多条会话"的歧义。</para>
+    /// <para>两处都要列：本机键是 Windows 自己读的那份，策略键（Policies）在有值时会覆盖它。
+    /// 只写本机键在这类机器上等于没改。</para>
     /// </remarks>
     public static readonly IReadOnlyList<(string KeyPath, string Name)> Whitelist = new[]
     {
         (@"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server", "fDenyTSConnections"),
         (@"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fDenyTSConnections"),
+        (@"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server", "fSingleSessionPerUser"),
+        (@"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services", "fSingleSessionPerUser"),
     };
 
     /// <summary>
