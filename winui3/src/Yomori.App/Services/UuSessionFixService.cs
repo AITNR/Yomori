@@ -146,6 +146,28 @@ internal static class UuSessionFixService
         return false;
     }
 
+    /// <summary>当前投屏进程所在会话；没有进程时返回 null。</summary>
+    public static int? TryGetServerSessionId()
+    {
+        try
+        {
+            var process = Process.GetProcessesByName(ServerProcessName).FirstOrDefault();
+            if (process is null)
+            {
+                return null;
+            }
+
+            using (process)
+            {
+                return process.SessionId;
+            }
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// 执行修复：注入载荷 → 结束当前投屏进程，让服务按修正后的枚举结果重新拉起。
     /// </summary>
@@ -178,6 +200,20 @@ internal static class UuSessionFixService
         }
 
         // 注入只改变量：现有投屏进程仍绑在旧会话上，必须让它重启一次。
+        // 但若它本来就在控制台会话，重启只会白断一次远控 —— 此时保留进程，只装上 hook 即可。
+        var currentServerSession = TryGetServerSessionId();
+        if (consoleKnown && currentServerSession == consoleId)
+        {
+            return new UuFixResult
+            {
+                Outcome = UuFixOutcome.Success,
+                ServicePid = pid,
+                ServerSessionId = currentServerSession,
+                ConsoleSessionId = consoleId,
+                Detail = "已启用：投屏进程本来就在主控会话，未打断当前连接。",
+            };
+        }
+
         KillServers();
         var serverSession = await WaitForServerSessionAsync(cancellationToken).ConfigureAwait(false);
 

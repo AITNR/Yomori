@@ -290,74 +290,79 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// UU 远程修复：注入会话判定修正模块，并让 UU 的投屏进程重新选择会话。
+    /// UU 远程修复开关：勾选即启用（注入 + 重选会话），取消即撤销（重启 UU 服务）。
     ///
-    /// <para>为什么必须二次确认：它会重启 UU 的投屏进程，正在进行的远控会中断一次。
-    /// 用户点按钮时未必意识到这一点，所以把影响写在确认框里而不是只写页面说明。</para>
+    /// <para>为什么先确认再动手：启用会重启 UU 的投屏进程，正在进行的远控会中断一次。
+    /// 用户拨开关时未必意识到这一点，所以把影响写进确认框；拒绝时把开关拨回去，
+    /// 不能留下「看着是开的、其实什么都没做」的状态。</para>
+    ///
+    /// <para>为什么不落配置：修复只存在于目标进程内存里，本程序退出或 UU 服务重启即失效。
+    /// 持久化会让下次启动时开关显示为开、实际却没生效，比不记忆更容易误导。</para>
     /// </summary>
-    private async void OnUuFixClicked(object sender, RoutedEventArgs e)
+    private async void OnUuFixToggled(object sender, RoutedEventArgs e)
     {
-        var confirm = await DialogHelper.ShowMessageAsync(
-            "修复 UU 远程会话",
-            "将向 UU 的服务进程注入会话判定修正模块，并重启它的投屏进程。\n\n" +
-            "影响：当前正在进行中的 UU 远控画面会中断一次；UU 服务重启后修复自动失效。\n" +
-            "不会修改 UU 的任何文件。\n\n" +
-            "需要 UU 远程已安装且服务正在运行。",
-            closeText: "取消",
-            primaryText: "开始修复");
-
-        if (confirm != ContentDialogResult.Primary)
+        if (_syncing)
         {
             return;
         }
 
+        if (sender is not ToggleSwitch toggle)
+        {
+            return;
+        }
+
+        var enable = toggle.IsOn;
+
+        var confirm = await DialogHelper.ShowMessageAsync(
+            enable ? "启用 UU 远程修复" : "关闭 UU 远程修复",
+            enable
+                ? "将向 UU 的服务进程注入会话判定修正模块，使其投屏进程回到本程序所在的桌面。\n\n"
+                  + "影响：当前正在进行中的 UU 远控画面会中断一次；本程序退出或 UU 服务重启后修复失效，需重新勾选。\n"
+                  + "不会修改 UU 的任何文件。\n\n"
+                  + "需要 UU 远程已安装且服务正在运行。"
+                : "将重启 UU 服务，使会话修正失效、行为恢复原状。\n\n"
+                  + "影响：当前正在进行中的 UU 远控画面会中断一次。",
+            closeText: "取消",
+            primaryText: enable ? "启用" : "关闭");
+
+        if (confirm != ContentDialogResult.Primary)
+        {
+            // 用户反悔：把开关拨回去，且不触发下一轮 Toggled
+            _syncing = true;
+            toggle.IsOn = !enable;
+            _syncing = false;
+            return;
+        }
+
         UuFixStatusText.Visibility = Visibility.Visible;
-        UuFixStatusText.Text = "正在修复…";
+        UuFixStatusText.Text = enable ? "正在启用…" : "正在关闭…";
 
         try
         {
-            var result = await UuSessionFixService.ApplyAsync(CancellationToken.None);
+            var result = enable
+                ? await UuSessionFixService.ApplyAsync(CancellationToken.None)
+                : UuSessionFixService.Restore();
+
             UuFixStatusText.Text = result.Detail;
             VM.AppendLog("[UU 修复] " + result.Detail);
+
+            var failed = enable ? !result.IsSuccess : result.Outcome != UuFixOutcome.Restored;
+            if (failed)
+            {
+                _syncing = true;
+                toggle.IsOn = !enable;
+                _syncing = false;
+            }
         }
         catch (Exception ex)
         {
-            // 注入链任何一段抛出来都要落到界面，不能只留日志
             var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
-            UuFixStatusText.Text = "修复失败：" + detail;
+            UuFixStatusText.Text = (enable ? "启用失败：" : "关闭失败：") + detail;
             VM.AppendLog("[UU 修复] 异常：" + detail);
-        }
-    }
 
-    /// <summary>撤销：重启 UU 服务，进程内 hook 随进程消失。</summary>
-    private async void OnUuRestoreClicked(object sender, RoutedEventArgs e)
-    {
-        var confirm = await DialogHelper.ShowMessageAsync(
-            "撤销 UU 修复",
-            "将重启 UU 服务，使会话修正失效、行为恢复原状。\n\n" +
-            "影响：当前正在进行中的 UU 远控画面会中断一次。",
-            closeText: "取消",
-            primaryText: "重启服务");
-
-        if (confirm != ContentDialogResult.Primary)
-        {
-            return;
-        }
-
-        UuFixStatusText.Visibility = Visibility.Visible;
-        UuFixStatusText.Text = "正在重启 UU 服务…";
-
-        try
-        {
-            var result = UuSessionFixService.Restore();
-            UuFixStatusText.Text = result.Detail;
-            VM.AppendLog("[UU 修复] " + result.Detail);
-        }
-        catch (Exception ex)
-        {
-            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
-            UuFixStatusText.Text = "撤销失败：" + detail;
-            VM.AppendLog("[UU 修复] 撤销异常：" + detail);
+            _syncing = true;
+            toggle.IsOn = !enable;
+            _syncing = false;
         }
     }
 
