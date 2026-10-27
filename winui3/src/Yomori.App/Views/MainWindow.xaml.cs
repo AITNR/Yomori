@@ -1,5 +1,6 @@
 // -*- coding: utf-8 -*-
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
@@ -59,6 +60,26 @@ public sealed partial class MainWindow : Window
 
     /// <summary>"任务跑完自动退出"的延时器（智能模式）。</summary>
     private DispatcherQueueTimer? _autoExitTimer;
+
+    /// <summary>
+    /// 正在播放的「子菜单入场动画」。
+    ///
+    /// <para>🔑 必须挂字段保活。Storyboard 不自持引用：<c>board.Begin()</c> 返回后，
+    /// 若没人引用它，它连同动画时钟一起可能被回收，而元素上的动画状态不会跟着清干净 ——
+    /// 之后命中测试调用 <c>CUIElement::GetLocalTransform</c> 算这个元素的变换时，
+    /// 读到的就是失效对象（2026-10-27 两次崩溃的栈顶就是这个函数）。</para>
+    /// </summary>
+    private readonly List<Storyboard> _menuEntranceBoards = new();
+
+    /// <summary>
+    /// 上一次生成的子菜单内容签名。内容没变就不重建 —— 跑任务时
+    /// <c>SessionsChanged</c> 会频繁触发，反复清空重建会让 NavigationView 内部
+    /// 不停销毁/重建这些项，既闪，也把动画状态带进已脱离可视树的元素里。
+    /// </summary>
+    private string _channelMenuSignature = string.Empty;
+
+    /// <summary>子菜单重建是否已排队（合并同一拍内的多次触发）。</summary>
+    private bool _menuRebuildQueued;
 
     /// <summary>窗口是否收在状态栏里（供外部判断，例如单实例激活时决定要不要 Show）。</summary>
     public bool IsHiddenToTray => _hiddenToTray;
@@ -1329,21 +1350,67 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// 重建「会话通道」父项下的子菜单。
+    /// 重建「会话通道」父项下的子菜单（排到下一拍执行）。
     ///
     /// 为什么不在 XAML 里绑集合：子项要先列配置通道、再补在跑的通道、末尾还要钉一个「通道管理…」，
     /// 由窗口统一重建比双向同步可靠得多，也避开 NavigationView 选中态与集合变更的竞态。
+    ///
+    /// <para>🔑 一律延后一拍：<c>MenuItems</c> 的增删会立刻引发 NavigationView 子树的进出
+    /// （<c>Enter</c>/<c>Leave</c>）。触发本方法的都是属性变更 / 集合变更回调，这些回调
+    /// 有可能正处在一趟布局或树进入过程里 —— 边遍历边改集合，2026-10-27 19:43 那次
+    /// <c>FailFastWithStowedExceptions</c>（栈底是 <c>CUIElementCollection::Append</c> →
+    /// <c>EnterImpl</c>）就是这个形状。排到下一拍就不可能落在遍历中间。</para>
     /// </summary>
     private void RebuildChannelMenuItems()
     {
-        // 可能来自后台线程（会话集合变化）——碰控件一律回 UI 线程
         if (!DispatcherQueue.HasThreadAccess)
         {
             DispatcherQueue.TryEnqueue(RebuildChannelMenuItems);
             return;
         }
 
+        // 多次触发合并成一次：任务运行期间 SessionsChanged 可能连发好几次。
+        if (_menuRebuildQueued)
+        {
+            return;
+        }
+
+        _menuRebuildQueued = true;
+        if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                _menuRebuildQueued = false;
+                RebuildChannelMenuItemsCore();
+            }))
+        {
+            _menuRebuildQueued = false;
+        }
+    }
+
+    private void RebuildChannelMenuItemsCore()
+    {
         var parent = ChannelsNavItem;
+
+        // 内容没变就整个跳过：不只省事，更是**避免销毁重建**。
+        // 这些项上可能正挂着入场动画的 RenderTransform，反复重建等于把带动画的元素
+        // 丢进垃圾堆，而动画时钟仍挂在它们身上。
+        var entries = EnumerateChannelMenuEntries();
+        var signature = BuildChannelMenuSignature(entries);
+        if (signature == _channelMenuSignature && parent.MenuItems.Count > 0)
+        {
+            if (_currentTag.Length > 0)
+            {
+                SyncNavigationSelection(_currentTag);
+            }
+            return;
+        }
+
+        _channelMenuSignature = signature;
+
+        // 🔑 清空前必须先停动画、摘掉变换：动画的 Completed 回调会晚于元素被移除，
+        // 那时再改 Opacity / TranslateY 就是把动画值写进一棵已经不存在的子树。
+        // 2026-10-27 两次崩溃的栈顶正是 CUIElement::GetLocalTransform ——
+        // 命中测试遍历左侧菜单时，算到某个已失效的 CompositeTransform 上。
+        StopChannelMenuAnimations();
 
         parent.MenuItems.Clear();
         parent.MenuItems.Add(new NavigationViewItem
@@ -1353,7 +1420,7 @@ public sealed partial class MainWindow : Window
             Icon = new SymbolIcon(Symbol.ViewAll),
         });
 
-        foreach (var (id, name, tooltip) in EnumerateChannelMenuEntries())
+        foreach (var (id, name, tooltip) in entries)
         {
             var item = new NavigationViewItem
             {
@@ -1418,13 +1485,16 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private void PlayChannelMenuEntrance()
     {
+        // 上一段还没播完就又展开：先把旧的停掉并摘掉变换，避免同一元素上叠两套动画。
+        StopChannelMenuAnimations();
+
         var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
         var duration = new Duration(TimeSpan.FromMilliseconds(MenuEntranceDurationMs));
         var index = 0;
 
         foreach (var entry in ChannelsNavItem.MenuItems)
         {
-            if (entry is not UIElement element)
+            if (entry is not FrameworkElement element)
             {
                 continue;
             }
@@ -1465,16 +1535,62 @@ public sealed partial class MainWindow : Window
             board.Children.Add(fade);
             board.Children.Add(slide);
 
-            // 收尾卸掉动画值：HoldEnd 会让动画值长期压住属性，之后谁再改 Opacity 都不生效
+            // 收尾卸掉动画值：HoldEnd 会让动画值长期压住属性，之后谁再改 Opacity 都不生效。
+            // 同时把 RenderTransform 摘掉 —— 留着一个只为动画存在的 CompositeTransform，
+            // 等于给命中测试留一个随时可能失效的变换对象。
             board.Completed += (_, _) =>
             {
-                element.Opacity = 1;
-                transform.TranslateY = 0;
+                _menuEntranceBoards.Remove(board);
                 board.Stop();
+
+                // 元素可能已经在重建时脱离子树了：那就什么都别碰。
+                if (element.IsLoaded)
+                {
+                    element.Opacity = 1;
+                    element.RenderTransform = null;
+                }
             };
 
+            // 保活：Storyboard 不自持引用，没人引用它就会被回收（见字段注释）。
+            _menuEntranceBoards.Add(board);
             board.Begin();
         }
+    }
+
+    /// <summary>
+    /// 停掉全部入场动画并摘掉它们挂在元素上的变换。
+    ///
+    /// <para>调用点只有两处、都是"元素即将离开子树"之前：重建子菜单清空前、
+    /// 以及再次展开前。先停再拆，动画的收尾回调就不会摸到已经脱树的元素。</para>
+    /// </summary>
+    private void StopChannelMenuAnimations()
+    {
+        if (_menuEntranceBoards.Count == 0)
+        {
+            return;
+        }
+
+        // Stop() 可能同步触发 Completed，而那个回调会从集合里移除自己 —— 先拍快照。
+        foreach (var board in _menuEntranceBoards.ToArray())
+        {
+            board.Stop();
+        }
+
+        _menuEntranceBoards.Clear();
+    }
+
+    /// <summary>
+    /// 子菜单内容签名。只包含会显示出来的东西（id / 名称 / 提示），
+    /// 拿它判断"这次重建是不是白干"。
+    /// </summary>
+    private static string BuildChannelMenuSignature(IReadOnlyList<(string Id, string Name, string Tooltip)> entries)
+    {
+        var builder = new System.Text.StringBuilder();
+        foreach (var (id, name, tooltip) in entries)
+        {
+            builder.Append(id).Append('\u001f').Append(name).Append('\u001f').Append(tooltip).Append('\u001e');
+        }
+        return builder.ToString();
     }
 
     /// <summary>
