@@ -23,6 +23,12 @@ add_library(uu_session_fix SHARED uu_session_fix.c)
 # 源码含 UTF-8 中文注释，MSVC 默认按 CP936 解析会啃坏注释
 target_compile_options(uu_session_fix PRIVATE /utf-8)
 
+# 必须用静态 CRT（/MT）：该 DLL 会被注入到别人的进程里，依赖 vcruntime140.dll
+# 会和宿主的运行库版本打架，表现是加载阶段就崩、且拿不到任何日志。
+target_compile_options(uu_session_fix PRIVATE /MT)
+set_target_properties(uu_session_fix PROPERTIES
+  MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # 注入载荷要尽量小：关掉增量链接的中间产物即可，优化级别保持默认
 set_target_properties(uu_session_fix PROPERTIES
   PREFIX ""

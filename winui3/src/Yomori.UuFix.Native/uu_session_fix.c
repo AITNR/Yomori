@@ -114,6 +114,93 @@ typedef struct
 
 #define UUFIX_MAX_THUNKS 4096
 
+/* 定位用日志。默认只在调试构建里生效（/DUUFIX_TRACE），
+   正式产物不写盘 —— 载荷跑在别人的 SYSTEM 服务里，不该留文件。 */
+#ifdef UUFIX_TRACE
+#include <stdio.h>
+#include <stdarg.h>
+
+static void UuFixTrace(const char *format, ...)
+{
+    wchar_t dir[MAX_PATH];
+    wchar_t path[MAX_PATH];
+    char line[512];
+    va_list args;
+    HANDLE file;
+    DWORD written;
+    int length;
+
+    if (GetTempPathW(MAX_PATH, dir) == 0)
+    {
+        return;
+    }
+
+    if (swprintf_s(path, MAX_PATH, L"%suufix_trace.log", dir) < 0)
+    {
+        return;
+    }
+
+    va_start(args, format);
+    length = _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args);
+    va_end(args);
+
+    if (length <= 0)
+    {
+        return;
+    }
+
+    line[length] = '\0';
+    if (length + 2 < (int)sizeof(line))
+    {
+        line[length] = '\r';
+        line[length + 1] = '\n';
+        line[length + 2] = '\0';
+        length += 2;
+    }
+
+    file = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    WriteFile(file, line, (DWORD)length, &written, NULL);
+    CloseHandle(file);
+}
+#else
+#define UuFixTrace(...) ((void)0)
+#endif
+
+/* 目标进程的导入表未必是标准形态（加壳、重定向、被改写）。
+   访问任何指针前先问系统这段内存到底可不可读，宁可放弃也不要越界。 */
+static BOOL IsReadable(const void *pointer, SIZE_T size)
+{
+    MEMORY_BASIC_INFORMATION info;
+
+    if (pointer == NULL)
+    {
+        return FALSE;
+    }
+
+    if (VirtualQuery(pointer, &info, sizeof(info)) == 0)
+    {
+        return FALSE;
+    }
+
+    if (info.State != MEM_COMMIT)
+    {
+        return FALSE;
+    }
+
+    if ((info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+    {
+        return FALSE;
+    }
+
+    return ((const BYTE *)pointer + size) <= ((const BYTE *)info.BaseAddress + info.RegionSize);
+}
+
 static BOOL MatchThunkTable(BYTE *base, IMAGE_THUNK_DATA *iat, IMAGE_THUNK_DATA *names,
                             ULONG_PTR **slot, ULONG_PTR *originalValue)
 {
@@ -133,6 +220,11 @@ static BOOL MatchThunkTable(BYTE *base, IMAGE_THUNK_DATA *iat, IMAGE_THUNK_DATA 
             return FALSE;
         }
 
+        if (!IsReadable(names, sizeof(IMAGE_THUNK_DATA)))
+        {
+            return FALSE;
+        }
+
         if (names->u1.AddressOfData == 0)
         {
             continue;
@@ -145,11 +237,22 @@ static BOOL MatchThunkTable(BYTE *base, IMAGE_THUNK_DATA *iat, IMAGE_THUNK_DATA 
         }
 
         hint = (IMAGE_IMPORT_BY_NAME *)(base + (DWORD)names->u1.AddressOfData);
+        if (!IsReadable(hint, sizeof(IMAGE_IMPORT_BY_NAME)))
+        {
+            continue;
+        }
+
+        if (!IsReadable(hint->Name, 2))
+        {
+            continue;
+        }
+
         if (strcmp((const char *)hint->Name, "WTSEnumerateSessionsW") != 0)
         {
             continue;
         }
 
+        UuFixTrace("match thunk index=%d name=%s", guard - 1, hint->Name);
         *slot = (ULONG_PTR *)&iat->u1.Function;
         *originalValue = iat->u1.Function;
         return TRUE;
@@ -186,6 +289,8 @@ static BOOL LocateIatSlot(HMODULE module, ULONG_PTR **slot, ULONG_PTR *originalV
 
     normal = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     delayed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    UuFixTrace("locate: base=%p import=%08lx delay=%08lx", (void *)base,
+               (unsigned long)normal.VirtualAddress, (unsigned long)delayed.VirtualAddress);
 
     /* 1) 普通导入表 */
     if (normal.VirtualAddress != 0)
@@ -193,9 +298,16 @@ static BOOL LocateIatSlot(HMODULE module, ULONG_PTR **slot, ULONG_PTR *originalV
         IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + normal.VirtualAddress);
         int guard = 0;
 
-        for (; desc->Name != 0 && guard < 256; desc++, guard++)
+        for (; guard < 64; desc++, guard++)
         {
+            if (!IsReadable(desc, sizeof(IMAGE_IMPORT_DESCRIPTOR)) || desc->Name == 0)
+            {
+                break;
+            }
+
             const char *dllName = (const char *)(base + desc->Name);
+
+            UuFixTrace("normal desc dll=%s", dllName);
 
             if (_stricmp(dllName, "wtsapi32.dll") != 0)
             {
@@ -225,9 +337,18 @@ static BOOL LocateIatSlot(HMODULE module, ULONG_PTR **slot, ULONG_PTR *originalV
         UUFIX_DELAY_DESC *desc = (UUFIX_DELAY_DESC *)(base + delayed.VirtualAddress);
         int guard = 0;
 
-        for (; desc->DllNameRVA != 0 && guard < 256; desc++, guard++)
+        for (; guard < 64; desc++, guard++)
         {
+            if (!IsReadable(desc, sizeof(UUFIX_DELAY_DESC)) || desc->DllNameRVA == 0)
+            {
+                break;
+            }
+
             const char *dllName = (const char *)(base + desc->DllNameRVA);
+
+            UuFixTrace("delay desc dll=%s iat=%08lx int=%08lx", dllName,
+                       (unsigned long)desc->ImportAddressTableRVA,
+                       (unsigned long)desc->ImportNameTableRVA);
 
             if (_stricmp(dllName, "wtsapi32.dll") != 0)
             {
@@ -263,17 +384,22 @@ static int InstallCore(void)
         return 2;
     }
 
+    UuFixTrace("install: enter");
     if (!LocateIatSlot(GetModuleHandleW(NULL), &g_iatSlot, &g_iatOriginal))
     {
+        UuFixTrace("install: slot not found");
         InterlockedExchange(&g_installed, 0);
         return 0;
     }
+
+    UuFixTrace("install: slot=%p old=%p", (void *)g_iatSlot, (void *)g_iatOriginal);
 
     g_original = (PFN_WTS_ENUM)g_iatOriginal;
     target = (void *)Hook_WTSEnumerateSessionsW;
 
     if (!VirtualProtect(g_iatSlot, sizeof(void *), PAGE_READWRITE, &oldProtect))
     {
+        UuFixTrace("install: vp failed err=%lu", (unsigned long)GetLastError());
         g_original = NULL;
         InterlockedExchange(&g_installed, 0);
         return -1;
@@ -282,6 +408,7 @@ static int InstallCore(void)
     *g_iatSlot = (ULONG_PTR)target;
     VirtualProtect(g_iatSlot, sizeof(void *), oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), g_iatSlot, sizeof(void *));
+    UuFixTrace("install: hooked ok");
 
     return 1;
 }
@@ -328,6 +455,21 @@ __declspec(dllexport) int WINAPI UuFixUninstall(void)
     g_iatOriginal = 0;
     InterlockedExchange(&g_installed, 0);
     return 1;
+}
+
+/* 诊断：故意触发一次访问冲突，用来确认 SEH 在这个编译配置下真的生效。
+   返回 -3 表示捕获成功；进程直接消失则说明 SEH 没编进去。 */
+__declspec(dllexport) int WINAPI UuFixSelfTest(void)
+{
+    __try
+    {
+        *(volatile int *)0 = 1;
+        return 1;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -3;
+    }
 }
 
 /* 诊断：高 32 位 = 枚举次数，低 32 位 = 改写条数 */

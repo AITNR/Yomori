@@ -307,10 +307,18 @@ internal static class UuSessionFixService
                     return Fail(UuFixOutcome.InjectFailed, "在当前进程里解析不到 LoadLibraryW");
                 }
 
-                if (!RunRemote(hProcess, loadLibrary, remotePath, cancellationToken, out var remoteModule) ||
-                    remoteModule == IntPtr.Zero)
+                if (!RunRemote(hProcess, loadLibrary, remotePath, cancellationToken, out _))
                 {
-                    return Fail(UuFixOutcome.InjectFailed, "目标进程拒绝加载载荷（位数或安全策略）");
+                    return Fail(UuFixOutcome.InjectFailed, "远程 LoadLibrary 超时或失败");
+                }
+
+                // 关键：GetExitCodeThread 只有 32 位，装不下 x64 的 HMODULE。
+                // 早期版本直接拿退出码当模块基址，高位被截断 → 算出的 Install 地址是野指针
+                // → 远程线程一跳就 0xC0000005。这里改从目标进程的模块表取完整地址。
+                var remoteModule = FindRemoteModule(pid, PayloadFileName);
+                if (remoteModule == IntPtr.Zero)
+                {
+                    return Fail(UuFixOutcome.InjectFailed, "载荷没出现在目标进程的模块表里（加载被拒）");
                 }
 
                 // 远端导出地址 = 远端基址 + (本地区性偏移)
@@ -336,7 +344,7 @@ internal static class UuSessionFixService
                         return Fail(UuFixOutcome.InjectFailed, "调用远程安装函数超时");
                     }
 
-                    return code.ToInt64() switch
+                    return (int)code switch
                     {
                         1 => new UuFixResult { Outcome = UuFixOutcome.Success, Detail = "载荷已安装。" },
                         2 => new UuFixResult { Outcome = UuFixOutcome.AlreadyInstalled, Detail = "该进程里已安装过，未重复注入。" },
@@ -351,7 +359,7 @@ internal static class UuSessionFixService
                             Detail = "载荷在目标进程里发生访问冲突（0xC0000005）并已自行中止，服务未受影响。"
                                      + "该版本的导入表结构可能不标准（加壳 / 重定向），此修复不适用。",
                         },
-                        _ => new UuFixResult { Outcome = UuFixOutcome.HookFailed, Detail = "安装函数返回 " + code.ToInt64() + "（改写导入表失败）。" },
+                        _ => new UuFixResult { Outcome = UuFixOutcome.HookFailed, Detail = "安装函数返回 " + (int)code + "（改写导入表失败）。" },
                     };
                 }
                 finally
@@ -375,9 +383,9 @@ internal static class UuSessionFixService
     }
 
     private static bool RunRemote(IntPtr hProcess, IntPtr start, IntPtr parameter,
-        CancellationToken cancellationToken, out IntPtr result)
+        CancellationToken cancellationToken, out uint result)
     {
-        result = IntPtr.Zero;
+        result = 0;
 
         var thread = CreateRemoteThread(hProcess, IntPtr.Zero, IntPtr.Zero, start, parameter, 0, out _);
         if (thread == IntPtr.Zero)
@@ -415,6 +423,49 @@ internal static class UuSessionFixService
     {
         var suffix = Marshal.GetLastWin32Error() is var err && err != 0 ? $"（Win32 {err}）" : string.Empty;
         return new UuFixResult { Outcome = outcome, Detail = detail + suffix };
+    }
+
+    /// <summary>
+    /// 在目标进程的模块表里找载荷基址。
+    ///
+    /// 不能用 <c>GetExitCodeThread</c> 接 <c>LoadLibraryW</c> 的返回值：那个 API 只给 32 位，
+    /// 而 x64 的 HMODULE 是 64 位 —— 高位被截断后算出的导出地址必然是野指针。
+    /// </summary>
+    private static IntPtr FindRemoteModule(int pid, string moduleName)
+    {
+        const uint TH32CS_SNAPMODULE = 0x00000008;
+        const uint TH32CS_SNAPMODULE32 = 0x00000010;
+        var invalid = new IntPtr(-1);
+
+        var snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snapshot == invalid || snapshot == IntPtr.Zero)
+        {
+            return IntPtr.Zero;
+        }
+
+        try
+        {
+            var entry = new MODULEENTRY32W { dwSize = (uint)Marshal.SizeOf<MODULEENTRY32W>() };
+            if (!Module32FirstW(snapshot, ref entry))
+            {
+                return IntPtr.Zero;
+            }
+
+            do
+            {
+                if (string.Equals(entry.szModule, moduleName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return entry.modBaseAddr;
+                }
+            }
+            while (Module32NextW(snapshot, ref entry));
+        }
+        finally
+        {
+            CloseHandle(snapshot);
+        }
+
+        return IntPtr.Zero;
     }
 
     private static void KillServers()
@@ -506,6 +557,36 @@ internal static class UuSessionFixService
 
     // ---------------- Win32 ----------------
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MODULEENTRY32W
+    {
+        public uint dwSize;
+        public uint th32ModuleID;
+        public uint th32ProcessID;
+        public uint GlblcntUsage;
+        public uint ProccntUsage;
+        public IntPtr modBaseAddr;
+        public uint modBaseSize;
+        public IntPtr hModule;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szModule;
+
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExePath;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, int processId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Module32FirstW(IntPtr snapshot, ref MODULEENTRY32W entry);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Module32NextW(IntPtr snapshot, ref MODULEENTRY32W entry);
+
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     private struct TOKEN_PRIVILEGES
     {
@@ -537,7 +618,7 @@ internal static class UuSessionFixService
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GetExitCodeThread(IntPtr thread, out IntPtr exitCode);
+    private static extern bool GetExitCodeThread(IntPtr thread, out uint exitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
