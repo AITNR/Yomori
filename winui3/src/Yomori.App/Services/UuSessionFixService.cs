@@ -296,10 +296,15 @@ internal static class UuSessionFixService
                 }
 
                 IntPtr kernel32 = GetModuleHandleW("kernel32.dll");
+                if (kernel32 == IntPtr.Zero)
+                {
+                    return Fail(UuFixOutcome.InjectFailed, "取不到 kernel32 模块句柄");
+                }
+
                 IntPtr loadLibrary = GetProcAddress(kernel32, "LoadLibraryW");
                 if (loadLibrary == IntPtr.Zero)
                 {
-                    return Fail(UuFixOutcome.InjectFailed, "取不到 LoadLibraryW");
+                    return Fail(UuFixOutcome.InjectFailed, "在当前进程里解析不到 LoadLibraryW");
                 }
 
                 if (!RunRemote(hProcess, loadLibrary, remotePath, cancellationToken, out var remoteModule) ||
@@ -532,13 +537,15 @@ internal static class UuSessionFixService
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr handle);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr GetModuleHandleW(string name);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    // GetProcAddress 只接受 ANSI 函数名（LPCSTR），这里必须是 CharSet.Ansi + ExactSpelling。
+    // 之前写成 Unicode，它把 "LoadLibraryW" 当 UTF-16 读成 "L"，返回 0 且 GetLastError=127。
+    [DllImport("kernel32.dll", CharSet = CharSet.Ansi, SetLastError = true, ExactSpelling = true)]
     private static extern IntPtr GetProcAddress(IntPtr module, string name);
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
+    private static extern IntPtr GetModuleHandleW(string name);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true, ExactSpelling = true)]
     private static extern IntPtr LoadLibraryW(string path);
 
     [DllImport("kernel32.dll", SetLastError = true)]
