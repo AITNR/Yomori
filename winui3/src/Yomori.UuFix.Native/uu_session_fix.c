@@ -32,88 +32,6 @@ typedef BOOL(WINAPI *PFN_WTS_ENUM)(HANDLE, DWORD, DWORD, UUFIX_SESSION_INFO **, 
 #define WTS_ACTIVE 0
 #define WTS_DISCONNECTED 4
 
-static PFN_WTS_ENUM g_original = NULL;
-static ULONG_PTR *g_iatSlot = NULL;
-static ULONG_PTR g_iatOriginal = 0;
-static volatile LONG g_installed = 0;
-static volatile LONG g_calls = 0;
-static volatile LONG g_rewritten = 0;
-
-static BOOL WINAPI Hook_WTSEnumerateSessionsW(HANDLE hServer, DWORD reserved, DWORD version,
-                                              UUFIX_SESSION_INFO **ppSessionInfo, DWORD *pCount)
-{
-    BOOL ok;
-    DWORD consoleId = (DWORD)-1;
-    DWORD i;
-
-    if (g_original == NULL)
-    {
-        return FALSE;
-    }
-
-    ok = g_original(hServer, reserved, version, ppSessionInfo, pCount);
-    if (!ok || ppSessionInfo == NULL || *ppSessionInfo == NULL || pCount == NULL)
-    {
-        return ok;
-    }
-
-    if (*pCount == 0 || *pCount > 512)
-    {
-        return ok;
-    }
-
-    InterlockedIncrement(&g_calls);
-
-    /* 先找 console：WinStationName 为 "console" 的那一项就是物理控制台 */
-    for (i = 0; i < *pCount; i++)
-    {
-        LPWSTR name = (*ppSessionInfo)[i].pWinStationName;
-        if (name != NULL && _wcsicmp(name, L"console") == 0)
-        {
-            consoleId = (*ppSessionInfo)[i].SessionId;
-            break;
-        }
-    }
-
-    if (consoleId == (DWORD)-1)
-    {
-        /* 控制台未附着：不做任何改写，避免把全部会话标成断开 */
-        return ok;
-    }
-
-    for (i = 0; i < *pCount; i++)
-    {
-        UUFIX_SESSION_INFO *item = &(*ppSessionInfo)[i];
-        if (item->SessionId != consoleId && item->State == WTS_ACTIVE)
-        {
-            item->State = WTS_DISCONNECTED;
-            InterlockedIncrement(&g_rewritten);
-        }
-    }
-
-    return ok;
-}
-
-/* 在模块导入表里定位 wtsapi32!WTSEnumerateSessionsW 的槽位
- *
- * 注意目标进程是 delay-load 的：GameViewerService.exe 的普通导入表里没有 wtsapi32，
- * 它在 .didat（延迟导入）段。只查普通导入表既找不到、又会因为 OriginalFirstThunk
- * 为空而拿着野指针当名字表遍历 —— 那就是 0xC0000005 的来源。
- */
-typedef struct
-{
-    DWORD Attributes;
-    DWORD DllNameRVA;
-    DWORD ModuleHandleRVA;
-    DWORD ImportAddressTableRVA;
-    DWORD ImportNameTableRVA;
-    DWORD BoundImportAddressTableRVA;
-    DWORD UnloadInformationTableRVA;
-    DWORD TimeDateStamp;
-} UUFIX_DELAY_DESC;
-
-#define UUFIX_MAX_THUNKS 4096
-
 /* 定位用日志。默认只在调试构建里生效（/DUUFIX_TRACE），
    正式产物不写盘 —— 载荷跑在别人的 SYSTEM 服务里，不该留文件。 */
 #ifdef UUFIX_TRACE
@@ -171,6 +89,116 @@ static void UuFixTrace(const char *format, ...)
 #else
 #define UuFixTrace(...) ((void)0)
 #endif
+
+static PFN_WTS_ENUM g_original = NULL;
+static ULONG_PTR *g_iatSlot = NULL;
+static ULONG_PTR g_iatOriginal = 0;
+static volatile LONG g_installed = 0;
+static volatile LONG g_calls = 0;
+static volatile LONG g_rewritten = 0;
+
+static BOOL WINAPI Hook_WTSEnumerateSessionsW(HANDLE hServer, DWORD reserved, DWORD version,
+                                              UUFIX_SESSION_INFO **ppSessionInfo, DWORD *pCount)
+{
+    BOOL ok;
+    DWORD consoleId = (DWORD)-1;
+    DWORD i;
+
+    if (g_original == NULL)
+    {
+        return FALSE;
+    }
+
+    ok = g_original(hServer, reserved, version, ppSessionInfo, pCount);
+    if (!ok || ppSessionInfo == NULL || *ppSessionInfo == NULL || pCount == NULL)
+    {
+        return ok;
+    }
+
+    if (*pCount == 0 || *pCount > 512)
+    {
+        return ok;
+    }
+
+    InterlockedIncrement(&g_calls);
+
+    /* 先找 console：WinStationName 为 "console" 的那一项就是物理控制台 */
+    for (i = 0; i < *pCount; i++)
+    {
+        LPWSTR name = (*ppSessionInfo)[i].pWinStationName;
+        if (name != NULL && _wcsicmp(name, L"console") == 0)
+        {
+            consoleId = (*ppSessionInfo)[i].SessionId;
+            break;
+        }
+    }
+
+    if (consoleId == (DWORD)-1)
+    {
+        /* 控制台未附着：不做任何改写，避免把全部会话标成断开 */
+        return ok;
+    }
+
+    /* 关键：**隐藏**而不是标记为 Disconnected。
+     *
+     * 早先的实现把非 console 会话的 State 改成 WTSDisconnected，结果 UU 服务把它当成
+     * 「残留会话」去做清理 —— 直接把那些会话注销掉，连带把我们自己的内嵌 RDP 连接踢下线
+     * （0x00010001 initiated by an administrative tool in another session），
+     * 随后进入重连风暴并让主控崩在 WinUI 侧。
+     *
+     * 现在改成「让它们不出现在列表里」：把 console 项移到数组前面，返回时只报 console 的条数。
+     * 数组本身不动长度（仍由 WTSFreeMemory 释放，语义不变），UU 只是看不到别的会话，
+     * 没有「断开的会话」可清，也就不再动它们。
+     */
+    {
+        DWORD write = 0;
+
+        for (i = 0; i < *pCount; i++)
+        {
+            if ((*ppSessionInfo)[i].SessionId == consoleId)
+            {
+                if (write != i)
+                {
+                    UUFIX_SESSION_INFO temp = (*ppSessionInfo)[write];
+                    (*ppSessionInfo)[write] = (*ppSessionInfo)[i];
+                    (*ppSessionInfo)[i] = temp;
+                }
+
+                write++;
+            }
+        }
+
+        if (write > 0)
+        {
+            InterlockedIncrement(&g_rewritten);
+            UuFixTrace("hook: keep %lu of %lu session(s), console=%lu", write, *pCount, consoleId);
+            *pCount = write;
+        }
+    }
+
+    return ok;
+}
+
+/* 在模块导入表里定位 wtsapi32!WTSEnumerateSessionsW 的槽位
+ *
+ * 注意目标进程是 delay-load 的：GameViewerService.exe 的普通导入表里没有 wtsapi32，
+ * 它在 .didat（延迟导入）段。只查普通导入表既找不到、又会因为 OriginalFirstThunk
+ * 为空而拿着野指针当名字表遍历 —— 那就是 0xC0000005 的来源。
+ */
+typedef struct
+{
+    DWORD Attributes;
+    DWORD DllNameRVA;
+    DWORD ModuleHandleRVA;
+    DWORD ImportAddressTableRVA;
+    DWORD ImportNameTableRVA;
+    DWORD BoundImportAddressTableRVA;
+    DWORD UnloadInformationTableRVA;
+    DWORD TimeDateStamp;
+} UUFIX_DELAY_DESC;
+
+#define UUFIX_MAX_THUNKS 4096
+
 
 /* 目标进程的导入表未必是标准形态（加壳、重定向、被改写）。
    访问任何指针前先问系统这段内存到底可不可读，宁可放弃也不要越界。 */

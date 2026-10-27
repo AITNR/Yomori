@@ -169,6 +169,37 @@ internal static class UuSessionFixService
     }
 
     /// <summary>
+    /// 只注入、不碰投屏进程。
+    ///
+    /// <para>开关一打开就要调这个：hook 装上后，UU 后续枚举就看不到其它会话，
+    /// 不会再跑去占通道会话。而 18 秒的延迟只用于「把已经连错的投屏进程迁回来」，
+    /// 不适合用来决定要不要装 hook —— 那个窗口正好够 UU 把会话抢走。</para>
+    /// </summary>
+    public static async Task<UuFixResult> InjectOnlyAsync(CancellationToken cancellationToken)
+    {
+        if (!PayloadExists)
+        {
+            return new UuFixResult
+            {
+                Outcome = UuFixOutcome.PayloadMissing,
+                Detail = "程序目录里没有 " + PayloadFileName + "。",
+            };
+        }
+
+        if (!TryGetServicePid(out var pid))
+        {
+            return new UuFixResult
+            {
+                Outcome = UuFixOutcome.ServiceNotRunning,
+                Detail = "UU 服务未运行，等它启动后连接通道时会自动补装。",
+            };
+        }
+
+        var result = await Task.Run(() => Inject(pid, cancellationToken), cancellationToken).ConfigureAwait(false);
+        return result with { ServicePid = pid };
+    }
+
+    /// <summary>
     /// 执行修复：注入载荷 → 结束当前投屏进程，让服务按修正后的枚举结果重新拉起。
     /// </summary>
     public static async Task<UuFixResult> ApplyAsync(CancellationToken cancellationToken)

@@ -4480,7 +4480,9 @@ public sealed class MainViewModel : ObservableObject
             _ = TriggerControllerSessionReturnAsync("手动连接", true);
         }
 
-        NotifyUuFixRelevantAction("内嵌连接建立");
+        // 刻意不在这里通知：本回调跑在原生渲染线程上，且正处在 D3D/SwapChain 建立的关键路径里。
+        // 用户点「连接通道」时已经通知过一次，这里再插一次只会把 18 秒的等待重置一遍，
+        // 收益为零，却多一次跨线程入队。
         Post(() =>
         {
             if (RdpStatusText.Contains("内嵌连接中", StringComparison.Ordinal) ||

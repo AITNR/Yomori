@@ -322,16 +322,58 @@ public sealed partial class SettingsPage : Page
 
         if (on)
         {
-            UuFixStatusText.Text = "已开启：下次「开始执行」或「连接通道」之后 18 秒自动应用。";
+            UuFixStatusText.Visibility = Visibility.Visible;
+            UuFixStatusText.Text = "已开启：正在装载修正…";
+
+            // 立刻装 hook（不杀投屏进程）。装晚了的代价很实在：
+            // 在这段窗口里 UU 会照旧去占通道会话，把内嵌画面踢掉并让主控崩掉。
+            _ = LoadUuFixHookAsync();
+            VM.AppendLog("[UU 修复] 已开启，正在装载会话修正。");
+            return;
+        }
+
+        VM.CancelUuFixSchedule();
+        UuFixStatusText.Visibility = Visibility.Visible;
+        UuFixStatusText.Text = "已关闭：不再自动应用。已生效的修正会在 UU 服务重启后失效。";
+        VM.AppendLog("[UU 修复] " + UuFixStatusText.Text);
+    }
+
+    /// <summary>开启开关后立刻装 hook；结果回 UI 线程再写状态文字。</summary>
+    private async Task LoadUuFixHookAsync()
+    {
+        try
+        {
+            var result = await UuSessionFixService.InjectOnlyAsync(CancellationToken.None);
+            ApplyUuFixStatus(result.IsSuccess
+                ? "已开启：修正已装载。连接或开始执行后 18 秒会自动检查投屏进程所在会话。"
+                : "已开启，但装载失败：" + result.Detail);
+            VM.AppendLog("[UU 修复] " + result.Detail);
+        }
+        catch (Exception ex)
+        {
+            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+            ApplyUuFixStatus("已开启，但装载异常：" + detail);
+            VM.AppendLog("[UU 修复] 装载异常：" + detail);
+        }
+    }
+
+    /// <summary>状态文字必须自己回 UI 线程（服务内部有 ConfigureAwait(false)）。</summary>
+    private void ApplyUuFixStatus(string text)
+    {
+        void Apply()
+        {
+            UuFixStatusText.Visibility = Visibility.Visible;
+            UuFixStatusText.Text = text;
+        }
+
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            Apply();
         }
         else
         {
-            VM.CancelUuFixSchedule();
-            UuFixStatusText.Text = "已关闭：不再自动应用。已生效的修正会在 UU 服务重启后失效。";
+            DispatcherQueue.TryEnqueue(Apply);
         }
-
-        UuFixStatusText.Visibility = Visibility.Visible;
-        VM.AppendLog("[UU 修复] " + UuFixStatusText.Text);
     }
 
     private void OnSave(object sender, RoutedEventArgs e) => VM.SaveConfig();

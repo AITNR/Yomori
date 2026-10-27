@@ -33,8 +33,8 @@ internal sealed class UuSessionFixScheduler : IDisposable
     /// <summary>执行中被触发时，先按这个间隔排下一次（给当前这次留出完成时间）。</summary>
     private const int BusyDelaySeconds = 30;
 
-    /// <summary>轮询粒度。计时器只有固定间隔，用轮询到期比反复改 Interval 稳。</summary>
-    private const int PollMilliseconds = 200;
+    /// <summary>到期后允许的最小提前量，避免 Interval 取 0 时行为不确定。</summary>
+    private const int MinArmMilliseconds = 50;
 
     private readonly DispatcherQueue _dispatcher;
     private readonly Action<string> _log;
@@ -99,15 +99,28 @@ internal sealed class UuSessionFixScheduler : IDisposable
             else if (_pendingUntil - now <= SettleSeconds * 1000L)
             {
                 _pendingUntil = now + SettleSeconds * 1000L;
+                _log($"[UU 修复] {source}：排队中的执行剩余不足 {SettleSeconds} 秒，重置为 {SettleSeconds} 秒。");
+            }
+            else
+            {
+                var left = (_pendingUntil - now + 999) / 1000;
+                _log($"[UU 修复] {source}：排队中的执行还剩 {left} 秒，不再顺延。");
             }
 
             return;
         }
 
-        // 空闲或等待中：一律重置
+        // 空闲或等待中：一律重置。日志要区分这两种情况 ——
+        // 「开始计时」说明这轮静置刚开始，「重置计时」说明上一个操作把等待推后了，
+        // 排查"为什么迟迟不执行"时看的就是这两行的先后。
+        var wasWaiting = _timer?.IsRunning == true;
+
         _waitingUntil = now + SettleSeconds * 1000L;
-        EnsureTimer();
-        _timer!.Start();
+        ArmTimer(_waitingUntil);
+
+        _log(wasWaiting
+            ? $"[UU 修复] {source}：重置计时，再等 {SettleSeconds} 秒。"
+            : $"[UU 修复] {source}：开始计时，{SettleSeconds} 秒后执行。");
     }
 
     /// <summary>关闭开关时调用：取消尚未开始的等待（正在执行的那次无法撤回）。</summary>
@@ -120,8 +133,15 @@ internal sealed class UuSessionFixScheduler : IDisposable
 
         void Apply()
         {
+            var hadWork = _hasPending || _timer?.IsRunning == true;
             _hasPending = false;
             _timer?.Stop();
+
+            // 只在真的取消了什么才写：Stop/退出都会走这里，没等待时不必刷日志
+            if (hadWork)
+            {
+                _log("[UU 修复] 已取消尚未开始的执行。");
+            }
         }
 
         if (_dispatcher.HasThreadAccess)
@@ -142,8 +162,29 @@ internal sealed class UuSessionFixScheduler : IDisposable
         }
 
         _timer = _dispatcher.CreateTimer();
-        _timer.Interval = TimeSpan.FromMilliseconds(PollMilliseconds);
         _timer.Tick += OnTick;
+    }
+
+    /// <summary>
+    /// 按剩余时间一次性定时。
+    ///
+    /// <para>早先用 200ms 固定轮询：18 秒要往 UI 线程插 90 次队。
+    /// 内嵌画面正在建立 D3D/SwapChain 时，这些插入会挤在渲染关键路径上 ——
+    /// 改成「按到期时间只定时一次」，正常情况整段等待只有 1 次 Tick。</para>
+    /// </summary>
+    private void ArmTimer(long dueAt)
+    {
+        EnsureTimer();
+
+        var delay = dueAt - Environment.TickCount64;
+        if (delay < MinArmMilliseconds)
+        {
+            delay = MinArmMilliseconds;
+        }
+
+        _timer!.Stop();
+        _timer.Interval = TimeSpan.FromMilliseconds(delay);
+        _timer.Start();
     }
 
     private void OnTick(DispatcherQueueTimer sender, object args)
@@ -156,6 +197,8 @@ internal sealed class UuSessionFixScheduler : IDisposable
 
         if (Environment.TickCount64 < _waitingUntil)
         {
+            // Interval 精度不足时可能提前来，重新按剩余时间定一次
+            ArmTimer(_waitingUntil);
             return;
         }
 
@@ -207,8 +250,9 @@ internal sealed class UuSessionFixScheduler : IDisposable
         var floor = now + SettleSeconds * 1000L;
         _waitingUntil = _pendingUntil > floor ? _pendingUntil : floor;
 
-        EnsureTimer();
-        _timer!.Start();
+        var delaySeconds = (_waitingUntil - now + 999) / 1000;
+        ArmTimer(_waitingUntil);
+        _log($"[UU 修复] 排队的那次开始计时，{delaySeconds} 秒后执行。");
     }
 
     public void Dispose()
