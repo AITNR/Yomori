@@ -301,7 +301,9 @@ public sealed partial class SettingsPage : Page
     /// </summary>
     private async void OnUuFixToggled(object sender, RoutedEventArgs e)
     {
-        if (_syncing)
+        // IsLoaded 挡的是 InitializeComponent 期间的那次 Toggled：
+        // 那时 UuFixStatusText 还没赋值，直接写它会 NullReference。
+        if (_syncing || !IsLoaded)
         {
             return;
         }
@@ -327,15 +329,11 @@ public sealed partial class SettingsPage : Page
 
         if (confirm != ContentDialogResult.Primary)
         {
-            // 用户反悔：把开关拨回去，且不触发下一轮 Toggled
-            _syncing = true;
-            toggle.IsOn = !enable;
-            _syncing = false;
+            SetUuFixSwitch(toggle, !enable);
             return;
         }
 
-        UuFixStatusText.Visibility = Visibility.Visible;
-        UuFixStatusText.Text = enable ? "正在启用…" : "正在关闭…";
+        SetUuFixStatus(enable ? "正在启用…" : "正在关闭…");
 
         try
         {
@@ -343,26 +341,64 @@ public sealed partial class SettingsPage : Page
                 ? await UuSessionFixService.ApplyAsync(CancellationToken.None)
                 : UuSessionFixService.Restore();
 
-            UuFixStatusText.Text = result.Detail;
+            SetUuFixStatus(result.Detail);
             VM.AppendLog("[UU 修复] " + result.Detail);
 
             var failed = enable ? !result.IsSuccess : result.Outcome != UuFixOutcome.Restored;
             if (failed)
             {
-                _syncing = true;
-                toggle.IsOn = !enable;
-                _syncing = false;
+                SetUuFixSwitch(toggle, !enable);
             }
         }
         catch (Exception ex)
         {
             var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
-            UuFixStatusText.Text = (enable ? "启用失败：" : "关闭失败：") + detail;
+            SetUuFixStatus((enable ? "启用失败：" : "关闭失败：") + detail);
             VM.AppendLog("[UU 修复] 异常：" + detail);
+            SetUuFixSwitch(toggle, !enable);
+        }
+    }
 
+    /// <summary>
+    /// 更新状态文字。必须自己回 UI 线程：<see cref="UuSessionFixService.ApplyAsync"/>
+    /// 内部用了 <c>ConfigureAwait(false)</c>，await 的续体不保证在 UI 线程上 ——
+    /// 直接写 TextBlock.Text 会以 RPC_E_WRONG_THREAD (0x8001010E) 掀掉整个进程。
+    /// </summary>
+    private void SetUuFixStatus(string text)
+    {
+        void Apply()
+        {
+            UuFixStatusText.Visibility = Visibility.Visible;
+            UuFixStatusText.Text = text;
+        }
+
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            Apply();
+        }
+        else
+        {
+            DispatcherQueue.TryEnqueue(Apply);
+        }
+    }
+
+    /// <summary>把开关拨回指定位置；<c>_syncing</c> 挡住回拨引发的下一轮 Toggled。</summary>
+    private void SetUuFixSwitch(ToggleSwitch toggle, bool on)
+    {
+        void Apply()
+        {
             _syncing = true;
-            toggle.IsOn = !enable;
+            toggle.IsOn = on;
             _syncing = false;
+        }
+
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            Apply();
+        }
+        else
+        {
+            DispatcherQueue.TryEnqueue(Apply);
         }
     }
 
