@@ -361,13 +361,20 @@ internal static class UuSessionFixService
                 // 关键：GetExitCodeThread 只有 32 位，装不下 x64 的 HMODULE。
                 // 早期版本直接拿退出码当模块基址，高位被截断 → 算出的 Install 地址是野指针
                 // → 远程线程一跳就 0xC0000005。这里改从目标进程的模块表取完整地址。
-                var remoteModule = FindRemoteModule(pid, PayloadFileName);
-                if (remoteModule == IntPtr.Zero)
+                //
+                // 而且必须按**完整路径**匹配，不能按文件名：同一台机器上同时存在开发版
+                // （repo\...\bin\...）与安装版（C:\Program Files\Yomori\）两份载荷时，
+                // 后加载的那份会以"同名不同路径"再加载一次；按文件名找到的可能是**另一份**，
+                // 于是「远端基址 + 本地偏移」算出来的地址落在对方的代码中间 ——
+                // 远程线程跳过去就是 0xC0000005，且崩在函数中间（偏移不对齐）。
+                // 2026-10-27 21:02 与 21:27 两次故障都是这个形状。
+                if (!TryFindRemoteModule(pid, path, out var remoteModule))
                 {
-                    return Fail(UuFixOutcome.InjectFailed, "载荷没出现在目标进程的模块表里（加载被拒）");
+                    return Fail(UuFixOutcome.InjectFailed,
+                        "载荷没出现在目标进程的模块表里（加载被拒，或已加载的是另一份同名文件）");
                 }
 
-                // 远端导出地址 = 远端基址 + (本地区性偏移)
+                // 远端导出地址 = 远端基址 + (本地偏移)
                 IntPtr localModule = LoadLibraryW(path);
                 if (localModule == IntPtr.Zero)
                 {
@@ -382,10 +389,32 @@ internal static class UuSessionFixService
                         return Fail(UuFixOutcome.InjectFailed, "载荷缺少 UuFixInstall 导出");
                     }
 
-                    var offset = localInstall.ToInt64() - localModule.ToInt64();
-                    var remoteInstall = (IntPtr)(remoteModule.ToInt64() + offset);
+                    // 再用 PE 时间戳确认「远端那份」与「本地这份」是同一个产物。
+                    // 不同版本的代码布局不同，偏移一错就跳到函数中间。
+                    if (!TryReadPeIdentity(hProcess, remoteModule, out var remoteStamp, out var remoteSize))
+                    {
+                        return Fail(UuFixOutcome.InjectFailed, "读不到远端载荷的 PE 头，拒绝按错误的基址调用");
+                    }
 
-                    if (!RunRemote(hProcess, remoteInstall, IntPtr.Zero, cancellationToken, out var code))
+                    var localStamp = ReadLocalPeTimeStamp(localModule);
+                    if (localStamp != 0 && remoteStamp != localStamp)
+                    {
+                        return Fail(UuFixOutcome.InjectFailed,
+                            "目标进程里已加载另一份同名载荷（版本不一致），需先重启 UU 服务再注入");
+                    }
+
+                    var offset = localInstall.ToInt64() - localModule.ToInt64();
+                    var remoteInstall = remoteModule.ToInt64() + offset;
+
+                    // 兜底：算出来的地址必须还落在这个模块的映像范围内
+                    if (remoteSize == 0 || remoteInstall < remoteModule.ToInt64()
+                        || remoteInstall >= remoteModule.ToInt64() + remoteSize)
+                    {
+                        return Fail(UuFixOutcome.InjectFailed,
+                            "算出的远程函数地址不在载荷映像内（基址不可信），已放弃调用");
+                    }
+
+                    if (!RunRemote(hProcess, (IntPtr)remoteInstall, IntPtr.Zero, cancellationToken, out var code))
                     {
                         return Fail(UuFixOutcome.InjectFailed, "调用远程安装函数超时");
                     }
@@ -472,36 +501,53 @@ internal static class UuSessionFixService
     }
 
     /// <summary>
-    /// 在目标进程的模块表里找载荷基址。
+    /// 在目标进程的模块表里按**完整路径**找载荷基址。
     ///
-    /// 不能用 <c>GetExitCodeThread</c> 接 <c>LoadLibraryW</c> 的返回值：那个 API 只给 32 位，
-    /// 而 x64 的 HMODULE 是 64 位 —— 高位被截断后算出的导出地址必然是野指针。
+    /// <p>不能按文件名找：开发版与安装版各有一份 <c>uu_session_fix.dll</c>，
+    /// 先后注入时目标进程里会同时存在两个同名模块，按名字拿到的那份未必是刚加载的这份，
+    /// 用它算偏移必然算错地址。路径对不上就退一步按「名字 + PE 时间戳」比对，
+    /// 仍然对不上则视为失败 —— 宁可放弃，也不按可疑基址调用。</p>
+    ///
+    /// <p>也不能用 <c>GetExitCodeThread</c> 接 <c>LoadLibraryW</c> 的返回值：那个 API 只给
+    /// 32 位，而 x64 的 HMODULE 是 64 位，高位被截断后算出的导出地址必然是野指针。</p>
     /// </summary>
-    private static IntPtr FindRemoteModule(int pid, string moduleName)
+    private static bool TryFindRemoteModule(int pid, string modulePath, out IntPtr baseAddress)
     {
         const uint TH32CS_SNAPMODULE = 0x00000008;
         const uint TH32CS_SNAPMODULE32 = 0x00000010;
         var invalid = new IntPtr(-1);
 
+        baseAddress = IntPtr.Zero;
+
         var snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         if (snapshot == invalid || snapshot == IntPtr.Zero)
         {
-            return IntPtr.Zero;
+            return false;
         }
+
+        var fileName = System.IO.Path.GetFileName(modulePath);
+        var candidates = new List<(string Name, string Path, IntPtr Base)>();
 
         try
         {
             var entry = new MODULEENTRY32W { dwSize = (uint)Marshal.SizeOf<MODULEENTRY32W>() };
             if (!Module32FirstW(snapshot, ref entry))
             {
-                return IntPtr.Zero;
+                return false;
             }
 
             do
             {
-                if (string.Equals(entry.szModule, moduleName, StringComparison.OrdinalIgnoreCase))
+                // 一次遍历把候选收齐：Toolhelp 的快照只能顺序走一遍
+                if (string.Equals(entry.szExePath, modulePath, StringComparison.OrdinalIgnoreCase))
                 {
-                    return entry.modBaseAddr;
+                    baseAddress = entry.modBaseAddr;
+                    return true;
+                }
+
+                if (string.Equals(entry.szModule, fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    candidates.Add((entry.szModule, entry.szExePath, entry.modBaseAddr));
                 }
             }
             while (Module32NextW(snapshot, ref entry));
@@ -511,7 +557,109 @@ internal static class UuSessionFixService
             CloseHandle(snapshot);
         }
 
-        return IntPtr.Zero;
+        // 路径对不上（例如长短名差异）：退一步按「同名 + PE 时间戳一致」认。
+        // 同名但时间戳不同，说明目标进程里加载的是**另一份**载荷 —— 宁可失败，
+        // 也不能拿它的基址去加本地偏移。
+        var localStamp = ReadLocalFilePeTimeStamp(modulePath);
+        if (localStamp == 0)
+        {
+            return false;
+        }
+
+        foreach (var candidate in candidates)
+        {
+            if (TryReadPeIdentity(IntPtr.Zero, candidate.Base, out var stamp, out _) && stamp == localStamp)
+            {
+                baseAddress = candidate.Base;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>按文件路径取 PE 时间戳（临时加载一份，读完立刻释放）。</summary>
+    private static uint ReadLocalFilePeTimeStamp(string path)
+    {
+        var module = LoadLibraryW(path);
+        if (module == IntPtr.Zero)
+        {
+            return 0;
+        }
+
+        try
+        {
+            return ReadLocalPeTimeStamp(module);
+        }
+        finally
+        {
+            FreeLibrary(module);
+        }
+    }
+
+    /// <summary>
+    /// 读某个模块的 PE 时间戳与映像大小。
+    /// <paramref name="hProcess"/> 传 <see cref="IntPtr.Zero"/> 表示读当前进程。
+    /// </summary>
+    private static bool TryReadPeIdentity(IntPtr hProcess, IntPtr moduleBase, out uint timeStamp, out uint sizeOfImage)
+    {
+        timeStamp = 0;
+        sizeOfImage = 0;
+
+        if (moduleBase == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var header = new byte[0x400];
+        if (!TryReadMemory(hProcess, moduleBase, header, header.Length))
+        {
+            return false;
+        }
+
+        if (header[0] != (byte)'M' || header[1] != (byte)'Z')
+        {
+            return false;
+        }
+
+        var peOffset = BitConverter.ToInt32(header, 0x3C);
+        if (peOffset <= 0 || peOffset + 0x60 > header.Length)
+        {
+            return false;
+        }
+
+        if (header[peOffset] != (byte)'P' || header[peOffset + 1] != (byte)'E')
+        {
+            return false;
+        }
+
+        timeStamp = BitConverter.ToUInt32(header, peOffset + 8);
+        sizeOfImage = BitConverter.ToUInt32(header, peOffset + 24 + 56);
+        return true;
+    }
+
+    private static bool TryReadMemory(IntPtr hProcess, IntPtr address, byte[] buffer, int size)
+    {
+        if (hProcess == IntPtr.Zero)
+        {
+            Marshal.Copy(address, buffer, 0, size);
+            return true;
+        }
+
+        return ReadProcessMemory(hProcess, address, buffer, (IntPtr)size, out var read)
+               && read.ToInt64() == size;
+    }
+
+    private static uint ReadLocalPeTimeStamp(IntPtr moduleBase)
+    {
+        try
+        {
+            return TryReadPeIdentity(IntPtr.Zero, moduleBase, out var stamp, out _) ? stamp : 0;
+        }
+        catch
+        {
+            return 0;
+        }
     }
 
     private static void KillServers()
@@ -654,6 +802,10 @@ internal static class UuSessionFixService
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WriteProcessMemory(IntPtr process, IntPtr address, byte[] buffer, IntPtr size, out IntPtr written);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer, IntPtr size, out IntPtr read);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateRemoteThread(IntPtr process, IntPtr attributes, IntPtr stackSize,
