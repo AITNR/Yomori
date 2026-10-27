@@ -289,6 +289,78 @@ public sealed partial class SettingsPage : Page
             : "已关闭「连接本机通道后自动切回主控会话」：之后不再自动切换桌面归属。");
     }
 
+    /// <summary>
+    /// UU 远程修复：注入会话判定修正模块，并让 UU 的投屏进程重新选择会话。
+    ///
+    /// <para>为什么必须二次确认：它会重启 UU 的投屏进程，正在进行的远控会中断一次。
+    /// 用户点按钮时未必意识到这一点，所以把影响写在确认框里而不是只写页面说明。</para>
+    /// </summary>
+    private async void OnUuFixClicked(object sender, RoutedEventArgs e)
+    {
+        var confirm = await DialogHelper.ShowMessageAsync(
+            "修复 UU 远程会话",
+            "将向 UU 的服务进程注入会话判定修正模块，并重启它的投屏进程。\n\n" +
+            "影响：当前正在进行中的 UU 远控画面会中断一次；UU 服务重启后修复自动失效。\n" +
+            "不会修改 UU 的任何文件。\n\n" +
+            "需要 UU 远程已安装且服务正在运行。",
+            closeText: "取消",
+            primaryText: "开始修复");
+
+        if (confirm != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        UuFixStatusText.Visibility = Visibility.Visible;
+        UuFixStatusText.Text = "正在修复…";
+
+        try
+        {
+            var result = await UuSessionFixService.ApplyAsync(CancellationToken.None);
+            UuFixStatusText.Text = result.Detail;
+            VM.AppendLog("[UU 修复] " + result.Detail);
+        }
+        catch (Exception ex)
+        {
+            // 注入链任何一段抛出来都要落到界面，不能只留日志
+            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+            UuFixStatusText.Text = "修复失败：" + detail;
+            VM.AppendLog("[UU 修复] 异常：" + detail);
+        }
+    }
+
+    /// <summary>撤销：重启 UU 服务，进程内 hook 随进程消失。</summary>
+    private async void OnUuRestoreClicked(object sender, RoutedEventArgs e)
+    {
+        var confirm = await DialogHelper.ShowMessageAsync(
+            "撤销 UU 修复",
+            "将重启 UU 服务，使会话修正失效、行为恢复原状。\n\n" +
+            "影响：当前正在进行中的 UU 远控画面会中断一次。",
+            closeText: "取消",
+            primaryText: "重启服务");
+
+        if (confirm != ContentDialogResult.Primary)
+        {
+            return;
+        }
+
+        UuFixStatusText.Visibility = Visibility.Visible;
+        UuFixStatusText.Text = "正在重启 UU 服务…";
+
+        try
+        {
+            var result = UuSessionFixService.Restore();
+            UuFixStatusText.Text = result.Detail;
+            VM.AppendLog("[UU 修复] " + result.Detail);
+        }
+        catch (Exception ex)
+        {
+            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+            UuFixStatusText.Text = "撤销失败：" + detail;
+            VM.AppendLog("[UU 修复] 撤销异常：" + detail);
+        }
+    }
+
     private void OnSave(object sender, RoutedEventArgs e) => VM.SaveConfig();
     private async void OnExport(object sender, RoutedEventArgs e) => await VM.ExportConfigAsync();
 

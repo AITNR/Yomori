@@ -54,6 +54,28 @@
                                TextWrapping="Wrap"
                                Opacity="0.7"
                                FontSize="12" />
+
+                    <!-- UU 远程修复：某些环境下 UU 会连到通道账户的桌面。
+                         根因是本机 wtsapi32 缺 WTSGetActiveConsoleSessionId，UU 取不到控制台身份。
+                         这里修正它对会话的判定，不修改 UU 的任何文件。 -->
+                    <TextBlock Text="UU 远程修复"
+                               FontWeight="SemiBold"
+                               Margin="0,10,0,0" />
+
+                    <TextBlock Text="若网易 UU 远程连过去看到的是通道账户的桌面、而不是本程序所在的桌面，用这里修复。修复会向 UU 的服务进程注入一个会话判定修正模块，并重启它的投屏进程：当前远控画面会中断一次，UU 服务重启后修复自动失效。不修改 UU 的任何文件。需要管理员权限。"
+                               TextWrapping="Wrap"
+                               Opacity="0.7"
+                               FontSize="12" />
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="修复" Click="OnUuFixClicked" />
+                        <Button Content="撤销修复" Click="OnUuRestoreClicked" />
+                    </StackPanel>
+
+                    <TextBlock x:Name="UuFixStatusText"
+                               TextWrapping="Wrap"
+                               Visibility="Collapsed"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                 </StackPanel>
             </Border>
 

@@ -72,6 +72,11 @@
   <ItemGroup Condition="'$(Platform)'=='x64'">
     <None Include="..\Yomori.RdpNative\build\Release\ycn_rdp.dll" Link="ycn_rdp.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
   </ItemGroup>
+  <!-- UuFix：注入到 UU 服务进程的会话判定修正载荷（仅 x64；构建见 Yomori.UuFix.Native/CMakeLists.txt） -->
+  <ItemGroup Condition="'$(Platform)'=='x64'">
+    <None Include="..\Yomori.UuFix.Native\build\Release\uu_session_fix.dll" Link="uu_session_fix.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+
   <Target Name="CopyRdpRuntimeDlls" AfterTargets="Build" Condition="'$(Platform)'=='x64'">
     <ItemGroup>
       <RdpRuntimeDll Include="..\Yomori.RdpNative\build\Release\*.dll" Exclude="..\Yomori.RdpNative\build\Release\ycn_rdp.dll" />
