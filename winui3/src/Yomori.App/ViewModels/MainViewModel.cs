@@ -74,6 +74,12 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>正在跑「多通道任务启动」的嵌套计数；&gt;0 时手动连接回调不另起切回意图。</summary>
     private int _channelRunDepth;
 
+    /// <summary>
+    /// UU 远程修复的延迟调度：连接/执行这类操作之后静置 18 秒再动手，
+    /// 避免和正在建立的会话抢时序。规则见 <see cref="UuSessionFixScheduler"/>。
+    /// </summary>
+    private readonly UuSessionFixScheduler _uuFixScheduler;
+
     private ScriptRunner? _runner;
     private Task? _runTask;
     private DispatcherQueueTimer? _memorySampleTimer;
@@ -90,6 +96,11 @@ public sealed class MainViewModel : ObservableObject
     public MainViewModel()
     {
         _dispatcher = DispatcherQueue.GetForCurrentThread();
+        _uuFixScheduler = new UuSessionFixScheduler(
+            _dispatcher,
+            AppendLog,
+            () => RdpSettings.UuSessionFixEnabled,
+            () => UuSessionFixService.ApplyAsync(CancellationToken.None));
         _configManager = new ConfigManager(AppPaths.ConfigPath);
         _logger = new FileLogger(AppPaths.LogDir);
         _statsManager = new RuntimeStatsManager(AppPaths.StatsDir);
@@ -1562,6 +1573,9 @@ public sealed class MainViewModel : ObservableObject
         var jobs = new List<Task>();
         var localChannels = 0;
 
+        // 任务启动会新开会话、改变控制台归属 —— 交给调度器延迟应用
+        NotifyUuFixRelevantAction("开始执行任务");
+
         Interlocked.Increment(ref _channelRunDepth);
         try
         {
@@ -1607,6 +1621,24 @@ public sealed class MainViewModel : ObservableObject
         // 此时合并成一次切回，而不是每条通道各切一次。
         await TriggerControllerSessionReturnAsync("任务启动", localChannels > 0);
     }
+
+    /// <summary>
+    /// 报告一次「可能改变控制台归属」的操作（开始执行、连接通道、连接全部、内嵌连上…）。
+    ///
+    /// <para>不直接执行修复：交给调度器按 18/30 秒规则合并。开关关闭时这里是空操作。</para>
+    /// </summary>
+    public void NotifyUuFixRelevantAction(string source)
+    {
+        if (!RdpSettings.UuSessionFixEnabled)
+        {
+            return;
+        }
+
+        _uuFixScheduler.Notify(source);
+    }
+
+    /// <summary>关闭 UU 修复开关：取消尚未开始的等待。</summary>
+    public void CancelUuFixSchedule() => _uuFixScheduler.Cancel();
 
     /// <summary>
     /// 请求一次「把控制台切回主控会话」。调用点必须是连接批次收敛之后，
@@ -3507,6 +3539,11 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
+        // 会话通道的主入口（「连接通道」「连接全部」都走这里）。
+        // 独立窗口模式会在下面再进 ConnectSurfaceNow，那里也会通知一次 ——
+        // 调度器按状态机合并，重复通知只会重置 18 秒，不会叠加执行。
+        NotifyUuFixRelevantAction("连接通道");
+
         if (!IsEmbeddedMode)
         {
             // 独立窗口模式的画面不在应用里，走常规连接入口即可。
@@ -3649,6 +3686,8 @@ public sealed class MainViewModel : ObservableObject
                 $"本机不存在账户「{RdpSettings.TargetUser}」。\n请先在 Windows 里创建该账户，再回到这里连接。");
             return;
         }
+
+        NotifyUuFixRelevantAction("连接通道");
 
         IsRdpBusy = true;
         RdpStatusText = "正在连接目标会话…";
@@ -4440,6 +4479,8 @@ public sealed class MainViewModel : ObservableObject
         {
             _ = TriggerControllerSessionReturnAsync("手动连接", true);
         }
+
+        NotifyUuFixRelevantAction("内嵌连接建立");
         Post(() =>
         {
             if (RdpStatusText.Contains("内嵌连接中", StringComparison.Ordinal) ||

@@ -217,6 +217,21 @@ internal static class UuSessionFixService
         KillServers();
         var serverSession = await WaitForServerSessionAsync(cancellationToken).ConfigureAwait(false);
 
+        // 投屏进程是**按需拉起**的：没有连接请求时它根本不常驻。
+        // 杀完等不到新进程，只说明「现在没人连」，不代表修正失效 ——
+        // hook 已经装进服务进程，下次 UU 连接时会按修正后的结果选会话。
+        if (serverSession is null)
+        {
+            return new UuFixResult
+            {
+                Outcome = UuFixOutcome.Success,
+                ServicePid = pid,
+                ServerSessionId = null,
+                ConsoleSessionId = consoleKnown ? consoleId : null,
+                Detail = "已启用：修正已装载。投屏进程当前未运行，下次 UU 连接时会直接进入主控桌面。",
+            };
+        }
+
         var effective = consoleKnown && serverSession == consoleId;
 
         return new UuFixResult

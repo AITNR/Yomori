@@ -50,7 +50,7 @@
                                   IsOn="{x:Bind VM.RdpSettings.AutoReturnToControllerSession, Mode=OneWay}"
                                   Toggled="OnAutoReturnToggled" />
 
-                    <TextBlock Text="把当前桌面切回本程序所在的账户会话，减少远控软件进入其他账户桌面的情况。开启后，本机内嵌通道连上时自动执行；当前占着桌面的会话会被断开（进程保留）。该设置只作用于本机，不随配置导入导出。"
+                    <TextBlock Text="本机内嵌通道连上后，把桌面切回本程序所在会话。切换时占着桌面的会话会断开（进程保留）。不随配置导入导出。"
                                TextWrapping="Wrap"
                                Opacity="0.7"
                                FontSize="12" />
@@ -61,9 +61,10 @@
                          不落配置：修复只在本进程生命周期内有效，持久化会出现「显示已开但实际失效」。 -->
                     <ToggleSwitch x:Name="UuFixSwitch"
                                   Header="UU 远程修复"
+                                  IsOn="{x:Bind VM.RdpSettings.UuSessionFixEnabled, Mode=OneWay}"
                                   Toggled="OnUuFixToggled" />
 
-                    <TextBlock Text="勾选后，UU 远程会连接到本程序所在的桌面，而不是通道账户的桌面。启用时会让 UU 的投屏进程重启一次（当前远控画面短暂中断）；不修改 UU 的任何文件。本程序退出或 UU 服务重启后需重新勾选。需要管理员权限。"
+                    <TextBlock Text="让 UU 远程连到本程序所在桌面。连接或开始执行后 18 秒自动应用；应用时 UU 投屏进程会重启一次（远控短暂中断）。关闭不撤销已生效的修正。"
                                TextWrapping="Wrap"
                                Opacity="0.7"
                                FontSize="12" />
@@ -119,7 +120,7 @@
                 <StackPanel Spacing="12">
                     <TextBlock Text="远程桌面解锁（RDP）" FontWeight="SemiBold" />
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.7"
-                               Text="用于让本机支持多账户同时远程连接。本区当前只做只读检测：读取 TermService 的 ServiceDll、服务状态、会话枚举、termsrv.dll 版本与本机 rdpwrap.ini。检测不修改任何系统设置，也不下载任何文件。" />
+                               Text="让本机支持多账户同时远程连接。当前仅只读检测：服务配置、会话、termsrv.dll 版本与 rdpwrap.ini，不改系统、不下载文件。" />
 
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button x:Name="RdpUnlockButton" Content="解锁 RDP" Click="OnRdpUnlock" />
@@ -128,11 +129,11 @@
                     </StackPanel>
 
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                               Text="三件事互不相同，因此是三个按钮：解锁 = 安装官方组件并改配置；还原注册表 = 只按快照恢复本功能改过的键值，不卸载组件；卸载 = 调用官方卸载器，不动账户与凭据。三者共享同一把锁，同时只能跑一个。" />
+                               Text="解锁＝装组件并改配置；还原注册表＝只回滚本功能改过的键值；卸载＝调用官方卸载器。三者不能同时运行。" />
 
                     <!-- 来源与许可说明（计划书 §9：外部下载资产不随包分发，但仍要交代来源与风险） -->
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                               Text="解锁组件来自上游 sebaxakerhtc/rdpwrap（Apache License 2.0，stascorp/rdpwrap 的分支）。Yomori 不随包分发任何解锁载荷，不修改 termsrv.dll，不做注入或进程内存写入；安装器与卸载器在需要时从官方 Releases 动态下载并在本机校验。该类组件可能被安全软件误报，Yomori 不隐藏、不混淆、不规避扫描。" />
+                               Text="组件来自 sebaxakerhtc/rdpwrap（Apache-2.0）。不随包分发载荷、不改 termsrv.dll、不做注入；安装器按需从官方 Releases 下载并校验。可能被安全软件误报，不做规避。" />
 
                     <InfoBar x:Name="RdpResultBar" IsOpen="False" IsClosable="True" />
 
@@ -196,7 +197,7 @@
                                   Toggled="OnDeveloperModeToggled" />
 
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.6"
-                               Text="打开后「运行日志」页才显示带 [embed] 标签的内嵌画面诊断日志（D3D 初始化、渲染路径、GFX 管线状态、帧到达节奏等）。关着时这些行不在页面上显示，但日志文件里始终完整保留，排障时可以照旧去日志目录里翻。" />
+                               Text="开启后运行日志页显示 [embed] 诊断行。关闭只影响页面显示，日志文件始终完整保留。" />
 
                     <!-- GitHub 访问令牌：从「远程桌面解锁」区挪到这里（2026-10-26）——
                          它只影响访问 GitHub 接口的配额，跟某个功能是一对一关系，不是 RDP 专属，
@@ -215,7 +216,7 @@
                         </StackPanel>
                         <TextBlock x:Name="GitHubTokenState" FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
                         <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                                   Text="用于检查更新、下载安装包与下载 RDP 解锁组件时提高 GitHub 接口配额：匿名每小时 60 次，带令牌 5000 次。不需要勾选任何权限（只读公开仓库即可）。令牌存进 Windows 凭据管理器，不写进 config.json，界面上只显示首尾各 4 位。" />
+                                   Text="提高 GitHub 接口配额（60 → 5000 次/小时）。只需公开仓库只读权限；令牌存凭据管理器，界面只显示首尾各 4 位。" />
                     </StackPanel>
                 </StackPanel>
             </Border>
@@ -238,9 +239,9 @@
             <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
                 <StackPanel Spacing="12">
                     <TextBlock Text="外部脚本日志" FontWeight="SemiBold" />
-                    <TextBlock Text="脚本自己写出来的实时日志（BetterGI / March7thAssistant / MaaEnd 等），按通道分目录、每天一份文件保存。目标账户会话里的那份由代理写在 %ProgramData%\Yomori\agent\external_logs，本地执行的那份写在程序目录的 external_logs。"
+                    <TextBlock Text="脚本自身输出的日志，按通道分目录、每天一份。目标会话写在 %ProgramData%\Yomori\agent\external_logs，本地写在程序目录 external_logs。"
                                TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
-                    <TextBlock Text="归档只保留 INFO 及以上：TRACE / DEBUG 级（MaaFramework 的函数进出、Pipeline 解析、GPU 探测）不写入文件，实测可减少约四分之三的体积。被省略的行会按批留下汇总行。需要完整明细时设环境变量 YOMORI_EXTERNAL_LOG_VERBOSE=1 后重启主控端与代理。"
+                    <TextBlock Text="只归档 INFO 及以上，TRACE/DEBUG 不入文件（体积约减四分之三）。需要完整明细时设 YOMORI_EXTERNAL_LOG_VERBOSE=1。"
                                TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
 
                     <Grid ColumnSpacing="12">
@@ -325,7 +326,7 @@
                     <!-- 本程序自己的许可。与上面那项区分开：那一项是 FreeRDP 等第三方组件的
                          声明，这一项才是本程序的许可 —— 两者混在一起时，用户会以为 GPL 只覆盖
                          别人那部分。 -->
-                    <TextBlock Text="本程序以 GNU General Public License v3.0 发布，许可证全文与源码见上方 GitHub 链接。"
+                    <TextBlock Text="以 GPL-3.0 发布，全文与源码见上方链接。"
                                TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
 
                     <!-- 版本号 + 检查更新。版本号从程序集信息版本里取（CI 传 -p:Version=），
@@ -415,7 +416,7 @@
                         </InfoBar.ActionButton>
                     </InfoBar>
 
-                    <TextBlock Text="检查更新只会去 GitHub 读一次发布信息（不下载、不改任何文件）；要装新版请点「前往下载」手动下载。更新渠道会记进 config.json。"
+                    <TextBlock Text="只读一次 GitHub 发布信息，不下载、不改文件。装新版请点「前往下载」。"
                                TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
                 </StackPanel>
             </Border>

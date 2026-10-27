@@ -508,6 +508,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private bool _notifyOnAllDone = true;
     private bool _notifyLocalTaskDone = true;
     private bool _autoReturnToControllerSession;
+    private bool _uuSessionFixEnabled;
     private int _connectTimeoutSeconds = 120;
     private bool _credentialSaved;
     private bool _embedRemoteDesktop;
@@ -600,6 +601,23 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     {
         get => _autoReturnToControllerSession;
         set => SetProperty(ref _autoReturnToControllerSession, value);
+    }
+
+    /// <summary>
+    /// 是否启用「UU 远程修复」。
+    ///
+    /// <para>与 <see cref="AutoReturnToControllerSession"/> 不同，这一项**要落盘**：
+    /// 它表示用户的长期意愿。勾选本身不立即执行，而是在「开始执行 / 连接通道」这类
+    /// 可能改变控制台归属的操作之后，延迟一小段时间再应用 —— 避免与连接过程抢时序。</para>
+    ///
+    /// <para>注意：修复只存活在 UU 服务进程的内存里，服务重启后会失效；
+    /// 下一次连接操作会自动补装，所以不需要额外的守护逻辑。</para>
+    /// </summary>
+    [JsonPropertyName("uu_session_fix_enabled")]
+    public bool UuSessionFixEnabled
+    {
+        get => _uuSessionFixEnabled;
+        set => SetProperty(ref _uuSessionFixEnabled, value);
     }
 
     /// <summary>每完成一个任务都弹系统通知。</summary>
@@ -824,6 +842,9 @@ public sealed class RdpConfig : ObservableObject, ICloneable
                     break;
                 case "autoreturntocontrollersession":
                     AutoReturnToControllerSession = element.ValueKind == JsonValueKind.True;
+                    break;
+                case "uusessionfixenabled":
+                    UuSessionFixEnabled = element.ValueKind == JsonValueKind.True;
                     break;                case "connecttimeoutseconds":
                     if (element.ValueKind == JsonValueKind.Number)
                     {

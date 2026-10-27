@@ -290,20 +290,18 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// UU 远程修复开关：勾选即启用（注入 + 重选会话），取消即撤销（重启 UU 服务）。
+    /// UU 远程修复开关：只记录「是否启用」，**不立即执行**。
     ///
-    /// <para>为什么先确认再动手：启用会重启 UU 的投屏进程，正在进行的远控会中断一次。
-    /// 用户拨开关时未必意识到这一点，所以把影响写进确认框；拒绝时把开关拨回去，
-    /// 不能留下「看着是开的、其实什么都没做」的状态。</para>
+    /// <para>真正的应用交给 <see cref="UuSessionFixScheduler"/>：在「开始执行 / 连接通道」
+    /// 这类可能改变控制台归属的操作之后静置 18 秒再动手，避免与正在建立的会话抢时序。
+    /// 勾选时立刻注入会撞上连接过程，之前就是那么把 UU 弄得设备离线的。</para>
     ///
-    /// <para>为什么不落配置：修复只存在于目标进程内存里，本程序退出或 UU 服务重启即失效。
-    /// 持久化会让下次启动时开关显示为开、实际却没生效，比不记忆更容易误导。</para>
+    /// <para>关闭时只取消尚未开始的等待，不重启 UU 服务 —— 撤销动作副作用太大，
+    /// 不该藏在一个开关里。已生效的修正随服务重启自然失效。</para>
     /// </summary>
-    private async void OnUuFixToggled(object sender, RoutedEventArgs e)
+    private void OnUuFixToggled(object sender, RoutedEventArgs e)
     {
-        // IsLoaded 挡的是 InitializeComponent 期间的那次 Toggled：
-        // 那时 UuFixStatusText 还没赋值，直接写它会 NullReference。
-        if (_syncing || !IsLoaded)
+        if (_syncing)
         {
             return;
         }
@@ -313,93 +311,27 @@ public sealed partial class SettingsPage : Page
             return;
         }
 
-        var enable = toggle.IsOn;
-
-        var confirm = await DialogHelper.ShowMessageAsync(
-            enable ? "启用 UU 远程修复" : "关闭 UU 远程修复",
-            enable
-                ? "将向 UU 的服务进程注入会话判定修正模块，使其投屏进程回到本程序所在的桌面。\n\n"
-                  + "影响：当前正在进行中的 UU 远控画面会中断一次；本程序退出或 UU 服务重启后修复失效，需重新勾选。\n"
-                  + "不会修改 UU 的任何文件。\n\n"
-                  + "需要 UU 远程已安装且服务正在运行。"
-                : "将重启 UU 服务，使会话修正失效、行为恢复原状。\n\n"
-                  + "影响：当前正在进行中的 UU 远控画面会中断一次。",
-            closeText: "取消",
-            primaryText: enable ? "启用" : "关闭");
-
-        if (confirm != ContentDialogResult.Primary)
+        var on = toggle.IsOn;
+        if (VM.RdpSettings.UuSessionFixEnabled == on)
         {
-            SetUuFixSwitch(toggle, !enable);
             return;
         }
 
-        SetUuFixStatus(enable ? "正在启用…" : "正在关闭…");
+        VM.RdpSettings.UuSessionFixEnabled = on;
+        VM.SaveConfig();
 
-        try
+        if (on)
         {
-            var result = enable
-                ? await UuSessionFixService.ApplyAsync(CancellationToken.None)
-                : UuSessionFixService.Restore();
-
-            SetUuFixStatus(result.Detail);
-            VM.AppendLog("[UU 修复] " + result.Detail);
-
-            var failed = enable ? !result.IsSuccess : result.Outcome != UuFixOutcome.Restored;
-            if (failed)
-            {
-                SetUuFixSwitch(toggle, !enable);
-            }
-        }
-        catch (Exception ex)
-        {
-            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
-            SetUuFixStatus((enable ? "启用失败：" : "关闭失败：") + detail);
-            VM.AppendLog("[UU 修复] 异常：" + detail);
-            SetUuFixSwitch(toggle, !enable);
-        }
-    }
-
-    /// <summary>
-    /// 更新状态文字。必须自己回 UI 线程：<see cref="UuSessionFixService.ApplyAsync"/>
-    /// 内部用了 <c>ConfigureAwait(false)</c>，await 的续体不保证在 UI 线程上 ——
-    /// 直接写 TextBlock.Text 会以 RPC_E_WRONG_THREAD (0x8001010E) 掀掉整个进程。
-    /// </summary>
-    private void SetUuFixStatus(string text)
-    {
-        void Apply()
-        {
-            UuFixStatusText.Visibility = Visibility.Visible;
-            UuFixStatusText.Text = text;
-        }
-
-        if (DispatcherQueue.HasThreadAccess)
-        {
-            Apply();
+            UuFixStatusText.Text = "已开启：下次「开始执行」或「连接通道」之后 18 秒自动应用。";
         }
         else
         {
-            DispatcherQueue.TryEnqueue(Apply);
-        }
-    }
-
-    /// <summary>把开关拨回指定位置；<c>_syncing</c> 挡住回拨引发的下一轮 Toggled。</summary>
-    private void SetUuFixSwitch(ToggleSwitch toggle, bool on)
-    {
-        void Apply()
-        {
-            _syncing = true;
-            toggle.IsOn = on;
-            _syncing = false;
+            VM.CancelUuFixSchedule();
+            UuFixStatusText.Text = "已关闭：不再自动应用。已生效的修正会在 UU 服务重启后失效。";
         }
 
-        if (DispatcherQueue.HasThreadAccess)
-        {
-            Apply();
-        }
-        else
-        {
-            DispatcherQueue.TryEnqueue(Apply);
-        }
+        UuFixStatusText.Visibility = Visibility.Visible;
+        VM.AppendLog("[UU 修复] " + UuFixStatusText.Text);
     }
 
     private void OnSave(object sender, RoutedEventArgs e) => VM.SaveConfig();
