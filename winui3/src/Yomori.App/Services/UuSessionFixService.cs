@@ -345,6 +345,12 @@ internal static class UuSessionFixService
                             Outcome = UuFixOutcome.HookFailed,
                             Detail = "载荷没找到 wtsapi32!WTSEnumerateSessionsW 的导入项 —— 该版本可能改成动态获取，此修复不适用。",
                         },
+                        -3 => new UuFixResult
+                        {
+                            Outcome = UuFixOutcome.HookFailed,
+                            Detail = "载荷在目标进程里发生访问冲突（0xC0000005）并已自行中止，服务未受影响。"
+                                     + "该版本的导入表结构可能不标准（加壳 / 重定向），此修复不适用。",
+                        },
                         _ => new UuFixResult { Outcome = UuFixOutcome.HookFailed, Detail = "安装函数返回 " + code.ToInt64() + "（改写导入表失败）。" },
                     };
                 }

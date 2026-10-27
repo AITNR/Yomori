@@ -94,14 +94,77 @@ static BOOL WINAPI Hook_WTSEnumerateSessionsW(HANDLE hServer, DWORD reserved, DW
     return ok;
 }
 
-/* 在模块导入表里定位 wtsapi32!WTSEnumerateSessionsW 的槽位 */
+/* 在模块导入表里定位 wtsapi32!WTSEnumerateSessionsW 的槽位
+ *
+ * 注意目标进程是 delay-load 的：GameViewerService.exe 的普通导入表里没有 wtsapi32，
+ * 它在 .didat（延迟导入）段。只查普通导入表既找不到、又会因为 OriginalFirstThunk
+ * 为空而拿着野指针当名字表遍历 —— 那就是 0xC0000005 的来源。
+ */
+typedef struct
+{
+    DWORD Attributes;
+    DWORD DllNameRVA;
+    DWORD ModuleHandleRVA;
+    DWORD ImportAddressTableRVA;
+    DWORD ImportNameTableRVA;
+    DWORD BoundImportAddressTableRVA;
+    DWORD UnloadInformationTableRVA;
+    DWORD TimeDateStamp;
+} UUFIX_DELAY_DESC;
+
+#define UUFIX_MAX_THUNKS 4096
+
+static BOOL MatchThunkTable(BYTE *base, IMAGE_THUNK_DATA *iat, IMAGE_THUNK_DATA *names,
+                            ULONG_PTR **slot, ULONG_PTR *originalValue)
+{
+    int guard = 0;
+
+    if (iat == NULL || names == NULL)
+    {
+        return FALSE;
+    }
+
+    for (; iat->u1.Function != 0; iat++, names++)
+    {
+        IMAGE_IMPORT_BY_NAME *hint;
+
+        if (++guard > UUFIX_MAX_THUNKS)
+        {
+            return FALSE;
+        }
+
+        if (names->u1.AddressOfData == 0)
+        {
+            continue;
+        }
+
+        /* 序号导入没有名字，跳过 */
+        if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
+        {
+            continue;
+        }
+
+        hint = (IMAGE_IMPORT_BY_NAME *)(base + (DWORD)names->u1.AddressOfData);
+        if (strcmp((const char *)hint->Name, "WTSEnumerateSessionsW") != 0)
+        {
+            continue;
+        }
+
+        *slot = (ULONG_PTR *)&iat->u1.Function;
+        *originalValue = iat->u1.Function;
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 static BOOL LocateIatSlot(HMODULE module, ULONG_PTR **slot, ULONG_PTR *originalValue)
 {
     BYTE *base;
     IMAGE_DOS_HEADER *dos;
     IMAGE_NT_HEADERS *nt;
-    IMAGE_DATA_DIRECTORY dir;
-    IMAGE_IMPORT_DESCRIPTOR *desc;
+    IMAGE_DATA_DIRECTORY normal;
+    IMAGE_DATA_DIRECTORY delayed;
 
     if (module == NULL)
     {
@@ -121,58 +184,76 @@ static BOOL LocateIatSlot(HMODULE module, ULONG_PTR **slot, ULONG_PTR *originalV
         return FALSE;
     }
 
-    dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (dir.VirtualAddress == 0)
+    normal = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    delayed = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+
+    /* 1) 普通导入表 */
+    if (normal.VirtualAddress != 0)
     {
-        return FALSE;
+        IMAGE_IMPORT_DESCRIPTOR *desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + normal.VirtualAddress);
+        int guard = 0;
+
+        for (; desc->Name != 0 && guard < 256; desc++, guard++)
+        {
+            const char *dllName = (const char *)(base + desc->Name);
+
+            if (_stricmp(dllName, "wtsapi32.dll") != 0)
+            {
+                continue;
+            }
+
+            /* OriginalFirstThunk 为 0 时没有名字表：此时按名遍历会把数据段当 thunk 读，
+               必须放弃，交给下面的 delay-load 分支 */
+            if (desc->OriginalFirstThunk == 0)
+            {
+                continue;
+            }
+
+            if (MatchThunkTable(base,
+                                (IMAGE_THUNK_DATA *)(base + desc->FirstThunk),
+                                (IMAGE_THUNK_DATA *)(base + desc->OriginalFirstThunk),
+                                slot, originalValue))
+            {
+                return TRUE;
+            }
+        }
     }
 
-    desc = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
-    for (; desc->Name != 0; desc++)
+    /* 2) 延迟导入表（目标进程走的是这一条） */
+    if (delayed.VirtualAddress != 0)
     {
-        const char *dllName = (const char *)(base + desc->Name);
-        IMAGE_THUNK_DATA *iat;
-        IMAGE_THUNK_DATA *names;
+        UUFIX_DELAY_DESC *desc = (UUFIX_DELAY_DESC *)(base + delayed.VirtualAddress);
+        int guard = 0;
 
-        if (_stricmp(dllName, "wtsapi32.dll") != 0)
+        for (; desc->DllNameRVA != 0 && guard < 256; desc++, guard++)
         {
-            continue;
-        }
+            const char *dllName = (const char *)(base + desc->DllNameRVA);
 
-        iat = (IMAGE_THUNK_DATA *)(base + desc->FirstThunk);
-        names = (IMAGE_THUNK_DATA *)(base + desc->OriginalFirstThunk);
-
-        for (; iat->u1.Function != 0; iat++, names++)
-        {
-            IMAGE_IMPORT_BY_NAME *hint;
-
-            if (names == NULL || names->u1.AddressOfData == 0)
+            if (_stricmp(dllName, "wtsapi32.dll") != 0)
             {
                 continue;
             }
 
-            if (IMAGE_SNAP_BY_ORDINAL(names->u1.Ordinal))
+            if (desc->ImportAddressTableRVA == 0 || desc->ImportNameTableRVA == 0)
             {
                 continue;
             }
 
-            hint = (IMAGE_IMPORT_BY_NAME *)(base + names->u1.AddressOfData);
-            if (strcmp((const char *)hint->Name, "WTSEnumerateSessionsW") != 0)
+            if (MatchThunkTable(base,
+                                (IMAGE_THUNK_DATA *)(base + desc->ImportAddressTableRVA),
+                                (IMAGE_THUNK_DATA *)(base + desc->ImportNameTableRVA),
+                                slot, originalValue))
             {
-                continue;
+                return TRUE;
             }
-
-            *slot = (ULONG_PTR *)&iat->u1.Function;
-            *originalValue = iat->u1.Function;
-            return TRUE;
         }
     }
 
     return FALSE;
 }
 
-/* 返回值：1 = 安装成功，2 = 已安装，0 = 未找到导入项，-1 = 保护失败 */
-__declspec(dllexport) int WINAPI UuFixInstall(void)
+/* 返回值：1 = 安装成功，2 = 已安装，0 = 未找到导入项，-1 = 保护失败，-3 = 访问冲突 */
+static int InstallCore(void)
 {
     DWORD oldProtect = 0;
     void *target = NULL;
@@ -203,6 +284,24 @@ __declspec(dllexport) int WINAPI UuFixInstall(void)
     FlushInstructionCache(GetCurrentProcess(), g_iatSlot, sizeof(void *));
 
     return 1;
+}
+
+__declspec(dllexport) int WINAPI UuFixInstall(void)
+{
+    /* 整段套 SEH：载荷跑在 UU 的 SYSTEM 服务里，任何一次越界读都会把远控服务掀掉。
+       宁可返回错误码、由主控如实提示，也绝不能让目标进程因为我们的探测而死。 */
+    __try
+    {
+        return InstallCore();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_original = NULL;
+        g_iatSlot = NULL;
+        g_iatOriginal = 0;
+        InterlockedExchange(&g_installed, 0);
+        return -3;
+    }
 }
 
 /* 恢复原导入项；返回 1 = 已恢复，0 = 本来没装 */
