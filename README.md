@@ -4,7 +4,7 @@
   <img alt="访问量" src="https://count.getloli.com/@Yomori?theme=booru-lewd&amp;padding=7&amp;offset=0&amp;align=top&amp;scale=1&amp;pixelated=1&amp;darkmode=auto">
 </p>
 
-Windows 桌面应用，使用 C# 与 WinUI 3（Windows App SDK）开发。当前版本 **v2.3.2**。
+Windows 桌面应用，使用 C# 与 WinUI 3（Windows App SDK）开发。当前版本 **v2.4.0**。
 
 用途：统一管理多个 Windows 账户下的每日自动化任务 —— 配置执行环境、按通道编排任务、监控执行状态，
 并在任务结束后按配置完成收尾（保持会话 / 断开 / 注销 / 关机）。
@@ -130,6 +130,9 @@ RDP Wrapper 项目地址：<https://github.com/stascorp/rdpwrap>
 | 内嵌画面 | FreeRDP 原生内嵌，鼠标键盘直接操作；多路同屏（2×2 分页）；支持独立窗口；分辨率可选 |
 | 运行反馈 | 状态面板、运行日志、按来源区分的脚本耗时统计 |
 | 凭据存储 | 密码仅保存于 Windows 凭据管理器；导出配置时剥离密码字段 |
+| 系统会话解锁 | 设置页「解锁 RDP」一键下载并安装 RDP Wrapper，解除客户端版单会话限制；提供还原注册表与卸载回退 |
+| UU 远程修复 | 实验性开关，修正 UU 远程连到被控会话而非主控桌面的问题，不修改 UU 自身文件 |
+| 主控会话保护 | 本机通道连上后可自动切回主控会话；单账户单会话策略生效时，连接前给出提示 |
 | 收尾 | 自动关机（可取消）、异常报告、开机自启 |
 | 其他 | 单实例运行、托盘常驻、`F8` 停止执行、`Ctrl+Alt+F8` 紧急停止、跟随系统主题、高 DPI 多显示器支持 |
 
