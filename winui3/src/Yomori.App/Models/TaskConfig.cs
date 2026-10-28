@@ -211,58 +211,19 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     public bool ExternalLogEnabled
     {
         get => _externalLogEnabled;
-        set
-        {
-            if (SetProperty(ref _externalLogEnabled, value))
-            {
-                OnPropertyChanged(nameof(ExternalLogHeaderText));
-            }
-        }
-    }
-
-    /// <summary>
-    /// 折叠标题上的状态摘要 —— **不展开也要能看出这一项开没开、采的是哪儿**。
-    ///
-    /// <para>为什么需要它：这个面板原先藏在「进阶设置」里，还要再展开一层才看得到开关，
-    /// 结果是「以为开了、其实一直没开」，实时日志空了也只能瞎猜（2026-10-28 就在这上面
-    /// 来回折腾了两轮）。标题直接把状态写出来，扫一眼就知道。</para>
-    /// </summary>
-    [JsonIgnore]
-    public string ExternalLogHeaderText
-    {
-        get
-        {
-            if (!_externalLogEnabled)
-            {
-                return "外部脚本实时日志 · 未启用";
-            }
-
-            var path = (_externalLogPath ?? string.Empty).Trim();
-            return path.Length == 0
-                ? "外部脚本实时日志 · 已启用，但没填日志路径（不会采集）"
-                : $"外部脚本实时日志 · 已启用（{path}；{ExternalLogDefaults.NormalizePattern(_externalLogPattern)}）";
-        }
+        set => SetProperty(ref _externalLogEnabled, value);
     }
 
     /// <summary>
     /// 日志文件路径，或**日志文件所在的目录**。支持环境变量（如 <c>%LOCALAPPDATA%</c>）。
     /// 填目录时按 <see cref="ExternalLogPattern"/> 匹配，并自动挑最近修改的那一份 ——
     /// 这样 BetterGI 按天滚动、MaaEnd 一份固定名 + 多份日期文件，都不用改配置。
-    ///
-    /// <para>相对路径以**脚本所在目录**为基准（如 MAA_bbb 填 <c>debug</c>，
-    /// 即 <c>&lt;安装目录&gt;\debug</c>）。这样多账户各自装在不同盘时不必为每台机器改配置。</para>
     /// </summary>
     [JsonPropertyName("external_log_path")]
     public string ExternalLogPath
     {
         get => _externalLogPath;
-        set
-        {
-            if (SetProperty(ref _externalLogPath, (value ?? string.Empty).Trim()))
-            {
-                OnPropertyChanged(nameof(ExternalLogHeaderText));
-            }
-        }
+        set => SetProperty(ref _externalLogPath, (value ?? string.Empty).Trim());
     }
 
     /// <summary><see cref="ExternalLogPath"/> 是目录时的文件名匹配模式，默认 <c>*.log</c>。</summary>
@@ -270,13 +231,7 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     public string ExternalLogPattern
     {
         get => _externalLogPattern;
-        set
-        {
-            if (SetProperty(ref _externalLogPattern, ExternalLogDefaults.NormalizePattern(value)))
-            {
-                OnPropertyChanged(nameof(ExternalLogHeaderText));
-            }
-        }
+        set => SetProperty(ref _externalLogPattern, ExternalLogDefaults.NormalizePattern(value));
     }
 
     /// <summary>
