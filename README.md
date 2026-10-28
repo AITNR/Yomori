@@ -1,8 +1,33 @@
-# Yomori · 二游脚本统合管理器
-
+<!-- markdownlint-disable MD033 MD041 -->
 <p align="right">
   <img alt="访问量" src="https://count.getloli.com/@Yomori?theme=booru-lewd&amp;padding=7&amp;offset=0&amp;align=top&amp;scale=1&amp;pixelated=1&amp;darkmode=auto">
 </p>
+
+<div align="center">
+
+<img alt="Yomori" src="assets/logo.png" width="150" />
+
+# Yomori
+
+_✨ 二游脚本统合管理器 ✨_
+
+[![C#](https://img.shields.io/badge/C%23-512BD4?logo=dotnet&logoColor=%23FFFFFF)](https://github.com/AITNR/Yomori/tree/main/winui3)
+[![WinUI 3](https://img.shields.io/badge/WinUI%203-0067C0)](https://github.com/AITNR/Yomori/tree/main/winui3)
+[![C](https://img.shields.io/badge/C-A8B9CC?logo=c&logoColor=%23000000)](https://github.com/AITNR/Yomori/tree/main/winui3/src/Yomori.RdpNative)
+[![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=%23FFFFFF)](https://github.com/AITNR/Yomori/tree/main/winui3/tools)
+[![license](https://img.shields.io/github/license/AITNR/Yomori)](https://github.com/AITNR/Yomori/blob/main/LICENSE)
+[![platform](https://img.shields.io/badge/platform-Windows-blueviolet)](https://github.com/AITNR/Yomori#6-运行环境)
+[![release](https://img.shields.io/github/v/release/AITNR/Yomori?label=release)](https://github.com/AITNR/Yomori/releases)
+[![downloads](https://img.shields.io/github/downloads/AITNR/Yomori/latest/total)](https://github.com/AITNR/Yomori/releases/latest)
+[![stars](https://img.shields.io/github/stars/AITNR/Yomori?style=flat)](https://github.com/AITNR/Yomori/stargazers)
+[![commit activity](https://img.shields.io/github/commit-activity/m/AITNR/Yomori)](https://github.com/AITNR/Yomori/commits/main)
+[![QQ 群](https://img.shields.io/badge/QQ%20%E7%BE%A4-1070749681-12B7F5)](https://qm.qq.com/q/Zm2aC5L10u)
+
+**会话隔离 · 多路并行 · FreeRDP 原生内嵌**
+
+[下载最新版](https://github.com/AITNR/Yomori/releases/latest) | [使用手册](winui3/USER_GUIDE.md) | [构建说明](winui3/README.md)
+
+</div>
 
 Windows 桌面应用，使用 C# 与 WinUI 3（Windows App SDK）开发。当前版本 **v2.4.0**。
 
@@ -217,7 +242,20 @@ docs/         文档截图
 仓库早期包含一套 Python + PySide6 实现（v1.0 RC1），已于 2026-09-28 移除；当前 `winui3/` 为唯一主线。
 如需旧代码，可从移除前的 Git 历史中获取。
 
-## 12. 许可证
+---
+
+## 12. 反馈与交流
+
+缺陷与功能建议可在 [Issues](https://github.com/AITNR/Yomori/issues) 提交，附上版本号、复现步骤与日志
+（`logs/` 目录，必要时脱敏）能显著缩短定位时间。
+
+使用问题、安装配置讨论与版本通知发布在 QQ 群，点击群号可直接加入：
+
+**QQ 群：[1070749681](https://qm.qq.com/q/Zm2aC5L10u)**
+
+---
+
+## 13. 许可证
 
 本程序以 [GNU General Public License v3.0](LICENSE) 发布。Copyright (c) 2026 YukinoChan。
 
