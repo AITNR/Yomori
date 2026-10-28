@@ -35,6 +35,11 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     private string _mainProcess = string.Empty;
     private string _gameProcess = string.Empty;
     private int _scopeOrder;
+
+    // ---------- 启动方式来源（仅用于展示与追溯，**不参与执行**） ----------
+
+    private string _launchPresetId = string.Empty;
+    private int _launchPresetRev;
     // ---------- 外部脚本实时日志（可选） ----------
 
     private bool _externalLogEnabled;
@@ -198,6 +203,26 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     {
         get => _gameProcess;
         set => SetProperty(ref _gameProcess, value);
+    }
+
+    /// <summary>
+    /// 这条启动参数是从哪个预设填来的（形如 <c>m7a:daily</c>）。
+    /// 只用于界面显示来源与将来做"预设已更新"提示，<b>不参与执行</b>。
+    /// 空串 = 手工填写；读取期不校验该 id 是否仍存在（预设改名属迁移问题，不在这里处理）。
+    /// </summary>
+    [JsonPropertyName("launch_preset_id")]
+    public string LaunchPresetId
+    {
+        get => _launchPresetId;
+        set => SetProperty(ref _launchPresetId, (value ?? string.Empty).Trim());
+    }
+
+    /// <summary>当时用的预设库版本号（<c>LaunchPresetLibrary.Rev</c>），用于判断"这份参数是不是旧的"。</summary>
+    [JsonPropertyName("launch_preset_rev")]
+    public int LaunchPresetRev
+    {
+        get => _launchPresetRev;
+        set => SetProperty(ref _launchPresetRev, value);
     }
 
 
@@ -375,6 +400,8 @@ public sealed class TaskConfig : ObservableObject, ICloneable
         Order = Math.Max(1, Order == 0 ? fallbackOrder : Order);
         ChannelId = (ChannelId ?? string.Empty).Trim();
         ConcurrentGroup = (ConcurrentGroup ?? string.Empty).Trim();
+        LaunchPresetId = (LaunchPresetId ?? string.Empty).Trim();
+        LaunchPresetRev = Math.Max(0, LaunchPresetRev);
         ProcessKeywords = KeywordHelper.Normalize(ProcessKeywords);
         WindowKeywords = KeywordHelper.Normalize(WindowKeywords);
 

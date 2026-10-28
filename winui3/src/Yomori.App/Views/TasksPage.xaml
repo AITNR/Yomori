@@ -290,9 +290,57 @@
                                 <ToggleSwitch Header="启用命令 / 参数" IsOn="{Binding UseArgs, Mode=TwoWay}"
                                               OnContent="启用" OffContent="关闭" />
 
-                                <TextBox Header="启动命令 / 参数"
-                                         PlaceholderText="例如 --startOneDragon 或 .\BetterGI.exe --startOneDragon"
-                                         Text="{Binding Args, Mode=TwoWay}" />
+                                <!-- 启动命令 / 参数：**可编辑下拉**。
+                                     下拉 = 该脚本已知的启动参数（Presets/launch_presets.json，识别依据是
+                                     可执行文件名 + 目录里 interface.json 的 mirrorchyan_rid）；
+                                     直接打字 = 自定义参数（上游随时会加新参数，所以不拦，只提示）。
+
+                                     ⚠️ 不要给 Text 加双向绑定：可编辑 ComboBox 的"选中项 ↔ 文本"没有
+                                        稳定的绑定方向，双向绑会互抖。取值统一走代码里的 Push/Pull 一对方法
+                                        （TextSubmitted / SelectionChanged / 内部 TextBox 的 TextChanged）。
+                                     ⚠️ 项类型 LaunchChoice 必须重写 ToString() 返回参数本身 ——
+                                        可编辑态在文本框里显示的正是 ToString()，不是 DisplayMemberPath。
+                                     ⚠️ 整体替换 ItemsSource 会清空 Text（换脚本时必然发生），
+                                        所以「替换 + 回填」必须写在同一个方法里，见 ReloadArgsForCurrentTask。 -->
+                                <ComboBox x:Name="ArgsCombo"
+                                          Header="启动命令 / 参数"
+                                          IsEditable="True"
+                                          IsTextSearchEnabled="False"
+                                          HorizontalAlignment="Stretch"
+                                          PlaceholderText="例如 --startOneDragon 或 daily -e；也可以直接手写"
+                                          TextSubmitted="OnArgsTextSubmitted"
+                                          SelectionChanged="OnArgsSelectionChanged"
+                                          LostFocus="OnArgsLostFocus"
+                                          Loaded="OnArgsComboLoaded">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Padding="0,3" Spacing="1">
+                                                <TextBlock Text="{Binding Args}" FontFamily="Consolas" />
+                                                <TextBlock Text="{Binding Detail}" FontSize="11" Opacity="0.6"
+                                                           TextWrapping="Wrap" />
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+
+                                <CheckBox x:Name="ApplyRecommendedCheck"
+                                          Content="同时套用推荐设置（完成判断 / 超时 / 日志）"
+                                          IsChecked="True"
+                                          Checked="OnApplyRecommendedChanged"
+                                          Unchecked="OnApplyRecommendedChanged">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="勾选时，选中一条启动参数会顺带写好完成判断（进程 / 窗口 / 直接等待，三选一）、最大运行时间与外部日志目录；不勾则只写参数。" />
+                                    </ToolTipService.ToolTip>
+                                </CheckBox>
+
+                                <!-- 参数说明行：命中预设 = 作用 + 前置条件（灰）；未命中 = 提醒拼写（黄）。 -->
+                                <TextBlock x:Name="ArgsHintText" TextWrapping="Wrap" FontSize="11"
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                                <!-- 完整命令行：下拉只显示参数，看不到可执行文件，这里给一行核对用。
+                                     走 CommandLine.BuildTaskCommand，与真实执行同一份拼装。 -->
+                                <TextBlock x:Name="ArgsCommandText" TextWrapping="Wrap" FontSize="11" Opacity="0.55"
+                                           FontFamily="Consolas" IsTextSelectionEnabled="True" />
                             </StackPanel>
                         </Expander>
 

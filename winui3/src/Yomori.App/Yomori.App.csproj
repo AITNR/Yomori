@@ -68,6 +68,16 @@
                       LogicalName="Yomori.ThirdParty.components.json" />
   </ItemGroup>
 
+  <!-- 启动方式预设库（任务页「启动命令 / 参数」下拉的数据源）。
+       ⚠️ LogicalName 被 Services/LaunchPresetStore.cs 的 ResourceName 常量硬引用 ——
+          改名必须两边一起改，否则会静默退化成空库（界面表现为"什么都没识别出来"）。
+       数据由 tools 脚本 _tools/gen_launch_presets.py 生成，来源是
+       Mirror酱自动化项目命令行启动能力.xlsx 的调查结果。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="Presets\launch_presets.json"
+                      LogicalName="Yomori.Presets.launch_presets.json" />
+  </ItemGroup>
+
   <!-- RdpNative：ycn_rdp.dll + FreeRDP 运行时（仅 x64；构建前置 = 先 build Yomori.RdpNative） -->
   <ItemGroup Condition="'$(Platform)'=='x64'">
     <None Include="..\Yomori.RdpNative\build\Release\ycn_rdp.dll" Link="ycn_rdp.dll" CopyToOutputDirectory="PreserveNewest" Visible="false" />

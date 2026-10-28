@@ -1,0 +1,1020 @@
+{
+  "rev": 1,
+  "updatedOn": "2026-10-28",
+  "frontends": [
+    {
+      "id": "mfaa",
+      "name": "MFAAvalonia（通用 GUI）",
+      "entries": [
+        "MFAAvalonia.exe"
+      ],
+      "source": "https://github.com/MaaXYZ/MFAAvalonia",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "autostart",
+          "name": "自动执行（用界面里勾好的任务）",
+          "args": "--autostart",
+          "primary": true,
+          "timeoutMinutes": 120,
+          "summary": "执行该实例当前配置里已勾选的任务",
+          "precondition": "必须先在界面里勾选任务并保存；命令行无法替你勾选"
+        },
+        {
+          "id": "autostart-quit",
+          "name": "自动执行，完成后退出程序",
+          "args": "--autostart -q",
+          "timeoutMinutes": 120,
+          "summary": "同上，跑完自动关闭程序，适合一次性后台执行",
+          "precondition": "-q 只能与 --autostart 同用",
+          "monitor": {
+            "kind": "direct"
+          }
+        },
+        {
+          "id": "help",
+          "name": "查看帮助（不启动界面）",
+          "args": "-h",
+          "timeoutMinutes": 1,
+          "summary": "打印支持的命令行参数后退出"
+        }
+      ],
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q；已在运行时加 -f 强制重跑"
+    },
+    {
+      "id": "mxu",
+      "name": "MXU（新前端）",
+      "entries": [
+        "mxu.exe"
+      ],
+      "source": "https://github.com/MaaXYZ/MXU",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "autostart",
+          "name": "自动执行（进开机自启模式）",
+          "args": "--autostart",
+          "primary": true,
+          "timeoutMinutes": 120,
+          "summary": "进入开机自启动模式并触发自动执行",
+          "precondition": "需先在界面配置自动执行实例"
+        },
+        {
+          "id": "autostart-quit",
+          "name": "自动执行，完成后关闭程序",
+          "args": "--autostart -q",
+          "timeoutMinutes": 120,
+          "summary": "一次性后台执行，跑完退出",
+          "monitor": {
+            "kind": "direct"
+          }
+        }
+      ],
+      "manualHint": "指定实例手写：--autostart -i \"实例名\""
+    },
+    {
+      "id": "picli",
+      "name": "MaaPiCli（框架官方命令行）",
+      "entries": [
+        "MaaPiCli.exe"
+      ],
+      "source": "https://github.com/MaaXYZ/MaaFramework/tree/main/source/MaaPiCli",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "direct",
+          "name": "按已保存配置直接运行",
+          "args": "-d",
+          "primary": true,
+          "timeoutMinutes": 120,
+          "summary": "跳过交互，按 config/maa_pi_config.json 直接跑任务",
+          "precondition": "必须先交互配置过一次（目录里要有 config/maa_pi_config.json）",
+          "requiresFile": "config/maa_pi_config.json"
+        },
+        {
+          "id": "interactive",
+          "name": "交互模式（不带参数）",
+          "args": "",
+          "timeoutMinutes": 120,
+          "summary": "进入菜单，依次选 ADB / 设备 / 资源 / 任务",
+          "precondition": "需要终端窗口交互，本程序会等到交互结束"
+        }
+      ]
+    },
+    {
+      "id": "mfw",
+      "name": "MFW-PyQt6 / MFW",
+      "entries": [
+        "MFW.exe"
+      ],
+      "source": "https://github.com/overflow65537/MFW-PyQt6",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "direct",
+          "name": "直接运行任务",
+          "args": "--direct-run",
+          "primary": true,
+          "timeoutMinutes": 120,
+          "summary": "启动后直接运行当前配置的任务",
+          "precondition": "MFW 自己的开关要写在分隔符 -- 之前"
+        },
+        {
+          "id": "direct-restart",
+          "name": "强制重启后直接运行",
+          "args": "--direct-run --force-restart",
+          "timeoutMinutes": 120,
+          "summary": "先关掉同目录下其他实例再跑",
+          "precondition": "会终止同类实例"
+        },
+        {
+          "id": "direct-reuse",
+          "name": "复用已有实例并运行",
+          "args": "--direct-run --reuse-existing",
+          "timeoutMinutes": 120,
+          "summary": "优先复用已开着的实例；实例忙时跳过",
+          "precondition": "单独用 --reuse-existing 不会执行任务"
+        }
+      ],
+      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx（ID = 配置文件名去掉 .json）"
+    },
+    {
+      "id": "oks",
+      "name": "ok-script 系（ok-ww / ok-gf2 等）",
+      "entries": [],
+      "source": "https://github.com/ok-oldking/ok-wuthering-waves",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "task1-exit",
+          "name": "跑第 1 个任务，完成后退出",
+          "args": "-t 1 -e",
+          "primary": true,
+          "timeoutMinutes": 120,
+          "volatile": true,
+          "summary": "启动后自动执行第 1 个任务（通常是一条龙/日常），跑完退出",
+          "precondition": "序号对应界面任务列表顺序，随版本与任务增删变化",
+          "monitor": {
+            "kind": "direct"
+          }
+        },
+        {
+          "id": "task1",
+          "name": "跑第 1 个任务，不退出",
+          "args": "-t 1",
+          "timeoutMinutes": 120,
+          "volatile": true,
+          "summary": "跑完停在界面，便于查看结果"
+        }
+      ],
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "generic",
+      "name": "通用（无参数）",
+      "entries": [],
+      "source": "",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "noargs",
+          "name": "不带参数启动",
+          "args": "",
+          "primary": true,
+          "timeoutMinutes": 60,
+          "summary": "直接启动脚本，不带任何参数",
+          "monitor": {
+            "kind": "direct"
+          }
+        }
+      ]
+    }
+  ],
+  "projects": [
+    {
+      "id": "m7a",
+      "name": "三月七小助手",
+      "game": "崩坏：星穹铁道",
+      "entries": [
+        "March7th Launcher.exe",
+        "March7th Assistant.exe"
+      ],
+      "source": "https://m7a.top/#/assets/docs/Tutorial",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "main",
+          "name": "完整运行",
+          "args": "main -e",
+          "primary": true,
+          "timeoutMinutes": 240,
+          "summary": "按设置只跑已启用且已刷新的内容（日常 + 周常 + 体力）",
+          "precondition": "游戏须 1920×1080 窗口或全屏；-e 只在正常完成时退出，失败会停在界面",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "routine",
+          "name": "日常",
+          "args": "routine -e",
+          "timeoutMinutes": 180,
+          "summary": "忽略刷新状态，跑一遍日常组",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "daily",
+          "name": "每日实训",
+          "args": "daily -e",
+          "timeoutMinutes": 90,
+          "summary": "只做每日实训",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "power",
+          "name": "清体力",
+          "args": "power -e",
+          "timeoutMinutes": 90,
+          "summary": "按副本设置自动消耗开拓力",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "currencywars",
+          "name": "货币战争",
+          "args": "currencywars -e",
+          "timeoutMinutes": 120,
+          "summary": "跑一次货币战争",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "fight",
+          "name": "锄大地",
+          "args": "fight -e",
+          "timeoutMinutes": 180,
+          "summary": "调用 Fhoe-Rail 跑图（耗时不定）",
+          "precondition": "需先开好锚点、清掉会干扰传送的任务",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "universe",
+          "name": "模拟宇宙",
+          "args": "universe -e",
+          "timeoutMinutes": 240,
+          "summary": "调用 Auto_Simulated_Universe（该项目已停止维护）",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "StarRail"
+            ]
+          }
+        },
+        {
+          "id": "help",
+          "name": "列出所有可用任务名",
+          "args": "-l",
+          "timeoutMinutes": 1,
+          "summary": "打印当前版本支持的任务名清单"
+        }
+      ],
+      "manualHint": "其它任务名：forgottenhall 混沌回忆 / purefiction 虚构叙事 / apocalyptic 末日幻影 / redemption 兑换码 / game 仅启动游戏"
+    },
+    {
+      "id": "bgi",
+      "name": "BetterGI",
+      "game": "原神",
+      "entries": [
+        "BetterGI.exe"
+      ],
+      "source": "https://bettergi.com/feats/command/introduce.html",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "oneDragon",
+          "name": "一条龙（用界面选定的配置）",
+          "args": "startOneDragon",
+          "primary": true,
+          "timeoutMinutes": 180,
+          "summary": "按「一条龙」页面上选定的配置执行",
+          "precondition": "需要管理员权限；非管理员启动时程序会自我提权重启",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "YuanShen",
+              "GenshinImpact"
+            ]
+          }
+        },
+        {
+          "id": "start",
+          "name": "走启动页的「启动」",
+          "args": "start",
+          "timeoutMinutes": 180,
+          "summary": "等同打开界面后点「启动」按钮",
+          "precondition": "需要管理员权限",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "YuanShen",
+              "GenshinImpact"
+            ]
+          }
+        },
+        {
+          "id": "groups",
+          "name": "按调度器配置组执行",
+          "args": "--startGroups",
+          "timeoutMinutes": 180,
+          "summary": "执行「全自动-调度器」里的配置组",
+          "precondition": "需要在参数后面补组名，多个组用空格分隔",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "YuanShen",
+              "GenshinImpact"
+            ]
+          }
+        }
+      ],
+      "manualHint": "多条配置组请手写：--startGroups 切换队伍 关闭游戏（组名照抄界面里的名字）"
+    },
+    {
+      "id": "zzz",
+      "name": "绝区零 一条龙",
+      "game": "绝区零",
+      "entries": [
+        "OneDragon-Launcher.exe",
+        "OneDragon-RuntimeLauncher.exe"
+      ],
+      "source": "https://one-dragon.com/zzz/zh/home.html",
+      "checkedOn": "2026-10-28",
+      "commands": [
+        {
+          "id": "onedragon",
+          "name": "直接运行一条龙并关游戏",
+          "args": "-o -c",
+          "primary": true,
+          "timeoutMinutes": 180,
+          "summary": "跑完整条一条龙，结束后关闭游戏",
+          "precondition": "需要管理员权限；参数语义据千机链文档",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "ZenlessZoneZero"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "sra",
+      "name": "SRA（StarRailAssistant）",
+      "game": "崩坏：星穹铁道",
+      "entries": [
+        "SRA.exe"
+      ],
+      "source": "https://starrailassistant.top/",
+      "checkedOn": "2026-10-28",
+      "manualHint": "先运行 SRA.exe 在界面里建好配置，再手写：-e run 配置名 + exit"
+    },
+    {
+      "id": "maa",
+      "name": "MAA",
+      "game": "明日方舟",
+      "entries": [
+        "MAA.exe"
+      ],
+      "source": "https://maa.plus/docs/zh-cn/manual/introduction/others.html",
+      "checkedOn": "2026-10-28",
+      "manualHint": "手写示例：--config 官服（只切配置，不自动执行；自动执行请用 MAA 自己的定时执行）"
+    },
+    {
+      "id": "man",
+      "name": "火影忍者手游MAA",
+      "game": "火影忍者手游",
+      "entries": [
+        "MaaAutoNaruto_cli.exe"
+      ],
+      "source": "https://github.com/duorua/MaaAutoNaruto_cli",
+      "checkedOn": "2026-10-28",
+      "manualHint": "命令行版是独立仓库 MaaAutoNaruto_cli，参数未在文档中展开，请参考其 README"
+    },
+    {
+      "id": "maaend",
+      "name": "MaaEnd",
+      "game": "终末地",
+      "entries": [
+        "MaaEnd.exe"
+      ],
+      "source": "https://maaend.com/",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "m9a",
+      "name": "M9A",
+      "game": "重返未来：1999",
+      "entries": [
+        "M9A.exe"
+      ],
+      "source": "https://1999.fan/zh_cn/manual/newbie.html",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maayuan",
+      "name": "MaaYuan",
+      "game": "代号鸢 / 如鸢",
+      "entries": [
+        "MaaYuan.exe"
+      ],
+      "source": "https://maayuan.com/Manual/Overview.html",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maayys",
+      "name": "MaaYYs",
+      "game": "阴阳师",
+      "entries": [
+        "MaaYYs.exe"
+      ],
+      "source": "https://github.com/TanyaShue/MaaYYs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mxu",
+      "manualHint": "指定实例手写：--autostart -i \"实例名\""
+    },
+    {
+      "id": "maabd2",
+      "name": "MaaBD2",
+      "game": "棕色尘埃2",
+      "entries": [
+        "MaaBD2.exe"
+      ],
+      "source": "https://github.com/sunyink/MFABD2/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maafgo",
+      "name": "MaaFgo",
+      "game": "FGO",
+      "entries": [
+        "MaaFgo.exe"
+      ],
+      "source": "https://github.com/xlxyvergil/MaaFgo/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "matr",
+      "name": "MATR",
+      "game": "刀剑乱舞",
+      "entries": [
+        "MATR.exe"
+      ],
+      "source": "https://github.com/NotZoruak/MATR",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maabbb",
+      "name": "识宝小助手",
+      "game": "崩坏3",
+      "entries": [
+        "mab.exe",
+        "Maa_bbb.exe"
+      ],
+      "source": "https://github.com/miaojiuqing/Maa_bbb",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfw",
+      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx"
+    },
+    {
+      "id": "maapvz",
+      "name": "MaaPVZ",
+      "game": "植物大战僵尸2",
+      "entries": [
+        "MaaPVZ.exe"
+      ],
+      "source": "https://github.com/Maa-Assistant-PVZ-The-best/MAAPVZ/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maaadr",
+      "name": "MaaADr",
+      "game": "龙脉R",
+      "entries": [
+        "MaaADr.exe"
+      ],
+      "source": "https://github.com/Azureetude/MaaADr/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "ssah",
+      "name": "MaaStellaSora",
+      "game": "星塔旅人",
+      "entries": [
+        "MaaStellaSora.exe"
+      ],
+      "source": "https://github.com/MaaStellaSora/MaaStellaSora/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "mabrowndust2",
+      "name": "Maa-Assistant-Browndust2",
+      "game": "棕色尘埃2",
+      "entries": [
+        "MaaBd2.exe"
+      ],
+      "source": "https://github.com/alkaidjin/Maa-Assistant-Browndust2",
+      "checkedOn": "2026-10-28",
+      "frontend": "mxu",
+      "manualHint": "指定实例手写：--autostart -i \"实例名\""
+    },
+    {
+      "id": "maagf2",
+      "name": "MaaGF2Exilium",
+      "game": "少女前线2：追放",
+      "entries": [
+        "MaaGF2Exilium.exe"
+      ],
+      "source": "https://github.com/DarkLingYun/MaaGF2Exilium/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maagb",
+      "name": "MaaGumballs",
+      "game": "不思议迷宫",
+      "entries": [
+        "MaaGumballs.exe"
+      ],
+      "source": "https://maagb.xyz/docs/zh_cn/manual/%E5%8A%9F%E8%83%BD%E4%BB%8B%E7%BB%8D.html",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maakes",
+      "name": "Maa_KES",
+      "game": "卡厄思梦境",
+      "entries": [
+        "Maa_KES.exe"
+      ],
+      "source": "https://github.com/miaojiuqing/Maa_Kes/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maalysk",
+      "name": "MaaLYSK",
+      "game": "恋与深空",
+      "entries": [
+        "MaaLYSK.exe"
+      ],
+      "source": "https://github.com/Witty36/MaaLYSK/blob/main/docs/index.md",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maagakumasu",
+      "name": "MaaGakumasu",
+      "game": "学园偶像大师",
+      "entries": [
+        "MaaGakumasu.exe"
+      ],
+      "source": "https://github.com/SuperWaterGod/MaaGakumasu/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "mbcctools",
+      "name": "MBCCtools",
+      "game": "无期迷途",
+      "entries": [
+        "MBCCtools.exe"
+      ],
+      "source": "https://github.com/quietlysnow/MBCCtools",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "mcca",
+      "name": "MCCA",
+      "game": "交错战线",
+      "entries": [
+        "MCCA.exe"
+      ],
+      "source": "https://github.com/MaaXYZ/MCCA",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "mra",
+      "name": "MRA（战舰少女R）",
+      "game": "战舰少女R",
+      "entries": [
+        "MRA.exe"
+      ],
+      "source": "https://github.com/Saratoga-Official/MRA/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maamhxy",
+      "name": "Maa_MHXY_MG",
+      "game": "梦幻西游手游",
+      "entries": [
+        "Maa_MHXY_MG.exe"
+      ],
+      "source": "https://github.com/gitlihang/Maa_MHXY_MG/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maatree",
+      "name": "MAATree",
+      "game": "悠久之树",
+      "entries": [
+        "MAATree.exe"
+      ],
+      "source": "https://github.com/caicai00001/MAATree/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "slimeim",
+      "name": "SLIMEIM_Maa",
+      "game": "魔王与龙的建国谭",
+      "entries": [
+        "SLIMEIM_Maa.exe",
+        "MaaPiCli.exe"
+      ],
+      "source": "https://github.com/miaojiuqing/SLIMEIM_Maa/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "mr3a",
+      "name": "MR3A",
+      "game": "忍者必须死3",
+      "entries": [
+        "MR3A.exe"
+      ],
+      "source": "https://github.com/originalsage/MR3A/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maadudul",
+      "name": "MaaDuDuL",
+      "game": "嘟嘟脸恶作剧",
+      "entries": [
+        "MaaDuDuL.exe"
+      ],
+      "source": "https://mddl.codax.site/docs/",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maahbr",
+      "name": "Maa-HBR",
+      "game": "炽焰天穹",
+      "entries": [
+        "Maa-HBR.exe"
+      ],
+      "source": "https://github.com/KarylDAZE/Maa-HBR/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "mmleo",
+      "name": "MMleo",
+      "game": "偶像梦幻祭2",
+      "entries": [
+        "MMleo.exe"
+      ],
+      "source": "https://github.com/fictionalflaw/MMleo/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maasnowbreak",
+      "name": "MAA_SnowBreak",
+      "game": "尘白禁区",
+      "entries": [
+        "MAA_SnowBreak.exe"
+      ],
+      "source": "https://github.com/overflow65537/MAA_SnowBreak/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfw",
+      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx"
+    },
+    {
+      "id": "mccframework",
+      "name": "MCC_Framework",
+      "game": "交错战线（开发中）",
+      "entries": [
+        "MCC_Framework.exe"
+      ],
+      "source": "https://github.com/MAACrossCore/MCC_Framework/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maakedr",
+      "name": "MaaKEDR",
+      "game": "雪松",
+      "entries": [
+        "MaaKEDR.exe"
+      ],
+      "source": "https://github.com/APPLe-DF/MaaKEDR/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maaresonance",
+      "name": "MaaResonance",
+      "game": "雷索纳斯",
+      "entries": [
+        "MaaResonance.exe"
+      ],
+      "source": "https://github.com/DaiMao204/MaaResonance/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maaash",
+      "name": "MaaAshEchoes",
+      "game": "白荆回廊",
+      "entries": [
+        "MaaAshEchoes.exe"
+      ],
+      "source": "https://github.com/moulai/MaaAshEchoes",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maawoa",
+      "name": "MaaWoA",
+      "game": "机场世界",
+      "entries": [
+        "MaaWoA.exe"
+      ],
+      "source": "https://github.com/huzesama/MaaWoA",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maadxcb3",
+      "name": "MaaDxcb3",
+      "game": "地下城堡3",
+      "entries": [
+        "MaaDxcb3.exe"
+      ],
+      "source": "https://github.com/Halo629/MaaDxcb3",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maaqnzl",
+      "name": "MaaQNZL",
+      "game": "千年之旅",
+      "entries": [
+        "MaaQNZL.exe"
+      ],
+      "source": "https://github.com/chenxing-ye/MaaQNZL/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maanikki",
+      "name": "MaaShiningNikki",
+      "game": "闪耀暖暖",
+      "entries": [
+        "MaaShiningNikki.exe"
+      ],
+      "source": "https://github.com/7iko-07/MaaShiningNikki/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maasr",
+      "name": "MaaStarResonance",
+      "game": "星痕共鸣",
+      "entries": [
+        "MaaStarResonance.exe"
+      ],
+      "source": "https://github.com/AsterleedsGuild0/MaaStarResonance/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maavc",
+      "name": "MaaVillageConquest",
+      "game": "村长征战团",
+      "entries": [
+        "MaaVillageConquest.exe"
+      ],
+      "source": "https://github.com/kpAjun/MaaVillageConquest/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maagc",
+      "name": "MaaGC（诸神皇冠）",
+      "game": "诸神皇冠",
+      "entries": [
+        "maagc.exe"
+      ],
+      "source": "https://github.com/KhazixW2/MAAGC/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "maash",
+      "name": "MaaSH",
+      "game": "时空中的绘旅人",
+      "entries": [
+        "MaaSH.exe"
+      ],
+      "source": "https://github.com/LiliiPop/MaaSH/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "baah",
+      "name": "BAAH 爱丽丝助手",
+      "game": "碧蓝档案",
+      "entries": [
+        "BAAH.exe"
+      ],
+      "source": "https://github.com/BlueArchiveArisHelper/BAAH/tree/main/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "mfaa",
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+    },
+    {
+      "id": "okww",
+      "name": "鸣潮 ok-ww",
+      "game": "鸣潮",
+      "entries": [
+        "ok-ww.exe"
+      ],
+      "source": "https://github.com/ok-oldking/ok-wuthering-waves",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "okgi",
+      "name": "原神 ok-gi",
+      "game": "原神",
+      "entries": [
+        "ok-gi.exe"
+      ],
+      "source": "https://github.com/ok-oldking/ok-genshin-impact",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "okgf2",
+      "name": "少前2 ok-gf2",
+      "game": "少女前线2：追放",
+      "entries": [
+        "ok-gf2.exe"
+      ],
+      "source": "https://github.com/AliceJump/ok-gf2/tree/master/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "oknte",
+      "name": "异环 ok-nte",
+      "game": "异环",
+      "entries": [
+        "ok-nte.exe"
+      ],
+      "source": "https://ok-script.com/ok-nte/",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "okef",
+      "name": "终末地 ok-ef",
+      "game": "终末地",
+      "entries": [
+        "ok-ef.exe"
+      ],
+      "source": "https://ok-script.com/ok-end-field/",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "okkes",
+      "name": "ok-kes",
+      "game": "卡厄思梦境",
+      "entries": [
+        "ok-kes.exe"
+      ],
+      "source": "https://ok-script.com/ok-kes/",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "okonmyoji",
+      "name": "ok-Onmyoji",
+      "game": "阴阳师",
+      "entries": [
+        "ok-Onmyoji.exe"
+      ],
+      "source": "https://github.com/YunLiuZ/ok-Onmyoji/tree/master/docs",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    },
+    {
+      "id": "oketheria",
+      "name": "ok-er（伊瑟）",
+      "game": "伊瑟",
+      "entries": [
+        "ok-etheria.exe"
+      ],
+      "source": "https://github.com/ok-oldking/ok-etheria",
+      "checkedOn": "2026-10-28",
+      "frontend": "oks",
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    }
+  ]
+}

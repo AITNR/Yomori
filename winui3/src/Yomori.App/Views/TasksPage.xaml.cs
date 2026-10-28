@@ -640,6 +640,9 @@ public sealed partial class TasksPage : Page
             SelectByKey(TimeoutActionBox, task.TimeoutAction);
             SelectByKey(WaitModeBox, task.WaitMode);
             SelectByKey(ConcurrentPolicyBox, task.ConcurrentPolicy);
+
+            // 换任务或首次进入时刷新启动参数候选：候选依赖脚本路径，路径没变则走缓存（不重复读盘）。
+            ReloadArgsForCurrentTask(autoFillPrimary: false);
         }
         finally
         {
@@ -741,6 +744,335 @@ public sealed partial class TasksPage : Page
         }
     }
 
+    // ---------------- 启动命令 / 参数：可编辑下拉（计划书 自动化项目启动方式快捷配置计划书-v2.md） ----------------
+
+    /// <summary>当前脚本可选的启动参数。换脚本时整体替换（候选集本来就随脚本变）。</summary>
+    private List<LaunchChoice> _argsChoices = new();
+
+    /// <summary>识别依据（「已识别：M9A（依据 interface.json）」），没识别到就是兜底文案。</summary>
+    private string _argsBasis = string.Empty;
+
+    /// <summary>项目自己要求"手写补充"的说明（多实例、配置名之类）。</summary>
+    private string _argsManualHint = string.Empty;
+
+    /// <summary>目录画像里探测到的日志目录（勾了「同时套用推荐设置」才用得上）。</summary>
+    private string? _argsLogDir;
+
+    /// <summary>
+    /// 可编辑 ComboBox 内部的 TextBox。拿不到 x:Name，只能在可视树里找。
+    /// 挂它的 TextChanged 是为了补住"打完字直接点开始执行、焦点还没离开控件"这一格 ——
+    /// 只靠 TextSubmitted（回车）+ LostFocus 会丢最后一次修改。
+    /// </summary>
+    private TextBox? _argsInnerBox;
+
+    /// <summary>防重入：程序自己改 ItemsSource / Text 时不要把事件当成用户输入。</summary>
+    private bool _suppressArgsEvents;
+
+    private void OnArgsComboLoaded(object sender, RoutedEventArgs e)
+    {
+        HookArgsInnerTextBox();
+        ReloadArgsForCurrentTask(autoFillPrimary: false);
+    }
+
+    private void HookArgsInnerTextBox()
+    {
+        if (_argsInnerBox is not null)
+        {
+            return;
+        }
+
+        _argsInnerBox = FindDescendant<TextBox>(ArgsCombo);
+        if (_argsInnerBox is not null)
+        {
+            _argsInnerBox.TextChanged += OnArgsInnerTextChanged;
+        }
+    }
+
+    private static T? FindDescendant<T>(DependencyObject root) where T : DependencyObject
+    {
+        var count = VisualTreeHelper.GetChildrenCount(root);
+        for (var i = 0; i < count; i++)
+        {
+            var child = VisualTreeHelper.GetChild(root, i);
+            if (child is T typed)
+            {
+                return typed;
+            }
+
+            var found = FindDescendant<T>(child);
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>用户在文本框里打字：立刻落库（不等失焦），再刷新说明行。</summary>
+    private void OnArgsInnerTextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_suppressArgsEvents)
+        {
+            return;
+        }
+
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        task.Args = ArgsCombo.Text ?? string.Empty;
+
+        // 手打的文本恰好等于某条预设 → 仍记为"命中"，但**不碰 UseArgs**（用户正在手填，他知道自己在干什么）
+        var match = LaunchPresetResolver.Match(_argsChoices, task.Args);
+        task.LaunchPresetId = match?.Key ?? string.Empty;
+        task.LaunchPresetRev = match is null ? 0 : LaunchPresetStore.Library.Rev;
+
+        RefreshArgsHint();
+    }
+
+    /// <summary>从下拉里选了一条：写参数 + 源标记，必要时顺带写推荐设置。</summary>
+    private void OnArgsSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressArgsEvents || ArgsCombo.SelectedItem is not LaunchChoice choice)
+        {
+            return;
+        }
+
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        LaunchPresetResolver.Apply(
+            choice, task, ApplyRecommendedCheck.IsChecked == true, _argsLogDir, LaunchPresetStore.Library.Rev);
+
+        // 选中项已经把文本换掉了（ComboBox 自己会做），这里只把说明行和完整命令刷新一遍
+        RefreshArgsHint();
+    }
+
+    /// <summary>回车确认自定义文本。</summary>
+    private void OnArgsTextSubmitted(ComboBox sender, ComboBoxTextSubmittedEventArgs args)
+    {
+        // Handled=true：告诉 ComboBox"文本我收下了，别再拿它去匹配项"——
+        // 否则它会尝试把不存在的文本当成选中项，行为在可编辑态下很怪。
+        args.Handled = true;
+        PushArgsText();
+    }
+
+    /// <summary>失焦兜底：内部 TextBox 找不着时（模板还没应用），只能靠这个把最后一段输入收下来。</summary>
+    private void OnArgsLostFocus(object sender, RoutedEventArgs e) => PushArgsText();
+
+    private void PushArgsText()
+    {
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        task.Args = ArgsCombo.Text ?? string.Empty;
+        var match = LaunchPresetResolver.Match(_argsChoices, task.Args);
+        task.LaunchPresetId = match?.Key ?? string.Empty;
+        task.LaunchPresetRev = match is null ? 0 : LaunchPresetStore.Library.Rev;
+        RefreshArgsHint();
+    }
+
+    private void OnApplyRecommendedChanged(object sender, RoutedEventArgs e)
+    {
+        if (_suppressArgsEvents || ApplyRecommendedCheck.IsChecked != true)
+        {
+            // 取消勾选不回滚：用户可能刚手调过完成判断，自动还原会把他的手改冲掉。
+            return;
+        }
+
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        var match = LaunchPresetResolver.Match(_argsChoices, task.Args);
+        if (match is null)
+        {
+            return;
+        }
+
+        LaunchPresetResolver.Apply(match, task, true, _argsLogDir, LaunchPresetStore.Library.Rev);
+    }
+
+    /// <summary>
+    /// 重新识别 + 换候选 + 回填文本。
+    ///
+    /// ⚠️ 「换 ItemsSource」与「回填 Text」必须在同一个方法里连着做：整体替换 ItemsSource 会清空 Text，
+    /// 靠绑定恢复不回来，用户会看到参数凭空消失。
+    /// </summary>
+    private void ReloadArgsForCurrentTask(bool autoFillPrimary)
+    {
+        var task = VM.SelectedTask;
+        var saved = _suppressArgsEvents;
+        _suppressArgsEvents = true;
+        try
+        {
+            _argsChoices = new List<LaunchChoice>();
+            _argsBasis = string.Empty;
+            _argsManualHint = string.Empty;
+            _argsLogDir = null;
+
+            var path = (task?.ScriptPath ?? string.Empty).Trim();
+            ArgsCombo.IsEnabled = task is not null && path.Length > 0;
+            ApplyRecommendedCheck.IsEnabled = task is not null;
+
+            if (task is null || path.Length == 0)
+            {
+                ArgsCombo.ItemsSource = null;
+                ArgsCombo.Text = string.Empty;
+            }
+            else
+            {
+                var (resolution, profile) = LaunchPresetStore.Resolve(path);
+                _argsChoices = LaunchPresetResolver.BuildChoices(resolution, profile, out var manualHint);
+                _argsBasis = resolution.Basis;
+                _argsManualHint = manualHint;
+                _argsLogDir = profile.LogDirectories.Count > 0 ? profile.LogDirectories[0] : null;
+
+                ArgsCombo.ItemsSource = _argsChoices;   // ← 这一行会清空 Text
+
+                // 只在参数为空时才预填主推项：绝不因为换了脚本就重写用户已经填好的参数。
+                if (autoFillPrimary && string.IsNullOrWhiteSpace(task.Args))
+                {
+                    var primary = LaunchPresetResolver.Primary(_argsChoices);
+                    if (primary is not null)
+                    {
+                        LaunchPresetResolver.Apply(primary, task, ApplyRecommendedCheck.IsChecked == true,
+                            _argsLogDir, LaunchPresetStore.Library.Rev);
+                    }
+                }
+
+                ArgsCombo.Text = task.Args ?? string.Empty;  // ← 回填
+            }
+        }
+        finally
+        {
+            _suppressArgsEvents = saved;
+        }
+
+        RefreshArgsHint();
+    }
+
+    /// <summary>
+    /// 说明行 + 完整命令行。
+    /// 命中判定**以文本反查为准**，不看 SelectedItem —— 手打时它永远是 null。
+    /// </summary>
+    private void RefreshArgsHint()
+    {
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            ArgsHintText.Text = string.Empty;
+            ArgsCommandText.Text = string.Empty;
+            return;
+        }
+
+        var text = ArgsCombo.Text ?? string.Empty;
+        var trimmed = text.Trim();
+        var match = LaunchPresetResolver.Match(_argsChoices, trimmed);
+        var parts = new List<string>();
+
+        if (trimmed.Length == 0)
+        {
+            parts.Add("可留空：留空表示不带任何参数启动。");
+        }
+        else if (match is not null)
+        {
+            if (match.Summary.Length > 0)
+            {
+                parts.Add(match.Summary);
+            }
+
+            if (match.Precondition.Length > 0)
+            {
+                parts.Add(match.Precondition);
+            }
+
+            if (match.Volatile)
+            {
+                parts.Add("参数里的序号随上游版本变化，建议先按界面任务顺序核对。");
+            }
+
+            if (!match.Verified)
+            {
+                parts.Add("该参数未在项目文档中确认。");
+            }
+        }
+        else
+        {
+            parts.Add("未收录的参数，请确认拼写。");
+            var nearest = LaunchPresetResolver.Nearest(_argsChoices, trimmed);
+            if (nearest is not null)
+            {
+                parts.Add($"最接近的已知参数：{nearest.Args}");
+            }
+
+            if (trimmed.Contains('{'))
+            {
+                parts.Add("含 {…} 占位符，运行时会被原样传给程序，记得换成实际名字。");
+            }
+        }
+
+        if (trimmed.Length > 0 && !task.UseArgs)
+        {
+            parts.Add("注意：「启用命令 / 参数」是关闭状态，这些参数不会生效。");
+        }
+
+        // 候选为空时把「识别依据」和「手写示例」补上 —— 这是用户唯一的线索来源。
+        if (_argsChoices.Count == 0 && _argsBasis.Length > 0)
+        {
+            parts.Add(_argsBasis);
+        }
+
+        if (_argsManualHint.Length > 0)
+        {
+            parts.Add(_argsManualHint);
+        }
+
+        ArgsHintText.Text = string.Join(" ", parts);
+        ArgsHintText.Foreground = trimmed.Length > 0 && match is null
+            ? ThemeBrush("SystemFillColorCautionBrush") ?? ArgsHintText.Foreground
+            : ThemeBrush("TextFillColorSecondaryBrush") ?? ArgsHintText.Foreground;
+
+        RefreshArgsCommand(task, trimmed);
+    }
+
+    private void RefreshArgsCommand(TaskConfig task, string text)
+    {
+        var path = (task.ScriptPath ?? string.Empty).Trim();
+        if (path.Length == 0 || !task.UseArgs)
+        {
+            ArgsCommandText.Text = task.UseArgs ? string.Empty : "（命令 / 参数未启用，只启动脚本本身）";
+            return;
+        }
+
+        try
+        {
+            var (fileName, arguments) = CommandLine.BuildTaskCommand(path, task.UseArgs, text);
+            var exe = Path.GetFileName(fileName);
+            ArgsCommandText.Text = arguments.Length > 0
+                ? $"完整命令：\"{exe}\" {arguments}"
+                : $"完整命令：\"{exe}\"（无参数）";
+        }
+        catch (Exception)
+        {
+            ArgsCommandText.Text = string.Empty;
+        }
+    }
+
+    private static Brush? ThemeBrush(string key) =>
+        Application.Current.Resources.TryGetValue(key, out var value) ? value as Brush : null;
+
     private async void OnBrowseScript(object sender, RoutedEventArgs e)
     {
         if (VM.SelectedTask is null)
@@ -766,5 +1098,9 @@ public sealed partial class TasksPage : Page
         {
             VM.SelectedTask.Name = Path.GetFileNameWithoutExtension(path);
         }
+
+        // 选了新脚本 = 候选集可能整个换掉：重新识别、换 ItemsSource、回填文本，
+        // 并在参数为空时预填主推项（"选完脚本就能跑"）。
+        ReloadArgsForCurrentTask(autoFillPrimary: true);
     }
 }
