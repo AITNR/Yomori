@@ -311,6 +311,59 @@
                             </StackPanel>
                         </Expander>
 
+                        <Expander Header="{Binding ExternalLogHeaderText}"
+                                  HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                            <StackPanel Spacing="10">
+                                <TextBlock TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                                           Text="采集脚本自己写到文件里的日志（不是它的 stdout）。标题栏会实时显示是否已启用、采的是哪个目录，不用展开也看得见。" />
+                                <ToggleSwitch Header="启用日志跟踪"
+                                              IsOn="{Binding ExternalLogEnabled, Mode=TwoWay}"
+                                              OnContent="开启" OffContent="关闭" />
+
+                                <TextBox Header="日志文件或目录"
+                                         PlaceholderText="例如：C:\Program Files\BetterGI\log，或相对脚本目录的 debug"
+                                         Text="{Binding ExternalLogPath, Mode=TwoWay}">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="填目录时按右侧匹配模式取该目录下全部日志（如 MAA_bbb 的 debug 目录下 maafw.log / gui.log / agent.log 会一起采集）；相对路径以脚本所在目录为基准。" />
+                                    </ToolTipService.ToolTip>
+                                </TextBox>
+
+                                <Grid ColumnSpacing="12">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBox Grid.Column="0" Header="文件匹配模式"
+                                             PlaceholderText="目录时使用，例如 *.log"
+                                             Text="{Binding ExternalLogPattern, Mode=TwoWay}" />
+                                    <ComboBox Grid.Column="1" Header="日志编码"
+                                              SelectedValuePath="Tag"
+                                              SelectedValue="{Binding ExternalLogEncoding, Mode=TwoWay}"
+                                              HorizontalAlignment="Stretch">
+                                        <ComboBoxItem Content="自动检测" Tag="auto" />
+                                        <ComboBoxItem Content="UTF-8" Tag="utf8" />
+                                        <ComboBoxItem Content="GBK / GB2312" Tag="gbk" />
+                                    </ComboBox>
+                                </Grid>
+
+                                <ToggleSwitch Header="从文件末尾开始跟踪"
+                                              IsOn="{Binding ExternalLogFollowTail, Mode=TwoWay}"
+                                              OnContent="开启" OffContent="关闭">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="开启时只读取本次任务启动后新增的日志；关闭时会从文件开头读取。" />
+                                    </ToolTipService.ToolTip>
+                                </ToggleSwitch>
+
+                                <TextBox Header="关键字（分号分隔）"
+                                         PlaceholderText="例如：error; exception; 失败"
+                                         Text="{Binding ExternalLogKeywordsText, Mode=TwoWay}">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="用于标记日志关注点；全部新增日志均会采集，显示窗口只保留最近记录。" />
+                                    </ToolTipService.ToolTip>
+                                </TextBox>
+                            </StackPanel>
+                        </Expander>
+
                         <!-- 进阶：并发与守护 -->
                         <Expander Header="进阶设置（并发 / 守护 / 监控关键词）"
                                   HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
@@ -341,57 +394,6 @@
                                 <ToggleSwitch Header="守护监控" IsOn="{Binding EnableWatchdog, Mode=TwoWay}"
                                               OnContent="开启" OffContent="关闭" />
 
-                                <Expander Header="外部脚本实时日志"
-                                          HorizontalAlignment="Stretch"
-                                          HorizontalContentAlignment="Stretch">
-                                    <StackPanel Spacing="10">
-                                        <ToggleSwitch Header="启用日志跟踪"
-                                                      IsOn="{Binding ExternalLogEnabled, Mode=TwoWay}"
-                                                      OnContent="开启" OffContent="关闭" />
-
-                                        <TextBox Header="日志文件或目录"
-                                                 PlaceholderText="例如：C:\Program Files\BetterGI\log，或相对脚本目录的 debug"
-                                                 Text="{Binding ExternalLogPath, Mode=TwoWay}">
-                                            <ToolTipService.ToolTip>
-                                                <ToolTip Content="填目录时按右侧匹配模式取该目录下全部日志（如 MAA_bbb 的 debug 目录下 maafw.log / gui.log / agent.log 会一起采集）；相对路径以脚本所在目录为基准。" />
-                                            </ToolTipService.ToolTip>
-                                        </TextBox>
-
-                                        <Grid ColumnSpacing="12">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="*" />
-                                                <ColumnDefinition Width="*" />
-                                            </Grid.ColumnDefinitions>
-                                            <TextBox Grid.Column="0" Header="文件匹配模式"
-                                                     PlaceholderText="目录时使用，例如 *.log"
-                                                     Text="{Binding ExternalLogPattern, Mode=TwoWay}" />
-                                            <ComboBox Grid.Column="1" Header="日志编码"
-                                                      SelectedValuePath="Tag"
-                                                      SelectedValue="{Binding ExternalLogEncoding, Mode=TwoWay}"
-                                                      HorizontalAlignment="Stretch">
-                                                <ComboBoxItem Content="自动检测" Tag="auto" />
-                                                <ComboBoxItem Content="UTF-8" Tag="utf8" />
-                                                <ComboBoxItem Content="GBK / GB2312" Tag="gbk" />
-                                            </ComboBox>
-                                        </Grid>
-
-                                        <ToggleSwitch Header="从文件末尾开始跟踪"
-                                                      IsOn="{Binding ExternalLogFollowTail, Mode=TwoWay}"
-                                                      OnContent="开启" OffContent="关闭">
-                                            <ToolTipService.ToolTip>
-                                                <ToolTip Content="开启时只读取本次任务启动后新增的日志；关闭时会从文件开头读取。" />
-                                            </ToolTipService.ToolTip>
-                                        </ToggleSwitch>
-
-                                        <TextBox Header="关键字（分号分隔）"
-                                                 PlaceholderText="例如：error; exception; 失败"
-                                                 Text="{Binding ExternalLogKeywordsText, Mode=TwoWay}">
-                                            <ToolTipService.ToolTip>
-                                                <ToolTip Content="用于标记日志关注点；全部新增日志均会采集，显示窗口只保留最近记录。" />
-                                            </ToolTipService.ToolTip>
-                                        </TextBox>
-                                    </StackPanel>
-                                </Expander>
 
                                 <TextBox Header="目标进程关键词"
                                          PlaceholderText="例如：Endfield.exe; OK-WW"
