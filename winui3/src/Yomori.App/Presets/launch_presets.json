@@ -57,7 +57,7 @@
           "primary": true,
           "timeoutMinutes": 120,
           "summary": "进入开机自启动模式并触发自动执行",
-          "precondition": "需先在界面配置自动执行实例"
+          "precondition": "设置里必须选定「自启动实例」，否则只开窗口不跑任务；也不能有另一份程序在运行（会直接退出）"
         },
         {
           "id": "autostart-quit",
@@ -65,12 +65,13 @@
           "args": "--autostart -q",
           "timeoutMinutes": 120,
           "summary": "一次性后台执行，跑完退出",
+          "precondition": "设置里必须选定「自启动实例」，否则 -q 不会生效；也不能有另一份程序在运行",
           "monitor": {
             "kind": "direct"
           }
         }
       ],
-      "manualHint": "指定实例手写：--autostart -i \"实例名\""
+      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）"
     },
     {
       "id": "picli",
@@ -435,8 +436,8 @@
       ],
       "source": "https://maaend.com/",
       "checkedOn": "2026-10-28",
-      "frontend": "mfaa",
-      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q"
+      "frontend": "mxu",
+      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）"
     },
     {
       "id": "m9a",
@@ -472,7 +473,7 @@
       "source": "https://github.com/TanyaShue/MaaYYs",
       "checkedOn": "2026-10-28",
       "frontend": "mxu",
-      "manualHint": "指定实例手写：--autostart -i \"实例名\""
+      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）"
     },
     {
       "id": "maabd2",
@@ -569,7 +570,7 @@
       "source": "https://github.com/alkaidjin/Maa-Assistant-Browndust2",
       "checkedOn": "2026-10-28",
       "frontend": "mxu",
-      "manualHint": "指定实例手写：--autostart -i \"实例名\""
+      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）"
     },
     {
       "id": "maagf2",

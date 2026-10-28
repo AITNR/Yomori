@@ -290,29 +290,30 @@
                                 <ToggleSwitch Header="启用命令 / 参数" IsOn="{Binding UseArgs, Mode=TwoWay}"
                                               OnContent="启用" OffContent="关闭" />
 
-                                <!-- 启动命令 / 参数：**可编辑下拉**。
+                                <!-- 启动命令 / 参数：**可写可下拉**（AutoSuggestBox）。
                                      下拉 = 该脚本已知的启动参数（Presets/launch_presets.json，识别依据是
                                      可执行文件名 + 目录里 interface.json 的 mirrorchyan_rid）；
                                      直接打字 = 自定义参数（上游随时会加新参数，所以不拦，只提示）。
 
-                                     ⚠️ 不要给 Text 加双向绑定：可编辑 ComboBox 的"选中项 ↔ 文本"没有
-                                        稳定的绑定方向，双向绑会互抖。取值统一走代码里的 Push/Pull 一对方法
-                                        （TextSubmitted / SelectionChanged / 内部 TextBox 的 TextChanged）。
-                                     ⚠️ 项类型 LaunchChoice 必须重写 ToString() 返回参数本身 ——
-                                        可编辑态在文本框里显示的正是 ToString()，不是 DisplayMemberPath。
-                                     ⚠️ 整体替换 ItemsSource 会清空 Text（换脚本时必然发生），
-                                        所以「替换 + 回填」必须写在同一个方法里，见 ReloadArgsForCurrentTask。 -->
-                                <ComboBox x:Name="ArgsCombo"
-                                          Header="启动命令 / 参数"
-                                          IsEditable="True"
-                                          IsTextSearchEnabled="False"
-                                          HorizontalAlignment="Stretch"
-                                          PlaceholderText="例如 --startOneDragon 或 daily -e；也可以直接手写"
-                                          TextSubmitted="OnArgsTextSubmitted"
-                                          SelectionChanged="OnArgsSelectionChanged"
-                                          LostFocus="OnArgsLostFocus"
-                                          Loaded="OnArgsComboLoaded">
-                                    <ComboBox.ItemTemplate>
+                                     ⚠️ 这里**曾经**用的是 `ComboBox IsEditable="True"`，实测"字能打上、
+                                        一离开就变回空"：可编辑 ComboBox 的 Text 不随输入实时提交，
+                                        靠"内部 TextBox 的 TextChanged + 失焦保存"两条路补，都不牢靠；
+                                        而且整体替换 ItemsSource 会清空 Text，回填又依赖手写代码。
+                                        AutoSuggestBox 的 Text 是普通 DP，能直接双向绑到 Args，
+                                        输入即落库、换脚本也不丢 —— 不要再换回 ComboBox。 -->
+                                <AutoSuggestBox x:Name="ArgsBox"
+                                                Header="启动命令 / 参数"
+                                                PlaceholderText="例如 --startOneDragon 或 daily -e；也可以直接手写"
+                                                Text="{Binding Args, Mode=TwoWay}"
+                                                TextMemberPath="Args"
+                                                TextChanged="OnArgsTextChanged"
+                                                SuggestionChosen="OnArgsSuggestionChosen"
+                                                QuerySubmitted="OnArgsQuerySubmitted"
+                                                Loaded="OnArgsBoxLoaded">
+                                    <AutoSuggestBox.QueryIcon>
+                                        <FontIcon Glyph="&#xE70D;" FontSize="12" />
+                                    </AutoSuggestBox.QueryIcon>
+                                    <AutoSuggestBox.ItemTemplate>
                                         <DataTemplate>
                                             <StackPanel Padding="0,3" Spacing="1">
                                                 <TextBlock Text="{Binding Args}" FontFamily="Consolas" />
@@ -320,8 +321,8 @@
                                                            TextWrapping="Wrap" />
                                             </StackPanel>
                                         </DataTemplate>
-                                    </ComboBox.ItemTemplate>
-                                </ComboBox>
+                                    </AutoSuggestBox.ItemTemplate>
+                                </AutoSuggestBox>
 
                                 <CheckBox x:Name="ApplyRecommendedCheck"
                                           Content="同时套用推荐设置（完成判断 / 超时 / 日志）"
