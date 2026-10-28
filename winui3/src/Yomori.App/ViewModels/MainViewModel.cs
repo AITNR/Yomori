@@ -270,7 +270,8 @@ public sealed class MainViewModel : ObservableObject
         {
             if (pick is null)
             {
-                NotifyDownloadUnavailable(release);
+                // 没有可下载资产时退回「前往发布页」那条通知 —— 但绝不能静默什么都不做
+                NotifyUpdateAvailable(release);
                 return;
             }
 
@@ -278,12 +279,31 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        // 「有更新时通知我」：通知本身就是下载入口 —— 点它直接在后台下，不必先去浏览器。
-        // AddIfNew：同一次运行里重复检查（手动 + 启动）不会攒出一串复读。
+        NotifyUpdateAvailable(release);
+    }
+
+    /// <summary>
+    /// 在铃铛里挂一条「发现新版本」，带更新内容摘要与下载入口。
+    ///
+    /// <para><b>启动时的自动检查与设置页手动「检查更新」共用这一个方法</b>：同一份发布，
+    /// 用户在哪发现它，铃铛里就该是同一个入口、同一段更新内容。各写一遍的结局是
+    /// 文案与动作慢慢走散 —— 在此之前手动检查只在设置页 InfoBar 里放一句话，
+    /// 铃铛里空着，用户一关设置页就再也找不到下载入口。</para>
+    ///
+    /// <para>去重交给 <see cref="NotificationCenter.AddIfNew"/>（按标题判）：同一次运行里
+    /// 启动检查 + 手动检查命中同一版本只留一条，重复检查会把内容刷成最新。</para>
+    ///
+    /// <para>线程：内部走 <see cref="Post"/>，任意线程都可调用。可下载时点通知直接在后台下
+    /// （见 <see cref="DownloadPackageAsync"/>），没有可下载资产则退回「用浏览器打开发布页」。</para>
+    /// </summary>
+    public void NotifyUpdateAvailable(GitHubRelease release)
+    {
+        var pick = UpdateService.PickDownload(release);
+
         var body = UpdateNotes.BuildBody(
             UpdateService.CurrentVersion,
             release.Version,
-            UpdateChannels.Label(channel),
+            UpdateChannels.Label(UpdateChannels.Normalize(Config.UpdateChannel)),
             release.PublishedAt,
             release.Body,
             canDownload: pick is not null);
@@ -295,21 +315,6 @@ public sealed class MainViewModel : ObservableObject
             pick is null ? AppNotificationActions.OpenUrl : AppNotificationActions.Download,
             pick is null ? release.PageUrl : pick.Value.Url));
     }
-
-    /// <summary>这份发布里没有可下载资产时的通知（只能去发布页）。</summary>
-    private void NotifyDownloadUnavailable(GitHubRelease release) =>
-        Post(() => Notifications.Add(
-            $"发现新版本 {release.Version}",
-            UpdateNotes.BuildBody(
-                UpdateService.CurrentVersion,
-                release.Version,
-                UpdateChannels.Label(UpdateChannels.Normalize(Config.UpdateChannel)),
-                release.PublishedAt,
-                release.Body,
-                canDownload: false),
-            AppNotificationKinds.Warning,
-            AppNotificationActions.OpenUrl,
-            release.PageUrl));
 
     /// <summary>
     /// 把安装包下载到 <see cref="UpdateDownloadDir"/>，并按结果挂通知。
