@@ -1447,6 +1447,7 @@ public sealed partial class SettingsPage : Page
     });
 
     /// <summary>
+    /// 手动兜底方案：一键解锁反复失败时，按第三方教程自己装。
     /// 打不开就直说。教程只在用户点的时候才开浏览器（计划书 3.4）。
     /// </summary>
     private void OnRdpTutorial(object sender, RoutedEventArgs e)
@@ -1455,7 +1456,7 @@ public sealed partial class SettingsPage : Page
 
         if (UpdateService.OpenUrl(url))
         {
-            SetRdpAction("已在浏览器打开排查教程。");
+            SetRdpAction("已在浏览器打开手动解锁方案（第三方教程）。");
             return;
         }
 

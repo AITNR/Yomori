@@ -150,7 +150,8 @@
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button x:Name="RdpRedetectButton" Content="重新检测" Click="OnRdpRedetect" />
                         <Button x:Name="RdpDiagnoseButton" Content="查看诊断" Click="OnRdpDiagnose" IsEnabled="False" />
-                        <Button Content="打开排查教程" Click="OnRdpTutorial" />
+                        <Button Content="打开排查教程" Click="OnRdpTutorial"
+                                ToolTipService.ToolTip="一键解锁反复失败时的手动兜底方案：第三方 RDP Wrapper 手动安装教程" />
                         <Button x:Name="RdpBackupButton" Content="历史备份" Click="OnRdpBackups" />
                         <Button x:Name="RdpPickInstallerButton" Content="指定安装包" Click="OnRdpPickInstaller"
                                 ToolTipService.ToolTip="网络拿不到 GitHub 附件时，用浏览器手动下载 RDPW_Installer.exe 后在这里选中它" />
