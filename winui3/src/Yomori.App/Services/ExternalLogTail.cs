@@ -39,11 +39,18 @@ public sealed class ExternalLogTail : IDisposable
     private string _lastError = string.Empty;
     private bool _disposed;
 
+    /// <summary>构造时刻：用来区分「本次运行新写的日志」与「上一轮留下的历史日志」。</summary>
+    private readonly DateTime _startedUtc = DateTime.UtcNow;
+
+    /// <summary>是否从文件末尾开始跟踪（历史文件也要跳到末尾，见 <see cref="CursorOffsetFor"/>）。</summary>
+    private readonly bool _followTail;
+
     static ExternalLogTail() => Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
     public ExternalLogTail(string path, string? pattern, string? encodingName, bool followTail,
         string? baseDirectory = null)
     {
+        _followTail = followTail;
         var expanded = Environment.ExpandEnvironmentVariables((path ?? string.Empty).Trim());
         _rootPath = expanded.Length == 0 ? string.Empty : Path.GetFullPath(expanded,
             Path.GetFullPath(baseDirectory ?? Environment.CurrentDirectory));
@@ -137,27 +144,31 @@ public sealed class ExternalLogTail : IDisposable
                     _currentFile = candidates[0];
                     var candidateSet = new HashSet<string>(candidates, StringComparer.OrdinalIgnoreCase);
                     var retired = _files.Keys.Where(file => !candidateSet.Contains(file)).ToArray();
-                    foreach (var file in _files.Keys.Where(file => !File.Exists(file)).ToArray())
-                    {
-                        _files.Remove(file);
-                    }
 
                     var bytesRemaining = MaxReadBytesPerPoll;
-                    foreach (var file in _files.Keys.Concat(new[] { _currentFile })
-                                 .Distinct(StringComparer.OrdinalIgnoreCase).ToArray())
+
+                    // ① 当前匹配的文件全部读，最新的在最前。
+                    //    必须遍历 candidates 而不是「已跟踪的 + 最新那个」：日志程序在运行期间
+                    //    新建的文件（轮转后重开的 gui.log、改名出来的备份）不在 _files 里，
+                    //    只要它不是目录里最新的那一份，旧写法就永远不会读它 —— 那份日志等于不存在。
+                    foreach (var file in candidates)
                     {
                         if (bytesRemaining <= 0 || result.Count >= MaxOutputLinesPerPoll) { break; }
-                        if (File.Exists(file))
+                        ReadFile(file, result, keywords, final, ref bytesRemaining);
+                    }
+
+                    // ② 已经不再匹配的文件（轮转改名 / 被删除）：最后再收一拍再淘汰。
+                    //    改名那一瞬间还留在缓冲里的几行就靠这一拍，直接丢掉会漏日志。
+                    foreach (var file in retired)
+                    {
+                        if (File.Exists(file) && bytesRemaining > 0 && result.Count < MaxOutputLinesPerPoll)
                         {
                             ReadFile(file, result, keywords, final, ref bytesRemaining);
                         }
 
-                        // 重命名后不再匹配的旧文件最多再收一拍；删除文件则直接淘汰。
-                        if (retired.Contains(file, StringComparer.OrdinalIgnoreCase) || !File.Exists(file))
-                        {
-                            _files.Remove(file);
-                        }
+                        _files.Remove(file);
                     }
+
                     _lastError = string.Empty;
                 }
             }
@@ -179,6 +190,35 @@ public sealed class ExternalLogTail : IDisposable
             : new[] { _rootPath };
     }
 
+    /// <summary>
+    /// 新出现的文件从哪儿开始读。
+    /// </summary>
+    /// <remarks>
+    /// <para>只有「本次运行期间才被写过的文件」才从 0 读。依据是**最后写入时间**而不是创建时间：
+    /// 日志库轮转时把自己改名（MaaFramework 每次启动都把 <c>maafw.log</c> 改名成
+    /// <c>maafw.bak.&lt;时间&gt;.log</c>），重命名**保留原 LastWriteTime**，
+    /// 所以改名出来的备份一眼就能认出是历史内容。</para>
+    /// <para>踩过：目录按 <c>*.log</c> 匹配时，改名出来的备份也算候选文件，于是每次启动都把上一轮
+    /// 十几 MB 的日志当「新日志」重放，实时日志被历史内容刷屏，还要几十拍才读完。</para>
+    /// </remarks>
+    private long CursorOffsetFor(string path, FileStream stream)
+    {
+        if (!_followTail)
+        {
+            return 0;
+        }
+
+        try
+        {
+            return File.GetLastWriteTimeUtc(path) < _startedUtc ? stream.Length : 0;
+        }
+        catch
+        {
+            // 取不到时间就保守地从末尾开始：宁可漏掉几行，也不要把历史内容当新日志灌进来
+            return stream.Length;
+        }
+    }
+
     private void ReadFile(string path, List<ExternalLogLine> result, IReadOnlyList<string>? keywords, bool final,
         ref int bytesRemaining)
     {
@@ -187,6 +227,8 @@ public sealed class ExternalLogTail : IDisposable
         if (!_files.TryGetValue(path, out var cursor))
         {
             cursor = new Cursor { Creation = creation };
+            cursor.Offset = CursorOffsetFor(path, stream);
+            cursor.Anchor = ReadAnchor(stream, cursor.Offset);
             _files[path] = cursor;
         }
         else if (creation != cursor.Creation || stream.Length < cursor.Offset ||
