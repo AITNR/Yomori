@@ -435,9 +435,40 @@
         "MaaEnd.exe"
       ],
       "source": "https://maaend.com/",
-      "checkedOn": "2026-10-28",
-      "frontend": "mxu",
-      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）"
+      "checkedOn": "2026-10-29",
+      "commands": [
+        {
+          "id": "auto-on-launch",
+          "name": "按「启动时自动执行」跑一遍",
+          "args": "",
+          "primary": true,
+          "timeoutMinutes": 180,
+          "summary": "启动后按 MaaEnd 设置里选定的实例执行任务（实测可行）",
+          "precondition": "必须先在 MaaEnd 设置里打开「启动时自动执行」并选定实例；跑完不会自动退出，靠超时或手动关闭结束",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "MaaEnd"
+            ]
+          }
+        },
+        {
+          "id": "autostart",
+          "name": "命令行自启动（实测未生效）",
+          "args": "--autostart -q",
+          "verified": false,
+          "timeoutMinutes": 180,
+          "summary": "MXU 文档里的开机自启动入口",
+          "precondition": "本机 v2.36.0-beta.5 实测：程序照常启动但不执行任务，-q 也不会让它退出",
+          "monitor": {
+            "kind": "process",
+            "keywords": [
+              "MaaEnd"
+            ]
+          }
+        }
+      ],
+      "manualHint": "它跑完不会自己退出：完成判断只能用进程监控 + 超时（maafw\\MaaPiCli.exe 不是替代品，它要的 interface.json 不在 maafw 目录里）"
     },
     {
       "id": "m9a",

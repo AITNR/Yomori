@@ -290,39 +290,43 @@
                                 <ToggleSwitch Header="启用命令 / 参数" IsOn="{Binding UseArgs, Mode=TwoWay}"
                                               OnContent="启用" OffContent="关闭" />
 
-                                <!-- 启动命令 / 参数：**可写可下拉**（AutoSuggestBox）。
+                                <!-- 启动命令 / 参数：**可写可下拉**（文本框 + 箭头 + 浮出列表）。
                                      下拉 = 该脚本已知的启动参数（Presets/launch_presets.json，识别依据是
                                      可执行文件名 + 目录里 interface.json 的 mirrorchyan_rid）；
                                      直接打字 = 自定义参数（上游随时会加新参数，所以不拦，只提示）。
 
-                                     ⚠️ 这里**曾经**用的是 `ComboBox IsEditable="True"`，实测"字能打上、
-                                        一离开就变回空"：可编辑 ComboBox 的 Text 不随输入实时提交，
-                                        靠"内部 TextBox 的 TextChanged + 失焦保存"两条路补，都不牢靠；
-                                        而且整体替换 ItemsSource 会清空 Text，回填又依赖手写代码。
-                                        AutoSuggestBox 的 Text 是普通 DP，能直接双向绑到 Args，
-                                        输入即落库、换脚本也不丢 —— 不要再换回 ComboBox。 -->
-                                <AutoSuggestBox x:Name="ArgsBox"
-                                                Header="启动命令 / 参数"
-                                                PlaceholderText="例如 --startOneDragon 或 daily -e；也可以直接手写"
-                                                Text="{Binding Args, Mode=TwoWay}"
-                                                TextMemberPath="Args"
-                                                TextChanged="OnArgsTextChanged"
-                                                SuggestionChosen="OnArgsSuggestionChosen"
-                                                QuerySubmitted="OnArgsQuerySubmitted"
-                                                Loaded="OnArgsBoxLoaded">
-                                    <AutoSuggestBox.QueryIcon>
+                                     ⚠️ 这里试过两个"原生控件"，都栽了，别再换回去：
+                                     ① `ComboBox IsEditable="True"`：Text 不随输入实时提交（只在回车 /
+                                        选项变化时更新），"内部 TextBox 的 TextChanged + 失焦保存"两条路
+                                        都得成立才不丢字，叠加"换 ItemsSource 清空 Text"，
+                                        表现为打完字一离开就被回填空值。
+                                     ② `AutoSuggestBox`：文本为空时它内部会主动把候选列表关掉，
+                                        点箭头（QueryIcon）也弹不出来 ——"下拉"形同不存在。
+                                     现在：TextBox 双向绑 Args（输入即落库、代码从不写 Text），
+                                     箭头按钮自己 Show 一个 Flyout，列表内容与开合全在自己手里。 -->
+                                <Grid ColumnSpacing="6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+
+                                    <TextBox x:Name="ArgsBox" Grid.Column="0"
+                                             Header="启动命令 / 参数"
+                                             PlaceholderText="例如 --startOneDragon 或 daily -e；也可以直接手写"
+                                             Text="{Binding Args, Mode=TwoWay}"
+                                             TextChanged="OnArgsTextChanged"
+                                             Loaded="OnArgsBoxLoaded" />
+
+                                    <Button x:Name="ArgsDropButton" Grid.Column="1"
+                                            VerticalAlignment="Bottom"
+                                            Padding="10,6"
+                                            Click="OnArgsDropClick">
                                         <FontIcon Glyph="&#xE70D;" FontSize="12" />
-                                    </AutoSuggestBox.QueryIcon>
-                                    <AutoSuggestBox.ItemTemplate>
-                                        <DataTemplate>
-                                            <StackPanel Padding="0,3" Spacing="1">
-                                                <TextBlock Text="{Binding Args}" FontFamily="Consolas" />
-                                                <TextBlock Text="{Binding Detail}" FontSize="11" Opacity="0.6"
-                                                           TextWrapping="Wrap" />
-                                            </StackPanel>
-                                        </DataTemplate>
-                                    </AutoSuggestBox.ItemTemplate>
-                                </AutoSuggestBox>
+                                        <ToolTipService.ToolTip>
+                                            <ToolTip Content="从该脚本已知的启动参数里挑一条；也可以直接在左边的框里手写。" />
+                                        </ToolTipService.ToolTip>
+                                    </Button>
+                                </Grid>
 
                                 <CheckBox x:Name="ApplyRecommendedCheck"
                                           Content="同时套用推荐设置（完成判断 / 超时 / 日志）"

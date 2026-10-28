@@ -768,50 +768,103 @@ public sealed partial class TasksPage : Page
     /// <summary>防重入：程序自己换候选时不要把相关事件当成用户操作。</summary>
     private bool _suppressArgsEvents;
 
+    /// <summary>箭头按钮弹出的候选列表（每次点都重建，用完即弃）。</summary>
+    private Flyout? _argsFlyout;
+
     private void OnArgsBoxLoaded(object sender, RoutedEventArgs e) =>
         ReloadArgsForCurrentTask(autoFillPrimary: false);
 
     /// <summary>
     /// 用户输入。Args 已经由 <c>Text="{Binding Args, Mode=TwoWay}"</c> 落库，
-    /// 这里只做两件事：边打边把候选露出来、刷新说明行。
+    /// 这里只负责刷新说明行（命中 / 未命中的提示）。
     /// </summary>
-    private void OnArgsTextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+    private void OnArgsTextChanged(object sender, TextChangedEventArgs e)
     {
         if (_suppressArgsEvents)
         {
             return;
         }
 
-        if (args.Reason == AutoSuggestionBoxTextChangeReason.UserInput && _argsChoices.Count > 0)
-        {
-            sender.IsSuggestionListOpen = true;
-        }
-
         RefreshArgsHint();
     }
 
-    private void OnArgsSuggestionChosen(AutoSuggestBox sender, AutoSuggestBoxSuggestionChosenEventArgs args)
+    /// <summary>
+    /// 箭头按钮：把该脚本已知的启动参数列出来。
+    ///
+    /// 为什么自己 Show 一个 Flyout，而不是用 ComboBox / AutoSuggestBox 自带的下拉：
+    /// 那两个控件的候选列表开合由它们内部决定（AutoSuggestBox 在文本为空时会主动关掉列表，
+    /// 点箭头也弹不出来）；这里只有几项，开合完全该由我们说了算。
+    /// </summary>
+    private void OnArgsDropClick(object sender, RoutedEventArgs e)
     {
-        if (args.SelectedItem is LaunchChoice choice)
+        var task = VM.SelectedTask;
+        if (task is null)
         {
-            ApplyChoice(choice);
-        }
-    }
-
-    private void OnArgsQuerySubmitted(AutoSuggestBox sender, AutoSuggestBoxQuerySubmittedEventArgs args)
-    {
-        if (args.ChosenSuggestion is LaunchChoice choice)
-        {
-            ApplyChoice(choice);
             return;
         }
 
-        // 点右侧箭头（或直接回车）时没有选中项 —— 把候选列表打开，
-        // 这就是"可下拉"的入口：不想手写的人点一下就能看见全部可用参数。
-        if (_argsChoices.Count > 0)
+        if (_argsChoices.Count == 0)
         {
-            sender.IsSuggestionListOpen = !sender.IsSuggestionListOpen;
+            // 没有候选也要给个交代，不能点了没反应
+            var empty = new Flyout
+            {
+                Content = new TextBlock
+                {
+                    Text = _argsBasis.Length > 0 ? _argsBasis : "这个脚本没有可选的启动参数，直接手写即可。",
+                    TextWrapping = TextWrapping.Wrap,
+                    MaxWidth = 320,
+                },
+            };
+            empty.ShowAt(ArgsDropButton);
+            return;
         }
+
+        var panel = new StackPanel { Spacing = 2, MinWidth = 340 };
+        foreach (var choice in _argsChoices)
+        {
+            var line = new StackPanel { Spacing = 1 };
+            line.Children.Add(new TextBlock
+            {
+                Text = choice.Args.Length > 0 ? choice.Args : "（不带参数）",
+                FontFamily = new FontFamily("Consolas"),
+            });
+            line.Children.Add(new TextBlock
+            {
+                Text = choice.Detail,
+                FontSize = 11,
+                Opacity = 0.65,
+                TextWrapping = TextWrapping.Wrap,
+            });
+
+            var item = new Button
+            {
+                Tag = choice,
+                Content = line,
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                Padding = new Thickness(10, 6, 10, 6),
+            };
+            item.Click += OnArgsChoiceClick;
+            panel.Children.Add(item);
+        }
+
+        _argsFlyout = new Flyout
+        {
+            Content = new ScrollViewer { Content = panel, MaxHeight = 420 },
+        };
+        _argsFlyout.ShowAt(ArgsDropButton);
+    }
+
+    private void OnArgsChoiceClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: LaunchChoice choice })
+        {
+            return;
+        }
+
+        ApplyChoice(choice);
+        _argsFlyout?.Hide();
+        _argsFlyout = null;
     }
 
     private void OnApplyRecommendedChanged(object sender, RoutedEventArgs e)
@@ -865,11 +918,12 @@ public sealed partial class TasksPage : Page
             var path = (task?.ScriptPath ?? string.Empty).Trim();
             ArgsBox.IsEnabled = task is not null && path.Length > 0;
             ApplyRecommendedCheck.IsEnabled = task is not null;
+            // 没有候选时把箭头也停掉 —— 按钮点了没反应比灰着更让人困惑
+            ArgsDropButton.IsEnabled = ArgsBox.IsEnabled;
 
             if (task is null || path.Length == 0)
             {
-                ArgsBox.ItemsSource = null;
-                ArgsBox.IsSuggestionListOpen = false;
+                _argsChoices = new List<LaunchChoice>();
             }
             else
             {
@@ -878,8 +932,7 @@ public sealed partial class TasksPage : Page
                 _argsBasis = resolution.Basis;
                 _argsManualHint = manualHint;
                 _argsLogDir = profile.LogDirectories.Count > 0 ? profile.LogDirectories[0] : null;
-
-                ArgsBox.ItemsSource = _argsChoices;
+                ArgsDropButton.IsEnabled = _argsChoices.Count > 0;
 
                 // 只在参数为空时才预填主推项：绝不因为换了脚本就重写用户已经填好的参数。
                 if (autoFillPrimary && string.IsNullOrWhiteSpace(task.Args))
@@ -919,11 +972,10 @@ public sealed partial class TasksPage : Page
         var match = LaunchPresetResolver.Match(_argsChoices, text);
         var parts = new List<string>();
 
-        if (text.Length == 0)
-        {
-            parts.Add("可留空：留空表示不带任何参数启动。");
-        }
-        else if (match is not null)
+        // ⚠️ 先判命中、后判空：有项目的主推方式就是"不带参数启动"（MaaEnd 依赖自己的设置项），
+        //    这种情况空参数**也是**一条命中的预设，不能落到通用的"可留空"提示上，
+        //    否则用户选完看不到那条方式的前置条件。
+        if (match is not null)
         {
             if (match.Summary.Length > 0)
             {
@@ -944,6 +996,10 @@ public sealed partial class TasksPage : Page
             {
                 parts.Add("该参数未在项目文档中确认。");
             }
+        }
+        else if (text.Length == 0)
+        {
+            parts.Add("可留空：留空表示不带任何参数启动。");
         }
         else
         {
