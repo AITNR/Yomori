@@ -217,7 +217,7 @@
                         </StackPanel>
                         <TextBlock x:Name="GitHubTokenState" FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
                         <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                                   Text="提高 GitHub 接口配额（60 → 5000 次/小时）。只需公开仓库只读权限；令牌存凭据管理器，界面只显示首尾各 4 位。" />
+                                   Text="提高 GitHub 接口配额（60 → 5000 次/小时）。检查更新（含每次启动时的自动检查）与远程桌面解锁都会带上它；只需公开仓库只读权限，令牌存凭据管理器，界面只显示首尾各 4 位。" />
                     </StackPanel>
                 </StackPanel>
             </Border>

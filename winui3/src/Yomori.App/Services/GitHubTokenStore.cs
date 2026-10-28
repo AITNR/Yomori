@@ -15,8 +15,12 @@ namespace Yomori.Services;
 /// </summary>
 /// <remarks>
 /// <para>用途：GitHub 的匿名接口每小时 60 次（按出口 IP 计），而 Yomori 每次真正需要下载
-/// RDP 解锁组件时都会查一次 <c>releases/latest</c>。配上个人访问令牌后额度是
-/// **每小时 5000 次**，基本不会再撞限流。</para>
+/// RDP 解锁组件时都会查一次 <c>releases/latest</c>，每次检查更新（手动点、以及每次启动时的自动检查）
+/// 也都要查一遍公开接口。配上个人访问令牌后额度是**每小时 5000 次**，基本不会再撞限流。</para>
+/// <para>谁在用这个令牌：<see cref="UpdateService"/> 的检查更新（两条通道）、
+/// <see cref="RdpReleaseResolver"/> 查上游工具发布、以及这里保存时的验证。
+/// 而下载安装包**不带**令牌 —— 那是 <c>objects.githubusercontent.com</c>，
+/// 不该把凭据发到另一个主机（见 <c>UpdateService.GetGitHubAsync</c>）。</para>
 /// <para><b>令牌只进 Windows 凭据管理器，不写 config.json。</b>
 /// config.json 会被导出、备份、贴给别人看；凭据不会。这一条与「通道密码只进凭据管理器」
 /// 是同一条规则，不因为是令牌就放松。</para>

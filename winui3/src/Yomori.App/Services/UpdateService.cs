@@ -110,8 +110,10 @@ public sealed class GitHubRelease
 ///   2) 否则从资产文件名里抠：<c>Yomori-winui3-&lt;版本&gt;-x64.zip</c> /
 ///      <c>Yomori-&lt;版本&gt;-setup.exe</c>。版本号自己带 '-'（2.4.1-dev.42），所以靠前后缀锚定。
 ///
-/// 网络与限流：GitHub 匿名接口每小时 60 次。本程序只在用户点「检查更新」时查一次，
-/// 远远用不到；真被限流（403 且额度为 0）会如实说明，绝不装作「已是最新」。
+/// 网络与限流：GitHub 匿名接口每小时 60 次（按出口 IP 计）。设置页填了 GitHub 访问令牌就
+/// 自动带上 —— 两条通道（手动「检查更新」与启动时自动检查）都走这里，配额提到每小时 5000 次。
+/// 令牌被拒（401，过期或被撤销）时**不**让整次检查作废：退回匿名再试一次并在日志里写明；
+/// 真被限流（403 且额度为 0）也会如实说明，绝不装作「已是最新」。
 /// </summary>
 public static class UpdateService
 {
@@ -235,6 +237,98 @@ public static class UpdateService
     }
 
     /// <summary>
+    /// 一次检查更新里「令牌用得怎么样」的记录本：用没用上、有没有被拒。
+    /// 最后拼进日志行 —— 启动时的检查只在日志里说话，令牌被拒这件事必须留痕，
+    /// 否则用户只会看到「查不到更新」，永远不知道是令牌过期了。
+    /// </summary>
+    private sealed class GitHubCallContext
+    {
+        /// <summary>本次请求真的带上了访问令牌。</summary>
+        public bool UsedToken;
+
+        /// <summary>需要写进日志的异常情况（目前只有「令牌被拒、已退回匿名」）。</summary>
+        public string? Note;
+    }
+
+    /// <summary>
+    /// 发一个 GitHub REST GET 请求：配了访问令牌就带 <c>Authorization: Bearer</c>。
+    ///
+    /// <para><b>为什么按请求加头，而不是挂在 <see cref="HttpClient"/> 的默认头上</b>：
+    /// client 是按代理设置缓存共享的，同一个 client 还要下载安装包（
+    /// <c>objects.githubusercontent.com</c>）。令牌跟着默认头走就会跨主机发出去 ——
+    /// 那是把凭据递给第三方主机，不能接受。</para>
+    ///
+    /// <para><b>令牌被拒要退回匿名</b>：令牌过期/撤销时 GitHub 返回 401，如果直接把它当失败，
+    /// 这台机器上的更新检查就静默瘫痪了（启动检查只在日志里写一行，用户根本不会去看）。
+    /// 所以退回匿名再试一次，结果照常返回，日志里补一句「令牌被拒」。</para>
+    /// </summary>
+    private static async Task<HttpResponseMessage> GetGitHubAsync(
+        HttpClient client,
+        string url,
+        GitHubCallContext call,
+        CancellationToken cancellationToken)
+    {
+        // 每发一次读一次：令牌在设置页保存/清除后不需要重启，下一次检查就按新的来。
+        var token = GitHubTokenStore.Read();
+
+        call.UsedToken = token is not null;
+        var response = await SendOnceAsync(client, url, token, cancellationToken).ConfigureAwait(false);
+
+        if (token is null || response.StatusCode != HttpStatusCode.Unauthorized)
+        {
+            return response;
+        }
+
+        response.Dispose();
+        call.UsedToken = false;
+        call.Note = "配置的 GitHub 访问令牌被 GitHub 拒绝（401），本次已退回匿名请求；"
+            + "请到「设置 → 开发者工具」重新保存或清除令牌";
+
+        return await SendOnceAsync(client, url, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<HttpResponseMessage> SendOnceAsync(
+        HttpClient client,
+        string url,
+        string? token,
+        CancellationToken cancellationToken)
+    {
+        var request = BuildGitHubRequest(url, token);
+
+        try
+        {
+            // 默认按 ResponseContentRead 收完内容，所以这里释放 request 不会碰到已缓冲的响应体。
+            return await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            request.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// 造一个查 GitHub 接口的 GET 请求：给了令牌才带 <c>Authorization: Bearer</c>。
+    ///
+    /// <para>公开给冒烟断言用（同 <see cref="PickNewest"/> 的理由）：这个函数决定「令牌发不发出去」，
+    /// 而它一旦写错，表现是配额没提上去或者凭据漏到不该去的主机 —— 两种都不会当场报错。</para>
+    /// </summary>
+    internal static HttpRequestMessage BuildGitHubRequest(string url, string? token)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+
+        if (!string.IsNullOrWhiteSpace(token))
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token.Trim());
+        }
+
+        return request;
+    }
+
+    /// <summary>把「令牌被拒」这类旁注拼到日志行后面；没事就是原样。</summary>
+    private static string WithTokenNote(string logLine, GitHubCallContext? call) =>
+        call?.Note is { Length: > 0 } note ? logLine + "　[" + note + "]" : logLine;
+
+    /// <summary>
     /// 解析代理地址；地址里没带密码时从 Windows 凭据管理器补上
     /// （密码不落 config.json，见 <see cref="UpdateProxySecretStore"/>）。
     /// 返回 <c>null</c> 表示地址本身解析不出来。
@@ -338,13 +432,16 @@ public static class UpdateService
         var normalized = UpdateChannels.Normalize(channel);
         var channelLabel = UpdateChannels.Label(normalized);
 
+        // 这一次请求用没用上令牌、令牌有没有被拒，都记在这里，最后拼进日志行。
+        var call = new GitHubCallContext();
+
         try
         {
             var client = GetClient(network);
 
             var release = normalized == UpdateChannels.Beta
-                ? await FetchNewestPrereleaseAsync(client, cancellationToken).ConfigureAwait(false)
-                : await FetchLatestStableAsync(client, cancellationToken).ConfigureAwait(false);
+                ? await FetchNewestPrereleaseAsync(client, call, cancellationToken).ConfigureAwait(false)
+                : await FetchLatestStableAsync(client, call, cancellationToken).ConfigureAwait(false);
 
             if (release is null)
             {
@@ -357,14 +454,16 @@ public static class UpdateService
                         Status = UpdateCheckStatus.NoRelease,
                         Message = $"测试版通道上还没有构建（当前 {CurrentVersion}）。"
                             + "CI 每推一次 main 才会发一份；想看正式发布请把更新渠道切到「正式版」。",
-                        LogLine = $"[更新检查 · {channelLabel}] 发布列表里没有标记为预发布的构建。",
+                        LogLine = WithTokenNote(
+                            $"[更新检查 · {channelLabel}] 发布列表里没有标记为预发布的构建。", call),
                     }
                     : new UpdateCheckResult
                     {
                         Status = UpdateCheckStatus.NoRelease,
                         Message = $"还没有发布过正式版（当前 {CurrentVersion}）。"
                             + "想看自动构建的测试版，把更新渠道切到「测试版」。",
-                        LogLine = $"[更新检查 · {channelLabel}] 正式版通道暂无发布（GitHub 返回 404）。",
+                        LogLine = WithTokenNote(
+                            $"[更新检查 · {channelLabel}] 正式版通道暂无发布（GitHub 返回 404）。", call),
                     };
             }
 
@@ -374,7 +473,8 @@ public static class UpdateService
                 {
                     Status = UpdateCheckStatus.Failed,
                     Message = $"查到最新发布是 {release.Tag}，但里面没有可识别的版本号，没法比较。",
-                    LogLine = $"[更新检查 · {channelLabel}] 发布 {release.Tag} 的 tag 与资产名里都没有版本号。",
+                    LogLine = WithTokenNote(
+                        $"[更新检查 · {channelLabel}] 发布 {release.Tag} 的 tag 与资产名里都没有版本号。", call),
                     Latest = release,
                 };
             }
@@ -389,8 +489,9 @@ public static class UpdateService
                     Message = $"当前是本机自编译的开发版（{CurrentVersion}）。"
                         + $"{channelLabel}通道上最新的是 {release.Version}（{FormatPublishedAt(release)}）——"
                         + "开发版和发布版没法直接比大小，想跟官方版本对齐请到「前往下载」换正式包。",
-                    LogLine = $"[更新检查 · {channelLabel}] 本机为自编译开发版 {CurrentVersion}，远端 {release.Version}"
-                        + $"（tag {release.Tag}）→ LocalBuild",
+                    LogLine = WithTokenNote(
+                        $"[更新检查 · {channelLabel}] 本机为自编译开发版 {CurrentVersion}，远端 {release.Version}"
+                        + $"（tag {release.Tag}）→ LocalBuild", call),
                     Latest = release,
                 };
             }
@@ -426,25 +527,35 @@ public static class UpdateService
             {
                 Status = status,
                 Message = message,
-                LogLine = $"[更新检查 · {channelLabel}] 本机 {CurrentVersion}，远端 {release.Version}"
-                    + $"（tag {release.Tag}，{(release.IsPrerelease ? "预发布" : "正式发布")}）→ {status}",
+                LogLine = WithTokenNote(
+                    $"[更新检查 · {channelLabel}] 本机 {CurrentVersion}，远端 {release.Version}"
+                    + $"（tag {release.Tag}，{(release.IsPrerelease ? "预发布" : "正式发布")}）"
+                    + $"→ {status}（{(call.UsedToken ? "已认证" : "匿名")}请求）", call),
                 Latest = release,
             };
         }
         catch (OperationCanceledException)
         {
-            return Failed(channelLabel, "请求被取消或超时", "检查更新被取消 / 超时了，稍后再试。");
+            return Failed(channelLabel, "请求被取消或超时", "检查更新被取消 / 超时了，稍后再试。", call);
         }
         catch (HttpRequestException ex)
         {
-            return Failed(channelLabel, ex.Message, $"连不上 GitHub：{ex.Message}");
+            return Failed(channelLabel, ex.Message, $"连不上 GitHub：{ex.Message}", call);
         }
         catch (RateLimitedException ex)
         {
+            // 带上令牌还撞限流，说明 5000 次/小时也用完了 —— 文案要跟匿名时分开，
+            // 否则用户会去配一个本来就已经在用的令牌。
             return Failed(
                 channelLabel,
                 ex.Message,
-                $"GitHub 接口请求太频繁（匿名调用每小时 60 次，{ex.ResetHint}）—— 过一会儿再点「检查更新」。");
+                call.UsedToken
+                    ? $"GitHub 接口请求太频繁（已用访问令牌，配额每小时 5000 次，{ex.ResetHint}）"
+                        + "—— 过一会儿再点「检查更新」。"
+                    : $"GitHub 接口请求太频繁（匿名调用每小时 60 次，{ex.ResetHint}）"
+                        + "—— 在「设置 → 开发者工具」配一个 GitHub 访问令牌可以提到每小时 5000 次，"
+                        + "或者过一会儿再点「检查更新」。",
+                call);
         }
         catch (Exception ex)
         {
@@ -452,24 +563,32 @@ public static class UpdateService
             return Failed(
                 channelLabel,
                 $"{ex.GetType().Name}: {ex.Message}",
-                $"检查更新失败：{ex.Message}");
+                $"检查更新失败：{ex.Message}",
+                call);
         }
     }
 
-    private static UpdateCheckResult Failed(string channelLabel, string detail, string message) =>
+    private static UpdateCheckResult Failed(
+        string channelLabel,
+        string detail,
+        string message,
+        GitHubCallContext? call = null) =>
         new()
         {
             Status = UpdateCheckStatus.Failed,
             Message = message,
-            LogLine = $"[更新检查 · {channelLabel}] 失败：{detail}",
+            LogLine = WithTokenNote($"[更新检查 · {channelLabel}] 失败：{detail}", call),
         };
 
     /// <summary>正式版通道：GitHub 定义的「最新正式版」。</summary>
-    private static async Task<GitHubRelease?> FetchLatestStableAsync(HttpClient client, CancellationToken cancellationToken)
+    private static async Task<GitHubRelease?> FetchLatestStableAsync(
+        HttpClient client,
+        GitHubCallContext call,
+        CancellationToken cancellationToken)
     {
         var url = $"https://api.github.com/repos/{Owner}/{Repo}/releases/latest";
 
-        using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
+        using var response = await GetGitHubAsync(client, url, call, cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.NotFound)
         {
@@ -496,11 +615,14 @@ public static class UpdateService
     /// <para>为什么不用「列表第一个」：列表按创建时间排，而 CI 每推一次 main 就发一份，
     /// 时间顺序不等于版本大小（重跑、回退、手改 tag 都会打乱）。按版本号挑才是稳的。</para>
     /// </summary>
-    private static async Task<GitHubRelease?> FetchNewestPrereleaseAsync(HttpClient client, CancellationToken cancellationToken)
+    private static async Task<GitHubRelease?> FetchNewestPrereleaseAsync(
+        HttpClient client,
+        GitHubCallContext call,
+        CancellationToken cancellationToken)
     {
         var url = $"https://api.github.com/repos/{Owner}/{Repo}/releases?per_page=50";
 
-        using var response = await client.GetAsync(url, cancellationToken).ConfigureAwait(false);
+        using var response = await GetGitHubAsync(client, url, call, cancellationToken).ConfigureAwait(false);
         await ThrowIfNotSuccessAsync(response, cancellationToken).ConfigureAwait(false);
 
         var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
