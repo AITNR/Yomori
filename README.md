@@ -1,8 +1,4 @@
 <!-- markdownlint-disable MD033 MD041 -->
-<p align="right">
-  <img alt="访问量" src="https://count.getloli.com/@Yomori?theme=booru-lewd&amp;padding=7&amp;offset=0&amp;align=top&amp;scale=1&amp;pixelated=1&amp;darkmode=auto">
-</p>
-
 <div align="center">
 
 <img alt="Yomori" src="assets/logo.png" width="150" />
@@ -271,3 +267,10 @@ GPL-3.0 要求在分发目标代码时一并提供对应源码，并随附许可
 各组件的完整版权与许可条款见安装目录或发布包内的 `THIRD-PARTY-NOTICES.txt`，也可在程序内「设置 → 关于 → 开源许可」查看清单。
 
 组件清单维护于 `winui3/third_party/components.json`，是程序界面与打包脚本共用的唯一数据源；`THIRD-PARTY-NOTICES.txt` 由 `winui3/tools/gen_third_party_notices.py` 在打包时依据该清单与构建所用 vcpkg 的许可证原文生成，不随仓库静态维护。
+
+---
+
+<p align="right">
+  <img alt="访问量" src="https://count.getloli.com/@Yomori?theme=booru-lewd&amp;padding=7&amp;offset=0&amp;align=top&amp;scale=1&amp;pixelated=1&amp;darkmode=auto">
+</p>
+
