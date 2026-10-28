@@ -917,6 +917,15 @@ public sealed partial class SettingsPage : Page
             : Visibility.Collapsed;
 
         UpdateResultBar.IsOpen = true;
+
+        // 手动检查命中新版本时，铃铛里也要有和启动检查**同一套**通知：
+        // InfoBar 一离开设置页就没了，而「有新版本可装」这件事得能一直看到、能直接点开下。
+        // 共用 VM.NotifyUpdateAvailable 而不是在这里另写一份文案，两边才不会慢慢走散。
+        if (result.Status == UpdateCheckStatus.UpdateAvailable && result.Latest is { } found)
+        {
+            VM.NotifyUpdateAvailable(found);
+            VM.AppendLog($"[更新检查] 已在通知中心挂上「发现新版本 {found.Version}」。");
+        }
     }
 
     private void HideUpdateResult()
@@ -1735,7 +1744,7 @@ public sealed partial class SettingsPage : Page
         scope.AppendLine("2. 修改注册表：HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server 的 fDenyTSConnections 改为 0");
         scope.AppendLine("3. 修改注册表：fSingleSessionPerUser 改为 1（本机键；若策略键里已有该值也一并改为 1）");
         scope.AppendLine("   这一项让同一账户只保留一条会话 —— 不设它，每连一次就会多一条「已断开」的历史会话。");
-        scope.AppendLine("4. 更新本机 rdpwrap.ini");
+        scope.AppendLine("4. 更新本机 rdpwrap.ini（需要联网；下载会走设置里配的更新代理）");
         scope.AppendLine("5. 重启 Remote Desktop Services（TermService）");
         scope.AppendLine();
         scope.AppendLine("风险：");

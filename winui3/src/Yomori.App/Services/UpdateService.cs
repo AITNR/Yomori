@@ -160,11 +160,21 @@ public static class UpdateService
     /// <summary>代理地址 / 认证改了：让下一次请求用新设置重建 client。见 <see cref="_clientGeneration"/>。</summary>
     public static void InvalidateClients() => Interlocked.Increment(ref _clientGeneration);
 
-    private static HttpClient GetClient(UpdateNetworkSettings network)
+    /// <summary>默认请求超时。<c>ResponseHeadersRead</c> 也按整体计时，所以它同时是下载的总预算。</summary>
+    private static readonly TimeSpan DefaultHttpTimeout = TimeSpan.FromSeconds(20);
+
+    /// <param name="timeout">
+    /// 本次请求的超时；传 null 用 <see cref="DefaultHttpTimeout"/>。
+    /// ⚠️ 超时是 <see cref="HttpClient"/> 级属性，不能按请求改 —— 所以它必须进缓存键，
+    /// 否则「先按 20 秒建了 client，再要 180 秒」会拿回那个短的那个（表现为大文件总在 20 秒断流）。
+    /// </param>
+    private static HttpClient GetClient(UpdateNetworkSettings network, TimeSpan? timeout = null)
     {
         var mode = UpdateProxyModes.Normalize(network.ProxyMode);
         var proxyUrl = (network.ProxyUrl ?? string.Empty).Trim();
-        var key = mode + "|" + proxyUrl + "|" + Volatile.Read(ref _clientGeneration);
+        var budget = timeout ?? DefaultHttpTimeout;
+        var key = mode + "|" + proxyUrl + "|" + budget.TotalSeconds.ToString("0") + "|"
+                  + Volatile.Read(ref _clientGeneration);
 
         lock (Clients)
         {
@@ -173,13 +183,13 @@ public static class UpdateService
                 return cached;
             }
 
-            var created = CreateClient(mode, proxyUrl);
+            var created = CreateClient(mode, proxyUrl, budget);
             Clients[key] = created;
             return created;
         }
     }
 
-    private static HttpClient CreateClient(string proxyMode, string proxyUrl)
+    private static HttpClient CreateClient(string proxyMode, string proxyUrl, TimeSpan timeout)
     {
         var handler = new HttpClientHandler();
 
@@ -227,7 +237,7 @@ public static class UpdateService
                 break;
         }
 
-        var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(20) };
+        var client = new HttpClient(handler) { Timeout = timeout };
 
         // GitHub 接口要求带 User-Agent，缺了直接 403；Accept 用官方推荐的那个
         client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Yomori", "1.0"));
@@ -1157,6 +1167,11 @@ public static class UpdateService
     /// <param name="targetPath">落盘路径（目录不存在会建）。</param>
     /// <param name="network">代理设置。</param>
     /// <param name="progress">进度 0~1（服务器不给 Content-Length 时不会回调）。</param>
+    /// <param name="timeout">
+    /// 整次下载的超时预算；null 用默认 20 秒。
+    /// 下载体积大、又必须走慢速代理时（RDP 解锁要取 577KB 的 rdpwrap.ini）用它放宽，
+    /// 否则会在「正在下」的时候被超时掐掉，报出来的却是「下载被取消或超时」，看不出是预算不够。
+    /// </param>
     /// <summary>
     /// 按代理设置取一个共享的 <see cref="HttpClient"/>。
     /// 对外开放是为了让别的模块查 GitHub 时复用同一套代理语义（RDP 解锁要查上游工具发布），
@@ -1169,13 +1184,14 @@ public static class UpdateService
         string targetPath,
         UpdateNetworkSettings network,
         IProgress<double>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        TimeSpan? timeout = null)
     {
         var partPath = targetPath + ".part";
 
         try
         {
-            var client = GetClient(network);
+            var client = GetClient(network, timeout);
 
             using var response = await client
                 .GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken)

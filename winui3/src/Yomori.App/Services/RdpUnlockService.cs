@@ -24,7 +24,7 @@ namespace Yomori.Services;
 /// <item>校验资产并锁定本轮 release ID，创建安装前快照</item>
 /// <item>调用外部安装器，等待结束并回读实际安装状态</item>
 /// <item>持久化注册表变更日志，逐项应用及回读</item>
-/// <item>备份 INI，调用 <c>RDPWInst.exe -w</c></item>
+/// <item>备份 INI；缺段时先走设置里的代理自己下载，失败再退回 <c>RDPWInst.exe -w</c></item>
 /// <item>正常结束后显式执行一轮 TermService 重启</item>
 /// <item>内置检测收敛四项状态</item>
 /// <item>结果中提醒用户重新开启安全防护</item>
@@ -39,6 +39,30 @@ public static class RdpUnlockService
 
     /// <summary>INI 更新（<c>RDPWInst -w</c>）的等待上限，计划书 6.2 给的初值是 120 秒。</summary>
     private static readonly TimeSpan IniTimeout = TimeSpan.FromSeconds(120);
+
+    /// <summary>
+    /// 程序自己下载 INI 的超时预算。
+    /// </summary>
+    /// <remarks>
+    /// 上游那份 rdpwrap.ini 现在约 577KB。默认的 20 秒留给它，在走代理的链路上会不够
+    /// （20 秒要下完 = 至少 29KB/s，慢速节点达不到）—— 而这条下载恰恰是「代理慢」时最该成功的一条。
+    /// </remarks>
+    private static readonly TimeSpan IniDownloadTimeout = TimeSpan.FromSeconds(180);
+
+    /// <summary>
+    /// 上游社区维护版 rdpwrap.ini 的固定地址。
+    /// </summary>
+    /// <remarks>
+    /// <para>与 <c>RDPWInst.exe -w</c> 内部写死的 <c>DEFAULT_URL</c> 是同一个地址
+    /// （见 <c>sebaxakerhtc/rdpwrap</c> 的 <c>src-installer/RDPWInst.dpr</c>：<c>GitINIFile</c> 的
+    /// <c>const DEFAULT_URL</c>）。用同一个源，才能保证「我们自己下到的」与「工具会下到的」一致。</para>
+    /// <para>为什么不再指望 <c>-w</c>：它走 WinInet 的 <c>INTERNET_OPEN_TYPE_PRECONFIG</c>，
+    /// 只认系统代理，<b>不认本程序设置里的自定义代理</b>（代码注释与 2026-10-26 真机记录都印证了）。
+    /// 而用户设置里的代理恰恰是这台机器唯一能上 GitHub 的路 —— 所以这一步要由程序自己发请求，
+    /// 走 <see cref="UpdateService.DownloadAsync"/>，与「检查更新」共用同一套代理语义。</para>
+    /// </remarks>
+    public const string IniDownloadUrl =
+        "https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap.ini/master/rdpwrap.ini";
 
     /// <summary>操作锁的等待时间：连点两次时第二次直接告诉用户"正在跑"，不要排长队。</summary>
     private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(2);
@@ -523,7 +547,7 @@ public static class RdpUnlockService
                 Report(progress, 7, "更新 INI");
                 var acquired = await AcquireIniAsync(
                     manifest, installDir, iniPathNow, termsrvVersion,
-                    request.ManualIniPath, steps, cancellationToken).ConfigureAwait(false);
+                    request.ManualIniPath, network, steps, cancellationToken).ConfigureAwait(false);
 
                 if (acquired.Unknown)
                 {
@@ -1089,13 +1113,16 @@ public static class RdpUnlockService
     private readonly record struct RegistryApplyOutcome(bool Ok, string Message, string LedgerError);
 
     /// <summary>
-    /// 取一份能覆盖当前构建的 INI：用户指定 → <c>RDPWInst.exe -w</c>。
+    /// 取一份能覆盖当前构建的 INI：用户指定 → 程序走设置里的代理自己下载 → <c>RDPWInst.exe -w</c>。
     /// </summary>
     /// <remarks>
-    /// <para>只有这两条路。<c>-w</c> 用 RDPWInst 自己的 WinInet，不认本程序的代理；
-    /// 上不了 GitHub 时它以退出码 5 失败 —— 那属于网络/配额问题，**不再想办法绕**
-    /// （2026-10-26 用户明确要求：这种情况不要管）。用户手上有 INI 就用「指定 INI」给他。</para>
-    /// <para>拿不到也不让整轮失败：组件已经装好了，回滚只会让人从头再来一遍。
+    /// <para><b>为什么中间那条是新增的</b>：<c>-w</c> 用 RDPWInst 自己的 WinInet，只认系统代理，
+    /// 不认本程序设置里的自定义代理。用户把代理配在 Yomori 里、系统代理空着的时候，
+    /// 前面几步（查发布、下安装器）都能走通，唯独 INI 这一步必然失败 ——
+    /// 表现就是「组件装好了，但远程桌面还是用不了」。2026-10-29 按用户要求补上这条路。</para>
+    /// <para>顺序也变了：先自己下。<c>-w</c> 只作回退 —— 它在系统代理可用、本程序代理没配的机器上仍有效，
+    /// 而且它还会顺带用内置样本兜底（虽然那份样本往往不含当前构建，回读校验会识破）。</para>
+    /// <para>三条路都失败也不让整轮失败：组件已经装好了，回滚只会让人从头再来一遍。
     /// 所以调用方把失败降成「注意」，交给最后的内置检测说清「Support 未覆盖」。</para>
     /// </remarks>
     private static async Task<IniAcquisition> AcquireIniAsync(
@@ -1104,6 +1131,7 @@ public static class RdpUnlockService
         string iniPath,
         string version,
         string manualIniPath,
+        UpdateNetworkSettings network,
         List<RdpStepRecord> steps,
         CancellationToken cancellationToken)
     {
@@ -1128,13 +1156,25 @@ public static class RdpUnlockService
             Add(steps, "ini-manual", "使用指定的 INI", RdpStepOutcome.Warn, message);
         }
 
-        // ---- 2. 交给 RDPWInst -w ----
+        // ---- 2. 程序自己下载（走设置里的代理，与「检查更新」同一套语义）----
+        var online = await DownloadIniAsync(manifest, iniPath, version, network, steps, cancellationToken)
+            .ConfigureAwait(false);
+
+        if (online.Ok)
+        {
+            return new IniAcquisition(true, online.Message, true, false);
+        }
+
+        failures.Add(online.Message);
+        Add(steps, "ini-online", "在线下载 INI", RdpStepOutcome.Warn, online.Message);
+
+        // ---- 3. 回退给 RDPWInst -w ----
         // 先看工具在不在：上游 Release 安装器不带 RDPWInst.exe，
-        // 在这种机器上「在线更新」这条路根本不存在，直接说清楚，别让用户等一个必然的失败。
+        // 在这种机器上这条路根本不存在，直接说清楚，别让用户等一个必然的失败。
         if (!File.Exists(Path.Combine(installDir, "RDPWInst.exe")))
         {
             failures.Add("安装目录里没有 RDPWInst.exe —— 上游的 Release 安装器不带这个控制台工具，"
-                         + "所以在这里没法在线更新 INI（CnC 的「Update ini」按钮同样会报 not found）。");
+                         + "所以在这里没法用工具在线更新 INI（CnC 的「Update ini」按钮同样会报 not found）。");
             return new IniAcquisition(false, string.Join("；", failures), false, false);
         }
 
@@ -1147,6 +1187,95 @@ public static class RdpUnlockService
 
         failures.Add(update.Message);
         return new IniAcquisition(false, string.Join("；", failures), false, update.Unknown);
+    }
+
+    /// <summary>
+    /// 用本程序的 HTTP 客户端（因此**走设置里那个代理**）从上游取一份 rdpwrap.ini 并写入。
+    /// </summary>
+    /// <remarks>
+    /// <para>落盘前先下到事务目录里，写成 <c>.download</c> 后缀 —— 半截的 INI 被替换上去会让
+    /// TermService 加载失败，比没有更糟；<see cref="WriteIni"/> 内部还会再做一次原子替换。</para>
+    /// <para>校验只做一项：正文里得有 <c>[当前构建号]</c> 段。上游这份文件没有签名与摘要可比，
+    /// 传输安全靠 HTTPS。这话要如实写进步骤说明，不能让它看起来像「验过发布者」。</para>
+    /// </remarks>
+    private static async Task<(bool Ok, string Message)> DownloadIniAsync(
+        RdpTransactionManifest manifest,
+        string iniPath,
+        string version,
+        UpdateNetworkSettings network,
+        List<RdpStepRecord> steps,
+        CancellationToken cancellationToken)
+    {
+        var stagingPath = Path.Combine(
+            RdpTransactionStore.DirectoryFor(manifest.Id),
+            "rdpwrap.ini" + RdpToolDownloader.PartialExtension);
+
+        try
+        {
+            var (downloaded, message) = await UpdateService
+                .DownloadAsync(
+                    IniDownloadUrl,
+                    stagingPath,
+                    network,
+                    progress: null,
+                    cancellationToken,
+                    IniDownloadTimeout)
+                .ConfigureAwait(false);
+
+            if (!downloaded)
+            {
+                return (false, "在线下载 rdpwrap.ini 失败：" + message);
+            }
+
+            var info = new FileInfo(stagingPath);
+            if (!info.Exists || info.Length == 0)
+            {
+                return (false, "在线下载 rdpwrap.ini 失败：得到的是空文件");
+            }
+
+            var text = ReadText(stagingPath);
+            var (written, writeMessage) = WriteIni(manifest, iniPath, text, version);
+
+            if (!written)
+            {
+                return (false, "在线下载的 rdpwrap.ini 不可用：" + writeMessage);
+            }
+
+            var updated = ReadIniUpdated(iniPath);
+
+            return (true, $"已按设置里的代理从上游下载 INI 并写入（{info.Length} 字节，"
+                          + $"{IniSectionCount(text)} 个段"
+                          + (updated.Length > 0 ? $"，Updated={updated}" : "")
+                          + "；来源 GitHub 原始文件，无签名与摘要可比对）");
+        }
+        catch (OperationCanceledException)
+        {
+            return (false, "在线下载 rdpwrap.ini 被取消。");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"在线下载 rdpwrap.ini 失败：{ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            // 下载用的临时文件不该留在事务目录里：它看起来像一份 INI 备份，会误导后面的「历史备份」排查
+            TryDeleteFile(stagingPath);
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // 删不掉就留着：扩展名是 .download，不会被当成 INI 用
+        }
     }
 
     /// <summary>
@@ -1249,8 +1378,11 @@ public static class RdpUnlockService
     /// [*] Current update date: 2026.10.03
     /// [-] Failed to download latest INI from GitHub.
     /// </code>
-    /// 退出码 5。它走 RDPWInst 自己的 WinInet，**不认本程序配置的代理**，
-    /// 所以在受限网络下这一步失败只说明「上不了 GitHub」，不说明本机 INI 有问题。
+    /// 退出码 5。它走 RDPWInst 自己的 WinInet（<c>InternetOpen</c> 用
+    /// <c>INTERNET_OPEN_TYPE_PRECONFIG</c>），只认**系统代理**，不认本程序设置里的自定义代理 ——
+    /// 所以它现在只是回退路径，主路径是 <see cref="DownloadIniAsync"/>（那条走
+    /// <see cref="UpdateService"/> 的代理语义）。在受限网络下这一步失败只说明
+    /// 「系统代理这条路也上不了 GitHub」，不说明本机 INI 有问题。
     /// 因此调用方只在「本地 INI 确实不覆盖当前版本」时才该跑它。
     /// </remarks>
     private static async Task<(bool Ok, string Message, bool Unknown)> UpdateIniAsync(
@@ -1298,7 +1430,9 @@ public static class RdpUnlockService
 
         if (run.ExitCode != 0)
         {
-            return (false, $"-w 退出码 {run.ExitCode}（该步需联网访问 GitHub）", false);
+            return (false,
+                $"-w 退出码 {run.ExitCode}（它只走系统代理，不认本程序设的代理；该步需联网访问 GitHub）",
+                false);
         }
 
         // 成功退出不等于已更新：回读正文，确认它真的含当前构建的段。
