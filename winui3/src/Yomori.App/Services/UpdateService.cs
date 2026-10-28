@@ -58,7 +58,7 @@ public sealed class GitHubRelease
 {
     public required string Tag { get; init; }
 
-    /// <summary>发布标题（形如「测试版（滚动更新）· 2.0.0-dev.42」）。</summary>
+    /// <summary>发布标题（形如「测试版（滚动更新）· 2.4.1-dev.42」）。</summary>
     public required string Title { get; init; }
 
     /// <summary>版本号（从 tag 或资产文件名里解析出来；解析不出时为空串）。</summary>
@@ -97,7 +97,7 @@ public sealed class GitHubRelease
 /// 版本号从哪来（顺序是固定的，因为滚动预发布的 tag 里**没有**版本号）：
 ///   1) tag 本身就是版本号（正式版 <c>v2.1.0</c>）→ 直接用；
 ///   2) 否则从资产文件名里抠：<c>Yomori-winui3-&lt;版本&gt;-x64.zip</c> /
-///      <c>Yomori-&lt;版本&gt;-setup.exe</c>。版本号自己带 '-'（2.0.0-dev.42），所以靠前后缀锚定。
+///      <c>Yomori-&lt;版本&gt;-setup.exe</c>。版本号自己带 '-'（2.4.1-dev.42），所以靠前后缀锚定。
 ///
 /// 网络与限流：GitHub 匿名接口每小时 60 次。本程序只在用户点「检查更新」时查一次，
 /// 远远用不到；真被限流（403 且额度为 0）会如实说明，绝不装作「已是最新」。
@@ -244,10 +244,10 @@ public static class UpdateService
     }
 
     /// <summary>
-    /// 当前版本号（形如 <c>2.0.0-dev.42</c>）。
+    /// 当前版本号（形如 <c>2.4.1-dev.42</c>）。
     ///
     /// 来源是程序集信息版本：CI 用 <c>-p:Version=</c> 写进去，本地编译用 csproj 里的兜底值。
-    /// 信息版本默认形如 <c>2.0.0-dev.42+7f3a1c2</c>（'+' 后面是提交哈希），显示与比较时都要去掉。
+    /// 信息版本默认形如 <c>2.4.1-dev.42+7f3a1c2</c>（'+' 后面是提交哈希），显示与比较时都要去掉。
     /// </summary>
     public static string CurrentVersion { get; } = ReadCurrentVersion();
 
@@ -401,11 +401,12 @@ public static class UpdateService
                     $"已是最新版本（{CurrentVersion}，{channelLabel}）。",
 
                 _ => normalized == UpdateChannels.Beta
-                    // 测试版走 2.0.0-dev.N，正式版走 v2.x —— 装的是正式版时一定会落到这里，
-                    // 但这个"更旧"只是编号体系不同，说清缘由，别让用户以为远端回退了。
+                    // 测试版的号取「最新正式版的次版本 +1」（v2.3.2 → 2.4.0-dev.N），本该永远压正式版一头；
+                    // 真落到这里，通常是刚发过正式版、CI 还没来得及按新号重新构建一轮，
+                    // 或者远端那份被回退过。说清缘由，别让用户以为自己的版本坏了。
                     ? $"测试版通道上最新的是 {release.Version}（{FormatPublishedAt(release)}），"
-                        + $"比当前 {CurrentVersion} 的版本号小 —— 测试版构建走 2.0.0-dev.N 编号，"
-                        + "和正式版 v2.x 不是一条线，别按大小理解。想换测试版请点「前往下载」。"
+                        + $"比当前 {CurrentVersion} 的版本号小 —— 多半是刚发过正式版、测试版还没重新构建。"
+                        + "想回到正式版请把更新渠道切到「正式版」。"
                     : $"当前版本（{CurrentVersion}）比{channelLabel}通道上最新的 {release.Version} 还要新 ——"
                         + "多半是远端那份被回退过，或者本地在跑自己编译的包。",
             };
@@ -475,9 +476,10 @@ public static class UpdateService
     /// <summary>
     /// 测试版通道：**只在预发布里**挑版本号最大的一份。
     ///
-    /// <para>为什么不把正式版也放进来比：两条线的版本号压根不是一条 —— 正式版发 <c>v2.2.1</c>，
-    /// 测试版是 CI 每推一次 main 就发的 <c>2.0.0-dev.N</c>。混在一起按大小取最大，
-    /// 正式版永远赢（2.2.1 &gt; 2.0.0-dev.105），于是「选了测试版却拿到正式版」——
+    /// <para>为什么不把正式版也放进来比：渠道是两条独立的线，编号规则也不同 —— 正式版发 <c>v2.4.0</c>，
+    /// 测试版是 CI 每推一次 main 就发的 <c>2.4.1-dev.N</c>（修订号 = 最新正式版 +1）。
+    /// 而且发布列表里还留着 2026-10 之前按 <c>2.0.0-dev.N</c> 编号的旧预发布，混在一起按大小取最大
+    /// 会被正式版压住（2.4.0 &gt; 2.0.0-dev.105），于是「选了测试版却拿到正式版」——
     /// 2026-10-25 用户实测反馈的就是这个。</para>
     ///
     /// <para>为什么不用「列表第一个」：列表按创建时间排，而 CI 每推一次 main 就发一份，
@@ -523,8 +525,9 @@ public static class UpdateService
     /// <summary>
     /// 从一批发布里挑出该通道的「最新」。
     ///
-    /// <para><b>渠道决定候选集，版本号决定先后</b> —— 这两件事必须分开。正式版 <c>v2.2.1</c>
-    /// 与测试版 <c>2.0.0-dev.105</c> 不在一套编号里，混着比大小永远是正式版赢，
+    /// <para><b>渠道决定候选集，版本号决定先后</b> —— 这两件事必须分开。正式版 <c>v2.4.0</c>
+    /// 与测试版 <c>2.4.1-dev.N</c> 的编号现在已经对齐（测试版压正式版一头），但发布列表里
+    /// 仍留着 <c>2.0.0-dev.N</c> 那套旧号的预发布，混着比大小永远被正式版压住，
     /// 「选了测试版却拿到正式版」就是这么来的（2026-10-25 实测）。</para>
     ///
     /// <para>同类里按版本号取最大而不是按发布时间：CI 每推一次 main 就发一份，
@@ -658,8 +661,8 @@ public static class UpdateService
     /// 从 tag / 资产文件名里抠版本号。
     ///
     /// 滚动预发布的 tag 是 <c>test-build</c>，里面根本没有版本号，所以必须回落到资产名：
-    ///   <c>Yomori-winui3-2.0.0-dev.42-x64.zip</c> / <c>Yomori-2.0.0-dev.42-setup.exe</c>。
-    /// 版本号自己带 '-'（2.0.0-dev.42），所以用前后缀锚定，避免把 dev.42 之类的片段切错。
+    ///   <c>Yomori-winui3-2.4.1-dev.42-x64.zip</c> / <c>Yomori-2.4.1-dev.42-setup.exe</c>。
+    /// 版本号自己带 '-'（2.4.1-dev.42），所以用前后缀锚定，避免把 dev.42 之类的片段切错。
     /// </summary>
     internal static string ExtractVersion(string tag, IReadOnlyList<string> assetNames)
     {
@@ -697,7 +700,7 @@ public static class UpdateService
         return match.Success && match.Groups.Count > 1 ? match.Groups[1].Value.Trim() : null;
     }
 
-    /// <summary>是不是形如 <c>2.1.0</c> / <c>2.0.0-dev.42</c> 的版本号（宽松判断，只用来挡住明显的 tag 名）。</summary>
+    /// <summary>是不是形如 <c>2.1.0</c> / <c>2.4.1-dev.42</c> 的版本号（宽松判断，只用来挡住明显的 tag 名）。</summary>
     internal static bool LooksLikeVersion(string text)
     {
         if (text.Length == 0 || !char.IsDigit(text[0]))

@@ -22,7 +22,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: 写入程序集版本（如 2.1.0，可带 -dev.1 这类后缀）。留空 = 2.0.0-dev.<run_number>
+        description: 写入程序集版本（如 2.1.0，可带 -dev.1 这类后缀）。留空 = 最新正式版修订号 +1 再挂 -dev.<run_number>（如最新 v2.4.0 → 2.4.1-dev.412）
         type: string
         required: false
         default: ''
@@ -240,14 +240,39 @@ jobs:
       setup_name: ${{ steps.setup.outputs.setup_name }}
       artifact_name: app-package
     steps:
+      # 版本号兜底要从已有的正式版 tag（vX.Y.Z）推算，所以这份 checkout 必须带全量 tag：
+      # 默认 fetch-depth 1 是不取 tag 的，`git tag` 会返回空 → 又退回写死的号。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 计算版本号
         id: ver
         shell: pwsh
         run: |
+          # 调用方给了号就用（正式版发布）；没给就自己算（CI 测试版）。
+          #
+          # 测试版的版本号必须**永远大于最新正式版** —— 否则「检查更新」把测试版当成旧版：
+          # 早先写死的 2.0.0-dev.<构建号>，在正式版过了 2.0 之后（v2.1.0 起）就永远比正式版小，
+          # 于是装了测试版的人点检查更新只会看到「更旧」，装了正式版的人切到测试版通道也拿不到更新。
+          #
+          # 现在的规则：取已有正式版 tag 里最大的 vX.Y.Z，修订号 +1，
+          # 再挂 -dev.<构建号>：v2.4.0 → 2.4.1-dev.412。下次发 v2.4.1 时 CI 自动变 2.4.2-dev.N，
+          # 始终压住任何已发布的正式版。一份正式版都没发过时从 2.0.1 起。
           $v = "${{ inputs.version }}".Trim().TrimStart('v', 'V')
-          if ([string]::IsNullOrEmpty($v)) { $v = "2.0.0-dev.${{ github.run_number }}" }
+          if ([string]::IsNullOrEmpty($v)) {
+            $best = $null
+            foreach ($t in (git tag --list 'v*')) {
+              if ($t -match '^v(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.]+)?$') {
+                $cand = [version]("{0}.{1}.{2}" -f $Matches[1], $Matches[2], $Matches[3])
+                if (($null -eq $best) -or ($cand -gt $best)) { $best = $cand }
+              }
+            }
+            $base = if ($best) { "{0}.{1}.{2}" -f $best.Major, $best.Minor, ($best.Build + 1) } else { "2.0.1" }
+            $v = "$base-dev.${{ github.run_number }}"
+            $latestLabel = if ($best) { "v$best" } else { "（还没有）" }
+            Write-Host "最新正式版：$latestLabel"
+          }
           "version=$v" >> $env:GITHUB_OUTPUT
           Write-Host "本次版本：$v"
 
