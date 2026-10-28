@@ -115,10 +115,11 @@ public sealed class MainViewModel : ObservableObject
         LogLines = new ObservableCollection<string>();
         StatRows = new ObservableCollection<StatRow>();
 
-        // 通知中心：先把上次的通知读回来（已读状态一起），再挂变更回调 ——
+        // 通知中心：每次启动都从空列表开始（历史通知只对当时那一刻有意义，
+        // 见 NotificationCenter.ResetOnStartup 的说明）。挂变更回调之后
         // 铃铛上的红点与"未读就摇"都由这里驱动。
         Notifications = new NotificationCenter();
-        Notifications.Load();
+        Notifications.ResetOnStartup();
         Notifications.Changed += (_, _) =>
         {
             OnPropertyChanged(nameof(NotifyDotVisibility));
@@ -139,6 +140,11 @@ public sealed class MainViewModel : ObservableObject
     public bool HasUnreadNotifications => Notifications.HasUnread;
 
     /// <summary>把一条通知标为已读，并按它的动作类型打开链接/目录。</summary>
+    /// <remarks>
+    /// 带动作的通知**点过就移除**：动作已经执行（下载已开始、安装器已拉起、浏览器已打开），
+    /// 条目留着只会让人重复点同一个动作。纯提示类（没有动作）只标已读 —— 它代表一条消息，
+    /// 看过了就该在列表里留个痕迹。
+    /// </remarks>
     public void OpenNotification(AppNotification? item)
     {
         if (item is null)
@@ -146,7 +152,11 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        Notifications.MarkRead(item);
+        if (!item.HasAction)
+        {
+            Notifications.MarkRead(item);
+            return;
+        }
 
         try
         {
@@ -161,7 +171,7 @@ public sealed class MainViewModel : ObservableObject
                     break;
 
                 case AppNotificationActions.Download when item.ActionTarget.Length > 0:
-                    // 不阻塞界面：下载几十秒到几分钟，交给后台，结果另挂一条通知
+                    // 不阻塞界面：下载几十秒到几分钟，交给后台，进度/结果另挂一条通知
                     _ = StartNotificationDownloadAsync(item.ActionTarget);
                     break;
 
@@ -174,6 +184,24 @@ public sealed class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             AppendLog($"[通知] 打开动作失败：{ex.Message}");
+        }
+
+        RemoveNotificationDeferred(item);
+    }
+
+    /// <summary>
+    /// 延后一拍删掉这条通知。
+    ///
+    /// <para>为什么不就地删：调用方是 <c>ListView.ItemClick</c>，此刻集合正处在
+    /// "事件处理器里改 ItemsSource"的位置上（工程里踩过同类：同步改集合落在树进入过程中，
+    /// 抛 <c>stowed exception</c>）。排到下一拍再动最稳。</para>
+    /// </summary>
+    private void RemoveNotificationDeferred(AppNotification item)
+    {
+        if (!_dispatcher.TryEnqueue(() => Notifications.Remove(item)))
+        {
+            // 派发器已经停了（正在退出）：就地删，反正界面也不刷了
+            Notifications.Remove(item);
         }
     }
 
@@ -233,6 +261,11 @@ public sealed class MainViewModel : ObservableObject
         var release = result.Latest;
         var pick = UpdateService.PickDownload(release);
 
+        // 通知里要带「更新内容」：发布说明是给人看发布页写的 Markdown（表格 / 代码块 /
+        // 下载说明全在里面），由 UpdateNotes 压成几行要点再上铃铛。
+        var notes = UpdateNotes.Summarize(release.Body);
+        AppendLog($"[更新检查] 更新内容摘要 {notes.Count} 行（发布说明原文 {release.Body.Length} 字符）。");
+
         if (mode == UpdateCheckModes.Download)
         {
             if (pick is null)
@@ -246,12 +279,18 @@ public sealed class MainViewModel : ObservableObject
         }
 
         // 「有更新时通知我」：通知本身就是下载入口 —— 点它直接在后台下，不必先去浏览器。
-        // AddIfNew：每次启动都会查到同一个新版本，不去重的话铃铛里会攒一串复读。
+        // AddIfNew：同一次运行里重复检查（手动 + 启动）不会攒出一串复读。
+        var body = UpdateNotes.BuildBody(
+            UpdateService.CurrentVersion,
+            release.Version,
+            UpdateChannels.Label(channel),
+            release.PublishedAt,
+            release.Body,
+            canDownload: pick is not null);
+
         Post(() => Notifications.AddIfNew(
             $"发现新版本 {release.Version}",
-            pick is null
-                ? result.Message + "\n这份发布里没有可下载的安装包，点这条去发布页看看。"
-                : result.Message + "\n点这条直接下载安装包，下完会再问你要不要装。",
+            body,
             pick is null ? AppNotificationKinds.Warning : AppNotificationKinds.Update,
             pick is null ? AppNotificationActions.OpenUrl : AppNotificationActions.Download,
             pick is null ? release.PageUrl : pick.Value.Url));
@@ -261,7 +300,13 @@ public sealed class MainViewModel : ObservableObject
     private void NotifyDownloadUnavailable(GitHubRelease release) =>
         Post(() => Notifications.Add(
             $"发现新版本 {release.Version}",
-            "这份发布里没有可下载的安装包，点这条去发布页看看。",
+            UpdateNotes.BuildBody(
+                UpdateService.CurrentVersion,
+                release.Version,
+                UpdateChannels.Label(UpdateChannels.Normalize(Config.UpdateChannel)),
+                release.PublishedAt,
+                release.Body,
+                canDownload: false),
             AppNotificationKinds.Warning,
             AppNotificationActions.OpenUrl,
             release.PageUrl));
@@ -286,18 +331,26 @@ public sealed class MainViewModel : ObservableObject
         _updateDownloadBusy = true;
         var target = Path.Combine(UpdateDownloadDir, fileName);
 
-        // 立刻挂一条"正在下载"：下载可能几十秒到几分钟，没有回执用户会以为点了没反应
-        var progressItem = PostAndGet(() => Notifications.Add(
-            "正在下载安装包",
-            $"{fileName}\n下载完成后会再通知一次。",
-            AppNotificationKinds.Download));
+        // 立刻挂一条"正在下载"：下载可能几十秒到几分钟，没有回执用户会以为点了没反应。
+        // Progress = 0 先把进度条画出来 —— 第一个字节还没到，但"已经在下了"这件事要立刻可见。
+        var progressItem = PostAndGet(() =>
+        {
+            var item = Notifications.Add(
+                "正在下载安装包",
+                $"{fileName}\n正在连接…",
+                AppNotificationKinds.Download);
+            item.Progress = 0;
+            return item;
+        });
+
+        var progress = CreateDownloadProgress(progressItem, fileName);
 
         try
         {
             AppendLog($"[更新检查] 开始下载 {fileName}（代理：{UpdateProxyModes.Label(network.ProxyMode)}）。");
 
             var (ok, message) = await UpdateService
-                .DownloadAsync(url, target, network)
+                .DownloadAsync(url, target, network, progress)
                 .ConfigureAwait(false);
 
             AppendLog($"[更新检查] {message}");
@@ -357,6 +410,51 @@ public sealed class MainViewModel : ObservableObject
         return result;
     }
 
+    /// <summary>
+    /// 下载进度的上报器：只在**整数百分比变化**时刷新那条通知。
+    ///
+    /// <para>为什么要节流：<see cref="UpdateService.DownloadAsync"/> 每读一块（80KB）就报一次，
+    /// 一个 90MB 的安装包是一千多次回调。每次都往 UI 线程排队，会把消息泵塞满、
+    /// 界面反而更卡（而且人眼也读不出 37.4% 和 37.6% 的差别）。</para>
+    ///
+    /// <para>为什么回 UI 线程：<c>Progress</c> / <c>Body</c> 都绑在 ListView 上，
+    /// 后台线程直接赋值就是跨线程改绑定（<c>0x8001010E</c>）。</para>
+    ///
+    /// <para>进度只进不退：<see cref="Progress{T}"/> 的回调是排队的，
+    /// 排在前面的旧百分比后执行时不该把进度条往回拖。</para>
+    /// </summary>
+    private IProgress<double> CreateDownloadProgress(AppNotification? item, string fileName)
+    {
+        var gate = new object();
+        var lastPercent = -1;
+
+        return new Progress<double>(fraction =>
+        {
+            var percent = (int)Math.Round(Math.Clamp(fraction, 0d, 1d) * 100);
+
+            lock (gate)
+            {
+                if (percent <= lastPercent)
+                {
+                    return;
+                }
+
+                lastPercent = percent;
+            }
+
+            Post(() =>
+            {
+                if (item is null)
+                {
+                    return;
+                }
+
+                item.Progress = percent;
+                item.Body = $"{fileName}\n正在下载 {percent}%";
+            });
+        });
+    }
+
     /// <summary>点「下载」那条通知：从 URL 反推文件名，走的还是同一套下载流程。</summary>
     private Task StartNotificationDownloadAsync(string url) =>
         DownloadPackageAsync(
@@ -366,6 +464,10 @@ public sealed class MainViewModel : ObservableObject
 
     private void StartInstallerAndExit(string setupPath)
     {
+        // 先记账再启动：安装器运行期间那个 exe 被它自己占着，删不掉；
+        // 只能写进清单，等新版本第一次启动时删（见 UpdatePackageCleanup）。
+        UpdatePackageCleanup.MarkPendingDeletion(UpdateDownloadDir, setupPath);
+
         try
         {
             // 主程序是 requireAdministrator，子进程继承同一个令牌 → 不会再弹一次 UAC
@@ -383,6 +485,38 @@ public sealed class MainViewModel : ObservableObject
         // ⚠️ 必须走 RequestExit：直接 Close() 会被关闭拦截变成"收进托盘"，
         //    进程留着就会锁住 Yomori.exe，安装程序随即覆盖失败。
         App.MainWindow?.RequestExit();
+    }
+
+    /// <summary>
+    /// 清掉「已经装完」的安装包与超期残留。
+    ///
+    /// <para>为什么必然只能放在启动时做：点「安装」那一刻，安装器正拿着那个 exe 在跑，
+    /// 文件被占用；本程序随即退出，没有机会再删。于是安装前记账、新版本首次启动删 ——
+    /// 记账与清单格式见 <see cref="UpdatePackageCleanup"/>。</para>
+    ///
+    /// <para>失败一律只写日志：清理是多占几十 MB 的问题，不能影响启动。</para>
+    /// </summary>
+    private void CleanupUpdatePackagesQuietly()
+    {
+        try
+        {
+            var directory = UpdateDownloadDir;
+            var (deleted, remaining) = UpdatePackageCleanup.RunPendingCleanup(directory);
+            var stale = UpdatePackageCleanup.SweepStale(directory);
+
+            if (deleted + remaining + stale == 0)
+            {
+                return;
+            }
+
+            AppendLog(remaining == 0
+                ? $"[更新检查] 已清理 {deleted} 个安装好的安装包、{stale} 个超期残留。"
+                : $"[更新检查] 已清理 {deleted + stale} 个安装包，还有 {remaining} 个删不掉（被占用，下次启动再试）。");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[更新检查] 清理安装包失败：{ex.Message}");
+        }
     }
 
     private void LogMemorySample()
@@ -570,6 +704,10 @@ public sealed class MainViewModel : ObservableObject
         // 启动顺手清一次超期的外部日志（每通道各留最近 KeepFiles 份）。
         // 只清文件、不碰任何运行状态；失败也只是少清一点，不影响启动。
         PruneExternalLogsQuietly();
+
+        // 更新装完之后留下的安装包：安装器运行时它被占着删不掉，只能等这一次启动删。
+        // 后台跑 —— 删几十 MB 不该拖慢启动（也一样失败不报错，只写一行日志）。
+        _ = Task.Run(CleanupUpdatePackagesQuietly);
 
         RefreshStats();
         ReloadChannels(refreshReadiness: false);

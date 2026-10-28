@@ -179,8 +179,17 @@
                                                                      未读状态看铃铛上的红点就够，列表行左边不用再顶两个字。 -->
                                                                 <StackPanel Grid.Column="0" Spacing="2">
                                                                     <TextBlock Text="{x:Bind Title}" TextWrapping="Wrap" />
-                                                                    <TextBlock Text="{x:Bind Body}" TextWrapping="Wrap"
+                                                                    <!-- Body 必须 OneWay：下载中这行会跟着百分比刷新
+                                                                         （x:Bind 默认是 OneTime，不写 Mode 就永远停在"正在连接…"）。 -->
+                                                                    <TextBlock Text="{x:Bind Body, Mode=OneWay}" TextWrapping="Wrap"
                                                                                FontSize="12" Opacity="0.7" />
+                                                                    <!-- 下载进度条：Progress 为 -1（没有进度可言）时 Opacity 归零，
+                                                                         而不是 Visibility —— 那是 XAML 类型，Models 层不许出现，
+                                                                         也省掉一个 BoolToVisibility 转换器。 -->
+                                                                    <ProgressBar Value="{x:Bind Progress, Mode=OneWay}"
+                                                                                 Maximum="100"
+                                                                                 Height="3" Margin="0,2,0,0"
+                                                                                 Opacity="{x:Bind ProgressOpacity, Mode=OneWay}" />
                                                                 </StackPanel>
 
                                                                 <TextBlock Grid.Column="1" Text="{x:Bind TimeText}"

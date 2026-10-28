@@ -54,7 +54,17 @@ public static class AppNotificationActions
 /// </summary>
 public sealed class AppNotification : ObservableObject
 {
+    /// <summary>
+    /// 「这条没有进度可显示」的哨兵值。
+    ///
+    /// <para>用 -1 而不是 0：0 是「刚开始下、还一个字节没到」，两者在界面上要区分开
+    /// （前者不画进度条，后者画一条 0% 的）。</para>
+    /// </summary>
+    public const double NoProgress = -1;
+
     private bool _isRead;
+    private string _body = string.Empty;
+    private double _progress = NoProgress;
 
     [JsonPropertyName("id")]
     public string Id { get; set; } = Guid.NewGuid().ToString("N")[..12];
@@ -62,8 +72,52 @@ public sealed class AppNotification : ObservableObject
     [JsonPropertyName("title")]
     public string Title { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 正文。**必须是可通知的属性**：下载过程中这行字会带着百分比刷新，
+    /// 界面上的 <c>x:Bind</c> 也因此必须写 <c>Mode=OneWay</c>（默认 OneTime 不会跟着变）。
+    /// </summary>
     [JsonPropertyName("body")]
-    public string Body { get; set; } = string.Empty;
+    public string Body
+    {
+        get => _body;
+        set => SetProperty(ref _body, value ?? string.Empty);
+    }
+
+    /// <summary>
+    /// 下载进度（0~100），<see cref="NoProgress"/> 表示这条没有进度条。
+    ///
+    /// <para>⚠️ 只能在 UI 线程上改：它是绑到界面的属性，后台线程直接赋值就是
+    /// 跨线程改绑定（<c>0x8001010E</c> 那条），调用方要自己 Post 回 UI 线程。</para>
+    /// </summary>
+    /// <remarks>不落盘：它是「这一次下载」的瞬时状态，存下来只会让下次启动看到个假的 37%。</remarks>
+    [JsonIgnore]
+    public double Progress
+    {
+        get => _progress;
+        set
+        {
+            var clamped = value < 0 ? NoProgress : Math.Min(100d, value);
+            if (SetProperty(ref _progress, clamped))
+            {
+                OnPropertyChanged(nameof(HasProgress));
+                OnPropertyChanged(nameof(ProgressOpacity));
+            }
+        }
+    }
+
+    /// <summary>这条有没有进度可显示（真值判断；界面上绑的是 <see cref="ProgressOpacity"/>）。</summary>
+    [JsonIgnore]
+    public bool HasProgress => _progress >= 0;
+
+    /// <summary>
+    /// 进度条的 <c>Opacity</c>（1 显示 / 0 隐藏）。
+    ///
+    /// <para>为什么用不透明度而不是 <c>Visibility</c>：<c>Visibility</c> 是
+    /// <c>Microsoft.UI.Xaml</c> 的类型，Models 层不许出现（见 MEMORY 的「Models 层纪律」）；
+    /// 用 double 就不用引入 <c>BoolToVisibility</c> 转换器，模板里一行绑定即可。</para>
+    /// </summary>
+    [JsonIgnore]
+    public double ProgressOpacity => _progress >= 0 ? 1d : 0d;
 
     /// <summary>取值见 <see cref="AppNotificationKinds"/>。</summary>
     [JsonPropertyName("kind")]

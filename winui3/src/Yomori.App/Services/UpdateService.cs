@@ -67,6 +67,17 @@ public sealed class GitHubRelease
     /// <summary>发布页面地址（浏览器打开用）。</summary>
     public required string PageUrl { get; init; }
 
+    /// <summary>
+    /// 发布说明原文（GitHub 的 <c>body</c>，Markdown）。可能为空。
+    ///
+    /// <para>不是 required：老的调用点（冒烟里的夹具）不关心它，
+    /// 而且它只影响通知里多出的那几行「更新内容」，缺了也不该编不过。</para>
+    ///
+    /// <para>怎么读成人话见 <see cref="UpdateNotes"/>（正文里带表格、代码块、下载说明，
+    /// 直接往通知里塞会把有用的那句挤没）。</para>
+    /// </summary>
+    public string Body { get; init; } = string.Empty;
+
     /// <summary>安装版直链（<c>*-setup.exe</c>），没有就是 null。</summary>
     public string? SetupUrl { get; init; }
 
@@ -645,6 +656,7 @@ public static class UpdateService
             Title = title,
             Version = ExtractVersion(tag, assetNames),
             PageUrl = pageUrl,
+            Body = GetString(element, "body"),
             SetupUrl = setupUrl,
             ZipUrl = zipUrl,
             IsPrerelease = isPrerelease,

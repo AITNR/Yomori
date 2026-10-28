@@ -162,8 +162,20 @@ CI 的每次构建都会建一个自己的预发布 tag，资产不会被下一�
 | 测试版（`beta`） | `GET /releases?per_page=50` 里版本号最大的一份 | CI 滚动预发布 `test-build`（资产名里解析版本号，因为 tag 里没有） |
 
 渠道选择存进 `config.json` 的 `update_channel`。检查逻辑在 `Services/UpdateService.cs`，只**读**发布信息：
-不下载、不安装、不改文件；有新版时用浏览器打开下载页。一份正式版都没发过时 `/releases/latest` 返回 404，
+不下载、不安装、不改文件。一份正式版都没发过时 `/releases/latest` 返回 404，
 程序把它当成「还没发过正式版」而不是错误。GitHub 匿名接口每小时 60 次上限，被限流会如实报出来。
+
+发现新版本时，通知（`MainWindow` 右上角铃铛）按以下约定呈现：
+
+| 环节 | 行为 | 实现位置 |
+|---|---|---|
+| 通知内容 | 版本对比 + **更新内容**（发布说明里的要点）+ 下一步提示。发布说明原文是发布页用的 Markdown（元信息表格、代码块、下载说明），由 `UpdateNotes.Summarize` 压成最多 6 条、240 字符的要点 | `Services/UpdateNotes.cs` |
+| 点击通知 | 直接后台下载安装包；**该条通知随即移除**（动作已执行，留着只会被重复点击） | `MainViewModel.OpenNotification` |
+| 下载中 | 通知正文显示百分比，行内进度条同步推进（只按整数百分比刷新，避免每 80KB 一次回调把消息泵塞满） | `AppNotification.Progress` |
+| 下载完成 | 换成一条「安装包已下载」，点击后启动安装器并退出本程序 | `MainViewModel.StartInstallerAndExit` |
+| 安装包清理 | 安装前把路径记入 `updates/pending-cleanup.json`；新版本首次启动时删除该安装包，并顺带清掉 `updates/` 里超过 7 天的旧包与 `*.part` 半成品 | `Services/UpdatePackageCleanup.cs` |
+| 启动 | 通知列表**每次启动清空**（历史通知只对当时那一刻成立，例如「安装包已下载」在装完后点开只会报文件不存在） | `NotificationCenter.ResetOnStartup` |
+
 
 ### 每次构建出两份：安装版 / 绿色版
 

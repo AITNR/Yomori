@@ -96,6 +96,36 @@ public sealed class NotificationCenter
         }
     }
 
+    /// <summary>
+    /// 启动时清空：内存里的历史清掉，落盘文件一并删除。
+    ///
+    /// <para>为什么不再"开机还在"：铃铛里的更新提醒、下载回执都是**当下这一刻**的状态 ——
+    /// 上次开机会话里那条「安装包已下载」，这次启动时安装包可能早就装完删了，
+    /// 点它只会报"文件不存在"。启动检查更新本来就会在 6 秒后再查一遍并按需重新挂一条，
+    /// 留着旧的那条只会变成误导。</para>
+    ///
+    /// <para>⚠️ 与 <see cref="Load"/> 是互斥的两种启动策略，产品里只用这一个；
+    /// <see cref="Load"/> 留着是因为「落盘/读回/损坏容错」这套能力自身还要能被冒烟验证。</para>
+    /// </summary>
+    public void ResetOnStartup()
+    {
+        Items.Clear();
+
+        try
+        {
+            if (File.Exists(_path))
+            {
+                File.Delete(_path);
+            }
+        }
+        catch
+        {
+            // 删不掉（只读目录 / 被占用）也不影响本次会话：反正启动不再回读它
+        }
+
+        Changed?.Invoke(this, EventArgs.Empty);
+    }
+
     /// <summary>加一条并落盘，返回新条目。</summary>
     public AppNotification Add(
         string title,
