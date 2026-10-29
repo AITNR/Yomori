@@ -4,6 +4,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Yomori.Models;
 
 namespace Yomori.Services;
@@ -53,6 +55,9 @@ public sealed class ExternalLogTail : IDisposable
     /// <summary>递归时最多收多少个匹配文件；超了只留前 N 个并在诊断里说明。</summary>
     private const int MaxRecursiveFiles = 500;
 
+    private readonly ExternalLogProjector _projector;
+    private readonly string _view;
+    private int _labelsLoading;
     private string? _currentFile;
     private string _lastError = string.Empty;
     private string _note = string.Empty;
@@ -64,15 +69,24 @@ public sealed class ExternalLogTail : IDisposable
     /// 目录模式是否递归子目录。默认 false —— 只在预设明确要求时打开（LALC 每次运行一个
     /// <c>logs\&lt;run_id&gt;\</c>、ok-Onmyoji 多开按实例分目录）。打开时受深度与文件数两道闸限制。
     /// </param>
+    /// <param name="view">
+    /// 显示视图（<c>panel</c> / <c>node</c> / <c>raw</c>）。原文视图直接跳过投影 ——
+    /// 用户要看原文时再套一层"重写"就自相矛盾了。
+    /// </param>
     public ExternalLogTail(string path, string? pattern, string? encodingName, bool followTail,
-        string? baseDirectory = null, bool recursive = false)
+        string? baseDirectory = null, bool recursive = false, string? view = null)
     {
         var expanded = Environment.ExpandEnvironmentVariables((path ?? string.Empty).Trim());
         _rootPath = expanded.Length == 0 ? string.Empty : Path.GetFullPath(expanded,
             Path.GetFullPath(baseDirectory ?? Environment.CurrentDirectory));
         _patterns = ParsePatterns(pattern);
         _recursive = recursive;
+        _view = ExternalLogViews.Normalize(view);
         _encodingMode = ExternalLogEncodings.Normalize(encodingName);
+        // 族判定在"打开文件之前"做一次：MaaFW 归档的头几十行往往是外壳启动日志
+        // （`[INFO][mxu_lib::commands::…]`），只在逐行流里判会把这些行当"不认识"原样放出来。
+        _projector = new ExternalLogProjector(LogLabelMap.Empty, ProbeMaafw()) { View = _view };
+        BeginLoadLabels(baseDirectory);
         try
         {
             foreach (var file in Candidates())
@@ -86,6 +100,36 @@ public sealed class ExternalLogTail : IDisposable
             }
         }
         catch (Exception ex) { SetError(ex); }
+    }
+
+    /// <summary>
+    /// 读文件开头 512 KB 判断是不是 MaaFramework 内核日志。
+    ///
+    /// <para>按 **ASCII 字节**找标记（`!!!OnEventNotify!!!` / `[msg=Tasker.` / `MaaNS::`），
+    /// 因此不受编码影响 —— GBK 日志里这些标记同样是单字节。找不到任何标记但文件有内容时，
+    /// 判定为"不是内核日志"（原样放行）；文件还不存在时返回 <c>null</c>，交给逐行判定兜底。</para>
+    /// </summary>
+    private bool? ProbeMaafw()
+    {
+        try
+        {
+            foreach (var file in Candidates())
+            {
+                using var stream = Open(file);
+                var buffer = new byte[512 * 1024];
+                var read = stream.Read(buffer, 0, buffer.Length);
+                if (read <= 0) { continue; }
+
+                var detected = ExternalLogGrammar.DetectMaafw(Encoding.Latin1.GetString(buffer, 0, read));
+                if (detected is not null) { return detected; }
+            }
+        }
+        catch (Exception)
+        {
+            // 探测失败不是错误：交给逐行判定。
+        }
+
+        return null;
     }
 
     public string? CurrentFile { get { lock (_sync) { return _currentFile; } } }
@@ -526,8 +570,82 @@ public sealed class ExternalLogTail : IDisposable
             try { text = StrictUtf8.GetString(bytes); }
             catch (DecoderFallbackException) { text = Encoding.GetEncoding(936).GetString(bytes); }
         }
-        var line = ExternalLogFilter.Parse(text.TrimEnd('\r'), keywords, wasTruncated);
-        if (line.Text.Length > 0) { result.Add(line); }
+
+        var raw = text.TrimEnd('\r');
+        var line = ExternalLogFilter.Parse(raw, keywords, wasTruncated);
+        if (line.Text.Length == 0) { return; }
+
+        // 原文视图不投影：用户要看原文时再套一层"重写"就自相矛盾了。
+        if (_view == ExternalLogViews.Raw)
+        {
+            result.Add(line);
+            return;
+        }
+
+        // 投影必须发生在外部日志过滤器之后、截断之前 —— Parse 只做级别识别与规整，
+        // 真正的截断在 NormalizeLine 里，而它作用在投影文本上（投影文本本来就很短）。
+        var projection = _projector.Project(raw);
+        if (!projection.Emit) { return; }
+        if (projection.UseRaw)
+        {
+            result.Add(line);
+            return;
+        }
+
+        if (projection.PanelText.Length == 0 && projection.NodeText.Length == 0) { return; }
+
+        // Text 是"这个视图该显示的那一行"：节点视图下节点名才是内容，面板视图下 focus 才是内容。
+        var display = _view == ExternalLogViews.Node
+            ? (projection.NodeText.Length > 0 ? projection.NodeText : projection.PanelText)
+            : projection.PanelText;
+        result.Add(new ExternalLogLine
+        {
+            Text = display,
+            NodeText = projection.NodeText,
+            Kind = projection.Kind,
+            Level = line.Level,
+            KeywordHit = line.KeywordHit,
+        });
+    }
+
+    /// <summary>
+    /// 采集节拍上的一次检查：任务在跑却没有输出时补心跳，长时间空档补一条"日志中断"。
+    ///
+    /// <para>必须由采集循环调用 —— 没有新行的时候才更需要它，否则长任务在面板上看起来就是卡死。</para>
+    /// </summary>
+    public ExternalLogLine? Tick()
+    {
+        if (_disposed) { return null; }
+        var projection = _projector.Tick(Environment.TickCount64);
+        if (projection is null) { return null; }
+        return new ExternalLogLine
+        {
+            Text = projection.PanelText,
+            NodeText = projection.NodeText,
+            Kind = projection.Kind,
+            Level = ExternalLogLevel.Info,
+        };
+    }
+
+    /// <summary>投影器的会话状态（顶部状态条：当前任务 / 已进节点数 / 失败数）。</summary>
+    public ExternalLogProjector Projector => _projector;
+
+    /// <summary>
+    /// 后台装项目资源（entry → 中文任务名）：5 MB 级 JSON，绝不能挡在采集线程的启动路径上。
+    /// 装好之前任务名显示 entry 原文，装好后从下一行开始生效。
+    /// </summary>
+    private void BeginLoadLabels(string? baseDirectory)
+    {
+        if (Interlocked.Exchange(ref _labelsLoading, 1) == 1) { return; }
+        var directory = baseDirectory;
+        _ = Task.Run(() =>
+        {
+            try { _projector.SetLabels(LogLabelStore.Get(directory)); }
+            catch (Exception)
+            {
+                // 读不到项目资源只是"任务名显示英文"，不该影响日志采集本身。
+            }
+        });
     }
 
     private static int GetEncodingWidth(Cursor cursor) => cursor.BomEncoding?.CodePage is 1200 or 1201 ? 2 :

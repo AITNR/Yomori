@@ -200,7 +200,7 @@ public sealed class ScriptRunner
                 if (_externalLogTailsClosed) { return; }
                 var tail = new ExternalLogTail(task.ExternalLogPath, task.ExternalLogPattern,
                     task.ExternalLogEncoding, task.ExternalLogFollowTail, scriptDirectory,
-                    task.ExternalLogRecursive);
+                    task.ExternalLogRecursive, task.ExternalLogView);
                 var state = new ExternalLogTailState(task, tail);
                 _externalLogTails[task] = state;
                 var start = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -308,6 +308,11 @@ public sealed class ScriptRunner
             EmitExternalLogDiagnostic(state.Task, error.Length == 0 ? "日志采集已恢复。" : error);
         }
         foreach (var line in lines) { EmitExternalLogLine(state.Task, line); }
+
+        // 心跳 / 日志中断：没有新行的时候才更需要它（否则长任务在面板上看起来像卡死）。
+        var tick = state.Tail.Tick();
+        if (tick is not null) { EmitExternalLogLine(state.Task, tick); }
+
         return lines.Count;
     }
 

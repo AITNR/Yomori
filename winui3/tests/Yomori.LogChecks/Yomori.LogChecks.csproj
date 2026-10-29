@@ -21,6 +21,9 @@
     <Compile Include="..\..\src\Yomori.App\Models\Enums.cs" Link="Production\Models\Enums.cs" />
     <Compile Include="..\..\src\Yomori.App\Models\TaskConfig.cs" Link="Production\Models\TaskConfig.cs" />
     <Compile Include="..\..\src\Yomori.App\Models\ExternalLogModels.cs" Link="Production\Models\ExternalLogModels.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\ExternalLogGrammar.cs" Link="Production\Models\ExternalLogGrammar.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\LogLabelMap.cs" Link="Production\Models\LogLabelMap.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\ExternalLogProjector.cs" Link="Production\Models\ExternalLogProjector.cs" />
     <Compile Include="..\..\src\Yomori.App\Models\RdpModels.cs" Link="Production\Models\RdpModels.cs" />
     <Compile Include="..\..\src\Yomori.App\Models\RdpChannel.cs" Link="Production\Models\RdpChannel.cs" />
     <Compile Include="..\..\src\Yomori.App\Models\RdpChannelPaths.cs" Link="Production\Models\RdpChannelPaths.cs" />
@@ -30,6 +33,7 @@
     <Compile Include="..\..\src\Yomori.App\Services\RuntimeStatsManager.cs" Link="Production\Services\RuntimeStatsManager.cs" />
     <Compile Include="..\..\src\Yomori.App\Services\ExternalLogTail.cs" Link="Production\Services\ExternalLogTail.cs" />
     <Compile Include="..\..\src\Yomori.App\Services\ExternalLogFilter.cs" Link="Production\Services\ExternalLogFilter.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\LogLabelStore.cs" Link="Production\Services\LogLabelStore.cs" />
   </ItemGroup>
 
   <ItemGroup>

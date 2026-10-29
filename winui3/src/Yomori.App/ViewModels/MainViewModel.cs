@@ -5913,7 +5913,7 @@ public sealed class MainViewModel : ObservableObject
 
     private void OnExternalLogLine(RdpChannelSession? session, TaskExternalLogLine item)
     {
-        if (session is null || item.Line.Text.Length == 0) return;
+        if (session is null || (item.Line.Text.Length == 0 && item.Line.NodeText.Length == 0)) return;
         var archivePath = ExternalLogStore.TodayFilePath(ExternalLogStore.LocalChannelTag, DateTime.Now);
 
         if (!ExternalLogFilter.ShouldArchive(item.Line.Level))
@@ -5931,8 +5931,10 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        var text = ExternalLogText(item.Line);
+        // 归档写节点档；上屏用当前视图文本（为空说明这一行只在节点档里存在）。
+        var text = ExternalLogText(item.Line.ArchiveText, item.Line.Level);
         ExternalLogStore.Append(archivePath, $"[{FormatHelper.NowTimeText()}] [{item.TaskName}] {text}");
+        if (item.Line.Text.Length == 0) return;
         _localLiveLogs.Enqueue((session, item));
         // The display queue is bounded independently from the archive.
         while (_localLiveLogs.Count > 4000) _localLiveLogs.TryDequeue(out _);
@@ -5945,7 +5947,7 @@ public sealed class MainViewModel : ObservableObject
         for (var i = 0; i < 500 && _localLiveLogs.TryDequeue(out var entry); i++)
         {
             var line = entry.Item.Line;
-            entry.Session.AddExternalLogLine(ExternalLogText(line), line.Level == ExternalLogLevel.Error,
+            entry.Session.AddExternalLogLine(ExternalLogText(line.Text, line.Level), line.Level == ExternalLogLevel.Error,
                 line.Level.ToString().ToLowerInvariant(), entry.Item.TaskName);
         }
         Interlocked.Exchange(ref _localLiveLogPostPending, 0);
@@ -5953,12 +5955,12 @@ public sealed class MainViewModel : ObservableObject
             _dispatcher.TryEnqueue(DrainLocalLiveLogs);
     }
 
-    /// <summary>给日志行加级别前缀（错误 / 警告），其余原样。</summary>
-    private static string ExternalLogText(ExternalLogLine line) => line.Level switch
+    /// <summary>给日志文本加级别前缀（错误 / 警告），其余原样。</summary>
+    private static string ExternalLogText(string text, ExternalLogLevel level) => level switch
     {
-        ExternalLogLevel.Error => $"[错误] {line.Text}",
-        ExternalLogLevel.Warn => $"[警告] {line.Text}",
-        _ => line.Text,
+        ExternalLogLevel.Error => $"[错误] {text}",
+        ExternalLogLevel.Warn => $"[警告] {text}",
+        _ => text,
     };
 
     /// <summary>

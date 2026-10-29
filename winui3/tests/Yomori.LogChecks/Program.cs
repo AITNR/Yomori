@@ -16,6 +16,11 @@ if (args.Length > 0 && string.Equals(args[0], "--observe", StringComparison.Ordi
     return ObserveBridge(args);
 }
 
+if (args.Length > 0 && string.Equals(args[0], "--replay", StringComparison.OrdinalIgnoreCase))
+{
+    return ReplayExternalLog(args);
+}
+
 var tests = new (string Name, Action Run)[]
 {
     ("Agent payload identity ignores patched EXE timestamp", TestAgentPayloadIdentity),
@@ -28,6 +33,7 @@ var tests = new (string Name, Action Run)[]
     ("ExternalLogTail large backlog drains in order across polls", TestExternalLogTailLargeBacklog),
     ("ExternalLogTail multi-pattern, recursion and carriage-return progress",
         TestExternalLogTailPatternsRecursionAndCarriageReturn),
+    ("ExternalLogProjector panel projection and label map", TestExternalLogProjector),
 };
 
 var failures = new List<string>();
@@ -538,6 +544,296 @@ static void AppendUtf8InChunks(string path, string text, int chunkSize)
 static void Touch(string path, DateTime utc)
 {
     File.SetLastWriteTimeUtc(path, utc);
+}
+
+// ------------------------------------------------------------------ 投影器（面板档）
+
+/// <summary>项目资源（含注释的任务文件 + i18n 词条）→ entry 中文名的解析。</summary>
+const string InterfaceJson = """
+{
+  "name": "Demo",
+  // 顶层的 task 直接写在这里，import 指向的再补充
+  "task": [ { "entry": "GameLauncherWakeMain", "name": "GameLauncherWakeMain" } ],
+  "import": [ "tasks/visit.json" ]
+}
+""";
+
+/// <summary>实测 MAA_bbb 的 tasks/游戏启动.json 里就有这种 `//` 注释与尾逗号。</summary>
+const string TaskJsonWithComments = """
+{
+  "task": [
+    {
+      "name": "VisitFriends",
+      "label": "$task.VisitFriends.label",
+      "entry": "VisitFriendsMain",   // 尾逗号 + 行内注释
+    }
+  ]
+}
+""";
+
+const string LocaleJson = """{ "task.VisitFriends.label": "🤝拜访好友" }""";
+
+const string TaskStartLine =
+    "[13:17:13] [2026-10-29 13:17:13.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+    "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Tasker.Task.Starting] " +
+    "[details={\"entry\":\"VisitFriendsMain\",\"task_id\":200000001}]";
+
+const string TaskDoneLine =
+    "[13:19:44] [2026-10-29 13:19:44.100][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+    "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Tasker.Task.Succeeded] " +
+    "[details={\"entry\":\"VisitFriendsMain\",\"task_id\":200000001}]";
+
+/// <summary>focus 的键等于当前事件 —— 唯一会显示的那种。</summary>
+const string FocusLine =
+    "[13:18:00] [2026-10-29 13:18:00.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+    "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.Action.Succeeded] " +
+    "[details={\"focus\":{\"Node.Action.Succeeded\":\"<div style=\\\"color:#00bfff\\\">获得</div>\"}," +
+    "\"name\":\"VisitFriendsQuickVisitNext\"}]";
+
+/// <summary>同一行换个事件名：focus 的键不匹配，一个字符都不该输出。</summary>
+const string FocusMismatchedLine =
+    "[13:18:00] [2026-10-29 13:18:00.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+    "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.Recognition.Starting] " +
+    "[details={\"focus\":{\"Node.Action.Succeeded\":\"获得\"},\"name\":\"VisitFriendsQuickVisitNext\"}]";
+
+const string NodeLine =
+    "[13:18:22] [2026-10-29 13:18:22.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+    "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Starting] " +
+    "[details={\"focus\":null,\"name\":\"VisitFriendsMenuAssistControlNexus\",\"node_id\":300000001}]";
+
+/// <summary>`Succeeded` 的 payload 以 action_details 打头：首个 name 是动作名，不是节点名。</summary>
+const string NodeSucceededLine =
+    "[13:19:44] [2026-10-29 13:19:44.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+    "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Succeeded] " +
+    "[details={\"action_details\":{\"action\":\"DoNothing\",\"name\":\"DoNothing\"}," +
+    "\"focus\":null,\"name\":\"VisitFriendsMain\"}]";
+
+const string InternalWarnLine =
+    "[13:22:41] [2026-10-29 13:22:41.190][WRN][Px82844][Tx54350][PipelineTask.cpp][L155]" +
+    "[MaaNS::TaskNS::PipelineTask::run_next] node not completed, handle error " +
+    "[node_name=DeliveryJobsContinueFillWulingAfterPriority1]";
+
+const string NoiseLine =
+    "[13:04:40] [2026-10-29 13:04:40.190][WRN][Px82844][Tx8661][OCRer.cpp][L139]" +
+    "[MaaNS::VisionNS::OCRer::handle_cached] cache is empty [name=x]";
+
+/// <summary>同一份归档里混进来的别的进程的行：只有类名、没有消息体。</summary>
+const string ForeignLine =
+    "[13:12:47] [13:12:46.935] [INF] [Primary:S3:P75124:T1793250766610] BetterGenshinImpact.Service.Instance";
+
+/// <summary>外壳告警：带 Yomori 自己的 `[警告]` 前缀，剥完才是消息。</summary>
+const string ShellWarnLine =
+    "[13:03:56] [警告] [2026-10-29 13:03:56,142][WARNING][i18n_service.py][L80]" +
+    "[load_translations_from_interface] | 未找到语言 zh_cn 的翻译文件配置";
+
+/// <summary>三月七那种"本来就是人话"的日志：一条都不许投影掉。</summary>
+const string March7thLine = "[13:04:50] 当前界面：手机菜单";
+
+/// <summary>断言辅助（参数顺序：说明在前）。本地函数套一层，避免和上面的 Equal 混淆。</summary>
+static void Same(string message, object? expected, object? actual)
+{
+    if (!Equals(expected, actual))
+    {
+        throw new InvalidOperationException($"{message}; expected '{expected}', actual '{actual}'");
+    }
+}
+
+void TestExternalLogProjector()
+{
+    // ---- 1. 项目资源：注释 / 尾逗号 / i18n 键
+    var labels = LogLabelMap.Build(InterfaceJson, new[] { TaskJsonWithComments }, new[] { LocaleJson });
+    Same("label：i18n 键被解析成中文", "🤝拜访好友", labels.Resolve("VisitFriendsMain"));
+    Same("label：无 label 时用 name", "GameLauncherWakeMain", labels.Resolve("GameLauncherWakeMain"));
+    Same("label：查不到就原样返回 entry", "UnknownEntry", labels.Resolve("UnknownEntry"));
+    Same("label：注释与尾逗号不影响解析", 2, labels.Count);
+
+    // ---- 2. 任务边界
+    var projector = new ExternalLogProjector(labels, maafw: true);
+    long now = 1_000_000;
+    var start = projector.Project(TaskStartLine, now);
+    Assert(start.Emit, "任务开始：不该被丢弃");
+    Same("任务开始：面板用中文名", "▶ 任务开始：🤝拜访好友", start.PanelText);
+    Same("任务开始：节点档用 entry", "▶ 任务 VisitFriendsMain", start.NodeText);
+    Same("任务开始：类型", ExternalLogKind.TaskStart, start.Kind);
+
+    // 同一 entry 未结束就重发（MaaFW 会重发 Starting）→ 丢弃
+    var duplicate = projector.Project(TaskStartLine, now + 200);
+    Assert(!duplicate.Emit, "任务开始：未结束的重发应丢弃");
+
+    // ---- 3. focus 只有"键等于当前事件"才显示
+    Assert(!projector.Project(FocusMismatchedLine, now + 300).Emit, "focus：键不匹配时不该输出");
+    var focus = projector.Project(FocusLine, now + 400);
+    Assert(focus.Emit, "focus：命中时应输出");
+    Same("focus：剥掉 HTML 标签", "获得", focus.PanelText);
+    Same("focus：类型", ExternalLogKind.Notice, focus.Kind);
+
+    // 连续同一条 focus（双线程各打一遍）→ 只留一条
+    Assert(!projector.Project(FocusLine, now + 500).Emit, "focus：连续重复应丢弃");
+
+    // ---- 4. 已经有 focus 的任务里，节点名不再上屏（否则行数翻倍）
+    var nodeInFocusTask = projector.Project(NodeLine, now + 600);
+    Assert(nodeInFocusTask.Emit, "节点：节点档必须保留");
+    Same("节点：面板档在有 focus 后不显示", "", nodeInFocusTask.PanelText);
+    Same("节点：节点档缩进两格", "  ▸ VisitFriendsMenuAssistControlNexus", nodeInFocusTask.NodeText);
+
+    // ---- 5. `Succeeded` 按 key 取节点名，不能取首个 name
+    var succeeded = projector.Project(NodeSucceededLine, now + 700);
+    Assert(!succeeded.Emit, "节点完成：当前实现只计数，不上屏");
+
+    // ---- 6. 中间层 WRN：不单独出，作为失败原因
+    var internalWarn = projector.Project(InternalWarnLine, now + 800);
+    Assert(!internalWarn.Emit, "中间层 WRN：不该单独出行");
+    var failed = new ExternalLogProjector(labels, maafw: true);
+    failed.Project(TaskStartLine, now);
+    failed.Project(InternalWarnLine, now + 10);
+    var failLine =
+        "[13:22:42] [2026-10-29 13:22:42.100][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Tasker.Task.Failed] " +
+        "[details={\"entry\":\"VisitFriendsMain\"}]";
+    var failure = failed.Project(failLine, now + 1000);
+    Same("任务失败：带原因", "✘ 任务失败：🤝拜访好友（1s） · node not completed, handle error",
+        failure.PanelText);
+    Same("任务失败：类型", ExternalLogKind.TaskFail, failure.Kind);
+
+    // ---- 7. 噪声与异种进程行直接丢
+    Assert(!projector.Project(NoiseLine, now + 900).Emit, "噪声：cache is empty 应丢弃");
+    Assert(!projector.Project(ForeignLine, now + 910).Emit, "异种进程行：应丢弃");
+
+    // ---- 8. 外壳告警：剥掉 Yomori 的级别前缀，只留消息
+    var shell = projector.Project(ShellWarnLine, now + 920);
+    Assert(shell.Emit, "外壳告警：应保留");
+    Same("外壳告警：去掉前缀", "未找到语言 zh_cn 的翻译文件配置", shell.PanelText);
+
+    // ---- 9. 没有任何 focus 的任务里，节点名按 30 秒节流上屏
+    var flat = new ExternalLogProjector(labels, maafw: true);
+    flat.Project(TaskStartLine, now);
+    var firstNode = flat.Project(NodeLine, now + 1000);
+    Same("节点（无 focus）：面板显示节点名", "▸ VisitFriendsMenuAssistControlNexus", firstNode.PanelText);
+    var nextNode =
+        "[13:18:40] [2026-10-29 13:18:40.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Starting] " +
+        "[details={\"focus\":null,\"name\":\"SceneEnterMenuFriendsList\"}]";
+    var throttled = flat.Project(nextNode, now + 2000);
+    Same("节点（无 focus）：30 秒内的第二个节点不再上屏", "", throttled.PanelText);
+    Assert(throttled.Emit, "节点（无 focus）：节流只影响面板档，节点档仍保留");
+    var reopened = flat.Project(nextNode, now + 40_000);
+    Same("节点（无 focus）：过了节流窗口再出一行", "▸ SceneEnterMenuFriendsList", reopened.PanelText);
+
+    // ---- 10. 内部节点（`__` 开头）不进面板
+    var internalNode =
+        "[13:18:50] [2026-10-29 13:18:50.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Starting] " +
+        "[details={\"focus\":null,\"name\":\"__ScenePrivateMapTeleportConfirm\"}]";
+    var internalProjection = flat.Project(internalNode, now + 80_000);
+    Same("内部节点：面板档不显示", "", internalProjection.PanelText);
+    Assert(internalProjection.Emit, "内部节点：节点档仍保留");
+
+    // ---- 11. 心跳：60 秒起跳，最多 6 条
+    var beating = new ExternalLogProjector(labels, maafw: true);
+    beating.Project(TaskStartLine, now);
+    Assert(beating.Tick(now + 30_000) is null, "心跳：不足 60 秒不该出");
+    var beat = beating.Tick(now + 61_000);
+    Assert(beat is not null, "心跳：超过 60 秒应出一条");
+    Same("心跳：类型", ExternalLogKind.Heartbeat, beat!.Kind);
+    for (var i = 0; i < 20; i++) { beating.Tick(now + 62_000 + i * 40_000); }
+    Assert(beating.Tick(now + 3_000_000) is null, "心跳：单任务最多 6 条，之后保持安静");
+
+    // ---- 12. 非 MaaFW 日志：一条都不许丢（三月七 / BetterGI / AUTO-MAS 全靠这条）
+    var passthrough = new ExternalLogProjector(labels);
+    var plain = passthrough.Project(March7thLine, now);
+    Assert(plain.Emit, "非 MaaFW：不能丢行");
+    Assert(plain.UseRaw, "非 MaaFW：原样放行");
+    Assert(!passthrough.IsMaafw, "非 MaaFW：判定为不认识");
+
+    // ---- 13. 幂等：把面板档的输出再喂一次，必须原样放行（主控端二次投影的前提）
+    var again = new ExternalLogProjector(labels, maafw: true);
+    var twice = again.Project(start.PanelText, now + 2000);
+    Assert(twice.Emit && twice.UseRaw, "幂等：已投影的行再投影应原样放行");
+
+    // ---- 14. 视图取值归一
+    Same("视图：非法值回落面板", ExternalLogViews.Panel, ExternalLogViews.Normalize("nonsense"));
+    Same("视图：大小写无关", ExternalLogViews.Node, ExternalLogViews.Normalize("NODE"));
+}
+
+/// <summary>
+/// 拿真实归档重放一遍投影（P0 验收判据 1 / 3 的可执行版本）。
+///
+/// <para>用法：<c>--replay &lt;日志&gt; &lt;项目目录|-&gt; [输出]</c>。
+/// 时间取每行自带的 `[HH:mm:ss]` 前缀 —— 节流与心跳都按真实时间推进，
+/// 而不是"每行加 1 秒"那种假时钟。</para>
+/// </summary>
+static int ReplayExternalLog(string[] args)
+{
+    if (args.Length < 3)
+    {
+        Console.Error.WriteLine("Usage: --replay <logPath> <projectDir|-> [outPath]");
+        return 2;
+    }
+
+    var logPath = args[1];
+    var projectDir = args[2];
+    var outPath = args.Length > 3 ? args[3] : logPath + ".panel.log";
+    if (!File.Exists(logPath))
+    {
+        Console.Error.WriteLine($"log not found: {logPath}");
+        return 2;
+    }
+
+    var labels = projectDir == "-" ? LogLabelMap.Empty : LogLabelStore.Get(projectDir);
+
+    // 与采集器同一套判定：先看文件开头，再逐行兜底
+    using var head = File.OpenRead(logPath);
+    var probe = new byte[512 * 1024];
+    var read = head.Read(probe, 0, probe.Length);
+    var maafw = ExternalLogGrammar.DetectMaafw(Encoding.Latin1.GetString(probe, 0, read));
+    Console.WriteLine($"labels={labels.Count} maafw={maafw}");
+
+    var projector = new ExternalLogProjector(labels, maafw);
+    var output = new List<string>(4096);
+    long lastHms = 0;
+    var dropped = 0;
+    var raw = 0;
+    var panel = 0;
+
+    foreach (var line in File.ReadLines(logPath))
+    {
+        var match = ExternalLogGrammar.ArchivePrefix.Match(line);
+        if (!match.Success) { dropped++; continue; }
+
+        var hms = match.Groups["hms"].Value;
+        var now = hms.Length == 8
+            ? long.Parse(hms[..2]) * 3600_000 +
+              long.Parse(hms.Substring(3, 2)) * 60_000 + long.Parse(hms.Substring(6, 2)) * 1000
+            : lastHms + 1000;
+        if (now < lastHms) { now += 24 * 3600_000; }   // 跨零点
+        lastHms = now;
+
+        var projection = projector.Project(line, now);
+        if (!projection.Emit) { dropped++; continue; }
+        if (projection.UseRaw)
+        {
+            raw++;
+            output.Add(line);
+            continue;
+        }
+
+        if (projection.PanelText.Length == 0) { dropped++; continue; }
+        panel++;
+        output.Add($"{hms}  {projection.PanelText}");
+
+        // 心跳 / 空档判定：采集器每拍都会调，重放时按行时间补上
+        var beat = projector.Tick(now);
+        if (beat is not null && beat.PanelText.Length > 0)
+        {
+            panel++;
+            output.Add($"{hms}  {beat.PanelText}");
+        }
+    }
+
+    File.WriteAllLines(outPath, output, new UTF8Encoding(false));
+    Console.WriteLine($"lines={File.ReadLines(logPath).Count()} panel={panel} raw={raw} dropped={dropped} out={output.Count}");
+    Console.WriteLine($"written: {outPath}");
+    return 0;
 }
 
 static void Assert(bool condition, string message)

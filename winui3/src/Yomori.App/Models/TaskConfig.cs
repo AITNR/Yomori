@@ -50,6 +50,7 @@ public sealed class TaskConfig : ObservableObject, ICloneable
 
     private bool _externalLogFollowTail = ExternalLogDefaults.FollowTail;
     private bool _externalLogRecursive;
+    private string _externalLogView = ExternalLogViews.Panel;
 
     // 日志推荐值的来源标记（与 launch_preset_* 同源：只用于展示与追溯，不参与执行）
     private string _externalLogPresetId = string.Empty;
@@ -301,6 +302,18 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     {
         get => _externalLogFollowTail;
         set => SetProperty(ref _externalLogFollowTail, value);
+    }
+
+    /// <summary>
+    /// 外部日志显示视图：<c>panel</c>（默认，任务与提示）/ <c>node</c>（节点进出）/ <c>raw</c>（原文）。
+    ///
+    /// <para>视图只影响"看什么"，不影响采集：同一份日志三种视图共用一次投影结果。</para>
+    /// </summary>
+    [JsonPropertyName("external_log_view")]
+    public string ExternalLogView
+    {
+        get => _externalLogView;
+        set => SetProperty(ref _externalLogView, ExternalLogViews.Normalize(value));
     }
 
     /// <summary>

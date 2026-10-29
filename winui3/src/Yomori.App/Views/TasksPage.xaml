@@ -429,6 +429,18 @@
                                                       IsOn="{Binding ExternalLogEnabled, Mode=TwoWay}"
                                                       OnContent="开启" OffContent="关闭" />
 
+                                        <!-- 视图只决定"看什么"，不改变采集：MaaFramework 系的项目
+                                             面板档是"任务开始：🤝拜访好友 / 画面检查通过"这种人话，
+                                             节点档是每个节点的进出，原文档是未投影的原始行。 -->
+                                        <ComboBox Header="显示视图"
+                                                  SelectedValuePath="Tag"
+                                                  SelectedValue="{Binding ExternalLogView, Mode=TwoWay}"
+                                                  HorizontalAlignment="Stretch">
+                                            <ComboBoxItem Content="面板：任务与人话提示（推荐）" Tag="panel" />
+                                            <ComboBoxItem Content="节点：每个节点的进出与告警" Tag="node" />
+                                            <ComboBoxItem Content="原文：未处理的日志行" Tag="raw" />
+                                        </ComboBox>
+
                                         <TextBox Header="日志文件或目录"
                                                  PlaceholderText="例如：C:\Program Files\BetterGI\log"
                                                  Text="{Binding ExternalLogPath, Mode=TwoWay}"

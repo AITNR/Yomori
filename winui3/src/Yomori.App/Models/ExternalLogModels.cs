@@ -76,14 +76,48 @@ public static class ExternalLogEncodings
 /// <summary>从外部日志文件里读出来的一行。</summary>
 public sealed class ExternalLogLine
 {
-    /// <summary>行正文（已规整：去转义、压空白、截断）。</summary>
+    /// <summary>行正文（已规整：去转义、压空白、截断）。面板档/节点档按视图取用。</summary>
     public string Text { get; init; } = string.Empty;
+
+    /// <summary>
+    /// 节点档文本（所有节点进出、告警、折叠）。
+    ///
+    /// <para>归档写它：事后排障要的是"跑到哪一步断了"，而不是面板上那几行人话。
+    /// 为空时表示这一行只在面板档出现（例如 focus 提示），归档退回 <see cref="Text"/>。</para>
+    /// </summary>
+    public string NodeText { get; init; } = string.Empty;
+
+    /// <summary>原始行（未投影）。只有编译期就知道要原文视图时才填，其余为空省内存。</summary>
+    public string Raw { get; init; } = string.Empty;
+
+    /// <summary>语义类型（任务 / 节点 / 人话 / 告警 / 心跳 …），界面据此上色。</summary>
+    public ExternalLogKind Kind { get; init; } = ExternalLogKind.Plain;
 
     /// <summary>识别出的级别。</summary>
     public ExternalLogLevel Level { get; init; }
 
     /// <summary>是否命中了用户配置的关键字。</summary>
     public bool KeywordHit { get; init; }
+
+    /// <summary>按视图取显示文本（原文视图没有 <see cref="Raw"/> 时退回投影文本，绝不返回空）。</summary>
+    public string TextFor(string? view)
+    {
+        var mode = ExternalLogViews.Normalize(view);
+        if (mode == ExternalLogViews.Raw)
+        {
+            return Raw.Length > 0 ? Raw : Text.Length > 0 ? Text : NodeText;
+        }
+
+        if (mode == ExternalLogViews.Node)
+        {
+            return NodeText.Length > 0 ? NodeText : Text;
+        }
+
+        return Text.Length > 0 ? Text : NodeText;
+    }
+
+    /// <summary>归档用文本：优先节点档（含全部节点事实），没有再退回面板档。</summary>
+    public string ArchiveText => NodeText.Length > 0 ? NodeText : Text;
 }
 
 /// <summary>日志行级别（从粗到细）。</summary>

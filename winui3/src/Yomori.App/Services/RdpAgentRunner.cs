@@ -347,7 +347,7 @@ public sealed class RdpAgentRunner
     private void OnExternalLogLine(TaskExternalLogLine item)
     {
         var line = item.Line;
-        if (line.Text.Length == 0)
+        if (line.Text.Length == 0 && line.NodeText.Length == 0)
         {
             return;
         }
@@ -371,8 +371,13 @@ public sealed class RdpAgentRunner
                 return;
             }
 
-            var text = ExternalLogText(line);
-            ExternalLogStore.Append(archivePath, $"[{FormatHelper.NowTimeText()}] {text}");
+            // 归档写节点档：事后排障要的是"跑到哪一步断了"，而不是面板上那几行人话。
+            var archiveText = ExternalLogText(line.ArchiveText, line.Level);
+            ExternalLogStore.Append(archivePath, $"[{FormatHelper.NowTimeText()}] {archiveText}");
+
+            // 上屏只发当前视图的文本；节点档独有的行（中间层 WRN）不发，免得面板上冒出代码。
+            var text = ExternalLogText(line.Text, line.Level);
+            if (line.Text.Length == 0) { return; }
 
             lock (_liveLogGate)
             {
@@ -443,11 +448,11 @@ public sealed class RdpAgentRunner
     }
 
     /// <summary>给日志行加级别前缀（错误 / 警告），其余原样。</summary>
-    private static string ExternalLogText(ExternalLogLine line) => line.Level switch
+    private static string ExternalLogText(string text, ExternalLogLevel level) => level switch
     {
-        ExternalLogLevel.Error => $"[错误] {line.Text}",
-        ExternalLogLevel.Warn => $"[警告] {line.Text}",
-        _ => line.Text,
+        ExternalLogLevel.Error => $"[错误] {text}",
+        ExternalLogLevel.Warn => $"[警告] {text}",
+        _ => text,
     };
 
     private void FinishSession(string phase, string summary)
