@@ -11,6 +11,7 @@
     x:Class="Yomori.Views.TasksPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:helpers="using:Yomori.Helpers"
     xmlns:models="using:Yomori.Models">
 
     <!-- ⚠️ 别把 MenuFlyout 放进 Page.Resources 并给它 x:Name ——
@@ -90,13 +91,20 @@
 
                                 <!-- 通道级开关：这条通道本轮要不要执行。
                                      本地执行（恒执行）与「未知通道」（配置已不存在）没有开关可拨 ——
-                                     用 x:Load 让它们连控件都不生成，省下那一列的宽度。
-                                     ⚠️ 别改成绑 Visibility 属性：ChannelScope 在 Models 里，
-                                     而冒烟工程是把 Models 的 .cs 直接链进纯 .NET 工程编译的，
-                                     引 Microsoft.UI.Xaml 会连编都编不过。 -->
+                                     用 Visibility 收起，省下那一列的宽度。
+
+                                     ⚠️ 2026-10-29 改：这里原来是 x:Load（+ x:Name），
+                                     生成了 XamlMarkupHelper.UnloadObject() / FindName("ScopeEnabledToggle")
+                                     这一对 —— 值一变就把控件从树里摘掉、模板部件释放，再靠字符串找回来。
+                                     主控端在 Microsoft.UI.Xaml.dll+0x1af9d5 因空指针崩过一次，
+                                     现场正是「Toggled 里改绑定属性」与「这个开关被卸载」撞在一起。
+                                     现在改成纯 Visibility（静态函数绑定），控件自始至终在树上，
+                                     不参与卸载/找回，也就没有这条路径。
+                                     ⚠️ 别直接绑 Visibility：ChannelScope 在 Models 里，而冒烟工程
+                                     把 Models 的 .cs 链进纯 .NET 工程编译，引 Microsoft.UI.Xaml 会编不过；
+                                     所以走 Helpers.XamlHelpers.ToVisibility。 -->
                                 <ToggleSwitch Grid.Column="1"
-                                              x:Name="ScopeEnabledToggle"
-                                              x:Load="{x:Bind CanToggle, Mode=OneWay}"
+                                              Visibility="{x:Bind helpers:XamlHelpers.ToVisibility(CanToggle), Mode=OneWay}"
                                               IsOn="{x:Bind Enabled, Mode=TwoWay}"
                                               OnContent="" OffContent=""
                                               MinWidth="0"

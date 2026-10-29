@@ -120,15 +120,63 @@ public sealed partial class TasksPage : Page
     /// 走 <c>Toggled</c> 而不是纯 <c>x:Bind</c> 两向绑定 —— <see cref="ChannelScope"/> 只是展示模型，
     /// 真正要改的是通道配置里的 <c>enabled</c>（「通道管理」页那个开关同一份），必须由 VM 落盘。
     /// 列表项实体化时 x:Bind 也会填一次 IsOn 触发本事件，VM 里对「值没变」做了空转处理。
+    ///
+    /// ⚠️ <b>不在本事件里同步写回。</b> 同步写回会当场改 <c>scope.Subtitle</c> / <c>IsUsable</c> /
+    /// <c>HintText</c> 三个绑定属性，行高与透明度随之重排，而这时控件自己还在 Toggled 的调用栈里 ——
+    /// 2026-10-29 主控端就是这样在 <c>Microsoft.UI.Xaml.dll+0x1af9d5</c> 空指针崩的
+    /// （`mov r14,[rcx+0x60]; mov rax,[r14]`，读空的模板部件；Toggled 里在改属性，
+    /// 同时那个带 x:Load 的开关正被 UnloadObject/FindName 摘掉找回）。
+    /// 现在只记下「谁被拨成了什么」，下一拍再统一落盘刷行。
     /// </summary>
     private void OnScopeEnabledToggled(object sender, RoutedEventArgs e)
     {
         // ⚠️ 必须读控件自己的 IsOn，不能读 scope.Enabled —— Toggled 早于 TwoWay 绑定回写，
         //    这时 scope.Enabled 还是**旧值**。读旧值的症状：把开关拨到"开"，配置却仍是停用，
         //    行上还挂着「通道已停用 —— 本轮不会下发」（2026-10-24 用户实测就是这个）。
-        if (sender is ToggleSwitch toggle && toggle.DataContext is ChannelScope scope)
+        //    读控件的值在事件里读、延后只用，才两头都不出错。
+        if (sender is not ToggleSwitch toggle || toggle.DataContext is not ChannelScope scope)
         {
-            VM.SetScopeEnabled(scope, toggle.IsOn);
+            return;
+        }
+
+        // 连拨（快速来回拨）合并成一次：同一行只保留最后一次的值，避免排队执行一串过时的写回，
+        // 也避免每拨一下都写一次 config.json。
+        _pendingScopeToggles[scope] = toggle.IsOn;
+
+        if (_scopeToggleFlushQueued)
+        {
+            return;
+        }
+
+        _scopeToggleFlushQueued = true;
+        if (!DispatcherQueue.TryEnqueue(FlushScopeToggles))
+        {
+            // 排不进队列（正在关窗等极端情况）：当场做，别留下「看着开了、其实没落盘」的假状态。
+            FlushScopeToggles();
+        }
+    }
+
+    /// <summary>待写回的通道开关：<see cref="ChannelScope"/> → 用户刚拨到的值。</summary>
+    private readonly Dictionary<ChannelScope, bool> _pendingScopeToggles = new();
+
+    /// <summary>是否已经排过一次 <see cref="FlushScopeToggles"/>，避免连拨时排一长串。</summary>
+    private bool _scopeToggleFlushQueued;
+
+    /// <summary>把攒下的开关改动一次性写回配置。必须在 UI 线程、且已脱离控件事件栈。</summary>
+    private void FlushScopeToggles()
+    {
+        _scopeToggleFlushQueued = false;
+        if (_pendingScopeToggles.Count == 0)
+        {
+            return;
+        }
+
+        var batch = _pendingScopeToggles.ToArray();
+        _pendingScopeToggles.Clear();
+
+        foreach (var (scope, enabled) in batch)
+        {
+            VM.SetScopeEnabled(scope, enabled);
         }
     }
 

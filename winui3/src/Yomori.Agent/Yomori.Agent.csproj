@@ -57,7 +57,7 @@
     <Compile Include="..\Yomori.App\Services\**\*.cs" LinkBase="Services"
              Exclude="..\Yomori.App\Services\NotificationService.cs;..\Yomori.App\Services\RdpD3DRenderer.cs;..\Yomori.App\Services\SingleInstance.cs;..\Yomori.App\Services\RdpUnlockService.cs;..\Yomori.App\Services\RdpUninstallService.cs;..\Yomori.App\Services\RdpReleaseResolver.cs;..\Yomori.App\Services\RdpToolDownloader.cs;..\Yomori.App\Services\RdpToolRunner.cs;..\Yomori.App\Services\RdpHiddenProcess.cs;..\Yomori.App\Services\RdpRegistryService.cs;..\Yomori.App\Services\RdpServiceControl.cs;..\Yomori.App\Services\RdpTransactionStore.cs;..\Yomori.App\Services\RdpToolProcessTree.cs;..\Yomori.App\Services\RdpDiagnoseCli.cs;..\Yomori.App\Services\ControllerSessionReturnService.cs;..\Yomori.App\Services\ControllerSessionReturnCoordinator.cs;..\Yomori.App\Services\UuSessionFixService.cs;..\Yomori.App\Services\UuSessionFixScheduler.cs" />
     <Compile Include="..\Yomori.App\Helpers\**\*.cs" LinkBase="Helpers"
-             Exclude="..\Yomori.App\Helpers\DialogHelper.cs;..\Yomori.App\Helpers\WindowHelper.cs" />
+             Exclude="..\Yomori.App\Helpers\DialogHelper.cs;..\Yomori.App\Helpers\WindowHelper.cs;..\Yomori.App\Helpers\XamlHelpers.cs" />
   </ItemGroup>
 
   <ItemGroup>

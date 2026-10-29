@@ -46,6 +46,16 @@ Python / PySide6 版（v1.0 RC1，legacy）的变更记录见仓库根的 [CHANG
 
 ### Fixed
 
+- **主控端拨「通道开关」时整个程序崩溃**（`Microsoft.UI.Xaml.dll+0x1af9d5`，0xC0000005 空指针）。
+  触发条件很窄：通道行那个开关原先用 `x:Load` 控显隐，生成的是
+  `XamlMarkupHelper.UnloadObject()` + `FindName("ScopeEnabledToggle")` 一对——值一变就把控件
+  从树里摘掉、模板部件全释放，再靠字符串找回来；而 `Toggled` 里又同步改
+  `Subtitle` / `IsUsable` / `HintText` 三个绑定属性，行高与透明度随之重排。两者撞在一起时，
+  框架里那个已被拆掉的内部对象还是被用了，直接空指针。
+  现在显隐改走 `Visibility`（`Helpers.XamlHelpers.ToVisibility`，静态函数绑定，模型层仍不引 XAML），
+  控件自始至终在树上；写回也挪出控件自己的事件栈——`Toggled` 里只记下「哪一行被拨成了什么」，
+  下一拍统一落盘刷行，连拨合并成一次。崩溃后 WER 采集 993MB 全量转储会把进程挂起两分钟，
+  这段时间界面僵住、日志与心跳全停，看着像死锁，其实是崩溃现场在落盘。
 - **MaaEnd 的启动方式按真机实测重写**：它的 `--autostart` 在 v2.36.0-beta.5 上不生效
   （日志里没有「命令行 --instance」与「开机自启动」，窗口照常显示），`-i` / `-q` 因此全部无从生效。
   改为按项目自带方式给出：主推「不带参数启动，依赖它设置里的『启动时自动执行』」，
