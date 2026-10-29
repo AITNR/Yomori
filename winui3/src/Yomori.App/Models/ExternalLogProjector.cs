@@ -356,11 +356,20 @@ public sealed class ExternalLogProjector
         if (_maafw is null && !Detect(raw)) { return ExternalLogProjection.Pass; }
         if (_maafw == false) { return ExternalLogProjection.Pass; }
 
+        // 已经是投影后的样子就别再加工（幂等：主控端对老代理的原始行再投一次也安全）。
+        if (ExternalLogGrammar.LooksProjected(raw)) { return ExternalLogProjection.Pass; }
+
         try
         {
+            // 两种形状都必须认：
+            //   ① 归档行：`[13:03:56] [警告] [2026-10-29 …][WARNING]…`（重放 / 归档时）
+            //   ② 源文件行：`[2026-10-29 18:31:45.556][DBG][Px…][Logger] …`（**实时采集时就是这个**）
+            //
+            // 早期版本只认 ①，于是实时链路里 `[msg=…]` 永远匹配不上 → 全部原样放行，
+            // 面板照旧刷一堆英文。重放与端到端用例当时喂的都是带前缀的归档行，
+            // 所以测试全绿而线上不生效 —— 这是本次最贵的一个坑。
             var prefix = ExternalLogGrammar.ArchivePrefix.Match(raw);
-            if (!prefix.Success) { return ExternalLogProjection.Pass; }
-            var rest = prefix.Groups["rest"].Value.Trim();
+            var rest = (prefix.Success ? prefix.Groups["rest"].Value : raw).Trim();
             if (rest.Length == 0) { return ExternalLogProjection.Drop; }
 
             var projection = ProjectCore(rest, nowMs, out var ownLine);

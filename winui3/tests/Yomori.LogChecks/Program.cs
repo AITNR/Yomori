@@ -34,6 +34,7 @@ var tests = new (string Name, Action Run)[]
     ("ExternalLogTail multi-pattern, recursion and carriage-return progress",
         TestExternalLogTailPatternsRecursionAndCarriageReturn),
     ("ExternalLogProjector panel projection and label map", TestExternalLogProjector),
+    ("ExternalLogTail projects real lines end to end", TestExternalLogTailProjectsRealLines),
 };
 
 var failures = new List<string>();
@@ -756,6 +757,46 @@ void TestExternalLogProjector()
 }
 
 /// <summary>
+/// 采集器接线检查：真实文件 → <see cref="ExternalLogTail"/> → 投影 → 行。
+///
+/// <para>投影器自身的断言在上一组；这里要钉的是"它到底有没有被接进去"——
+/// 单元测试全绿但 Tail 忘了调投影，界面照样是一堆英文，这类缺口只能靠端到端用例抓。</para>
+/// </summary>
+void TestExternalLogTailProjectsRealLines()
+{
+    using var temp = new TempDirectory();
+    var path = Path.Combine(temp.Path, "maafw.log");
+
+    // ⚠ 这三行是**源文件形状**（没有 [HH:mm:ss] 前缀）。实时采集读到的就是它；
+    // 加上前缀反而是归档形状。早期版本只认带前缀的那种，于是线上一条都没投影。
+    const string startLine =
+        "[2026-10-29 13:17:13.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Tasker.Task.Starting] " +
+        "[details={\"entry\":\"VisitFriendsMain\"}]";
+    const string noiseLine =
+        "[2026-10-29 13:17:14.190][WRN][Px82844][Tx8661][OCRer.cpp][L139]" +
+        "[MaaNS::VisionNS::OCRer::handle_cached] cache is empty [name=x]";
+    const string focusLine =
+        "[2026-10-29 13:17:15.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.Action.Succeeded] " +
+        "[details={\"focus\":{\"Node.Action.Succeeded\":\"画面检查通过\"},\"name\":\"X\"}]";
+
+    File.WriteAllLines(path, new[] { startLine, noiseLine, focusLine }, new UTF8Encoding(false));
+
+    using var tail = new ExternalLogTail(path, "*.log", ExternalLogEncodings.Utf8, followTail: false,
+        baseDirectory: temp.Path);
+    var lines = tail.Poll(Array.Empty<string>());
+
+    Same("接线：两行有效（任务开始 + 提示），噪声被丢", 2, lines.Count);
+    // 本用例的临时目录里没有 interface.json，所以任务名只能是 entry —— 这里钉"投影确实生效"
+    Same("接线：任务开始被投影", "▶ 任务开始：VisitFriendsMain", lines[0].Text);
+    Same("接线：focus 变成人话", "画面检查通过", lines[1].Text);
+    Same("接线：类型", ExternalLogKind.Notice, lines[1].Kind);
+    // 归档按设计写**节点档**（"跑到哪一步断了"），所以这里必须是 entry 而不是中文任务名
+    Same("接线：归档走节点档", "▶ 任务 VisitFriendsMain", lines[0].ArchiveText);
+}
+
+/// <summary>
 /// 拿真实归档重放一遍投影（P0 验收判据 1 / 3 的可执行版本）。
 ///
 /// <para>用法：<c>--replay &lt;日志&gt; &lt;项目目录|-&gt; [输出]</c>。
@@ -795,10 +836,33 @@ static int ReplayExternalLog(string[] args)
     var raw = 0;
     var panel = 0;
 
+    // 两种输入都要能喂：归档行（带 [HH:mm:ss] 前缀）与源文件行（MaaFW 原生形状）。
+    // 源文件行的形状是 `[2026-10-29 18:31:45.556][INF]…`，时间从行首的日期时间里取。
+    var sourceShape = false;
     foreach (var line in File.ReadLines(logPath))
     {
         var match = ExternalLogGrammar.ArchivePrefix.Match(line);
-        if (!match.Success) { dropped++; continue; }
+        if (!match.Success)
+        {
+            if (!sourceShape) { sourceShape = true; }
+            var stamp = System.Text.RegularExpressions.Regex.Match(line,
+                @"^\[\d{4}-\d{2}-\d{2} (\d{2}):(\d{2}):(\d{2})");
+            if (!stamp.Success) { dropped++; continue; }
+
+            var sourceNow = long.Parse(stamp.Groups[1].Value) * 3600_000 +
+                            long.Parse(stamp.Groups[2].Value) * 60_000 +
+                            long.Parse(stamp.Groups[3].Value) * 1000;
+            if (sourceNow < lastHms) { sourceNow += 24 * 3600_000; }
+            lastHms = sourceNow;
+
+            var projected = projector.Project(line, sourceNow);
+            if (!projected.Emit) { dropped++; continue; }
+            if (projected.UseRaw) { raw++; output.Add(line); continue; }
+            if (projected.PanelText.Length == 0) { dropped++; continue; }
+            panel++;
+            output.Add($"{stamp.Groups[1].Value}:{stamp.Groups[2].Value}:{stamp.Groups[3].Value}  {projected.PanelText}");
+            continue;
+        }
 
         var hms = match.Groups["hms"].Value;
         var now = hms.Length == 8
@@ -831,7 +895,8 @@ static int ReplayExternalLog(string[] args)
     }
 
     File.WriteAllLines(outPath, output, new UTF8Encoding(false));
-    Console.WriteLine($"lines={File.ReadLines(logPath).Count()} panel={panel} raw={raw} dropped={dropped} out={output.Count}");
+    Console.WriteLine($"shape={(sourceShape ? "source" : "archive")} lines={File.ReadLines(logPath).Count()} " +
+                      $"panel={panel} raw={raw} dropped={dropped} out={output.Count}");
     Console.WriteLine($"written: {outPath}");
     return 0;
 }

@@ -168,6 +168,27 @@ public static class ExternalLogGrammar
         return false;
     }
 
+    /// <summary>
+    /// 这一行看起来已经是**投影后的输出**（`▶ 任务开始：…` / `  ▸ 节点` / `⋯ 进行中`）。
+    ///
+    /// <para>用途只有一个：保证"再投影一次还是它自己"。这样主控端可以对老代理发来的原始行
+    /// 再投影一次，而新代理已经投影过的行不会被二次加工；用户把日志目录指到 Yomori 自己的
+    /// 归档目录时也不会把面板文本再洗一遍。</para>
+    /// </summary>
+    public static bool LooksProjected(string line)
+    {
+        if (line.Length == 0) { return false; }
+        var text = line.TrimStart();
+        return text.StartsWith("▶", StringComparison.Ordinal) ||
+               text.StartsWith("✔", StringComparison.Ordinal) ||
+               text.StartsWith("✘", StringComparison.Ordinal) ||
+               text.StartsWith("▸", StringComparison.Ordinal) ||
+               text.StartsWith("✓", StringComparison.Ordinal) ||
+               text.StartsWith("✗", StringComparison.Ordinal) ||
+               text.StartsWith("⚠", StringComparison.Ordinal) ||
+               text.StartsWith("⋯", StringComparison.Ordinal);
+    }
+
     /// <summary>是不是一份 MaaFramework 内核日志（含事件行的那一类）。</summary>
     public static bool LooksLikeMaafw(IReadOnlyList<string> firstLines)
     {
