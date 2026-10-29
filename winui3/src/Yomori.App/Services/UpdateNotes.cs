@@ -21,8 +21,14 @@ namespace Yomori.Services;
 /// <para>直接把这些塞进通知，占满一屏的还是「怎么用」「Full Changelog」，
 /// 真正想知道的那几条变更反而被挤到看不见。所以这里只留**要点**：</para>
 /// <list type="bullet">
-///   <item>列表项（<c>- / * / + / 1.</c>）与代码块里的行（测试版就是提交信息）当正文；</item>
-///   <item>表格、引用、HTML、分隔线、结构性标题（<c>##</c>）一律丢掉；</item>
+///   <item><b>列表项</b>（<c>- / * / + / 1.</c>）与**它的续行**当正文（markdown 允许一条跨行写，
+///     不合并就会切在半句）；</item>
+///   <item><b>代码块里的行</b>（测试版「本次提交」就在代码块里）；</item>
+///   <item><b><c>###</c> 小节标题 + 其下第一句</b>，合成「标题：首句」一条。
+///     正式版的手写说明主干全在散文里（RDP 解锁、UU 修复、授权统一都是这种），
+///     只认列表项会让最重要的几条整段消失，只剩边角料；</item>
+///   <item>表格、引用、HTML、分隔线、<c>#</c> / <c>##</c> 大标题、流程性小节标题
+///     （「怎么用」「本次提交」）与 <c>Full Changelog</c> 一律丢掉；</item>
 ///   <item>顺手剥掉 <c>**加粗**</c>、反引号、<c>[文字](链接)</c>、<c>by @user in 链接</c>、
 ///     行首短哈希 —— 那些是 GitHub 网页上的排版残留，在通知里只会占宽度。</item>
 /// </list>
@@ -37,14 +43,39 @@ public static class UpdateNotes
     /// <summary>通知里最多列几条。再多就没人读了，铃铛也给不了那么高。</summary>
     public const int DefaultMaxLines = 6;
 
-    /// <summary>全部要点的字符预算（380px 宽的通知里大约 8 行）。</summary>
-    public const int DefaultMaxChars = 240;
+    /// <summary>全部要点的字符预算（380px 宽的通知里大约 10 行）。</summary>
+    public const int DefaultMaxChars = 320;
+
+    /// <summary>
+    /// 一条要点至少要有这么多字符才值得出现。
+    ///
+    /// <para>预算见底时宁可少列一条，也不要留「授权规则的统一：本机被控账…」这种残句 ——
+    /// 残句既不说明问题，又把下一条挤掉。</para>
+    /// </summary>
+    private const int MinLineChars = 24;
 
     /// <summary>单条要点最长字符数。一条 commit 标题再长也不该独占六行。</summary>
     private const int MaxLineChars = 72;
 
     /// <summary>GitHub 自动生成的那行收尾链接，对用户没有信息量。</summary>
     private const string FullChangelogMarker = "Full Changelog";
+
+    /// <summary>句末标点：一条要点只取第一句，截断也优先断在这里。</summary>
+    private static readonly char[] SentenceMarks = { '。', '！', '？', '；' };
+
+    /// <summary>句中的停顿标点（断在这里要补省略号，表示话没说完）。</summary>
+    private static readonly char[] PauseMarks = { '，', '、', ',', ';' };
+
+    /// <summary>
+    /// 流程性小节标题（装、下、提交了什么 …）。判据是「关键词命中」，宁可漏判也不要误判：
+    /// 漏判顶多多一条「怎么用：两种下载方式」，误判会把真正的小节（如「修复」）吞掉。
+    /// </summary>
+    private static readonly string[] FlowHeadingWords =
+    {
+        "怎么用", "如何使用", "用法", "安装说明", "下载方式", "下载地址", "使用说明",
+        "本次提交", "更新日志", "变更记录", "changelog", "usage", "install", "how to",
+        "what's changed", "whats changed",
+    };
 
     /// <summary><c>* fix: … by @AITNR in https://…</c> 的尾巴。</summary>
     private static readonly Regex ByAuthorTail = new(
@@ -89,10 +120,14 @@ public static class UpdateNotes
         var inFence = false;
         var inHtmlComment = false;
 
-        foreach (var raw in markdown.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
-        {
-            var line = raw.Trim();
+        // 已读到 `###` 小节标题、正等它下面第一段散文（headingConsumed = 已经用掉）
+        string? heading = null;
+        var headingConsumed = false;
 
+        // 先把跨行的段落合并成逻辑行：markdown 里一句可以用好几行写，
+        // 按物理行判断会把句子切在半句（"…减少远控软件"就是这么来的）。
+        foreach (var line in MergeContinuationLines(markdown))
+        {
             if (inHtmlComment)
             {
                 if (line.Contains("-->", StringComparison.Ordinal))
@@ -113,42 +148,162 @@ public static class UpdateNotes
                 line.StartsWith("~~~", StringComparison.Ordinal))
             {
                 inFence = !inFence;
+                heading = null;
                 continue;
             }
 
             if (line.Length == 0)
             {
+                // 空行 = 段落结束：标题不再等它下面那段
                 continue;
             }
 
             if (inFence)
             {
                 // 代码块里的行就是测试版真正的「本次提交」
-                Append(bullets, CleanCommitLine(line));
+                AppendUnique(bullets, CleanCommitLine(line));
+                heading = null;
                 continue;
             }
 
-            // 表格 / 引用 / HTML / 分隔线 / 结构性标题 / 收尾链接：都不是要点
-            if (line[0] is '|' or '>' or '<' or '#' or '=' ||
+            // 表格 / 引用 / HTML / 分隔线 / 收尾链接：都不是要点
+            if (line[0] is '|' or '>' or '<' or '=' ||
                 IsHorizontalRule(line) ||
                 line.Contains(FullChangelogMarker, StringComparison.OrdinalIgnoreCase))
             {
+                heading = null;
+                continue;
+            }
+
+            if (line[0] == '#')
+            {
+                // `#` / `##` 是整份说明的大标题（通常就是版本号本身），丢掉；
+                // `###` 以下才是「这一版改了什么」的分节，记下来等它的第一段散文。
+                heading = ReadSectionHeading(line);
+                headingConsumed = false;
                 continue;
             }
 
             var item = StripListMarker(line);
             if (item is not null)
             {
-                Append(bullets, CleanInline(item));
+                // 列表项自己就是要点，前面那个标题不再重复采用
+                heading = null;
+                AppendUnique(bullets, CleanInline(item));
                 continue;
             }
 
-            Append(prose, CleanInline(line));
+            var body = CleanInline(line);
+            if (body.Length == 0)
+            {
+                continue;
+            }
+
+            if (heading is { Length: > 0 } section && !headingConsumed)
+            {
+                // 「### 小节标题 + 首句」合成一条要点。
+                // 正式版手写说明的主干全在散文里（RDP 解锁、UU 修复、授权统一都是这种），
+                // 只认列表项会让最重要的几条整段消失，只剩边角料。
+                if (AppendUnique(bullets, section + "：" + FirstSentence(body)))
+                {
+                    headingConsumed = true;
+                }
+
+                continue;
+            }
+
+            heading = null;
+            AppendUnique(prose, body);
         }
 
-        var result = bullets.Count > 0 ? bullets : prose;
-        return Fit(result, maxLines, maxChars);
+        // 长度上限放到最后统一处理：合并完整段才有上下文，
+        // 也才有机会在标点处断开而不是硬切。
+        for (var i = 0; i < bullets.Count; i++)
+        {
+            bullets[i] = TrimTo(bullets[i], MaxLineChars, preferBreak: true);
+        }
+
+        return Fit(bullets.Count > 0 ? bullets : prose, maxLines, maxChars);
     }
+
+    /// <summary>
+    /// 把 markdown 的软换行合并成逻辑行。
+    ///
+    /// <para>markdown 里「一句话」可以跨任意多行写，只有空行才分段。按物理行处理会有两个后果：
+    /// 句子被切在半句，以及「标题 + 其下第一句」只吃到第一行（v2.4.0 的说明就是这样，
+    /// 「…根因是本机 wtsapi32.dll」后面那半句直接被丢）。</para>
+    ///
+    /// <para>代码块内的行**不合并**（每行是独立的一条提交）；标题、表格、引用、
+    /// HTML、分隔线这类结构性行既不与上一行合并，也不让下一行并进来。</para>
+    /// </summary>
+    private static List<string> MergeContinuationLines(string markdown)
+    {
+        var output = new List<string>();
+        var inFence = false;
+
+        // 代码块整体只留第一个非空行 —— 见下面 inFence 分支的说明
+        var fenceHasLine = false;
+
+        foreach (var raw in markdown.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        {
+            var line = raw.Trim();
+
+            if (line.StartsWith("```", StringComparison.Ordinal) ||
+                line.StartsWith("~~~", StringComparison.Ordinal))
+            {
+                inFence = !inFence;
+                fenceHasLine = false;
+                output.Add(line);
+                continue;
+            }
+
+            if (inFence)
+            {
+                // CI 的「本次提交」代码块放的是**整条提交信息**（标题 + 空行 + 正文段落）。
+                // 逐行当成独立要点，通知里会出现六条半句碎片，全是同一条提交的正文；
+                // 只取标题那一行才是「这一版改了什么」。
+                if (line.Length > 0 && !fenceHasLine)
+                {
+                    output.Add(line);
+                    fenceHasLine = true;
+                }
+
+                continue;
+            }
+
+            if (line.Length == 0)
+            {
+                output.Add(string.Empty);
+                continue;
+            }
+
+            var indented = raw.Length > 0 && (raw[0] == ' ' || raw[0] == '\t');
+
+            // 标题 / 表格 / 引用 / HTML / 分隔线，以及**顶格写的列表项**：都自成一块。
+            // 列表项必须在这里拦下：`* fix: a` 下一行是 `* feat: b`，不拦会合并成一条。
+            if (IsStructuralLine(line) || (!indented && StripListMarker(line) is not null))
+            {
+                output.Add(line);
+                continue;
+            }
+
+            // 缩进的续行（markdown 里列表项的第二行必须缩进）与普通散文行接在上一块后面
+            if (output.Count > 0 && output[^1].Length > 0 && !IsStructuralLine(output[^1]))
+            {
+                output[^1] = Join(output[^1], line);
+                continue;
+            }
+
+            output.Add(line);
+        }
+
+        return output;
+    }
+
+    /// <summary>标题 / 表格 / 引用 / HTML / 分隔线：这些行自成一块，不与相邻行合并。</summary>
+    private static bool IsStructuralLine(string line) =>
+        line.Length > 0
+        && (line[0] is '#' or '|' or '>' or '<' or '=' || IsHorizontalRule(line));
 
     /// <summary>
     /// 造一条「发现新版本」通知的正文：版本对比 + 更新内容 + 下一步该做什么。
@@ -216,6 +371,64 @@ public static class UpdateNotes
         return CleanInline(line);
     }
 
+    /// <summary>
+    /// 读出 `###` 及更深的小节标题；`#` / `##` 与流程性标题（「怎么用」「本次提交」）返回 null。
+    /// </summary>
+    private static string? ReadSectionHeading(string line)
+    {
+        var level = 0;
+        while (level < line.Length && line[level] == '#')
+        {
+            level++;
+        }
+
+        if (level <= 2)
+        {
+            return null;
+        }
+
+        var text = CleanInline(line[level..].Trim());
+        if (text.Length == 0 || IsFlowHeading(text))
+        {
+            return null;
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// 流程性小节标题：它们是「怎么装、怎么下、本次提交了什么」这类说明，
+    /// 不是「这一版改了什么」。当作要点会让通知里出现「怎么用：两种下载方式，任选其一：」这种废话。
+    /// </summary>
+    private static bool IsFlowHeading(string text)
+    {
+        foreach (var word in FlowHeadingWords)
+        {
+            if (text.Contains(word, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>取一句话（到第一个句末标点）。整段塞进一条要点会立刻超长。</summary>
+    private static string FirstSentence(string text)
+    {
+        var end = -1;
+        foreach (var mark in SentenceMarks)
+        {
+            var index = text.IndexOf(mark);
+            if (index >= 0 && (end < 0 || index < end))
+            {
+                end = index;
+            }
+        }
+
+        return end >= 0 ? text[..(end + 1)] : text;
+    }
+
     /// <summary>剥掉 markdown 的内联排版残留。</summary>
     private static string CleanInline(string line)
     {
@@ -239,7 +452,10 @@ public static class UpdateNotes
         }
 
         text = Whitespace.Replace(text, " ").Trim();
-        return TrimTo(text, MaxLineChars);
+
+        // 这里**不截断**：列表项跨行写的时候，续行要接到完整句子上才截，
+        // 提前切会让「合并续行」拿到的已经是半句（v2.4.0 说明就栽在这）。
+        return text;
     }
 
     /// <summary>是不是列表项；是则返回去掉标记后的内容。</summary>
@@ -289,23 +505,54 @@ public static class UpdateNotes
         return true;
     }
 
-    private static void Append(List<string> list, string text)
+    /// <summary>
+    /// 接续一行文字。中文之间**不加空格** —— markdown 的软换行是排版，不是词间隔；
+    /// 补一个空格会变成「减少远控软件 进到其他账户桌面」这种夹生句。
+    /// </summary>
+    private static string Join(string head, string tail)
+    {
+        if (head.Length == 0)
+        {
+            return tail;
+        }
+
+        if (tail.Length == 0)
+        {
+            return head;
+        }
+
+        return IsWideChar(head[^1]) || IsWideChar(tail[0])
+            ? head + tail
+            : head + " " + tail;
+    }
+
+    /// <summary>CJK 汉字、中文标点、全角字符（这些字符之间按中文习惯不空格）。</summary>
+    private static bool IsWideChar(char c) =>
+        c is >= '\u4E00' and <= '\u9FFF'
+            or >= '\u3000' and <= '\u303F'
+            or >= '\uFF00' and <= '\uFFEF';
+
+    /// <summary>
+    /// 去重追加，返回是否真的加进去了。
+    /// 同一句重复出现（有人把同一条列两遍）只留一次。
+    /// </summary>
+    private static bool AppendUnique(List<string> list, string text)
     {
         if (text.Length == 0)
         {
-            return;
+            return false;
         }
 
-        // 同一句重复出现（有人把同一条列两遍）只留一次
         foreach (var existing in list)
         {
             if (string.Equals(existing, text, StringComparison.Ordinal))
             {
-                return;
+                return false;
             }
         }
 
         list.Add(text);
+        return true;
     }
 
     /// <summary>按条数上限与总字符预算收敛。</summary>
@@ -321,8 +568,14 @@ public static class UpdateNotes
                 break;
             }
 
+            // 预算见底时宁可少一条，也不要留半截残句（残句既不说明问题，还占掉一条的位置）
+            if (result.Count > 0 && budget < MinLineChars)
+            {
+                break;
+            }
+
             // 还剩预算就按剩余长度截断，别整条丢掉 —— 半句也比一片空白有用
-            var text = line.Length <= budget ? line : TrimTo(line, budget);
+            var text = line.Length <= budget ? line : TrimTo(line, budget, preferBreak: true);
             if (text.Length == 0)
             {
                 break;
@@ -340,13 +593,47 @@ public static class UpdateNotes
         return result;
     }
 
-    private static string TrimTo(string text, int max)
+    /// <summary>
+    /// 截到 <paramref name="max"/> 字符以内。
+    /// </summary>
+    /// <param name="preferBreak">
+    /// 是否尽量断在标点上。中文句子硬切会切在词中间（「…减少远控软件」）；
+    /// 断在逗号后要补省略号（话没说完），断在句号后不补（本来就是完整一句）。
+    /// </param>
+    private static string TrimTo(string text, int max, bool preferBreak = false)
     {
         if (max <= 0)
         {
             return string.Empty;
         }
 
-        return text.Length <= max ? text : text[..Math.Max(0, max - 1)] + "…";
+        if (text.Length <= max)
+        {
+            return text;
+        }
+
+        var cut = max - 1;
+
+        if (preferBreak)
+        {
+            // 断得太早（不到三分之一处就找到标点）比硬切更难看，宁可继续往下找
+            var floor = max / 3;
+
+            // ① 句末标点：本身就是一句话的终点，不必再补省略号
+            var end = text.LastIndexOfAny(SentenceMarks, cut);
+            if (end >= floor)
+            {
+                return text[..(end + 1)];
+            }
+
+            // ② 句中停顿：断在这里补省略号，读者才知道后面还有
+            var pause = text.LastIndexOfAny(PauseMarks, cut);
+            if (pause >= floor)
+            {
+                return text[..(pause + 1)] + "…";
+            }
+        }
+
+        return text[..cut] + "…";
     }
 }
