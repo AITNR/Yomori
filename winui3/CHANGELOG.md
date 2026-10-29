@@ -46,6 +46,15 @@ Python / PySide6 版（v1.0 RC1，legacy）的变更记录见仓库根的 [CHANG
 
 ### Fixed
 
+- **面板里混进英文节点名**（`Stack.AutoCollectRouteValleyWukinddoTask1Assertion1` 这种）。
+  节点名的中文来源一直没接上：MaaFramework 的 pipeline 节点名本身是英文
+  （`AncientTreeQuickTeleport`），中文只在节点的 `desc` 字段里（「在古树任务地图中点击传送」），
+  实测 MaaEnd 6,561 个节点里 5,776 个有 `desc`。现在 `LogLabelStore` 会连同
+  `resource/pipeline/*.json` 一起读（路径取 `interface.json` 的 `resource[].path`，
+  多个 resource 只读第一个），面板显示 `desc`，节点档仍记原名。
+  名字既无 `desc` 又无中文的（agent 动态注册的节点）**不上面板**——它占一整行只会把中文提示挤走；
+  但节点失败仍会显示（查不到中文就退回原名，失败是少数且必须可见，同一节点 2 秒内去重）。
+  真实源文件窗口实测 24,143 行 → **16 行，全部中文**。
 - **外部日志「面板档」上线后没生效，面板照旧刷英文原始行**：投影器要求每行以 Yomori 归档前缀
   `[13:03:56] [警告] [2026-10-29 …]` 开头，而实时采集读到的是源文件原样
   `[2026-10-29 18:31:45.556][DBG][Px…][Logger] …`（没有前缀），于是一行都没被认出来。

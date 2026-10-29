@@ -280,7 +280,9 @@ public sealed class ExternalLogProjector
     private string _printedNode = string.Empty;
     private string _lastInternal = string.Empty;
     private string _lastNotice = string.Empty;
+    private string _lastFailNode = string.Empty;
     private long _lastNodeAtMs = long.MinValue / 2;
+    private long _lastFailAtMs = long.MinValue / 2;
     private long _lastOutMs = long.MinValue / 2;
     private long _lastOwnLineMs = -1;
     private long _runStartedAtMs;
@@ -333,7 +335,9 @@ public sealed class ExternalLogProjector
         _printedNode = string.Empty;
         _lastInternal = string.Empty;
         _lastNotice = string.Empty;
+        _lastFailNode = string.Empty;
         _lastNodeAtMs = long.MinValue / 2;
+        _lastFailAtMs = long.MinValue / 2;
         _lastOutMs = long.MinValue / 2;
         _lastOwnLineMs = -1;
         _runStartedAtMs = 0;
@@ -502,6 +506,7 @@ public sealed class ExternalLogProjector
             _hasFocus = false;
             _lastNotice = string.Empty;
             _printedNode = string.Empty;
+            _lastFailNode = string.Empty;
             if (_openTasks.Count == 0) { _lastNode = string.Empty; }
 
             Touch(nowMs);
@@ -536,6 +541,7 @@ public sealed class ExternalLogProjector
             NodeCount++;
             _lastNode = name;
 
+            // 节点档永远记原名（排障要能对上 pipeline 里的 key）。
             var nodeText = $"  ▸ {name}";
             if (_hasFocus || ExternalLogGrammar.WaitLike.IsMatch(name) || name.StartsWith("__", StringComparison.Ordinal))
             {
@@ -550,10 +556,19 @@ public sealed class ExternalLogProjector
                 return ExternalLogProjection.New(string.Empty, nodeText, ExternalLogKind.Node);
             }
 
+            // 面板只显示"人话"节点名：有中文 desc 用 desc，名字本身是中文就直接用。
+            // 两者都不满足的（`Stack.AutoCollectRouteValleyWukinddoTask1Assertion1` 这类
+            // 动态注册节点）不上屏 —— 它占一整行只会把真正的中文提示挤掉。
+            var display = NodeDisplay(name);
+            if (display.Length == 0)
+            {
+                return ExternalLogProjection.New(string.Empty, nodeText, ExternalLogKind.Node);
+            }
+
             _printedNode = name;
             _lastNodeAtMs = nowMs;
             Touch(nowMs);
-            return ExternalLogProjection.New($"▸ {name}", nodeText, ExternalLogKind.Node);
+            return ExternalLogProjection.New($"▸ {display}", nodeText, ExternalLogKind.Node);
         }
 
         if (eventName == "Node.PipelineNode.Failed")
@@ -561,8 +576,21 @@ public sealed class ExternalLogProjector
             var name = details.Node;
             if (name.Length == 0) { name = _lastNode; }
             if (name.Length == 0) { return ExternalLogProjection.Drop; }
+
+            // 失败是少数且必须可见：查不到中文就退回原名，绝不因为"不好读"就丢掉。
+            // 同一节点失败常被两个线程各打一遍，2 秒内同名字只出一次。
+            if (string.Equals(name, _lastFailNode, StringComparison.Ordinal) && nowMs - _lastFailAtMs < 2_000)
+            {
+                return ExternalLogProjection.Drop;
+            }
+
+            _lastFailNode = name;
+            _lastFailAtMs = nowMs;
+            var display = NodeDisplay(name);
+            if (display.Length == 0) { display = name; }
+
             Touch(nowMs);
-            return ExternalLogProjection.New($"✗ 节点失败：{name}", $"  ✗ {name} 失败", ExternalLogKind.NodeFail);
+            return ExternalLogProjection.New($"✗ 节点失败：{display}", $"  ✗ {name} 失败", ExternalLogKind.NodeFail);
         }
 
         // 识别失败 / 动作 / 下一节点列表：计数即可，逐条上屏没有信息量
@@ -661,13 +689,29 @@ public sealed class ExternalLogProjector
         if (nowMs - _lastOutMs < limit || _heartbeats >= MaxHeartbeats) { return null; }
 
         _heartbeats++;
-        var tail = _lastNode.Length > 0 ? $"，最近：{_lastNode}" : string.Empty;
+        var lastDisplay = NodeDisplay(_lastNode);
+        var tail = lastDisplay.Length > 0 ? $"，最近：{lastDisplay}" : string.Empty;
         var text = $"⋯ 进行中（本次运行已 {Duration(age)}{tail}）";
         Touch(nowMs);
         return ExternalLogProjection.New(text, text, ExternalLogKind.Heartbeat);
     }
 
     private void Touch(long nowMs) => _lastOutMs = nowMs;
+
+    /// <summary>
+    /// 节点名的“面板显示形态”：有中文 `desc` 用 `desc`，名字本身是中文用它自己，
+    /// 两者都不满足返回空串（调用方据此决定不上屏）。
+    ///
+    /// <para>为什么必须拦：MaaEnd 那类项目节点名是英文（`AncientTreeQuickTeleport`），
+    /// agent 动态注册的更是 `Stack.AutoCollectRouteValleyWukinddoTask1Assertion1` 这种长 ID。
+    /// 面板上每一行都是这种名字，等于把“在干什么”重新变回“一堆代码”。</para>
+    /// </summary>
+    private string NodeDisplay(string name)
+    {
+        var desc = _labels.ResolveNode(name);
+        if (desc.Length > 0) { return desc; }
+        return _labels.IsNodeReadable(name) ? name : string.Empty;
+    }
 
     private static string Shorten(string body)
     {

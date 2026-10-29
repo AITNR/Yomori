@@ -102,7 +102,8 @@ public static class LogLabelStore
 
         return $"{Stamp(Path.Combine(directory, "interface.json"))}|" +
                $"{Stamp(Path.Combine(directory, "tasks"))}|" +
-               $"{Stamp(Path.Combine(directory, "locales"))}";
+               $"{Stamp(Path.Combine(directory, "locales"))}|" +
+               $"{Stamp(Path.Combine(directory, "resource", "pipeline"))}";
     }
 
     private static LogLabelMap Load(string directory)
@@ -147,7 +148,17 @@ public static class LogLabelStore
                 if (text is not null) { localeTexts.Add(text); }
             }
 
-            return LogLabelMap.Build(interfaceText, taskTexts, localeTexts);
+            // pipeline：节点名的唯一中文来源。MaaEnd 的 nodes.json 单个 4.3 MB，
+            // 所以在 tasks 之后读，超预算就停（任务名比节点名更关键）。
+            var pipelineTexts = new List<string>();
+            foreach (var full in EnumeratePipelines(directory, interfaceText))
+            {
+                if (watch.ElapsedMilliseconds > MaxElapsedMs || bytes > MaxTotalBytes) { break; }
+                var text = ReadText(full, ref bytes, watch);
+                if (text is not null) { pipelineTexts.Add(text); }
+            }
+
+            return LogLabelMap.Build(interfaceText, taskTexts, localeTexts, pipelineTexts);
         }
         catch (Exception)
         {
@@ -171,6 +182,102 @@ public static class LogLabelStore
             if (item.ValueKind != JsonValueKind.String) { continue; }
             var value = (item.GetString() ?? string.Empty).Trim();
             if (value.Length > 0) { yield return value; }
+        }
+    }
+
+    /// <summary>
+    /// 找出 pipeline 目录下的 json 文件。
+    ///
+    /// <para>路径优先取 `interface.json` 的 `resource[].path`（可能是字符串或数组），
+    /// 取不到再试 `<项目>/resource/pipeline`、`<项目>/pipeline`。
+    /// **只取第一个 resource**：MaaEnd 有 resource / resource_adb / resource_linux 等 7 套，
+    /// 内容相同，全读一次就是 30 MB。</para>
+    /// </summary>
+    private static IEnumerable<string> EnumeratePipelines(string directory, string interfaceText)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in ResourceRoots(directory, interfaceText))
+        {
+            var pipeline = Path.Combine(root, "pipeline");
+            if (!Directory.Exists(pipeline)) { continue; }
+            if (!seen.Add(pipeline)) { continue; }
+
+            string[] files;
+            try
+            {
+                files = Directory.GetFiles(pipeline, "*.json", SearchOption.TopDirectoryOnly);
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+            foreach (var file in files) { yield return file; }
+            yield break;      // 第一个存在的 resource 就是它，别把 7 套副本全读一遍
+        }
+    }
+
+    private static IEnumerable<string> ResourceRoots(string directory, string interfaceText)
+    {
+        using var doc = LenientJson.Parse(interfaceText);
+        if (doc is not null && doc.RootElement.ValueKind == JsonValueKind.Object &&
+            doc.RootElement.TryGetProperty("resource", out var resources) &&
+            resources.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var resource in resources.EnumerateArray())
+            {
+                if (resource.ValueKind != JsonValueKind.Object) { continue; }
+                if (!resource.TryGetProperty("path", out var paths)) { continue; }
+                foreach (var relative in Flatten(paths))
+                {
+                    var full = FullPath(directory, relative);
+                    if (full.Length > 0) { yield return full; }
+                }
+            }
+        }
+
+        yield return Path.Combine(directory, "resource");
+        yield return directory;
+    }
+
+    /// <summary>`"path": "./resource"` 与 `"path": ["./resource", "./x"]` 两种写法都认。</summary>
+    private static IEnumerable<string> Flatten(JsonElement paths)
+    {
+        if (paths.ValueKind == JsonValueKind.String)
+        {
+            var single = (paths.GetString() ?? string.Empty).Trim();
+            if (single.Length > 0) { yield return single; }
+            yield break;
+        }
+
+        if (paths.ValueKind != JsonValueKind.Array) { yield break; }
+        foreach (var item in paths.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String) { continue; }
+            var value = (item.GetString() ?? string.Empty).Trim();
+            if (value.Length > 0) { yield return value; }
+        }
+    }
+
+    private static string FullPath(string baseDirectory, string relative)
+    {
+        try
+        {
+            var trimmed = relative.Replace('/', Path.DirectorySeparatorChar).TrimStart('.', '\\', '/');
+            var full = Path.GetFullPath(Path.Combine(baseDirectory, trimmed));
+
+            // 不允许跑到项目目录外面去（项目文件里写 `../..` 的情况不是没有）
+            if (!full.StartsWith(Path.GetFullPath(baseDirectory), StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Empty;
+            }
+
+            return Directory.Exists(full) ? full : string.Empty;
+        }
+        catch (Exception)
+        {
+            return string.Empty;
         }
     }
 

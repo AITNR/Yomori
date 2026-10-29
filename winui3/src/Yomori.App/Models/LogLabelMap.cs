@@ -20,14 +20,24 @@ namespace Yomori.Models;
 public sealed class LogLabelMap
 {
     /// <summary>空表：读不到项目资源时的兜底，`Resolve` 原样返回 entry。</summary>
-    public static readonly LogLabelMap Empty = new(new Dictionary<string, string>(StringComparer.Ordinal));
+    public static readonly LogLabelMap Empty = new(
+        new Dictionary<string, string>(StringComparer.Ordinal),
+        new Dictionary<string, string>(StringComparer.Ordinal));
 
     private readonly Dictionary<string, string> _labels;
+    private readonly Dictionary<string, string> _nodes;
 
-    private LogLabelMap(Dictionary<string, string> labels) => _labels = labels;
+    private LogLabelMap(Dictionary<string, string> labels, Dictionary<string, string> nodes)
+    {
+        _labels = labels;
+        _nodes = nodes;
+    }
 
     /// <summary>条目数（0 表示这份项目没有可用的 label）。</summary>
     public int Count => _labels.Count;
+
+    /// <summary>带中文描述的节点数（`resource/pipeline` 里的 `desc`）。</summary>
+    public int NodeCount => _nodes.Count;
 
     /// <summary>按 entry 取中文名；取不到就原样返回 entry（fail-open，绝不返回空串丢信息）。</summary>
     public string Resolve(string? entry)
@@ -38,15 +48,60 @@ public sealed class LogLabelMap
     }
 
     /// <summary>
+    /// 按 pipeline 节点名取中文描述；**查不到返回空串**（与 <see cref="Resolve"/> 的 fail-open 相反）。
+    ///
+    /// <para>为什么这里不能 fail-open：调用方要靠“空 / 非空”判断这个节点名到底能不能读，
+    /// 好决定要不要上面板。原样返回名字就等于宣告“可读”，英文字符串又会被当成可读内容刷屏。</para>
+    /// </summary>
+    public string ResolveNode(string? name)
+    {
+        var key = (name ?? string.Empty).Trim();
+        if (key.Length == 0) { return string.Empty; }
+        return _nodes.TryGetValue(key, out var desc) ? desc : string.Empty;
+    }
+
+    /// <summary>
+    /// 这个节点名在面板上是否值得显示：有中文描述，或名字本身含中文（4.x 项目常见）。
+    ///
+    /// <para>反例（实测 MaaEnd）：`Stack.AutoCollectRouteValleyWukinddoTask1Assertion1` ——
+    /// 动态注册的节点，`pipeline/nodes.json` 里没有它，也没有任何中文来源。
+    /// 这种名字占一整行只会把真正的中文提示挤走。</para>
+    /// </summary>
+    public bool IsNodeReadable(string? name)
+    {
+        var key = (name ?? string.Empty).Trim();
+        if (key.Length == 0) { return false; }
+        if (_nodes.ContainsKey(key)) { return true; }
+        return ContainsCjk(key);
+    }
+
+    /// <summary>是否含中日韩统一表意文字（用来看“这个名字本身是不是人话”）。</summary>
+    internal static bool ContainsCjk(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (ch >= '\u4e00' && ch <= '\u9fff') { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// 用项目的三份资源建表。任何一份解析失败都只跳过它，不影响其余文件。
     /// </summary>
     /// <param name="interfaceJson">`interface.json` 原文。</param>
     /// <param name="taskJsonTexts">`import[]` 指向的 `tasks/*.json` 原文。</param>
     /// <param name="localeTexts">`locales/**/zh_cn.json` 原文（可多份，后读的覆盖先读的）。</param>
+    /// <param name="pipelineJsonTexts">
+    /// `resource/pipeline/*.json` 原文。节点名本身是英文（`AncientTreeQuickTeleport`），
+    /// 但 MaaFramework 的 pipeline 节点普遍带中文 `desc`（「在古树任务地图中点击传送」），
+    /// 这是面板上唯一可用的节点中文来源 —— 实测 MaaEnd 6,561 个节点里 5,776 个有 `desc`。
+    /// </param>
     public static LogLabelMap Build(
         string? interfaceJson,
         IEnumerable<string>? taskJsonTexts,
-        IEnumerable<string>? localeTexts)
+        IEnumerable<string>? localeTexts,
+        IEnumerable<string>? pipelineJsonTexts = null)
     {
         var labels = new Dictionary<string, string>(StringComparer.Ordinal);
         var locale = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -122,7 +177,28 @@ public sealed class LogLabelMap
             }
         }
 
-        return labels.Count == 0 ? Empty : new LogLabelMap(labels);
+        var nodes = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (pipelineJsonTexts is not null)
+        {
+            foreach (var text in pipelineJsonTexts)
+            {
+                using var doc = LenientJson.Parse(text);
+                if (doc is null || doc.RootElement.ValueKind != JsonValueKind.Object) { continue; }
+
+                // pipeline 文件的顶层就是 `{ "节点名": {…} }`，没有外层容器。
+                foreach (var node in doc.RootElement.EnumerateObject())
+                {
+                    if (node.Value.ValueKind != JsonValueKind.Object) { continue; }
+                    var desc = ResolveKey(Str(node.Value, "desc"), locale);
+                    if (desc.Length == 0 || desc == node.Name) { continue; }
+                    nodes[node.Name] = LogTextSanitizer.Clean(desc, Empty).Trim();
+                }
+            }
+        }
+
+        return labels.Count == 0 && nodes.Count == 0
+            ? Empty
+            : new LogLabelMap(labels, nodes);
     }
 
     /// <summary>`"$task.X.label"` → 查词条；查不到返回去掉 `$` 的键名（可读、可定位）。</summary>

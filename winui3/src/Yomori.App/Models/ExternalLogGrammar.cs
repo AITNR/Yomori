@@ -148,6 +148,9 @@ public static class ExternalLogGrammar
     {
         "PipelineTask.cpp", "TaskBase.cpp", "Context.cpp", "PipelineBase.cpp",
         "MaaTasker.cpp", "Tasker.cpp",
+        // 识别/动作层的自检：`failed to get target rect for wait_freezes` 之类。
+        // 它意味着"这一次没认出来"，而项目本身会继续重试 —— 上屏只会把中文提示挤走。
+        "ActionHelper.cpp", "ControllerAgent.cpp", "Recognizer.cpp",
     };
 
     /// <summary>

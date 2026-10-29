@@ -574,6 +574,22 @@ const string TaskJsonWithComments = """
 
 const string LocaleJson = """{ "task.VisitFriends.label": "🤝拜访好友" }""";
 
+/// <summary>
+/// `resource/pipeline/*.json`：节点名是英文，中文只在 `desc` 里。
+/// 实测 MaaEnd 6,561 个节点里 5,776 个带 `desc`，这是面板上唯一的节点中文来源。
+/// </summary>
+const string PipelineJson = """
+{
+  "VisitFriendsMenuAssistControlNexus": { "desc": "点开好友菜单", "next": [] },
+  "SceneEnterMenuFriendsList": { "desc": "进入好友列表", "next": [] },
+  "AncientTreeQuickTeleport": { "desc": "在古树任务地图中点击传送", "next": [] },
+  "NoDescNode": { "action": "Click", "next": [] }
+}
+""";
+
+/// <summary>agent 动态注册的节点：pipeline 里没有、名字无中文 —— 面板上不该出现。</summary>
+const string DynamicNodeName = "Stack.AutoCollectRouteValleyWukinddoTask1Assertion1";
+
 const string TaskStartLine =
     "[13:17:13] [2026-10-29 13:17:13.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
     "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Tasker.Task.Starting] " +
@@ -642,11 +658,17 @@ static void Same(string message, object? expected, object? actual)
 void TestExternalLogProjector()
 {
     // ---- 1. 项目资源：注释 / 尾逗号 / i18n 键
-    var labels = LogLabelMap.Build(InterfaceJson, new[] { TaskJsonWithComments }, new[] { LocaleJson });
+    var labels = LogLabelMap.Build(InterfaceJson, new[] { TaskJsonWithComments }, new[] { LocaleJson },
+        new[] { PipelineJson });
     Same("label：i18n 键被解析成中文", "🤝拜访好友", labels.Resolve("VisitFriendsMain"));
     Same("label：无 label 时用 name", "GameLauncherWakeMain", labels.Resolve("GameLauncherWakeMain"));
     Same("label：查不到就原样返回 entry", "UnknownEntry", labels.Resolve("UnknownEntry"));
     Same("label：注释与尾逗号不影响解析", 2, labels.Count);
+    Same("node：desc 当中文名", "点开好友菜单", labels.ResolveNode("VisitFriendsMenuAssistControlNexus"));
+    Same("node：无 desc 返回空串（不能 fail-open）", "", labels.ResolveNode("NoDescNode"));
+    Same("node：可读 = 有 desc", true, labels.IsNodeReadable("VisitFriendsMenuAssistControlNexus"));
+    Same("node：无 desc 的英文名不可读", false, labels.IsNodeReadable("NoDescNode"));
+    Same("node：中文名本身就可读", true, labels.IsNodeReadable("舰团每日委托-可以做委托"));
 
     // ---- 2. 任务边界
     var projector = new ExternalLogProjector(labels, maafw: true);
@@ -705,11 +727,12 @@ void TestExternalLogProjector()
     Assert(shell.Emit, "外壳告警：应保留");
     Same("外壳告警：去掉前缀", "未找到语言 zh_cn 的翻译文件配置", shell.PanelText);
 
-    // ---- 9. 没有任何 focus 的任务里，节点名按 30 秒节流上屏
+    // ---- 9. 没有任何 focus 的任务里，节点按 30 秒节流上屏，且只显示中文 desc
     var flat = new ExternalLogProjector(labels, maafw: true);
     flat.Project(TaskStartLine, now);
     var firstNode = flat.Project(NodeLine, now + 1000);
-    Same("节点（无 focus）：面板显示节点名", "▸ VisitFriendsMenuAssistControlNexus", firstNode.PanelText);
+    Same("节点（无 focus）：面板显示 desc 而不是英文节点名", "▸ 点开好友菜单", firstNode.PanelText);
+    Same("节点（无 focus）：节点档仍是原名", "  ▸ VisitFriendsMenuAssistControlNexus", firstNode.NodeText);
     var nextNode =
         "[13:18:40] [2026-10-29 13:18:40.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
         "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Starting] " +
@@ -718,7 +741,35 @@ void TestExternalLogProjector()
     Same("节点（无 focus）：30 秒内的第二个节点不再上屏", "", throttled.PanelText);
     Assert(throttled.Emit, "节点（无 focus）：节流只影响面板档，节点档仍保留");
     var reopened = flat.Project(nextNode, now + 40_000);
-    Same("节点（无 focus）：过了节流窗口再出一行", "▸ SceneEnterMenuFriendsList", reopened.PanelText);
+    Same("节点（无 focus）：过了节流窗口再出一行", "▸ 进入好友列表", reopened.PanelText);
+
+    // ---- 9b. 无 desc 的英文节点名（agent 动态注册）不进面板 —— 面板不能又变回一堆代码
+    var dynamicNode =
+        "[13:18:45] [2026-10-29 13:18:45.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Starting] " +
+        "[details={\"focus\":null,\"name\":\"" + DynamicNodeName + "\"}]";
+    var dynamicProjection = flat.Project(dynamicNode, now + 90_000);
+    Same("动态节点（无 desc）：面板不显示", "", dynamicProjection.PanelText);
+    Assert(dynamicProjection.Emit, "动态节点（无 desc）：节点档仍保留");
+    Same("动态节点（无 desc）：节点档是原名", "  ▸ " + DynamicNodeName, dynamicProjection.NodeText);
+
+    // ---- 9c. 节点失败：用 desc，且同一节点 2 秒内只出一次（双线程各打一遍）
+    var nodeFailLine =
+        "[13:18:50] [2026-10-29 13:18:50.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Failed] " +
+        "[details={\"focus\":null,\"name\":\"VisitFriendsMenuAssistControlNexus\"}]";
+    var failedNode = flat.Project(nodeFailLine, now + 100_000);
+    Same("节点失败：用 desc", "✗ 节点失败：点开好友菜单", failedNode.PanelText);
+    Same("节点失败：类型", ExternalLogKind.NodeFail, failedNode.Kind);
+    Assert(!flat.Project(nodeFailLine, now + 100_500).Emit, "节点失败：同一节点 2 秒内的重复应丢弃");
+
+    // 无 desc 的失败节点必须可见（失败是少数，宁可英文也不能丢）
+    var failNoDesc =
+        "[13:18:55] [2026-10-29 13:18:55.190][INF][Px82844][Tx54350][Utils/EventDispatcher.hpp][L65]" +
+        "[MaaNS::EventDispatcher::notify] !!!OnEventNotify!!! [handle=true] [msg=Node.PipelineNode.Failed] " +
+        "[details={\"focus\":null,\"name\":\"NoDescNode\"}]";
+    Same("节点失败（无 desc）：退回原名而不是丢掉", "✗ 节点失败：NoDescNode",
+        flat.Project(failNoDesc, now + 110_000).PanelText);
 
     // ---- 10. 内部节点（`__` 开头）不进面板
     var internalNode =
