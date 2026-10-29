@@ -49,6 +49,12 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     private List<string> _externalLogKeywords = new();
 
     private bool _externalLogFollowTail = ExternalLogDefaults.FollowTail;
+    private bool _externalLogRecursive;
+
+    // 日志推荐值的来源标记（与 launch_preset_* 同源：只用于展示与追溯，不参与执行）
+    private string _externalLogPresetId = string.Empty;
+    private int _externalLogRev;
+    private bool _externalLogTouched;
 
     [JsonPropertyName("enabled")]
     public bool Enabled
@@ -297,8 +303,54 @@ public sealed class TaskConfig : ObservableObject, ICloneable
         set => SetProperty(ref _externalLogFollowTail, value);
     }
 
-    /// <summary>关键字的文本形态（分号分隔），专供 UI 两向绑定。</summary>
-    [JsonIgnore]
+    /// <summary>
+    /// 目录模式下是否递归子目录。
+    ///
+    /// <para>只为"每次运行建一个子目录"的项目准备：LALC 的 <c>logs\&lt;run_id&gt;\run.log</c>、
+    /// ok-Onmyoji 多开时的 <c>logs\&lt;实例id&gt;\</c>。默认关闭 —— 打开会扫更多文件，
+    /// 采集端有深度 3 / 500 个文件两道闸。</para>
+    /// </summary>
+    [JsonPropertyName("external_log_recursive")]
+    public bool ExternalLogRecursive
+    {
+        get => _externalLogRecursive;
+        set => SetProperty(ref _externalLogRecursive, value);
+    }
+
+    /// <summary>
+    /// 这条日志配置是从哪条预设填的：<c>m7a</c> / <c>mfaa</c> / <c>entry:auto-mas.exe</c>。
+    /// 空串 = 手工填写。**不参与执行**，只用于界面显示来源、以及将来做「预设已更新」提示。
+    /// </summary>
+    [JsonPropertyName("external_log_preset_id")]
+    public string ExternalLogPresetId
+    {
+        get => _externalLogPresetId;
+        set => SetProperty(ref _externalLogPresetId, (value ?? string.Empty).Trim());
+    }
+
+    /// <summary>写入时的预设库版本。</summary>
+    [JsonPropertyName("external_log_rev")]
+    public int ExternalLogRev
+    {
+        get => _externalLogRev;
+        set => SetProperty(ref _externalLogRev, value);
+    }
+
+    /// <summary>
+    /// 用户手改过任一日志字段。
+    ///
+    /// <para>置位后预设不再覆盖任何字段 —— 与启动参数的「只在空值时预填」是同一条纪律，
+    /// 只是这里更严格：日志路径一旦被手工指到别处（比如多开要跟另一个实例），
+    /// 任何自动重算都不该把它改回去。还原推荐值时由界面显式清掉。</para>
+    /// </summary>
+    [JsonPropertyName("external_log_touched")]
+    public bool ExternalLogTouched
+    {
+        get => _externalLogTouched;
+        set => SetProperty(ref _externalLogTouched, value);
+    }
+
+    /// <summary>关键字的文本形态（分号分隔），专供 UI 两向绑定。</summary>    [JsonIgnore]
     public string ExternalLogKeywordsText
     {
         get => KeywordHelper.ToText(_externalLogKeywords);
@@ -410,6 +462,8 @@ public sealed class TaskConfig : ObservableObject, ICloneable
         ExternalLogPattern = ExternalLogDefaults.NormalizePattern(ExternalLogPattern);
         ExternalLogEncoding = ExternalLogEncodings.Normalize(ExternalLogEncoding);
         ExternalLogKeywords = KeywordHelper.Normalize(ExternalLogKeywords);
+        ExternalLogPresetId = (ExternalLogPresetId ?? string.Empty).Trim();
+        ExternalLogRev = Math.Max(0, ExternalLogRev);
 
     }
 }

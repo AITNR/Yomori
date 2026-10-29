@@ -21,6 +21,16 @@ public sealed class ExternalLogTail : IDisposable
         public byte[] Anchor = Array.Empty<byte>();
         public readonly List<byte> Pending = new();
         public readonly List<byte> DiscardProbe = new();
+
+        /// <summary>
+        /// 用 <c>\r</c> 刷新同一行的进度条内容（<c>10%\r20%\r…</c>）。
+        ///
+        /// <para>为什么不直接当普通行发出去：pip / uv / 解压器每几百毫秒刷一次，
+        /// 一次下载就是上千行；面板只有 200 行、归档又会全留（Unknown 级别不丢）。
+        /// 这里只保留**最后一段**，遇到换行或收尾时才输出一次，语义与终端里看到的一致。</para>
+        /// </summary>
+        public readonly List<byte> Progress = new();
+
         public Encoding? BomEncoding;
         public bool HeaderChecked;
         public bool DiscardingOversizeLine;
@@ -28,26 +38,40 @@ public sealed class ExternalLogTail : IDisposable
 
     private readonly object _sync = new();
     private readonly string _rootPath;
-    private readonly string _pattern;
+    private readonly List<string> _patterns;
+    private readonly bool _recursive;
     private readonly string _encodingMode;
     private readonly Dictionary<string, Cursor> _files = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
     private const int MaxReadBytesPerPoll = 256 * 1024;
     private const int MaxOutputLinesPerPoll = 200;
     private const int MaxPendingBytes = 64 * 1024;
+
+    /// <summary>递归时最多进几层子目录（LALC 的 logs/&lt;run_id&gt;/ 只有一层）。</summary>
+    private const int MaxRecursiveDepth = 3;
+
+    /// <summary>递归时最多收多少个匹配文件；超了只留前 N 个并在诊断里说明。</summary>
+    private const int MaxRecursiveFiles = 500;
+
     private string? _currentFile;
     private string _lastError = string.Empty;
+    private string _note = string.Empty;
     private bool _disposed;
 
     static ExternalLogTail() => Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
+    /// <param name="recursive">
+    /// 目录模式是否递归子目录。默认 false —— 只在预设明确要求时打开（LALC 每次运行一个
+    /// <c>logs\&lt;run_id&gt;\</c>、ok-Onmyoji 多开按实例分目录）。打开时受深度与文件数两道闸限制。
+    /// </param>
     public ExternalLogTail(string path, string? pattern, string? encodingName, bool followTail,
-        string? baseDirectory = null)
+        string? baseDirectory = null, bool recursive = false)
     {
         var expanded = Environment.ExpandEnvironmentVariables((path ?? string.Empty).Trim());
         _rootPath = expanded.Length == 0 ? string.Empty : Path.GetFullPath(expanded,
             Path.GetFullPath(baseDirectory ?? Environment.CurrentDirectory));
-        _pattern = ExternalLogDefaults.NormalizePattern(pattern);
+        _patterns = ParsePatterns(pattern);
+        _recursive = recursive;
         _encodingMode = ExternalLogEncodings.Normalize(encodingName);
         try
         {
@@ -66,7 +90,8 @@ public sealed class ExternalLogTail : IDisposable
 
     public string? CurrentFile { get { lock (_sync) { return _currentFile; } } }
     /// <summary>最近一次诊断；成功读取后清空。由 worker 在变化/恢复时报告。</summary>
-    public string LastError { get { lock (_sync) { return _lastError; } } }
+    /// <summary>最近一次诊断。读取成功后清空；构造期的提示（<see cref="_note"/>）常驻。</summary>
+    public string LastError { get { lock (_sync) { return _lastError.Length > 0 ? _lastError : _note; } } }
 
     /// <summary>是否仍有已缓存或尚未读取的日志字节；用于有界的收尾 drain 循环。</summary>
     public bool HasUnreadData
@@ -130,7 +155,7 @@ public sealed class ExternalLogTail : IDisposable
                     // 清理其 Pending，防止 final drain 因 HasUnreadData 重复空转。
                     _files.Clear();
 
-                    _lastError = $"等待日志文件：{_rootPath}（匹配 {_pattern}）";
+                    _lastError = $"等待日志文件：{_rootPath}（匹配 {string.Join(";", _patterns)}）";
                 }
                 else
                 {
@@ -174,9 +199,91 @@ public sealed class ExternalLogTail : IDisposable
         try { attributes = File.GetAttributes(_rootPath); }
         catch (FileNotFoundException) { return Array.Empty<string>(); }
         catch (DirectoryNotFoundException) { throw new DirectoryNotFoundException($"日志目录不存在：{_rootPath}"); }
-        return (attributes & FileAttributes.Directory) != 0
-            ? Directory.GetFiles(_rootPath, _pattern)
-            : new[] { _rootPath };
+        if ((attributes & FileAttributes.Directory) == 0)
+        {
+            // 直接指定了文件：模式与递归都不参与（用户已经说清楚要哪一份）
+            return new[] { _rootPath };
+        }
+
+        return EnumerateMatches();
+    }
+
+    /// <summary>
+    /// 多模式 + 可选递归地列出匹配文件。
+    ///
+    /// <para>模式用 <c>;</c> 分隔（如 <c>maafw.log;maa.log</c> 覆盖两代内核的文件名）。
+    /// 递归时加两道闸：深度 ≤ <see cref="MaxRecursiveDepth"/>、总数 ≤ <see cref="MaxRecursiveFiles"/>。
+    /// 顺序上先按深度筛再计数，避免在 <c>logs\</c> 这种每天一个子目录的地方把枚举跑穿。</para>
+    /// </summary>
+    private List<string> EnumerateMatches()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        var option = _recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var overflow = false;
+
+        foreach (var pattern in _patterns)
+        {
+            IEnumerable<string> files;
+            try
+            {
+                files = Directory.EnumerateFiles(_rootPath, pattern, option);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                continue;   // 单个模式出错不该让其它模式一起失效
+            }
+
+            foreach (var file in files)
+            {
+                if (result.Count >= MaxRecursiveFiles) { overflow = true; break; }
+                if (_recursive && DepthOf(file) > MaxRecursiveDepth) { continue; }
+                if (seen.Add(file)) { result.Add(file); }
+            }
+
+            if (overflow) { break; }
+        }
+
+        if (overflow && _note.Length == 0)
+        {
+            _note = $"日志目录里的匹配文件超过 {MaxRecursiveFiles} 个，只跟了前 {MaxRecursiveFiles} 个：" +
+                    $"{_rootPath}（建议缩小目录或模式）";
+        }
+
+        return result;
+    }
+
+    /// <summary>文件相对日志根目录的层数（根下为 0，<c>run_id\run.log</c> 为 1）。</summary>
+    private int DepthOf(string file)
+    {
+        try
+        {
+            var relative = Path.GetRelativePath(_rootPath, Path.GetDirectoryName(file) ?? _rootPath);
+            if (relative.Length == 0 || relative == ".") { return 0; }
+            return relative.Count(ch => ch == Path.DirectorySeparatorChar) + 1;
+        }
+        catch (Exception)
+        {
+            return 0;   // 算不出层数就当作在根下，宁可多跟一个也不整段丢掉
+        }
+    }
+
+    /// <summary>把 <c>a.log;b.log</c> 拆成模式列表；空项丢弃，全空时回落默认 <c>*.log</c>。</summary>
+    private static List<string> ParsePatterns(string? pattern)
+    {
+        var result = new List<string>();
+        foreach (var part in (pattern ?? string.Empty).Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var text = part.Trim();
+            if (text.Length > 0) { result.Add(text); }
+        }
+
+        if (result.Count == 0)
+        {
+            result.Add(ExternalLogDefaults.Pattern);
+        }
+
+        return result;
     }
 
     private void ReadFile(string path, List<ExternalLogLine> result, IReadOnlyList<string>? keywords, bool final,
@@ -271,37 +378,107 @@ public sealed class ExternalLogTail : IDisposable
         if (!cursor.HeaderChecked)
         {
             // 跨 Poll 的 BOM 和多字节字符暂存原始字节，完整行到达后才解码。
-            if (!final && cursor.Pending.Count < 4 && !cursor.Pending.Contains((byte)'\n')) { return; }
+            // \r 也算行界：只有进度条的程序可能整段都没有 \n。
+            if (!final && cursor.Pending.Count < 4 && !HasLineBreak(cursor.Pending)) { return; }
             var bytes = cursor.Pending.ToArray();
             var bomLength = FindBom(bytes, out var encoding);
             cursor.BomEncoding = encoding;
             cursor.HeaderChecked = true;
             if (bomLength > 0) { cursor.Pending.RemoveRange(0, bomLength); }
         }
-        var width = cursor.BomEncoding?.CodePage is 1200 or 1201 ? 2 :
-            cursor.BomEncoding?.CodePage is 12000 or 12001 ? 4 : 1;
-        var bigEndian = cursor.BomEncoding?.CodePage is 1201 or 12001;
+        var width = GetEncodingWidth(cursor);
+        var bigEndian = IsBigEndian(cursor);
         var start = 0;
-        for (var i = 0; i + width <= cursor.Pending.Count; i += width)
+        var i = 0;
+        while (i + width <= cursor.Pending.Count)
         {
-            var lf = true;
-            for (var b = 0; b < width; b++)
+            if (IsLineFeed(cursor.Pending, i, width, bigEndian))
             {
-                var expected = b == (bigEndian ? width - 1 : 0) ? 10 : 0;
-                if (cursor.Pending[i + b] != expected) { lf = false; break; }
+                EmitSegment(cursor, start, i - start, result, keywords);
+                start = i + width;
+                i = start;
+                if (result.Count >= MaxOutputLinesPerPoll) { break; }
+                continue;
             }
-            if (!lf) { continue; }
-            AddLine(cursor, cursor.Pending.GetRange(start, i - start).ToArray(), result, keywords);
-            start = i + width;
-            if (result.Count >= MaxOutputLinesPerPoll) { break; }
+
+            if (IsCarriageReturn(cursor.Pending, i, width, bigEndian))
+            {
+                var next = i + width;
+                if (next + width <= cursor.Pending.Count && IsLineFeed(cursor.Pending, next, width, bigEndian))
+                {
+                    // \r\n：先把进度段补出来，再当一次普通换行（Windows 文本 / 带 \r 的日志）
+                    EmitSegment(cursor, start, i - start, result, keywords);
+                    start = next + width;
+                    i = start;
+                    if (result.Count >= MaxOutputLinesPerPoll) { break; }
+                    continue;
+                }
+
+                if (next + width > cursor.Pending.Count && !final)
+                {
+                    // 末字节可能是 \r\n 的前半：等下一拍再判，别把 \r\n 切成两行
+                    break;
+                }
+
+                // 孤立的 \r：进度刷新，整段覆盖进 Progress，不直接产出
+                cursor.Progress.Clear();
+                if (i > start) { cursor.Progress.AddRange(cursor.Pending.GetRange(start, i - start)); }
+                start = next;
+                i = start;
+                continue;
+            }
+
+            i += width;
         }
+
         if (start > 0) { cursor.Pending.RemoveRange(0, start); }
+
         // 达到批次行数上限时保留完整尾行给下一轮 Drain，不能把它们合并成一行。
-        if (final && result.Count < MaxOutputLinesPerPoll && cursor.Pending.Count > 0)
+        if (final && result.Count < MaxOutputLinesPerPoll)
         {
-            AddLine(cursor, cursor.Pending.ToArray(), result, keywords);
-            cursor.Pending.Clear();
+            if (cursor.Pending.Count > 0)
+            {
+                // 收尾时还有半行：它同样覆盖了之前那一段进度，直接发它
+                cursor.Progress.Clear();
+                AddLine(cursor, cursor.Pending.ToArray(), result, keywords);
+                cursor.Pending.Clear();
+            }
+            else
+            {
+                FlushProgress(cursor, result, keywords);
+            }
         }
+    }
+
+    /// <summary>
+    /// 输出一段到换行为止的内容。
+    ///
+    /// <para>与挂起的进度段的关系按终端语义处理：<c>\r</c> 只是回到行首，
+    /// 之后写进来的字符会把旧内容覆盖掉。所以本段非空时直接丢弃进度段（旧的那一行在
+    /// 屏幕上已经看不见了），只有本段为空（<c>\r\n</c> 或末拍）才把进度段补出来。</para>
+    /// </summary>
+    private void EmitSegment(Cursor cursor, int start, int count, List<ExternalLogLine> result,
+        IReadOnlyList<string>? keywords)
+    {
+        if (count > 0)
+        {
+            cursor.Progress.Clear();
+            AddLine(cursor, cursor.Pending.GetRange(start, count).ToArray(), result, keywords);
+            return;
+        }
+
+        FlushProgress(cursor, result, keywords);
+    }
+
+    /// <summary>
+    /// 输出进度条的最后一段。批次数满时不输出也不清空 —— 这些字节已经出了 Pending，
+    /// 清掉就真丢了，留给下一拍。
+    /// </summary>
+    private void FlushProgress(Cursor cursor, List<ExternalLogLine> result, IReadOnlyList<string>? keywords)
+    {
+        if (cursor.Progress.Count == 0 || result.Count >= MaxOutputLinesPerPoll) { return; }
+        AddLine(cursor, cursor.Progress.ToArray(), result, keywords);
+        cursor.Progress.Clear();
     }
 
     private void ConsumeDiscardedByte(Cursor cursor, byte value, List<ExternalLogLine> result,
@@ -311,7 +488,9 @@ public sealed class ExternalLogTail : IDisposable
         cursor.DiscardProbe.Add(value);
         if (cursor.DiscardProbe.Count < width) { return; }
 
-        if (IsLineFeed(cursor.DiscardProbe, width, IsBigEndian(cursor)))
+        var bigEndian = IsBigEndian(cursor);
+        if (IsLineFeed(cursor.DiscardProbe, 0, width, bigEndian) ||
+            IsCarriageReturn(cursor.DiscardProbe, 0, width, bigEndian))
         {
             AddLine(cursor, cursor.Pending.ToArray(), result, keywords, wasTruncated: true);
             cursor.Pending.Clear();
@@ -356,15 +535,39 @@ public sealed class ExternalLogTail : IDisposable
 
     private static bool IsBigEndian(Cursor cursor) => cursor.BomEncoding?.CodePage is 1201 or 12001;
 
-    private static bool IsLineFeed(IReadOnlyList<byte> bytes, int width, bool bigEndian)
+    /// <summary>从 <paramref name="offset"/> 起是否是一个换行符（按编码宽度对齐）。</summary>
+    private static bool IsLineFeed(IReadOnlyList<byte> bytes, int offset, int width, bool bigEndian) =>
+        MatchesCodeUnit(bytes, offset, width, bigEndian, 10);
+
+    /// <summary>从 <paramref name="offset"/> 起是否是一个回车符。</summary>
+    private static bool IsCarriageReturn(IReadOnlyList<byte> bytes, int offset, int width, bool bigEndian) =>
+        MatchesCodeUnit(bytes, offset, width, bigEndian, 13);
+
+    /// <summary>
+    /// 比较一个码元。UTF-16 / UTF-32 下有效字节在低位，高位补 0；
+    /// UTF-8 与 GBK 下 0x0A / 0x0D 不可能出现在多字节字符的后续字节里，按字节比对即可。
+    /// </summary>
+    private static bool MatchesCodeUnit(IReadOnlyList<byte> bytes, int offset, int width, bool bigEndian, byte value)
     {
+        if (offset < 0 || offset + width > bytes.Count) { return false; }
         for (var i = 0; i < width; i++)
         {
-            var expected = i == (bigEndian ? width - 1 : 0) ? 10 : 0;
-            if (bytes[i] != expected) { return false; }
+            var expected = i == (bigEndian ? width - 1 : 0) ? value : (byte)0;
+            if (bytes[offset + i] != expected) { return false; }
         }
 
         return true;
+    }
+
+    /// <summary>这段待解码字节里有没有行界（<c>\n</c> 或 <c>\r</c>）。</summary>
+    private static bool HasLineBreak(List<byte> bytes)
+    {
+        for (var i = 0; i < bytes.Count; i++)
+        {
+            if (bytes[i] is 10 or 13) { return true; }
+        }
+
+        return false;
     }
 
     private static void DetectExistingBom(FileStream stream, Cursor cursor)

@@ -298,6 +298,144 @@ public static class LaunchPresetResolver
         return choices[0];
     }
 
+    // ---------------------------------------------------------------- 外部日志推荐值
+
+    /// <summary>
+    /// 解析「这次任务该跟哪个日志文件」的推荐值。**纯函数**：只查预设 + 目录画像，不读盘。
+    ///
+    /// <para>优先级（与计划书 §3.3 一致）：项目 <c>log</c> → <c>logsByEntry</c>（exe 名精确匹配）
+    /// → 前端 <c>log</c> → 无。</para>
+    ///
+    /// <para>为什么 exe 名匹配排在前端之前：L4 兜底永远会给出 <c>generic</c> 前端，
+    /// 若前端优先，兜底表就永远轮不到（AUTO-MAS 这类不在 55 个项目里的工具全部落到通用探测）。
+    /// exe 名是精确匹配，比"某个壳的默认值"更具体。</para>
+    ///
+    /// <para>为什么项目要整块盖掉前端：三月七的 <c>debug\</c> 只有异常截图，业务日志在
+    /// <c>logs\</c>；若按字段合并，会得到"目录取项目、模式取壳"的半对半错组合，
+    /// 出问题时无法解释到底是哪一层错了。</para>
+    ///
+    /// <para>目录候选按预设顺序逐个查 <see cref="LauncherProfile.ExistingRelativeDirs"/>，
+    /// **只取第一个存在的**：采集器一次只跟一个根路径。</para>
+    /// </summary>
+    public static LaunchLogPlan? ResolveLog(
+        LaunchPresetLibrary? library, LaunchResolution? resolution, LauncherProfile? profile, string? scriptPath)
+    {
+        if (library is null)
+        {
+            return null;
+        }
+
+        var preset = resolution?.Project?.Log;
+        var presetId = resolution?.Project?.Id ?? string.Empty;
+        var presetName = resolution?.Project?.Name ?? string.Empty;
+
+        // 兜底：不在 projects 里的工具（AUTO-MAS 之类）按 exe 名精确匹配，优先于壳的默认值
+        if (preset is null)
+        {
+            var exeName = FileName(scriptPath);
+            if (exeName.Length > 0)
+            {
+                foreach (var entry in library.LogsByEntry)
+                {
+                    if (entry.Log is null || !MatchesEntry(entry, exeName))
+                    {
+                        continue;
+                    }
+
+                    preset = entry.Log;
+                    presetId = $"entry:{exeName.ToLowerInvariant()}";
+                    presetName = exeName;
+                    break;
+                }
+            }
+        }
+
+        if (preset is null && resolution?.Frontend is { } frontend)
+        {
+            preset = frontend.Log;
+            presetId = frontend.Id;
+            presetName = frontend.Name;
+        }
+
+        if (preset is null)
+        {
+            return null;
+        }
+
+        var directory = string.Empty;
+        if (profile is not null && profile.ExeDirectory.Length > 0)
+        {
+            foreach (var candidate in preset.Dirs)
+            {
+                var relative = (candidate ?? string.Empty).Trim();
+                if (relative.Length == 0 || !profile.HasRelativeDir(relative))
+                {
+                    continue;
+                }
+
+                directory = CombineUnder(profile.ExeDirectory, relative);
+                break;
+            }
+        }
+
+        return new LaunchLogPlan
+        {
+            PresetId = presetId,
+            PresetName = presetName,
+            Enabled = preset.Enabled,
+            Directory = directory,
+            Pattern = ExternalLogDefaults.NormalizePattern(preset.Pattern),
+            Encoding = ExternalLogEncodings.Normalize(preset.Encoding),
+            FollowTail = preset.FollowTail,
+            Recursive = preset.Recursive,
+            Keywords = new List<string>(preset.Keywords ?? new List<string>()),
+            Summary = preset.Summary ?? string.Empty,
+            Source = preset.Source ?? string.Empty,
+            Confidence = LaunchLogConfidences.Normalize(preset.Confidence),
+            Basis = LaunchLogConfidences.Describe(preset.Confidence),
+        };
+    }
+
+    /// <summary>兜底条目里有没有这个 exe 名。</summary>
+    private static bool MatchesEntry(LaunchLogEntry entry, string exeName)
+    {
+        foreach (var item in entry.Entries)
+        {
+            if (FileName(item).Equals(exeName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 把相对目录拼到 exe 目录下。**在这里拼、不提前展开成绝对路径**：
+    /// 远程执行时由执行账户解析，主控端不应写入自己机器上的路径。
+    /// </summary>
+    private static string CombineUnder(string exeDirectory, string relativePath)
+    {
+        var normalized = (relativePath ?? string.Empty).Trim()
+            .Replace('/', Path.DirectorySeparatorChar)
+            .Replace('\\', Path.DirectorySeparatorChar)
+            .Trim(Path.DirectorySeparatorChar);
+
+        if (normalized.Length == 0)
+        {
+            return exeDirectory;
+        }
+
+        try
+        {
+            return Path.GetFullPath(Path.Combine(exeDirectory, normalized));
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
     /// <summary>按文本反查命中的候选（**不用 SelectedItem**：手打时它永远是 null）。</summary>
     public static LaunchChoice? Match(List<LaunchChoice>? choices, string? args)
     {
@@ -368,11 +506,14 @@ public static class LaunchPresetResolver
     /// 把一条候选写进任务。
     ///
     /// <paramref name="applyRecommended"/> = 界面上的「同时套用推荐设置」：
-    /// 打开时顺带写超时、完成判断（三选一，绝不两种同时写）、外部日志目录。
+    /// 打开时顺带写超时、完成判断（三选一，绝不两种同时写）、外部日志五项。
     /// **永不覆盖**通道归属、并发、清理进程名、任务名 —— 那些是"这台机器"的信息，与启动参数无关。
+    ///
+    /// <para><paramref name="logPlan"/> 为 null 或为空时不写日志字段：探测不到目录就
+    /// 不启用（写一个不存在的路径会静默采集不到，比不启用更难查）。</para>
     /// </summary>
     public static void Apply(
-        LaunchChoice choice, TaskConfig task, bool applyRecommended, string? logDirectory, int rev)
+        LaunchChoice choice, TaskConfig task, bool applyRecommended, LaunchLogPlan? logPlan, int rev)
     {
         if (choice is null || task is null)
         {
@@ -419,12 +560,41 @@ public static class LaunchPresetResolver
             }
         }
 
-        // 日志目录：探测不到就**不启用**（写一个不存在的路径会静默采集不到，比不启用更难查）
-        if (!string.IsNullOrWhiteSpace(logDirectory))
+        // 日志：预设只「填入」不「锁定」。用户手改过（ExternalLogTouched）就一个字不动 ——
+        // 否则每次换脚本重算都会把他刚填的路径冲掉。
+        if (logPlan is null || task.ExternalLogTouched)
         {
-            task.ExternalLogEnabled = true;
-            task.ExternalLogPath = logDirectory;
+            return;
         }
+
+        if (!logPlan.Enabled)
+        {
+            // 该项目不落盘：显式关掉，并且绝不写路径（写了就永远在等一个不会出现的文件）
+            task.ExternalLogEnabled = false;
+            task.ExternalLogPresetId = logPlan.PresetId;
+            task.ExternalLogRev = rev;
+            return;
+        }
+
+        if (!logPlan.HasDirectory)
+        {
+            // 启用但目录没探测到：保持现状。既不能写不存在的路径，也不该关掉用户原本开着的采集
+            return;
+        }
+
+        task.ExternalLogEnabled = true;
+        task.ExternalLogPath = logPlan.Directory;
+        task.ExternalLogPattern = logPlan.Pattern;
+        task.ExternalLogEncoding = logPlan.Encoding;
+        task.ExternalLogFollowTail = logPlan.FollowTail;
+        task.ExternalLogRecursive = logPlan.Recursive;
+        if (logPlan.Keywords.Count > 0)
+        {
+            task.ExternalLogKeywords = new List<string>(logPlan.Keywords);
+        }
+
+        task.ExternalLogPresetId = logPlan.PresetId;
+        task.ExternalLogRev = rev;
     }
 
     // ---------------------------------------------------------------- 内部

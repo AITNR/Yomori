@@ -398,13 +398,41 @@
                                           HorizontalAlignment="Stretch"
                                           HorizontalContentAlignment="Stretch">
                                     <StackPanel Spacing="10">
+                                        <!-- 推荐值状态行：只读，回答"这些值哪来的、识别凭什么"。
+                                             与「同时套用推荐设置」共用同一条写入路径（LaunchPresetResolver.Apply）。 -->
+                                        <Grid ColumnSpacing="8">
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <TextBlock x:Name="LogProfileHint"
+                                                       Grid.Column="0"
+                                                       FontSize="12"
+                                                       Opacity="0.7"
+                                                       TextWrapping="Wrap"
+                                                       VerticalAlignment="Center"
+                                                       Text="选完脚本路径后，这里会显示识别出的项目与推荐日志位置" />
+                                            <Button x:Name="ApplyLogPresetButton"
+                                                    Grid.Column="1"
+                                                    Content="套用推荐值"
+                                                    IsEnabled="False"
+                                                    Click="OnApplyLogPresetClick" />
+                                            <Button x:Name="RestoreLogPresetButton"
+                                                    Grid.Column="2"
+                                                    Content="还原推荐值"
+                                                    Visibility="Collapsed"
+                                                    Click="OnRestoreLogPresetClick" />
+                                        </Grid>
+
                                         <ToggleSwitch Header="启用日志跟踪"
                                                       IsOn="{Binding ExternalLogEnabled, Mode=TwoWay}"
                                                       OnContent="开启" OffContent="关闭" />
 
                                         <TextBox Header="日志文件或目录"
                                                  PlaceholderText="例如：C:\Program Files\BetterGI\log"
-                                                 Text="{Binding ExternalLogPath, Mode=TwoWay}" />
+                                                 Text="{Binding ExternalLogPath, Mode=TwoWay}"
+                                                 LostFocus="OnExternalLogFieldEdited" />
 
                                         <Grid ColumnSpacing="12">
                                             <Grid.ColumnDefinitions>
@@ -413,10 +441,12 @@
                                             </Grid.ColumnDefinitions>
                                             <TextBox Grid.Column="0" Header="文件匹配模式"
                                                      PlaceholderText="目录时使用，例如 *.log"
-                                                     Text="{Binding ExternalLogPattern, Mode=TwoWay}" />
+                                                     Text="{Binding ExternalLogPattern, Mode=TwoWay}"
+                                                     LostFocus="OnExternalLogFieldEdited" />
                                             <ComboBox Grid.Column="1" Header="日志编码"
                                                       SelectedValuePath="Tag"
                                                       SelectedValue="{Binding ExternalLogEncoding, Mode=TwoWay}"
+                                                      SelectionChanged="OnExternalLogEncodingChanged"
                                                       HorizontalAlignment="Stretch">
                                                 <ComboBoxItem Content="自动检测" Tag="auto" />
                                                 <ComboBoxItem Content="UTF-8" Tag="utf8" />
@@ -426,15 +456,25 @@
 
                                         <ToggleSwitch Header="从文件末尾开始跟踪"
                                                       IsOn="{Binding ExternalLogFollowTail, Mode=TwoWay}"
-                                                      OnContent="开启" OffContent="关闭">
+                                                      OnContent="开启" OffContent="关闭"
+                                                      Toggled="OnExternalLogFieldEdited">
                                             <ToolTipService.ToolTip>
                                                 <ToolTip Content="开启时只读取本次任务启动后新增的日志；关闭时会从文件开头读取。" />
                                             </ToolTipService.ToolTip>
                                         </ToggleSwitch>
 
+                                        <CheckBox Content="包含子目录（递归匹配）"
+                                                  IsChecked="{Binding ExternalLogRecursive, Mode=TwoWay}"
+                                                  Click="OnExternalLogFieldEdited">
+                                            <ToolTipService.ToolTip>
+                                                <ToolTip Content="只为「每次运行建一个子目录」的项目准备（例如 logs/&lt;时间戳&gt;/run.log）。默认关闭；打开后最多进 3 层、最多跟 500 个文件，超限会在日志窗口提示一次。" />
+                                            </ToolTipService.ToolTip>
+                                        </CheckBox>
+
                                         <TextBox Header="关键字（分号分隔）"
                                                  PlaceholderText="例如：error; exception; 失败"
-                                                 Text="{Binding ExternalLogKeywordsText, Mode=TwoWay}">
+                                                 Text="{Binding ExternalLogKeywordsText, Mode=TwoWay}"
+                                                 LostFocus="OnExternalLogFieldEdited">
                                             <ToolTipService.ToolTip>
                                                 <ToolTip Content="用于标记日志关注点；全部新增日志均会采集，显示窗口只保留最近记录。" />
                                             </ToolTipService.ToolTip>

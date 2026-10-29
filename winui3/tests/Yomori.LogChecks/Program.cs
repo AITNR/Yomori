@@ -26,6 +26,8 @@ var tests = new (string Name, Action Run)[]
     ("ExternalLogFilter normalization and classification", TestExternalLogFilter),
     ("ExternalLogTail incremental, rotation, partial lines and encoding", TestExternalLogTail),
     ("ExternalLogTail large backlog drains in order across polls", TestExternalLogTailLargeBacklog),
+    ("ExternalLogTail multi-pattern, recursion and carriage-return progress",
+        TestExternalLogTailPatternsRecursionAndCarriageReturn),
 };
 
 var failures = new List<string>();
@@ -433,6 +435,87 @@ static void TestExternalLogTail()
         Equal(1, gbk.Count, "explicit GBK file is read");
         Equal("启动中文", gbk[0].Text, "GBK Chinese text is decoded");
     });
+
+    if (failures.Count > 0)
+    {
+        throw new InvalidOperationException(string.Join(" | ", failures));
+    }
+}
+
+static void TestExternalLogTailPatternsRecursionAndCarriageReturn()
+{
+    using var temp = new TempDirectory();
+    var failures = new List<string>();
+
+    void Check(string name, Action assertion)
+    {
+        try
+        {
+            assertion();
+        }
+        catch (Exception ex)
+        {
+            failures.Add($"{name}: {ex.Message}");
+        }
+    }
+
+    var root = Path.Combine(temp.Path, "logs");
+    var runDir = Path.Combine(root, "20261029_120000");
+    var deepDir = Path.Combine(root, "a", "b", "c", "d");
+    Directory.CreateDirectory(runDir);
+    Directory.CreateDirectory(deepDir);
+
+    var utf8 = new UTF8Encoding(false);
+    File.WriteAllText(Path.Combine(root, "top.log"), "顶层一行\n", utf8);
+    File.WriteAllText(Path.Combine(runDir, "run.log"), "子目录一行\n", utf8);
+    File.WriteAllText(Path.Combine(deepDir, "deep.log"), "太深的一行\n", utf8);
+    File.WriteAllText(Path.Combine(root, "progress.log"), "10%\r20%\r30%\n完成\r\n", utf8);
+
+    // 多模式：分号分隔逐个匹配；不存在的模式不该让整次采集失败
+    using (var multi = new ExternalLogTail(root, "top.log;missing.log", ExternalLogEncodings.Utf8, followTail: false))
+    {
+        var lines = multi.Poll(Array.Empty<string>());
+        Check("multi-pattern collects matched file", () => Equal(1, lines.Count, "multi-pattern count"));
+        Check("multi-pattern content", () => Equal("顶层一行", lines[0].Text, "multi-pattern text"));
+    }
+
+    // 递归关（默认）：子目录里的 run.log 采不到
+    using (var flat = new ExternalLogTail(root, "run.log", ExternalLogEncodings.Utf8, followTail: false))
+    {
+        Check("recursive off skips subdirectories", () => Equal(0, flat.Poll(Array.Empty<string>()).Count, "flat"));
+    }
+
+    // 递归开：进一层能找到；超过 3 层的丢掉
+    using (var recursed = new ExternalLogTail(root, "run.log;deep.log", ExternalLogEncodings.Utf8,
+               followTail: false, baseDirectory: null, recursive: true))
+    {
+        var lines = recursed.Poll(Array.Empty<string>());
+        Check("recursive on finds nested file", () => Equal(1, lines.Count, "recursive count"));
+        Check("recursive on content", () => Equal("子目录一行", lines[0].Text, "recursive text"));
+    }
+
+    // \r 进度行：只保留最后一段；\r\n 当普通换行
+    using (var progress = new ExternalLogTail(Path.Combine(root, "progress.log"), null,
+               ExternalLogEncodings.Utf8, followTail: false))
+    {
+        var lines = progress.Poll(Array.Empty<string>());
+        Check("progress segments collapse", () =>
+            Equal(2, lines.Count, "progress count: " + string.Join("|", lines.Select(l => l.Text))));
+        Check("progress keeps last segment", () => Equal("30%", lines[0].Text, "progress first"));
+        Check("crlf line stays intact", () => Equal("完成", lines[1].Text, "progress second"));
+    }
+
+    // 收尾时还没换行的进度段要补出来（否则最后一步的进度永远看不到）
+    var tailFile = Path.Combine(root, "tailprogress.log");
+    File.WriteAllText(tailFile, "building\r50%", utf8);
+    using (var partial = new ExternalLogTail(tailFile, null, ExternalLogEncodings.Utf8, followTail: false))
+    {
+        partial.Poll(Array.Empty<string>());
+        var drained = partial.Drain(Array.Empty<string>());
+        Check("pending progress flushed on drain",
+            () => Assert(drained.Any(l => l.Text == "50%"),
+                "drain: " + string.Join("|", drained.Select(l => l.Text))));
+    }
 
     if (failures.Count > 0)
     {

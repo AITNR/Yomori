@@ -199,7 +199,8 @@ public sealed class ScriptRunner
                 // WaitFirst 并发任务可能仍在启动，队列收尾后禁止再注册 worker。
                 if (_externalLogTailsClosed) { return; }
                 var tail = new ExternalLogTail(task.ExternalLogPath, task.ExternalLogPattern,
-                    task.ExternalLogEncoding, task.ExternalLogFollowTail, scriptDirectory);
+                    task.ExternalLogEncoding, task.ExternalLogFollowTail, scriptDirectory,
+                    task.ExternalLogRecursive);
                 var state = new ExternalLogTailState(task, tail);
                 _externalLogTails[task] = state;
                 var start = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);

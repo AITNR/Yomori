@@ -762,8 +762,20 @@ public sealed partial class TasksPage : Page
     /// <summary>项目自己要求"手写补充"的说明（多实例、配置名之类）。</summary>
     private string _argsManualHint = string.Empty;
 
-    /// <summary>目录画像里探测到的日志目录（勾了「同时套用推荐设置」才用得上）。</summary>
-    private string? _argsLogDir;
+    /// <summary>
+    /// 本次识别出的日志推荐值（勾了「同时套用推荐设置」或点「套用推荐值」才写进任务）。
+    /// 为 null 表示没识别到 / 该项目没收录，此时不碰日志字段。
+    /// </summary>
+    private LaunchLogPlan? _argsLogPlan;
+
+    /// <summary>
+    /// 防重入：程序自己套用推荐值时，别把控件的变化当成"用户改了"。
+    ///
+    /// <para>与 <see cref="_suppressArgsEvents"/> 同类，但用途相反：那一个是防"用户操作被程序误判"，
+    /// 这一个是防"程序写值被当成用户手改" —— 一旦误判，<c>ExternalLogTouched</c> 会被置位，
+    /// 之后预设永远不再更新，用户会以为功能坏了。</para>
+    /// </summary>
+    private bool _suppressExternalLogEvents;
 
     /// <summary>防重入：程序自己换候选时不要把相关事件当成用户操作。</summary>
     private bool _suppressArgsEvents;
@@ -893,9 +905,10 @@ public sealed partial class TasksPage : Page
         }
 
         LaunchPresetResolver.Apply(
-            choice, task, ApplyRecommendedCheck.IsChecked == true, _argsLogDir, LaunchPresetStore.Library.Rev);
+            choice, task, ApplyRecommendedCheck.IsChecked == true, _argsLogPlan, LaunchPresetStore.Library.Rev);
 
         RefreshArgsHint();
+        RefreshLogProfileHint();
     }
 
     /// <summary>
@@ -913,7 +926,7 @@ public sealed partial class TasksPage : Page
             _argsChoices = new List<LaunchChoice>();
             _argsBasis = string.Empty;
             _argsManualHint = string.Empty;
-            _argsLogDir = null;
+            _argsLogPlan = null;
 
             var path = (task?.ScriptPath ?? string.Empty).Trim();
             ArgsBox.IsEnabled = task is not null && path.Length > 0;
@@ -931,7 +944,8 @@ public sealed partial class TasksPage : Page
                 _argsChoices = LaunchPresetResolver.BuildChoices(resolution, profile, out var manualHint);
                 _argsBasis = resolution.Basis;
                 _argsManualHint = manualHint;
-                _argsLogDir = profile.LogDirectories.Count > 0 ? profile.LogDirectories[0] : null;
+                _argsLogPlan = LaunchPresetResolver.ResolveLog(
+                    LaunchPresetStore.Library, resolution, profile, path);
                 ArgsDropButton.IsEnabled = _argsChoices.Count > 0;
 
                 // 只在参数为空时才预填主推项：绝不因为换了脚本就重写用户已经填好的参数。
@@ -941,7 +955,7 @@ public sealed partial class TasksPage : Page
                     if (primary is not null)
                     {
                         LaunchPresetResolver.Apply(primary, task, ApplyRecommendedCheck.IsChecked == true,
-                            _argsLogDir, LaunchPresetStore.Library.Rev);
+                            _argsLogPlan, LaunchPresetStore.Library.Rev);
                     }
                 }
             }
@@ -952,6 +966,171 @@ public sealed partial class TasksPage : Page
         }
 
         RefreshArgsHint();
+        RefreshLogProfileHint();
+    }
+
+    // ---------------------------------------------------------------- 外部日志推荐值
+
+    /// <summary>
+    /// 把推荐值写进任务的日志五项。
+    ///
+    /// <para>为什么写之前先清 <c>ExternalLogTouched</c>：点这个按钮的语义就是"回到推荐值"，
+    /// 若保留"已自定义"标记，下一次重算又不会更新，用户会以为按钮没生效。</para>
+    ///
+    /// <para>无日志项目 / 目录没探测到：一个字段都不写，只刷状态行说明原因 ——
+    /// 写一个不存在的路径会静默采集不到，比不启用更难查。</para>
+    /// </summary>
+    private void ApplyLogPlan()
+    {
+        var task = VM.SelectedTask;
+        if (task is null || _argsLogPlan is null || !_argsLogPlan.Enabled || !_argsLogPlan.HasDirectory)
+        {
+            RefreshLogProfileHint();
+            return;
+        }
+
+        var saved = _suppressExternalLogEvents;
+        _suppressExternalLogEvents = true;
+        try
+        {
+            task.ExternalLogTouched = false;
+            task.ExternalLogEnabled = true;
+            task.ExternalLogPath = _argsLogPlan.Directory;
+            task.ExternalLogPattern = _argsLogPlan.Pattern;
+            task.ExternalLogEncoding = _argsLogPlan.Encoding;
+            task.ExternalLogFollowTail = _argsLogPlan.FollowTail;
+            task.ExternalLogRecursive = _argsLogPlan.Recursive;
+            if (_argsLogPlan.Keywords.Count > 0)
+            {
+                task.ExternalLogKeywords = new List<string>(_argsLogPlan.Keywords);
+            }
+
+            task.ExternalLogPresetId = _argsLogPlan.PresetId;
+            task.ExternalLogRev = LaunchPresetStore.Library.Rev;
+        }
+        finally
+        {
+            _suppressExternalLogEvents = saved;
+        }
+
+        RefreshLogProfileHint();
+    }
+
+    private void OnApplyLogPresetClick(object sender, RoutedEventArgs e) => ApplyLogPlan();
+
+    private void OnRestoreLogPresetClick(object sender, RoutedEventArgs e) => ApplyLogPlan();
+
+    /// <summary>用户在路径 / 模式 / 关键字上编辑结束，或在「末尾开始跟踪」上动过。</summary>
+    private void OnExternalLogFieldEdited(object sender, RoutedEventArgs e) => MarkExternalLogTouched();
+
+    private void OnExternalLogEncodingChanged(object sender, SelectionChangedEventArgs e) => MarkExternalLogTouched();
+
+    /// <summary>
+    /// 标记「已自定义」——**只在值真的与推荐值不同时才标**。
+    ///
+    /// <para>为什么不无条件标：焦点进出输入框也会触发 LostFocus。
+    /// 若照单全收，用户只是点进去看了一眼，<c>ExternalLogTouched</c> 就被置位，
+    /// 之后换脚本再也不更新推荐值，而界面上还会显示"已自定义" —— 看起来像功能坏了。</para>
+    /// </summary>
+    private void MarkExternalLogTouched()
+    {
+        if (_suppressExternalLogEvents)
+        {
+            return;
+        }
+
+        var task = VM.SelectedTask;
+        if (task is null || task.ExternalLogTouched)
+        {
+            return;
+        }
+
+        if (_argsLogPlan is not null && SameAsPlan(task, _argsLogPlan))
+        {
+            return;
+        }
+
+        task.ExternalLogTouched = true;
+        RefreshLogProfileHint();
+    }
+
+    private static bool SameAsPlan(TaskConfig task, LaunchLogPlan plan) =>
+        string.Equals((task.ExternalLogPath ?? string.Empty).Trim(), plan.Directory ?? string.Empty,
+            StringComparison.OrdinalIgnoreCase)
+        && string.Equals(ExternalLogDefaults.NormalizePattern(task.ExternalLogPattern), plan.Pattern,
+            StringComparison.Ordinal)
+        && string.Equals(ExternalLogEncodings.Normalize(task.ExternalLogEncoding), plan.Encoding,
+            StringComparison.Ordinal)
+        && task.ExternalLogFollowTail == plan.FollowTail
+        && task.ExternalLogRecursive == plan.Recursive;
+
+    /// <summary>状态行 + 两个按钮的可用性，全部由"识别结果 + 是否已自定义"推导。</summary>
+    private void RefreshLogProfileHint()
+    {
+        var task = VM.SelectedTask;
+        ApplyLogPresetButton.IsEnabled = false;
+        RestoreLogPresetButton.Visibility = Visibility.Collapsed;
+
+        if (task is null)
+        {
+            LogProfileHint.Text = "选完脚本路径后，这里会显示识别出的项目与推荐日志位置";
+            return;
+        }
+
+        if (_argsLogPlan is null)
+        {
+            LogProfileHint.Text = "未收录这个脚本，日志位置请手动填写";
+            return;
+        }
+
+        if (!_argsLogPlan.Enabled)
+        {
+            LogProfileHint.Text = $"该项目不落盘日志：{_argsLogPlan.Summary}";
+            return;
+        }
+
+        var target = _argsLogPlan.HasDirectory
+            ? DescribeLogTarget(task, _argsLogPlan)
+            : "（未找到推荐目录，需手填）";
+
+        if (_argsLogPlan.HasDirectory)
+        {
+            ApplyLogPresetButton.IsEnabled = true;
+        }
+
+        if (task.ExternalLogTouched)
+        {
+            LogProfileHint.Text = $"已自定义（推荐值：{target}）";
+            RestoreLogPresetButton.Visibility = Visibility.Visible;
+            return;
+        }
+
+        var name = string.IsNullOrWhiteSpace(_argsLogPlan.PresetName) ? string.Empty : $" · {_argsLogPlan.PresetName}";
+        LogProfileHint.Text = $"{_argsLogPlan.Basis}{name}：{target}";
+    }
+
+    /// <summary>
+    /// 「目录 + 模式」的显示形态：能相对脚本目录就相对（<c>logs · 模式 log-YYYYMMDD.log</c>），
+    /// 否则退回绝对路径。整条 <c>C:\Program Files\...</c> 会把这行挤爆。
+    /// </summary>
+    private static string DescribeLogTarget(TaskConfig task, LaunchLogPlan plan)
+    {
+        var directory = plan.Directory;
+        try
+        {
+            var exeDirectory = Path.GetDirectoryName((task.ScriptPath ?? string.Empty).Trim());
+            if (!string.IsNullOrEmpty(exeDirectory)
+                && directory.StartsWith(exeDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                directory = directory.Substring(exeDirectory.Length).TrimStart('\\', '/');
+            }
+        }
+        catch (Exception)
+        {
+            // 路径非法就用原样，显示层不该抛
+        }
+
+        return directory.Length == 0 ? plan.Pattern : $"{directory} · 模式 {plan.Pattern}";
     }
 
     /// <summary>

@@ -1,6 +1,6 @@
 {
-  "rev": 1,
-  "updatedOn": "2026-10-28",
+  "rev": 2,
+  "updatedOn": "2026-10-29",
   "frontends": [
     {
       "id": "mfaa",
@@ -39,7 +39,27 @@
           "summary": "打印支持的命令行参数后退出"
         }
       ],
-      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q；已在运行时加 -f 强制重跑"
+      "manualHint": "多实例请手写：--autostart -i \"实例名\" -q；已在运行时加 -f 强制重跑",
+      "log": {
+        "dirs": [
+          "logs",
+          "debug"
+        ],
+        "pattern": "log-*.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "任务出错",
+          "ERROR",
+          "WARN"
+        ],
+        "enabled": true,
+        "summary": "先跟 GUI 日志（用户操作 / 配置切换 / 任务提交，最像人话，按天 14 份）；想看节点级识别与点击，把模式改成 maafw.log（4.x 内核为 maa.log）",
+        "source": "MFAAvalonia Helper/LoggerHelper.cs、Helper/AppPaths.cs",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "mxu",
@@ -71,7 +91,26 @@
           }
         }
       ],
-      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）"
+      "manualHint": "没配「自启动实例」时手写：--autostart -i \"实例名\" -q（实例名照抄界面左侧）",
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "maafw.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "TaskChainError",
+          "SubTaskError",
+          "ERROR"
+        ],
+        "enabled": true,
+        "summary": "内核日志（识别 / 点击 / 任务链）。排查前端自身问题再看 mxu-tauri.log（1MB × 8 份）",
+        "source": "MaaXYZ/MXU src-tauri/src/lib.rs:39、src-tauri/src/commands/utils.rs:220",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "picli",
@@ -100,7 +139,25 @@
           "summary": "进入菜单，依次选 ADB / 设备 / 资源 / 任务",
           "precondition": "需要终端窗口交互，本程序会等到交互结束"
         }
-      ]
+      ],
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "maafw.log;maa.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "TaskChainError",
+          "SubTaskError"
+        ],
+        "enabled": true,
+        "summary": "框架自带命令行的内核日志；两代文件名一起跟（maafw.log 为 5.x，maa.log 为 4.x，不会同时存在）",
+        "source": "MaaFramework docs/zh_cn/5.1-问题反馈.md",
+        "checkedOn": "2026-10-29",
+        "confidence": "framework"
+      }
     },
     {
       "id": "mfw",
@@ -137,7 +194,25 @@
           "precondition": "单独用 --reuse-existing 不会执行任务"
         }
       ],
-      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx（ID = 配置文件名去掉 .json）"
+      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx（ID = 配置文件名去掉 .json）",
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "gui.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "任务出错",
+          "ERROR"
+        ],
+        "enabled": true,
+        "summary": "Python 侧任务流转 / OCR / 异常栈（按天保留 3 份）；内核细节改 maafw.log，停止瞬间截图在 debug\\stop",
+        "source": "overflow65537/MFW-PyQt6 app/utils/logger.py:36 / 98",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "oks",
@@ -168,7 +243,26 @@
           "summary": "跑完停在界面，便于查看结果"
         }
       ],
-      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出",
+      "log": {
+        "dirs": [
+          "logs"
+        ],
+        "pattern": "*.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "错误",
+          "ERROR",
+          "完成"
+        ],
+        "enabled": true,
+        "summary": "框架统一写 logs\\<name>.log（按天 7 份），别按项目名找文件；旧版本才叫 ok-ww.log",
+        "source": "ok-oldking/ok-script ok/util/logger.py:219 / 227",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "generic",
@@ -188,7 +282,26 @@
             "kind": "direct"
           }
         }
-      ]
+      ],
+      "log": {
+        "dirs": [
+          "debug",
+          "logs",
+          "log",
+          ".log",
+          "runtime/logs"
+        ],
+        "pattern": "*.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [],
+        "enabled": true,
+        "summary": "未收录项目的通用探测：debug → logs → log → .log → runtime/logs。BAAS 的 runtime\\logs 里是 .html，需手改模式",
+        "source": "原有行为 + 《日志位置速查》通用规律",
+        "checkedOn": "2026-10-29",
+        "confidence": "guess"
+      }
     }
   ],
   "projects": [
@@ -305,7 +418,26 @@
           "summary": "打印当前版本支持的任务名清单"
         }
       ],
-      "manualHint": "其它任务名：forgottenhall 混沌回忆 / purefiction 虚构叙事 / apocalyptic 末日幻影 / redemption 兑换码 / game 仅启动游戏"
+      "manualHint": "其它任务名：forgottenhall 混沌回忆 / purefiction 虚构叙事 / apocalyptic 末日幻影 / redemption 兑换码 / game 仅启动游戏",
+      "log": {
+        "dirs": [
+          "logs"
+        ],
+        "pattern": "20??-??-??.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "失败",
+          "错误",
+          "完成"
+        ],
+        "enabled": true,
+        "summary": "只跟业务日志；模式本身就排除了 config_diag.log（配置读写 DEBUG，一次启动几千行 sha256）。debug\\ 里只有异常截图，不能选",
+        "source": "本机实测 C://Program Files\\March7thAssistant_v2.7.0\\logs\\2026-10-28.log",
+        "checkedOn": "2026-10-29",
+        "confidence": "measured"
+      }
     },
     {
       "id": "bgi",
@@ -364,7 +496,25 @@
           }
         }
       ],
-      "manualHint": "多条配置组请手写：--startGroups 切换队伍 关闭游戏（组名照抄界面里的名字）"
+      "manualHint": "多条配置组请手写：--startGroups 切换队伍 关闭游戏（组名照抄界面里的名字）",
+      "log": {
+        "dirs": [
+          "log"
+        ],
+        "pattern": "better-genshin-impact*.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "任务出错",
+          "失败"
+        ],
+        "enabled": true,
+        "summary": "按天一个文件，行内带 进程:Session:线程 标签，多开可分辨；结构化执行记录在 log\\ExecutionRecords（非流式，未纳入）",
+        "source": "本机实测 C://Program Files\\BetterGI\\log\\better-genshin-impact20261028.log",
+        "checkedOn": "2026-10-29",
+        "confidence": "measured"
+      }
     },
     {
       "id": "zzz",
@@ -392,7 +542,26 @@
             ]
           }
         }
-      ]
+      ],
+      "log": {
+        "dirs": [
+          ".log"
+        ],
+        "pattern": "log.txt",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "ERROR",
+          "失败",
+          "完成"
+        ],
+        "enabled": true,
+        "summary": "隐藏目录（资源管理器需开「显示隐藏项目」）；任务轮次、点击区名、退出码都在这里，午夜轮转保留 3 份",
+        "source": "ZenlessZoneZero-OneDragon src/one_dragon/utils/log_utils.py:145",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "sra",
@@ -403,7 +572,25 @@
       ],
       "source": "https://starrailassistant.top/",
       "checkedOn": "2026-10-28",
-      "manualHint": "先运行 SRA.exe 在界面里建好配置，再手写：-e run 配置名 + exit"
+      "manualHint": "先运行 SRA.exe 在界面里建好配置，再手写：-e run 配置名 + exit",
+      "log": {
+        "dirs": [
+          "log"
+        ],
+        "pattern": "SRA*.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "ERROR",
+          "失败"
+        ],
+        "enabled": true,
+        "summary": "后端日志（TRACE 全量，按天保留 7 份）；WPF 前端另有一份在 %APPDATA%\\SRA\\logs，这里不取",
+        "source": "Shasnow/StarRailAssistant SRACore/util/logger.py:9",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "maa",
@@ -414,7 +601,26 @@
       ],
       "source": "https://maa.plus/docs/zh-cn/manual/introduction/others.html",
       "checkedOn": "2026-10-28",
-      "manualHint": "手写示例：--config 官服（只切配置，不自动执行；自动执行请用 MAA 自己的定时执行）"
+      "manualHint": "手写示例：--config 官服（只切配置，不自动执行；自动执行请用 MAA 自己的定时执行）",
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "asst.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "TaskChainError",
+          "SubTaskError",
+          "任务出错"
+        ],
+        "enabled": true,
+        "summary": "MAA 用自己的 asst/gui 双日志，不写 maafw.log；想看界面操作与所选关卡，把模式改成 gui.log",
+        "source": "MaaAssistantArknights src/MaaCore/Utils/Logger.hpp、src/MaaWpfGui/Main/Bootstrapper.cs",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "man",
@@ -425,7 +631,25 @@
       ],
       "source": "https://github.com/duorua/MaaAutoNaruto_cli",
       "checkedOn": "2026-10-28",
-      "manualHint": "命令行版是独立仓库 MaaAutoNaruto_cli，参数未在文档中展开，请参考其 README"
+      "manualHint": "命令行版是独立仓库 MaaAutoNaruto_cli，参数未在文档中展开，请参考其 README",
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "maafw.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "TaskChainError",
+          "SubTaskError"
+        ],
+        "enabled": true,
+        "summary": "MaaFramework 内核日志；4.x 内核为 maa.log，改一下模式即可",
+        "source": "MaaFramework docs/zh_cn/5.1-问题反馈.md",
+        "checkedOn": "2026-10-29",
+        "confidence": "framework"
+      }
     },
     {
       "id": "maaend",
@@ -468,7 +692,26 @@
           }
         }
       ],
-      "manualHint": "它跑完不会自己退出：完成判断只能用进程监控 + 超时（maafw\\MaaPiCli.exe 不是替代品，它要的 interface.json 不在 maafw 目录里）"
+      "manualHint": "它跑完不会自己退出：完成判断只能用进程监控 + 超时（maafw\\MaaPiCli.exe 不是替代品，它要的 interface.json 不在 maafw 目录里）",
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "maafw.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "TaskChainError",
+          "SubTaskError",
+          "ERROR"
+        ],
+        "enabled": true,
+        "summary": "内核日志（框架 5.x）；4.x 内核为 maa.log。MXU 壳另有 debug\\mxu-tauri.log",
+        "source": "MaaFramework docs/zh_cn/5.1-问题反馈.md",
+        "checkedOn": "2026-10-29",
+        "confidence": "framework"
+      }
     },
     {
       "id": "m9a",
@@ -1034,7 +1277,22 @@
       "source": "https://github.com/YunLiuZ/ok-Onmyoji/tree/master/docs",
       "checkedOn": "2026-10-28",
       "frontend": "oks",
-      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出",
+      "log": {
+        "dirs": [
+          "logs"
+        ],
+        "pattern": "ok-script*.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": true,
+        "keywords": [],
+        "enabled": true,
+        "summary": "多开时按实例分目录（logs\\<实例id>\\），已开启「包含子目录」；只跟最近写入的那一份，界面显示的是当前实例的进度",
+        "source": "YunLiuZ/ok-Onmyoji main.py:53-58",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     },
     {
       "id": "oketheria",
@@ -1047,6 +1305,54 @@
       "checkedOn": "2026-10-28",
       "frontend": "oks",
       "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+    }
+  ],
+  "logsByEntry": [
+    {
+      "entries": [
+        "AUTO-MAS.exe"
+      ],
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "app.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "ERROR",
+          "失败"
+        ],
+        "enabled": true,
+        "summary": "后端日志（版本/工作目录/端口/子进程退出与耗时）。前端另有 frontend.log；启动链故障在 debug\\runtime（JSONL，未纳入）",
+        "source": "本机实测 C://Program Files\\AUTO-MAS\\debug\\app.log",
+        "checkedOn": "2026-10-29",
+        "confidence": "measured"
+      }
+    },
+    {
+      "entries": [
+        "LixAssistantLimbusCompany.exe"
+      ],
+      "log": {
+        "dirs": [
+          "logs"
+        ],
+        "pattern": "run.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": true,
+        "keywords": [
+          "ERROR",
+          "失败"
+        ],
+        "enabled": true,
+        "summary": "每次运行建一个 logs\\<时间戳>\\ 子目录（只保留最近 3 次），已开启「包含子目录」；同一目录下的 images\\ 是逐步截图，不在这里跟",
+        "source": "HSLix/LixAssistantLimbusCompany lalc_backend/utils/logger.py:29",
+        "checkedOn": "2026-10-29",
+        "confidence": "source"
+      }
     }
   ]
 }

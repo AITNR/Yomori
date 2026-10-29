@@ -111,6 +111,17 @@ public static class LaunchPresetStore
                     profile.LogDirectories.Add(logDir);
                 }
             }
+
+            // 预设里出现过的所有相对目录一次探完，交给判定层按各自顺序挑 ——
+            // 判定层不能读盘，否则 Models 就进不了冒烟工程。
+            foreach (var name in CandidateLogDirs(Library))
+            {
+                var full = Path.Combine(directory, name.Replace('/', Path.DirectorySeparatorChar));
+                if (Directory.Exists(full))
+                {
+                    profile.ExistingRelativeDirs.Add(LauncherProfile.NormalizeRelative(name));
+                }
+            }
         }
         catch (Exception)
         {
@@ -120,8 +131,54 @@ public static class LaunchPresetStore
         return profile;
     }
 
-    private static void ReadInterfaceJson(string jsonPath, LauncherProfile profile)
+    /// <summary>
+    /// 预设里出现过的全部日志目录（去重、保留原写法）。
+    ///
+    /// <para>为什么要先收集再一次性探测：判定层（Models）不能读盘，只能查
+    /// <see cref="LauncherProfile.ExistingRelativeDirs"/>；而每个项目想看的目录不同
+    /// （MFAAvalonia 先 logs 后 debug、三月七只要 logs），所以存在性必须按"全集"预先探好，
+    /// 由判定层按各自顺序挑。</para>
+    /// </summary>
+    private static HashSet<string> CandidateLogDirs(LaunchPresetLibrary library)
     {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void Add(LaunchLogPreset? preset)
+        {
+            if (preset is null)
+            {
+                return;
+            }
+
+            foreach (var dir in preset.Dirs)
+            {
+                var text = (dir ?? string.Empty).Trim();
+                if (text.Length > 0)
+                {
+                    result.Add(text);
+                }
+            }
+        }
+
+        foreach (var frontend in library.Frontends)
+        {
+            Add(frontend.Log);
+        }
+
+        foreach (var project in library.Projects)
+        {
+            Add(project.Log);
+        }
+
+        foreach (var entry in library.LogsByEntry)
+        {
+            Add(entry.Log);
+        }
+
+        return result;
+    }
+
+    private static void ReadInterfaceJson(string jsonPath, LauncherProfile profile)    {
         try
         {
             var info = new FileInfo(jsonPath);

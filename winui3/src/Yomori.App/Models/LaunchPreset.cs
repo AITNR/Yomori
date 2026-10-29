@@ -25,7 +25,123 @@ public sealed class LaunchPresetLibrary
 
     [JsonPropertyName("projects")]
     public List<LaunchProject> Projects { get; set; } = new();
+
+    /// <summary>
+    /// 「按可执行文件名兜底」的日志预设，只服务于不在 <see cref="Projects"/> 里的工具
+    /// （AUTO-MAS / LALC / ArkLights 之类）。不参与启动参数，不与项目条目争夺识别优先级。
+    /// </summary>
+    [JsonPropertyName("logsByEntry")]
+    public List<LaunchLogEntry> LogsByEntry { get; set; } = new();
 }
+
+/// <summary>
+/// 一条按入口文件名匹配的日志预设（兜底用）。
+///
+/// 为什么需要第三层：`projects` 只收录了有启动参数可配的 55 个项目，
+/// 而第二大类基础设施（AUTO-MAS、千机链、ModAVD）与部分自研工具同样有日志要看，
+/// 又不该为了"给它配日志"而硬塞一条空的 `commands`。
+/// </summary>
+public sealed class LaunchLogEntry
+{
+    /// <summary>可执行文件名候选（不含路径）。</summary>
+    [JsonPropertyName("entries")]
+    public List<string> Entries { get; set; } = new();
+
+    [JsonPropertyName("log")]
+    public LaunchLogPreset? Log { get; set; }
+}
+
+/// <summary>
+/// 外部脚本实时日志的推荐值（可被用户全量改写的"初值"）。
+///
+/// <para>为什么挂在 frontend / project 两层而不是逐项目写 76 份：45 个 MaaFramework 项目的
+/// 日志都落在 `debug\` 或 `logs\`，形态一致；逐项写既臃肿又必然写串。project 上的 `log`
+/// 用于覆盖"与壳默认相反"的项目（三月七的 debug 只有截图，业务日志在 logs）。</para>
+///
+/// <para>合并规则是<b>整块替换</b>，不做字段级合并 —— 否则会出现"目录取项目的、模式取壳的"
+/// 这种半对半错的组合，排查时无法解释。</para>
+/// </summary>
+public sealed class LaunchLogPreset
+{
+    /// <summary>
+    /// 日志目录候选，**相对 exe 目录**，按序探测取第一个存在的；允许嵌套（`runtime/logs`）。
+    /// 相对路径是有意的：项目升版只改版本目录名，相对路径不受影响。
+    /// </summary>
+    [JsonPropertyName("dirs")]
+    public List<string> Dirs { get; set; } = new() { "debug", "logs", "log" };
+
+    /// <summary>文件名匹配模式；P0 只用单个模式（多模式 `;` 需 P2 的采集器扩展）。</summary>
+    [JsonPropertyName("pattern")]
+    public string Pattern { get; set; } = ExternalLogDefaults.Pattern;
+
+    /// <summary>auto / utf8 / gbk。默认 auto：BOM → 严格 UTF-8 → 回退 GBK，硬写 gbk 会把 UTF-8 读成乱码。</summary>
+    [JsonPropertyName("encoding")]
+    public string Encoding { get; set; } = ExternalLogEncodings.Auto;
+
+    [JsonPropertyName("followTail")]
+    public bool FollowTail { get; set; } = ExternalLogDefaults.FollowTail;
+
+    /// <summary>
+    /// 递归子目录。P0 采集器还不支持，带这个标记的预设一律 `enabled=false`，
+    /// 等 P2（多模式 + 递归 + `\r` 行界）一起打开。
+    /// </summary>
+    [JsonPropertyName("recursive")]
+    public bool Recursive { get; set; }
+
+    [JsonPropertyName("keywords")]
+    public List<string> Keywords { get; set; } = new();
+
+    /// <summary>false = 该项目不落盘日志（或不值得采集），套用后开关必须保持关闭。</summary>
+    [JsonPropertyName("enabled")]
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>界面灰字：为什么这么配。</summary>
+    [JsonPropertyName("summary")]
+    public string Summary { get; set; } = string.Empty;
+
+    /// <summary>源码/文档锚点，便于核对（与 xlsx「依据」列同源）。</summary>
+    [JsonPropertyName("source")]
+    public string Source { get; set; } = string.Empty;
+
+    [JsonPropertyName("checkedOn")]
+    public string CheckedOn { get; set; } = string.Empty;
+
+    /// <summary>measured（本机实测）/ source（源码核实）/ framework（框架规则）/ guess（推测）。</summary>
+    [JsonPropertyName("confidence")]
+    public string Confidence { get; set; } = LaunchLogConfidences.Guess;
+}
+
+/// <summary>日志预设的置信度取值与界面文案。</summary>
+public static class LaunchLogConfidences
+{
+    public const string Measured = "measured";
+    public const string Source = "source";
+    public const string Framework = "framework";
+    public const string Guess = "guess";
+
+    /// <summary>给界面用的中文说明；未知值按「推测」处理，不抛。</summary>
+    public static string Describe(string? value) => (value ?? string.Empty).Trim().ToLowerInvariant() switch
+    {
+        Measured => "日志位置来自本机实测",
+        Source => "日志位置来自源码核实",
+        Framework => "日志位置来自框架规则",
+        _ => "日志位置为推测",
+    };
+
+    /// <summary>归一：未知值回落 guess。</summary>
+    public static string Normalize(string? value)
+    {
+        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return text switch
+        {
+            Measured => Measured,
+            Source => Source,
+            Framework => Framework,
+            _ => Guess,
+        };
+    }
+}
+
 
 /// <summary>一套参数（属于某个通用前端，如 MFAAvalonia / MaaPiCli / ok-script）。</summary>
 public sealed class LaunchFrontend
@@ -52,6 +168,10 @@ public sealed class LaunchFrontend
     /// <summary>需要用户自己补名字/组名时的示例（下拉里放不下，只能写在说明行）。</summary>
     [JsonPropertyName("manualHint")]
     public string ManualHint { get; set; } = string.Empty;
+
+    /// <summary>这一套壳的日志默认值（`MFAAvalonia` 的 `logs\` + `debug\`）。项目上的 `log` 覆盖它。</summary>
+    [JsonPropertyName("log")]
+    public LaunchLogPreset? Log { get; set; }
 }
 
 /// <summary>一个上游项目（三月七 / BetterGI / M9A …）。</summary>
@@ -85,6 +205,13 @@ public sealed class LaunchProject
 
     [JsonPropertyName("manualHint")]
     public string ManualHint { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 覆盖前端默认的日志位置。整块替换（不按字段合并）：三月七的 `debug\` 只有异常截图，
+    /// 必须改指 `logs\`；混着取会得到"目录对、模式错"的组合。
+    /// </summary>
+    [JsonPropertyName("log")]
+    public LaunchLogPreset? Log { get; set; }
 }
 
 /// <summary>一条「启动方式」= 一组参数 + 它对用户意味着什么。</summary>
@@ -204,4 +331,48 @@ public sealed class LaunchChoice
     public string Key => string.IsNullOrEmpty(ProjectId) ? CommandId : $"{ProjectId}:{CommandId}";
 
     public override string ToString() => Args;
+}
+
+/// <summary>
+/// 一次「日志推荐值」的解析结果（纯数据，界面据此填五个字段 + 显示一行来源）。
+///
+/// <para>注意这里只有一个目录而不是列表：<c>ExternalLogTail</c> 一次只跟一个根路径，
+/// 同时跟两个目录会让"当前文件"在两者之间来回跳、日志顺序错乱。
+/// 多候选只在**选择阶段**用（按序探测第一个存在的）。</para>
+/// </summary>
+public sealed class LaunchLogPlan
+{
+    /// <summary>预设来源 id：项目 id / 前端 id / <c>entry:auto-mas.exe</c>。</summary>
+    public string PresetId { get; init; } = string.Empty;
+
+    public string PresetName { get; init; } = string.Empty;
+
+    /// <summary>该项目是否值得采集；false 时开关必须保持关闭。</summary>
+    public bool Enabled { get; init; } = true;
+
+    /// <summary>探测到的日志目录（绝对路径，已被执行侧解析）；空表示没找到。</summary>
+    public string Directory { get; init; } = string.Empty;
+
+    public string Pattern { get; init; } = ExternalLogDefaults.Pattern;
+
+    public string Encoding { get; init; } = ExternalLogEncodings.Auto;
+
+    public bool FollowTail { get; init; } = ExternalLogDefaults.FollowTail;
+
+    /// <summary>需要递归子目录（P0 采集器尚不支持，此类预设一律 enabled=false）。</summary>
+    public bool Recursive { get; init; }
+
+    public List<string> Keywords { get; init; } = new();
+
+    public string Summary { get; init; } = string.Empty;
+
+    public string Source { get; init; } = string.Empty;
+
+    /// <summary>measured / source / framework / guess。</summary>
+    public string Confidence { get; init; } = LaunchLogConfidences.Guess;
+
+    /// <summary>给界面显示的一句话，如「日志位置来自源码核实」。</summary>
+    public string Basis { get; init; } = string.Empty;
+
+    public bool HasDirectory => Directory.Length > 0;
 }
