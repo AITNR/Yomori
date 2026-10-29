@@ -892,7 +892,15 @@ public sealed partial class SettingsPage : Page
         _latestRelease = result.Latest;
         VM.AppendLog(result.LogLine);
 
-        UpdateResultText.Text = result.Message;
+        // 诊断行：不管结论是什么都记下「发布说明抓没抓到、摘要出几行」。
+        // 「通知里没有更新内容」这种反馈，只看着上面那行结论分不清是没拿到 body
+        // 还是摘要规则没命中 —— 多这一行就能一眼判定（2026-10-29 为此查过一轮）。
+        if (result.Latest is { } probed)
+        {
+            VM.AppendLog($"[更新检查] 发布说明 {probed.Body.Length} 字符，摘要 {UpdateNotes.Summarize(probed.Body).Count} 行。");
+        }
+
+        UpdateResultText.Text = BuildUpdateResultText(result);
         UpdateResultBar.Severity = result.Status switch
         {
             UpdateCheckStatus.UpdateAvailable => InfoBarSeverity.Success,
@@ -926,6 +934,37 @@ public sealed partial class SettingsPage : Page
             VM.NotifyUpdateAvailable(found);
             VM.AppendLog($"[更新检查] 已在通知中心挂上「发现新版本 {found.Version}」。");
         }
+    }
+
+    /// <summary>
+    /// InfoBar 里那段话：结论 + 更新内容要点。
+    ///
+    /// <para>原来只有一句「发现新版本 X —— 当前是 Y。发布日期：…」，用户点完「检查更新」
+    /// 仍然不知道这次改了什么，还得自己开浏览器去翻发布页。发布说明本来就在手上
+    /// （<see cref="GitHubRelease.Body"/>），这里和铃铛里那条通知共用
+    /// <see cref="UpdateNotes"/> 的同一套摘要，两处才不会各说各的。</para>
+    /// </summary>
+    private static string BuildUpdateResultText(UpdateCheckResult result)
+    {
+        if (result is not { Status: UpdateCheckStatus.UpdateAvailable, Latest: { } release })
+        {
+            return result.Message;
+        }
+
+        var notes = UpdateNotes.Summarize(release.Body);
+        if (notes.Count == 0)
+        {
+            return result.Message;
+        }
+
+        var text = new System.Text.StringBuilder(result.Message);
+        text.Append("\n更新内容：");
+        foreach (var note in notes)
+        {
+            text.Append("\n· ").Append(note);
+        }
+
+        return text.ToString();
     }
 
     private void HideUpdateResult()

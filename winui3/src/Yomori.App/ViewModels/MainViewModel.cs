@@ -253,6 +253,14 @@ public sealed class MainViewModel : ObservableObject
         var result = await UpdateService.CheckAsync(channel, network).ConfigureAwait(false);
         AppendLog(result.LogLine);
 
+        // 诊断行：不管结论是什么，先记下发布说明抓没抓到、摘要出几行。
+        // 「通知里没有更新内容」这种反馈，只看着上面那行结论分不清是 body 没到手
+        // 还是摘要规则没命中 —— 多这一行就能一眼判定（2026-10-29 为此查过一轮）。
+        if (result.Latest is { } latest)
+        {
+            AppendLog($"[更新检查] 发布说明 {latest.Body.Length} 字符，摘要 {UpdateNotes.Summarize(latest.Body).Count} 行。");
+        }
+
         if (result.Status != UpdateCheckStatus.UpdateAvailable || result.Latest is null)
         {
             return;
@@ -260,11 +268,6 @@ public sealed class MainViewModel : ObservableObject
 
         var release = result.Latest;
         var pick = UpdateService.PickDownload(release);
-
-        // 通知里要带「更新内容」：发布说明是给人看发布页写的 Markdown（表格 / 代码块 /
-        // 下载说明全在里面），由 UpdateNotes 压成几行要点再上铃铛。
-        var notes = UpdateNotes.Summarize(release.Body);
-        AppendLog($"[更新检查] 更新内容摘要 {notes.Count} 行（发布说明原文 {release.Body.Length} 字符）。");
 
         if (mode == UpdateCheckModes.Download)
         {
