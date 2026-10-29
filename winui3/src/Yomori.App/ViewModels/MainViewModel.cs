@@ -1915,19 +1915,19 @@ public sealed class MainViewModel : ObservableObject
         _runner?.RequestResume();
     }
 
+    /// <summary>
+    /// 停止执行。界面上只有这一个停止入口（原「紧急停止全部」已合并进来）。
+    ///
+    /// <para>注意「停止」的语义是**中止本轮并做全量收尾**，不是"跑完当前任务"：
+    /// 队列立即停，后续任务一个都不执行；收尾范围取全部任务配置（见
+    /// <c>ScriptRunner.RequestStop</c> 的说明）。</para>
+    /// </summary>
     public void Stop()
     {
         // 停止时先作废尚未提交的切回请求：用户要的是「停下」，不是把桌面再抢一次。
         _controllerSessionReturn.CancelPending();
         _runner?.RequestStop();
         RequestRemoteStop(emergency: false);
-    }
-
-    public void EmergencyStop()
-    {
-        _controllerSessionReturn.CancelPending();
-        _runner?.RequestEmergencyStop();
-        RequestRemoteStop(emergency: true);
     }
 
     /// <summary>程序退出前调用：抑制尚未提交的切回，避免退出流程与会话切换抢时序。</summary>

@@ -122,10 +122,6 @@
                                             IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
                                             Click="OnStopClicked"
                                             Background="{StaticResource YomoriDangerBrush}" />
-                                    <Button Content="紧急停止全部  Ctrl+Alt+F8"
-                                            IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
-                                            Click="OnEmergencyStopClicked"
-                                            Background="{StaticResource YomoriDangerDeepBrush}" />
                                     <Button Content="保存配置" Click="OnSaveClicked" />
                                     <Button Content="取消关机" Click="OnCancelShutdownClicked" />
                                 </StackPanel>

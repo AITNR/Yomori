@@ -508,7 +508,7 @@
                                          LostFocus="OnCleanupFieldLostFocus"
                                          Text="{Binding ProcessKeywordsText, Mode=TwoWay}">
                                     <ToolTipService.ToolTip>
-                                        <ToolTip Content="脚本拉起 / 等待 / 需要清理的目标程序。用于等待判断、超时清理、停止执行和紧急停止。" />
+                                        <ToolTip Content="脚本拉起 / 等待 / 需要清理的目标程序。用于等待判断、超时清理和停止执行。" />
                                     </ToolTipService.ToolTip>
                                 </TextBox>
 

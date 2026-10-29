@@ -170,7 +170,6 @@ public sealed class ScriptRunner
     /// </summary>
     private readonly ManualResetEventSlim _stopSignal = new(false);
     private volatile bool _pauseRequested;
-    private volatile bool _emergencyRequested;
     private int _liveTaskWorkers;
     private volatile bool _runFinished;
 
@@ -414,14 +413,17 @@ public sealed class ScriptRunner
     }
 
     /// <summary>
-    /// 停止执行：只收尾当前正在运行的任务。
+    /// 停止执行：队列立即停，并按**全部任务配置**做统一收尾。
     ///
-    /// 【为什么不再在这里做整轮清理】本方法是被"每秒计时回调"/停止监听线程**同步**调用的，
-    /// 而按关键词清理要枚举全部进程、逐个 taskkill，实测一轮要十几秒。
-    /// 在这十几秒里工作线程被完全占住：进度停摆、心跳停摆、状态不再回传 ——
-    /// 主控端看到的就是"点了停止，界面卡住没反应"（真机日志实证过：停止到收尾隔了 14 秒）。
-    /// 现在这里只做两件轻量且立刻见效的事：置标志位 + 终止已登记的直接脚本进程；
-    /// 按关键词的统一三层清理交给主循环下一拍（250ms 内必到），那里本来就有完整的收尾分支。
+    /// <para>【收尾范围为什么取全部】界面上只有一个停止按钮（原「紧急停止全部」已合并进来），
+    /// 那它必须是"能停干净"的那个 —— 只清本轮启动过的任务会漏掉「启动后不等待」那类
+    /// 已经脱离本轮的进程，用户看到的就是"点了停止，游戏还在跑"。</para>
+    ///
+    /// <para>【为什么这里不做整轮清理】本方法由界面 / 停止监听线程**同步**调用，
+    /// 而按关键词清理要枚举进程、逐个发 taskkill。在这十几秒里工作线程被完全占住：
+    /// 进度停摆、心跳停摆、状态不再回传 —— 主控端看到的就是"点了停止，界面卡住没反应"
+    /// （真机日志实证过：停止到收尾隔了 14 秒）。所以这里只做两件轻量且立刻见效的事：
+    /// 置标志位 + 结束已登记的直接脚本进程；三层清理交给主循环下一拍（250ms 内必到）。</para>
     /// </summary>
     public void RequestStop()
     {
@@ -429,28 +431,17 @@ public sealed class ScriptRunner
         _stopCancellation.Cancel();
         _stopSignal.Set();
         _pauseRequested = false;
-        Log("收到用户停止执行请求：正在按当前任务的启动脚本进程 → 目标进程 → 游戏窗口/扩展进程顺序收尾。");
+        Log("收到停止请求：本轮立即停止，并按全部任务配置清理进程。");
         TerminateTrackedProcesses("停止执行");
     }
 
     /// <summary>
-    /// 紧急停止：停掉队列，并把**全部任务配置**（不只当前任务）的进程一起收尾。
+    /// 兼容旧主控端下发的 <c>stop.json</c>（<c>emergency = true</c>）。
     ///
-    /// 与 <see cref="RequestStop"/> 的唯一差别是清理范围：
-    ///   常规停止 = 当前任务（+ 本轮监控学到的真实镜像名）；
-    ///   紧急停止 = 全部任务配置 —— 因此连"启动后不等待"那类已经脱离本轮的进程也能扫到。
-    /// 两者都不在这里做重活（理由同 RequestStop）。
+    /// <para>停止只有一个档位了，本方法等价于 <see cref="RequestStop"/>；保留它是因为
+    /// 桥协议里 <c>emergency</c> 字段还在，旧版本主控端仍会带着 true 发过来。</para>
     /// </summary>
-    public void RequestEmergencyStop()
-    {
-        _stopRequested = true;
-        _stopCancellation.Cancel();
-        _pauseRequested = false;
-        _emergencyRequested = true;
-        _stopSignal.Set();
-        Log("收到紧急停止请求：本轮立即停止，并按全部任务配置（不只当前任务）清理进程。");
-        TerminateTrackedProcesses("紧急停止");
-    }
+    public void RequestEmergencyStop() => RequestStop();
 
     /// <summary>
     /// 立刻结束当前登记在册的脚本进程（轻量：只 Kill，不枚举、不扫关键词）。
@@ -850,15 +841,25 @@ public sealed class ScriptRunner
     /// </summary>
     private static readonly HashSet<string> CandidateProcessBlocklist = new(StringComparer.OrdinalIgnoreCase)
     {
+        // 内核 / 会话宿主
         "system", "idle", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
         "services.exe", "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe",
+        // 桌面外壳与交互宿主
         "explorer.exe", "sihost.exe", "ctfmon.exe", "conhost.exe", "dllhost.exe",
         "runtimebroker.exe", "taskhostw.exe", "searchapp.exe", "startmenuexperiencehost.exe",
         "shellexperiencehost.exe", "backgroundtaskhost.exe", "applicationframehost.exe",
         "textinputhost.exe", "werfault.exe", "wmiprvse.exe", "taskmgr.exe",
+        // 本程序自己
         "yomori.exe", "yomori.agent.exe", "msedgewebview2.exe",
+        // 运行时与脚本宿主：自动化工具必然带它们，但不是"这次任务专用的"
         "cmd.exe", "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe",
         "node.exe", "java.exe", "javaw.exe", "dotnet.exe",
+        // 系统服务（真机日志里这三个被当成候选报出来过）
+        "rtkauduservice64.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+        "searchindexer.exe", "sppsvc.exe", "spoolsv.exe", "audiodg.exe",
+        "msmpeng.exe", "securityhealthservice.exe", "securityhealthsystray.exe",
+        "smartscreen.exe", "wudfhost.exe", "useroobebroker.exe", "dcomlaunch.exe",
+        "igfxem.exe", "nvcontainer.exe", "nvngx_update.exe", "nvsphelper64.exe",
     };
 
     private static HashSet<int> CapturePidSnapshot()
@@ -1173,12 +1174,10 @@ public sealed class ScriptRunner
             WaitIfPaused();
             if (_stopRequested)
             {
-                Log($"任务「{name}」执行中收到停止请求，正在按统一清理顺序收尾当前任务。");
+                Log($"任务「{name}」执行中收到停止请求，正在按统一清理顺序收尾。");
 
-                // 常规停止只收尾当前任务；紧急停止按全部任务配置清理。
-                var scope = _emergencyRequested
-                    ? new List<TaskConfig>(_tasks)
-                    : new List<TaskConfig> { task };
+                // 收尾范围取全部任务配置：界面上只有一个停止按钮，它必须能停干净。
+                var scope = new List<TaskConfig>(_tasks);
 
                 CleanupProcessesForTasks(scope, new List<IMonitoredProcess> { process }, "停止执行", includeWindowKeywords: true);
                 StopExternalLogTail(task);
@@ -1655,6 +1654,26 @@ public sealed class ScriptRunner
     /// 每个都必须给回执：这次事故里最难发现的一环正是"上一步报成功、子进程其实还在"，
     /// 所以这里不用任何"没抛异常就算过"的写法，结论一律来自进程表的复查。
     /// </summary>
+    /// <summary>
+    /// 清理脚本后代时要跳过的"公共宿主"进程。
+    ///
+    /// <para>【为什么单列一份】它们确实是脚本进程的后代（`conhost.exe` 是控制台宿主、
+    /// `msedgewebview2.exe` 是工具自己的 UI 壳），但**杀掉它们没有意义** —— 宿主一退它们自己就走，
+    /// 而每一个都要单独花一次 taskkill（固定 ~2 秒）。真机日志里一次停止有 4 个 conhost +
+    /// 4 个 msedgewebview2，光这些就白等 16 秒。</para>
+    ///
+    /// <para>与 <see cref="CandidateProcessBlocklist"/> 的区别：那份是"别推荐给用户填进清理名单"，
+    /// 这份是"清理时干脆别碰"。两者有重叠，但目的不同，不合并。</para>
+    /// </summary>
+    private static readonly HashSet<string> SharedHostProcesses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "conhost.exe", "msedgewebview2.exe", "werfault.exe", "runtimebroker.exe",
+        "dllhost.exe", "taskhostw.exe", "sihost.exe", "ctfmon.exe",
+        "textinputhost.exe", "applicationframehost.exe", "searchapp.exe",
+        "startmenuexperiencehost.exe", "shellexperiencehost.exe",
+        "backgroundtaskhost.exe", "wmiprvse.exe", "dwm.exe",
+    };
+
     private void TerminateScriptDescendants(string scopeLabel)
     {
         List<ProcessSnapshotEntry> descendants;
@@ -1669,6 +1688,9 @@ public sealed class ScriptRunner
         }
 
         // 倒着收 = 从最深的叶子往根：先断掉"会自己重启游戏"的引擎，壳留到最后。
+        // 同时把公共宿主剔出去（它们会随宿主退出，不值得各花 2 秒）。
+        var targets = new List<ProcessSnapshotEntry>();
+        var skippedHosts = new List<string>();
         for (var i = descendants.Count - 1; i >= 0; i--)
         {
             var item = descendants[i];
@@ -1677,20 +1699,66 @@ public sealed class ScriptRunner
                 continue;
             }
 
-            Log($"{scopeLabel}：正在清理脚本进程派生的子进程：{item.Name}（PID {item.Pid}）");
-            var result = ProcessHelper.TerminateProcessTree(item.Pid);
-            Log($"{scopeLabel}：结束「{item.Name}」（PID {item.Pid}）：{result.Summary}");
-
-            if (result.Ok)
+            if (SharedHostProcesses.Contains(item.Name) || SharedHostProcesses.Contains(ProcessHelper.BareImageName(item.Name)))
             {
+                AddUnique(skippedHosts, item.Name);
+                continue;
+            }
+
+            targets.Add(item);
+        }
+
+        if (skippedHosts.Count > 0)
+        {
+            Log($"{scopeLabel}：跳过 {skippedHosts.Count} 个公共宿主进程（{string.Join("、", skippedHosts)}）"
+                + " —— 它们会随宿主退出，单独结束每个要白等约 2 秒。");
+        }
+
+        if (targets.Count == 0)
+        {
+            return;
+        }
+
+        var nameList = new List<string>();
+        foreach (var item in targets)
+        {
+            AddUnique(nameList, item.Name);
+        }
+
+        Log($"{scopeLabel}：正在清理 {targets.Count} 个脚本派生的子进程（叶子优先）：{string.Join("、", nameList)}");
+
+        // ① 先逐个托管结束：毫秒级，绝大多数进程在这一步就没了。
+        var refused = new List<int>();
+        foreach (var item in targets)
+        {
+            if (!ProcessHelper.TryKill(item.Pid))
+            {
+                refused.Add(item.Pid);
+            }
+        }
+
+        // ② 被拒的合成一次 taskkill：taskkill 的固定开销约 2 秒/次，与杀几个无关，
+        //    所以 N 个被拒的进程也只该付一次代价（原先是一个一个来，12 个 = 24 秒）。
+        if (refused.Count > 0)
+        {
+            var batch = ProcessHelper.TerminatePidTreeBatch(refused);
+            Log($"{scopeLabel}：{refused.Count} 个进程直接结束被拒，改用一次批量 taskkill：{batch.Summary}");
+        }
+
+        // ③ 复查给回执：结论只来自"还在不在"，不看上一步返回了什么。
+        foreach (var item in targets)
+        {
+            if (!ProcessHelper.IsSameProcessAlive(item.Pid, item.Name))
+            {
+                Log($"{scopeLabel}：已结束「{item.Name}」（PID {item.Pid}）");
                 continue;
             }
 
             var closed = ProcessHelper.CloseMainWindowsByPid(item.Pid);
-            if (closed > 0)
-            {
-                Log($"{scopeLabel}：强制结束被拒，已向「{item.Name}」的 {closed} 个窗口发送关闭请求（走它自己的退出流程）。");
-            }
+            Log($"{scopeLabel}：结束「{item.Name}」（PID {item.Pid}）：未能结束"
+                + (closed > 0
+                    ? $"；已向其 {closed} 个窗口发送关闭请求（走它自己的退出流程）"
+                    : "；也没有可发送关闭请求的窗口"));
         }
     }
 
@@ -1977,14 +2045,27 @@ public sealed class ScriptRunner
             return;
         }
 
+        // 先把"确实在跑"的候选挑出来再动手：taskkill 哪怕报「没有找到进程」也要花近 2 秒，
+        // 而清理名单里绝大多数名字在停止那一刻早就退出了（真机日志里 4 次白等 = 8 秒）。
         var tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var running = new List<string>();
         foreach (var candidate in ProcessHelper.ProcessNameCandidates(text))
         {
-            if (tried.Add(candidate))
+            if (tried.Add(candidate) && ProcessHelper.IsProcessNameRunning(candidate))
             {
-                var byName = ProcessHelper.TerminateProcessName(candidate);
-                Log($"结束进程名「{candidate}」：{byName.Summary}");
+                running.Add(candidate);
             }
+        }
+
+        if (running.Count == 0)
+        {
+            Log($"结束进程名「{text}」：未在运行，跳过");
+        }
+
+        foreach (var candidate in running)
+        {
+            var byName = ProcessHelper.TerminateProcessName(candidate);
+            Log($"结束进程名「{candidate}」：{byName.Summary}");
         }
 
         try
@@ -2420,9 +2501,9 @@ public sealed class ScriptRunner
         lock (_sync)
         {
             processes = new List<IMonitoredProcess>(_currentProcesses);
-            tasks = _emergencyRequested
-                ? new List<TaskConfig>(_tasks)
-                : DistinctTasks(_tasksByPid.Values);
+            // 范围取全部任务配置：停止只有一个档位，界面上没有"更彻底的那个"可点第二次，
+            // 所以这里必须一次清到位（含「启动后不等待」那类已脱离本轮的进程）。
+            tasks = new List<TaskConfig>(_tasks);
         }
 
         if (processes.Count == 0 && tasks.Count == 0)
@@ -2430,29 +2511,8 @@ public sealed class ScriptRunner
             return;
         }
 
-        var label = _emergencyRequested ? "紧急停止" : "停止执行";
-        Log($"{label}：统一收尾 —— 复查 {tasks.Count} 个任务配置、{processes.Count} 个登记进程。");
-        CleanupProcessesForTasks(tasks, processes, label, includeWindowKeywords: true);
-
-        if (_emergencyRequested)
-        {
-            Log("紧急停止处理已执行。");
-        }
-    }
-
-    private static List<TaskConfig> DistinctTasks(IEnumerable<TaskConfig> source)
-    {
-        var result = new List<TaskConfig>();
-        var seen = new HashSet<TaskConfig>();
-        foreach (var task in source)
-        {
-            if (seen.Add(task))
-            {
-                result.Add(task);
-            }
-        }
-
-        return result;
+        Log($"停止执行：统一收尾 —— 复查 {tasks.Count} 个任务配置、{processes.Count} 个登记进程。");
+        CleanupProcessesForTasks(tasks, processes, "停止执行", includeWindowKeywords: true);
     }
 
     private void SchedulePressEnter(int delaySeconds, string taskName)

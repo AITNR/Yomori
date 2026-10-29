@@ -1770,8 +1770,6 @@ public sealed partial class MainWindow : Window
 
     private void OnStopClicked(object sender, RoutedEventArgs e) => VM.Stop();
 
-    private void OnEmergencyStopClicked(object sender, RoutedEventArgs e) => VM.EmergencyStop();
-
     private void OnSaveClicked(object sender, RoutedEventArgs e) => VM.SaveConfig();
 
     private void OnCancelShutdownClicked(object sender, RoutedEventArgs e) => VM.CancelShutdown();
@@ -1795,26 +1793,13 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    // ---------------- 快捷键：F8 停止 / Ctrl+Alt+F8 紧急停止 ----------------
+    // ---------------- 快捷键：F8 停止 ----------------
 
     private void OnRootKeyDown(object sender, KeyRoutedEventArgs e)
     {
-        var ctrl = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(Windows.System.VirtualKey.Control)
-            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
-        var alt = Microsoft.UI.Input.InputKeyboardSource.GetKeyStateForCurrentThread(Windows.System.VirtualKey.Menu)
-            .HasFlag(Windows.UI.Core.CoreVirtualKeyStates.Down);
-
         if (e.Key == Windows.System.VirtualKey.F8)
         {
-            if (ctrl && alt)
-            {
-                VM.EmergencyStop();
-            }
-            else
-            {
-                VM.Stop();
-            }
-
+            VM.Stop();
             e.Handled = true;
         }
     }

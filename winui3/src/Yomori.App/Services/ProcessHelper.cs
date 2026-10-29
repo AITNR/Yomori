@@ -574,6 +574,14 @@ public static class ProcessHelper
             return ProcessTerminateResult.Skip("进程名为空");
         }
 
+        // 【先查再杀】taskkill 哪怕目标根本不存在，也要花近 2 秒（实测 1931ms，
+        // 它要跟内核做一轮往返）。清理名单里大量名字本来就是"已经不在"的状态，
+        // 不先判断的话，每个名字白等 2 秒 —— 一次停止光这一项就能拖掉十几秒。
+        if (!IsProcessNameRunning(processName))
+        {
+            return ProcessTerminateResult.Skip("未在运行");
+        }
+
         var result = RunHidden("taskkill", $"/IM \"{processName}\" /T /F", 10000);
         return new ProcessTerminateResult(result.Ok, result.ExitCode, result.Detail);
     }
@@ -586,9 +594,62 @@ public static class ProcessHelper
             return ProcessTerminateResult.Skip("PID 无效");
         }
 
+        // 同上：PID 已经被系统回收 / 进程早已退出时，别让 taskkill 白跑 2 秒。
+        if (!IsSameProcessAlive(pid, null))
+        {
+            return ProcessTerminateResult.Skip("进程已不存在");
+        }
+
         var result = RunHidden("taskkill", $"/PID {pid} /T /F", 10000);
         return new ProcessTerminateResult(result.Ok, result.ExitCode, result.Detail);
     }
+
+    /// <summary>
+    /// 一次 taskkill 结束多个 PID（`/PID a /PID b …`）。
+    ///
+    /// <para>【为什么需要】taskkill 的固定开销约 2 秒/次，与"杀几个进程"无关。
+    /// 逐个调用的代价是 N×2 秒：真机日志里一次停止要清 12 个后代，光这就 24 秒，
+    /// 用户看到的是"点了停止，十几秒后才轮到游戏本体"。</para>
+    ///
+    /// <para>只有 1 个时退回单个版本；0 个时直接算成功（本来就没有）。</para>
+    /// </summary>
+    public static ProcessTerminateResult TerminatePidTreeBatch(IReadOnlyList<int> pids)
+    {
+        var alive = new List<int>();
+        foreach (var pid in pids)
+        {
+            if (pid > 0 && !alive.Contains(pid) && IsSameProcessAlive(pid, null))
+            {
+                alive.Add(pid);
+            }
+        }
+
+        if (alive.Count == 0)
+        {
+            return new ProcessTerminateResult(true, -1, "进程都已不存在");
+        }
+
+        if (alive.Count == 1)
+        {
+            return TerminatePidTree(alive[0]);
+        }
+
+        var arguments = new StringBuilder();
+        foreach (var pid in alive)
+        {
+            arguments.Append("/PID ").Append(pid).Append(' ');
+        }
+
+        arguments.Append("/T /F");
+        var result = RunHidden("taskkill", arguments.ToString(), 15000);
+        return new ProcessTerminateResult(result.Ok, result.ExitCode, result.Detail);
+    }
+
+    /// <summary>
+    /// 直接结束单个 PID，不走 taskkill（毫秒级）。返回 true = 已结束或本来就不在。
+    /// 清理后代时先走这个，只有被拒的才退回批量 taskkill。
+    /// </summary>
+    public static bool TryKill(int pid) => pid > 0 && KillByPid(pid).Length == 0;
 
     /// <summary>
     /// 结束**整棵进程树**：taskkill 不成自己按 PPID 逐层收，最后**复查**才给结论。
