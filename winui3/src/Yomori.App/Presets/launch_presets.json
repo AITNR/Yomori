@@ -1,5 +1,5 @@
 {
-  "rev": 2,
+  "rev": 3,
   "updatedOn": "2026-10-29",
   "frontends": [
     {
@@ -590,6 +590,17 @@
         "source": "Shasnow/StarRailAssistant SRACore/util/logger.py:9",
         "checkedOn": "2026-10-29",
         "confidence": "source"
+      },
+      "cleanup": {
+        "launcher": [],
+        "main": [],
+        "game": [
+          "StarRail.exe"
+        ],
+        "confidence": "source",
+        "summary": "同游戏 m7a 的 monitor 已核验过这个名字，sra 没有 monitor，需单独登记。",
+        "source": "沿用 m7a 的 monitor.keywords",
+        "checkedOn": "2026-10-29"
       }
     },
     {
@@ -711,6 +722,19 @@
         "source": "MaaFramework docs/zh_cn/5.1-问题反馈.md",
         "checkedOn": "2026-10-29",
         "confidence": "framework"
+      },
+      "cleanup": {
+        "launcher": [],
+        "main": [],
+        "game": [
+          "Endfield.exe",
+          "PlatformProcess.exe",
+          "UnityCrashHandler64.exe"
+        ],
+        "confidence": "measured",
+        "summary": "MaaEnd 本身不拉起游戏，游戏由鹰角启动器 + UAC 静默提权拉起；这三个进程必须单独登记，否则停止时名单里只有 MaaEnd。不纳入 QtWebEngineProcess.exe（Qt 通用名，易误杀）。",
+        "source": "本机 2026-10-29 实测",
+        "checkedOn": "2026-10-29"
       }
     },
     {
@@ -796,7 +820,18 @@
       "source": "https://github.com/miaojiuqing/Maa_bbb",
       "checkedOn": "2026-10-28",
       "frontend": "mfw",
-      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx"
+      "manualHint": "指定配置手写：--direct-run --config-id c_xxxx",
+      "cleanup": {
+        "launcher": [],
+        "main": [],
+        "game": [
+          "BH3.exe"
+        ],
+        "confidence": "measured",
+        "summary": "识宝小助手没有 monitor，游戏本体只能靠这一栏；BH3.exe 由 mab.exe 派生（日志实证）。",
+        "source": "2026-10-29 代理日志",
+        "checkedOn": "2026-10-29"
+      }
     },
     {
       "id": "maapvz",
@@ -1205,7 +1240,18 @@
       "source": "https://github.com/ok-oldking/ok-wuthering-waves",
       "checkedOn": "2026-10-28",
       "frontend": "oks",
-      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出",
+      "cleanup": {
+        "launcher": [],
+        "main": [],
+        "game": [
+          "Client-Win64-Shipping.exe"
+        ],
+        "confidence": "measured",
+        "summary": "鸣潮是 UE 项目，真实镜像名与显示名完全不同；monitor 是 direct，必须单独登记。",
+        "source": "本机实测 Wuthering Waves/Client/Binaries/Win64/",
+        "checkedOn": "2026-10-29"
+      }
     },
     {
       "id": "okgi",
@@ -1217,7 +1263,19 @@
       "source": "https://github.com/ok-oldking/ok-genshin-impact",
       "checkedOn": "2026-10-28",
       "frontend": "oks",
-      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出",
+      "cleanup": {
+        "launcher": [],
+        "main": [],
+        "game": [
+          "YuanShen.exe",
+          "GenshinImpact.exe"
+        ],
+        "confidence": "source",
+        "summary": "同游戏 bgi 的 monitor 已核验过这两个名字，okgi 只是没写；补上以便 direct 模式也能清理。",
+        "source": "沿用 bgi 的 monitor.keywords",
+        "checkedOn": "2026-10-29"
+      }
     },
     {
       "id": "okgf2",
@@ -1253,7 +1311,20 @@
       "source": "https://ok-script.com/ok-end-field/",
       "checkedOn": "2026-10-28",
       "frontend": "oks",
-      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出"
+      "manualHint": "跑第 N 个任务就把数字改成 N；-e 表示跑完退出",
+      "cleanup": {
+        "launcher": [],
+        "main": [],
+        "game": [
+          "Endfield.exe",
+          "PlatformProcess.exe",
+          "UnityCrashHandler64.exe"
+        ],
+        "confidence": "measured",
+        "summary": "同 maaend：ok-ef 的完成判定是 direct，ProcessKeywords 为空，游戏本体不在任何一层。",
+        "source": "本机 2026-10-29 实测",
+        "checkedOn": "2026-10-29"
+      }
     },
     {
       "id": "okkes",

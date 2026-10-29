@@ -992,6 +992,23 @@ public static class RdpEventKinds
     public const string ExternalLog = "ext_log";
 }
 
+/// <summary>
+/// 一条「本次运行新出现的进程」候选（代理 → 主控端）。
+///
+/// <para>只有镜像名与 PID，不含路径：路径跨会话读不到，而且跨机器（远程通道）时
+/// 主控端根本不认识对方的盘符。界面靠镜像名就能让用户认出是哪个程序。</para>
+/// </summary>
+public sealed class RdpCandidateProcess
+{
+    /// <summary>属于哪个任务（任务显示名）；旧代理可能为空，界面按"未知任务"处理。</summary>
+    public string Task { get; set; } = string.Empty;
+
+    /// <summary>镜像名，带 <c>.exe</c>（如 <c>Endfield.exe</c>）。</summary>
+    public string Name { get; set; } = string.Empty;
+
+    public int Pid { get; set; }
+}
+
 /// <summary>Agent 的运行状态快照。</summary>
 public sealed class RdpStatus
 {
@@ -1012,6 +1029,18 @@ public sealed class RdpStatus
     public List<RdpTaskEvent> Events { get; set; } = new();
     public int LiveLogProtocol { get; set; }
     public string LiveLogError { get; set; } = string.Empty;
+
+    /// <summary>
+    /// 本次运行期间新出现的进程（代理侧采集），供主控端的「从上次运行填入」使用。
+    ///
+    /// <para>【为什么必须回传】采集发生在**代理进程**里，主控端读不到它的内存。
+    /// 不回传的话，远程通道上那个按钮永远是空的 —— 而本条功能最初的触发场景
+    ///（终末地）恰好跑在远程通道里。</para>
+    ///
+    /// <para>老代理不写这个字段 → 反序列化为空列表，界面按"没有采集结果"处理，
+    /// 与旧版本互通不受影响。</para>
+    /// </summary>
+    public List<RdpCandidateProcess> CandidateProcesses { get; set; } = new();
 
     /// <summary>
     /// 代理是否<b>正在执行任务</b>。

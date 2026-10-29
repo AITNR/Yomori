@@ -213,7 +213,9 @@ public static class LaunchPresetResolver
 
         if (resolution?.Project is { } project)
         {
-            AppendCommandList(choices, seen, project.Commands, project.Id, project.Name, profile);
+            // 项目自己的清理登记优先；没有就整块用前端那份（与 log 段的继承规则一致）
+            var cleanup = project.Cleanup ?? resolution.Frontend?.Cleanup;
+            AppendCommandList(choices, seen, project.Commands, project.Id, project.Name, profile, cleanup);
             if (manualHint.Length == 0)
             {
                 manualHint = project.ManualHint;
@@ -222,7 +224,7 @@ public static class LaunchPresetResolver
 
         if (resolution?.Frontend is { } frontend)
         {
-            AppendCommandList(choices, seen, frontend.Commands, resolution.ProjectId, frontend.Name, profile);
+            AppendCommandList(choices, seen, frontend.Commands, resolution.ProjectId, frontend.Name, profile, frontend.Cleanup);
             if (manualHint.Length == 0)
             {
                 manualHint = frontend.ManualHint;
@@ -234,7 +236,7 @@ public static class LaunchPresetResolver
 
     private static void AppendCommandList(
         List<LaunchChoice> choices, HashSet<string> seen, List<LaunchCommand>? commands,
-        string projectId, string projectName, LauncherProfile? profile)
+        string projectId, string projectName, LauncherProfile? profile, LaunchCleanup? cleanup)
     {
         if (commands is null)
         {
@@ -275,6 +277,7 @@ public static class LaunchPresetResolver
                 Verified = command.Verified,
                 TimeoutMinutes = command.TimeoutMinutes,
                 Monitor = command.Monitor,
+                Cleanup = cleanup,
             });
         }
     }
@@ -506,8 +509,11 @@ public static class LaunchPresetResolver
     /// 把一条候选写进任务。
     ///
     /// <paramref name="applyRecommended"/> = 界面上的「同时套用推荐设置」：
-    /// 打开时顺带写超时、完成判断（三选一，绝不两种同时写）、外部日志五项。
-    /// **永不覆盖**通道归属、并发、清理进程名、任务名 —— 那些是"这台机器"的信息，与启动参数无关。
+    /// 打开时顺带写超时、完成判断（三选一，绝不两种同时写）、清理登记、外部日志五项。
+    ///
+    /// <para>**永不覆盖**通道归属、并发、任务名 —— 那些是"这台机器"的信息，与启动参数无关。
+    /// 清理三栏与两个关键词栏则受 <see cref="TaskConfig.CleanupTouched"/> 控制：
+    /// 用户在界面上手改过任一个之后，这些字段一律不再自动写入（三栏另外还遵守"只填空"）。</para>
     ///
     /// <para><paramref name="logPlan"/> 为 null 或为空时不写日志字段：探测不到目录就
     /// 不启用（写一个不存在的路径会静默采集不到，比不启用更难查）。</para>
@@ -536,7 +542,7 @@ public static class LaunchPresetResolver
         }
 
         var monitor = choice.Monitor;
-        if (monitor is not null)
+        if (monitor is not null && !task.CleanupTouched)
         {
             switch (monitor.Kind)
             {
@@ -558,6 +564,32 @@ public static class LaunchPresetResolver
                     task.WindowKeywords = new List<string>();
                     break;
             }
+        }
+
+        // 「进程清理登记」：只填空栏，不覆盖已有值。
+        // 【为什么这里必须判 CleanupTouched】上面那句"永不覆盖清理进程名"的承诺，原先只写在注释里、
+        // 代码里并没有兑现 —— 用户手填的 LauncherProcess/MainProcess/GameProcess 会被预设一路忽略，
+        // ProcessKeywords 更是被无条件替换。现在把"用户动过"这件事记进 CleanupTouched：
+        // 置位后关键词与三栏一个字都不碰，由用户自己负责。
+        if (choice.Cleanup is { } cleanup && cleanup.IsUsable && !task.CleanupTouched)
+        {
+            if (task.LauncherProcess.Trim().Length == 0)
+            {
+                task.LauncherProcess = JoinNames(cleanup.Launcher);
+            }
+
+            if (task.MainProcess.Trim().Length == 0)
+            {
+                task.MainProcess = JoinNames(cleanup.Main);
+            }
+
+            if (task.GameProcess.Trim().Length == 0)
+            {
+                task.GameProcess = JoinNames(cleanup.Game);
+            }
+
+            task.CleanupPresetId = choice.Key;
+            task.CleanupRev = rev;
         }
 
         // 日志：预设只「填入」不「锁定」。用户手改过（ExternalLogTouched）就一个字不动 ——
@@ -598,6 +630,31 @@ public static class LaunchPresetResolver
     }
 
     // ---------------------------------------------------------------- 内部
+
+    /// <summary>
+    /// 把预设里的名字列表拼成 <c>TaskConfig</c> 用的分号串（`A; B`）。
+    ///
+    /// <para>为什么用分号而不是只取第一个：一个游戏常常有多个必须一起收尾的进程
+    /// （`Endfield.exe` + `PlatformProcess.exe` + `UnityCrashHandler64.exe`），
+    /// 漏掉 `UnityCrashHandler64` 会让它挂着继续占文件。</para>
+    ///
+    /// <para>为什么要 Trim 并跳过空项：JSON 里手写时很容易留下尾随空格，
+    /// 而按名清理是逐字比较，`"Endfield.exe "` 会静默打不中。</para>
+    /// </summary>
+    private static string JoinNames(List<string> names)
+    {
+        var parts = new List<string>();
+        foreach (var name in names)
+        {
+            var text = (name ?? string.Empty).Trim();
+            if (text.Length > 0)
+            {
+                parts.Add(text);
+            }
+        }
+
+        return string.Join("; ", parts);
+    }
 
     private static string FileName(string? pathOrName)
     {

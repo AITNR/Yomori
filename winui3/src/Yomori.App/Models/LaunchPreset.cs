@@ -172,6 +172,10 @@ public sealed class LaunchFrontend
     /// <summary>这一套壳的日志默认值（`MFAAvalonia` 的 `logs\` + `debug\`）。项目上的 `log` 覆盖它。</summary>
     [JsonPropertyName("log")]
     public LaunchLogPreset? Log { get; set; }
+
+    /// <summary>这套壳的默认清理登记；项目自己的 <see cref="LaunchProject.Cleanup"/> 整块覆盖它。</summary>
+    [JsonPropertyName("cleanup")]
+    public LaunchCleanup? Cleanup { get; set; }
 }
 
 /// <summary>一个上游项目（三月七 / BetterGI / M9A …）。</summary>
@@ -212,6 +216,14 @@ public sealed class LaunchProject
     /// </summary>
     [JsonPropertyName("log")]
     public LaunchLogPreset? Log { get; set; }
+
+    /// <summary>
+    /// 本项目的清理登记建议。整块替换前端的那份（不按字段合并）——
+    /// 字段级合并会出现"launcher 来自项目、main 来自前端"这种半对半错的组合，
+    /// 出问题时无法解释名单里那个名字是谁给的。
+    /// </summary>
+    [JsonPropertyName("cleanup")]
+    public LaunchCleanup? Cleanup { get; set; }
 }
 
 /// <summary>一条「启动方式」= 一组参数 + 它对用户意味着什么。</summary>
@@ -280,6 +292,70 @@ public sealed class LaunchMonitor
     public List<string> Keywords { get; set; } = new();
 }
 
+/// <summary>
+/// 「进程清理登记」建议：三栏分别落到 <c>TaskConfig</c> 的
+/// <c>LauncherProcess</c> / <c>MainProcess</c> / <c>GameProcess</c>。
+///
+/// <para>【为什么必须有它】清理名单的名字全部来自任务配置，而预设原先只写「监控关键词」。</para>
+/// <para>监控关键词确实会经 <c>BuildCleanupPlan</c> 并入②「目标进程」，但这只对
+/// `monitor.kind=process` 且关键词**就是游戏本体**的项目成立（m7a/bgi/zzz）。
+/// 另外两类仍然缺：关键词写的是工具自己（maaend → MaaEnd），或根本没有 monitor（51 个 direct 项目）。
+/// 终末地两条正落在缺口里 —— 名单里只有工具，游戏本体一层都没有。</para>
+///
+/// <para>【为什么不给 game 栏批量填】写错的代价是误杀：`QtWebEngineProcess.exe` / `uninst.exe`
+/// 这类通用名一旦进名单，会杀掉无关程序。所以只填有实证的，「宁可留空，不许猜」。</para>
+/// </summary>
+public sealed class LaunchCleanup
+{
+    /// <summary>落到①「启动脚本进程」。放壳 / 启动器 / 提权重启后的另一个入口名。</summary>
+    [JsonPropertyName("launcher")]
+    public List<string> Launcher { get; set; } = new();
+
+    /// <summary>落到②「目标进程」。放真正执行任务的引擎进程，**禁止**放游戏本体。</summary>
+    [JsonPropertyName("main")]
+    public List<string> Main { get; set; } = new();
+
+    /// <summary>落到③「游戏/扩展进程」。只在「monitor 没覆盖到游戏本体」时填。</summary>
+    [JsonPropertyName("game")]
+    public List<string> Game { get; set; } = new();
+
+    /// <summary>取自 <see cref="LaunchCleanupConfidences"/>；<c>guess</c> 一律不写。</summary>
+    [JsonPropertyName("confidence")]
+    public string Confidence { get; set; } = LaunchCleanupConfidences.Source;
+
+    [JsonPropertyName("summary")]
+    public string Summary { get; set; } = string.Empty;
+
+    [JsonPropertyName("source")]
+    public string Source { get; set; } = string.Empty;
+
+    [JsonPropertyName("checkedOn")]
+    public string CheckedOn { get; set; } = string.Empty;
+
+    /// <summary>有名字可写、且不是纯推测。<c>guess</c> 保留在 JSON 里供核对，但不写进任务。</summary>
+    [JsonIgnore]
+    public bool IsUsable =>
+        !string.Equals(Confidence, LaunchCleanupConfidences.Guess, StringComparison.OrdinalIgnoreCase)
+        && (Launcher.Count > 0 || Main.Count > 0 || Game.Count > 0);
+}
+
+/// <summary>清理登记的可信度。<c>guess</c> 与其它三档的区别是"会不会写进任务"。</summary>
+public static class LaunchCleanupConfidences
+{
+    /// <summary>本机实跑观测到的真实镜像名。</summary>
+    public const string Measured = "measured";
+
+    /// <summary>官方文档 / 源码写明。</summary>
+    public const string Source = "source";
+
+    /// <summary>按框架规则推（MaaFramework 系引擎是 DLL，没有独立进程）。</summary>
+    public const string Framework = "framework";
+
+    /// <summary>推测：只登记不落库。</summary>
+    public const string Guess = "guess";
+}
+
+
 /// <summary>参数里的占位符声明（目前只登记，不替换）。</summary>
 public sealed class LaunchPlaceholder
 {
@@ -326,6 +402,9 @@ public sealed class LaunchChoice
     public int TimeoutMinutes { get; init; }
 
     public LaunchMonitor? Monitor { get; init; }
+
+    /// <summary>该项目的清理登记建议（项目自己的优先，否则用前端的）。</summary>
+    public LaunchCleanup? Cleanup { get; init; }
 
     /// <summary>来源标记，写进 <c>TaskConfig.LaunchPresetId</c>：<c>m7a:daily</c>。</summary>
     public string Key => string.IsNullOrEmpty(ProjectId) ? CommandId : $"{ProjectId}:{CommandId}";

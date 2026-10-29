@@ -53,6 +53,12 @@ public sealed class RdpAgentRunner
     /// <summary>本代理读写哪座桥 —— Agent 启动时由 --bridge:（或按账户名派生）确定，见 App.OnLaunched。</summary>
     private readonly RdpBridge _bridge;
 
+    /// <summary>
+    /// 本轮任务执行器（<see cref="RunAsync"/> 里创建）。只用于把「新出现的进程」候选
+    /// 回传主控端 —— 采集发生在代理进程，主控端自己读不到。
+    /// </summary>
+    private ScriptRunner? _currentRunner;
+
     /// <summary>停止请求只处理一次（击键连点 / 多拍重复读到同一个请求时不要反复下发）。</summary>
     private bool _stopHandled;
 
@@ -136,6 +142,10 @@ public sealed class RdpAgentRunner
             _logger,
             _stats,
             _command.EnableTimeoutScreenshot);
+
+        // 交给状态写入用：采集到的「本次运行新出现的进程」要回传主控端，
+        // 否则「从上次运行填入」在远程通道上永远是空的（采集发生在代理进程里，主控端读不到）。
+        _currentRunner = runner;
 
         // 停止监听与任务执行并行：不再依赖计时回调，任何阶段都能响应"停"。
         using var stopWatch = new CancellationTokenSource();
@@ -512,8 +522,33 @@ public sealed class RdpAgentRunner
             status.AgentUser = Environment.UserName;
             status.LiveLogProtocol = RdpLiveLogProtocol.Current;
             status.LiveLogError = _liveLogWriteFailureReported ? "实时日志回传暂时不可用，正在重试。" : string.Empty;
+            status.CandidateProcesses = BuildCandidatePayload();
             return mutator(status);
         });
+    }
+
+    /// <summary>
+    /// 把采集到的候选进程转成桥上的形状。
+    ///
+    /// <para>为什么每次 Update 都重算而不是"完成时写一次"：状态的写入点分散在
+    /// 开始 / 每个任务完成 / 收尾，完成事件之后主控端还会收到多次心跳；只在某一处写，
+    /// 下一次心跳就可能把它覆盖成空（历史上相位 done 就被空闲心跳冲掉过）。</para>
+    /// </summary>
+    private List<RdpCandidateProcess> BuildCandidatePayload()
+    {
+        var runner = _currentRunner;
+        if (runner is null)
+        {
+            return new List<RdpCandidateProcess>();
+        }
+
+        var result = new List<RdpCandidateProcess>();
+        foreach (var (task, name, pid) in runner.CandidateSnapshot())
+        {
+            result.Add(new RdpCandidateProcess { Task = task, Name = name, Pid = pid });
+        }
+
+        return result;
     }
 
     private void Append(string kind, string message, bool abnormal = false) =>

@@ -56,6 +56,9 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     private string _externalLogPresetId = string.Empty;
     private int _externalLogRev;
     private bool _externalLogTouched;
+    private string _cleanupPresetId = string.Empty;
+    private int _cleanupRev;
+    private bool _cleanupTouched;
 
     [JsonPropertyName("enabled")]
     public bool Enabled
@@ -363,6 +366,43 @@ public sealed class TaskConfig : ObservableObject, ICloneable
         set => SetProperty(ref _externalLogTouched, value);
     }
 
+    /// <summary>
+    /// 「进程清理登记」是从哪条预设填的：<c>maaend:auto-on-launch</c>。空串 = 手工填写。
+    /// 与 <see cref="ExternalLogPresetId"/> 同性质：**不参与执行**，只用于界面显示来源。
+    /// </summary>
+    [JsonPropertyName("cleanup_preset_id")]
+    public string CleanupPresetId
+    {
+        get => _cleanupPresetId;
+        set => SetProperty(ref _cleanupPresetId, (value ?? string.Empty).Trim());
+    }
+
+    /// <summary>写入时的预设库版本。</summary>
+    [JsonPropertyName("cleanup_rev")]
+    public int CleanupRev
+    {
+        get => _cleanupRev;
+        set => SetProperty(ref _cleanupRev, value);
+    }
+
+    /// <summary>
+    /// 用户手改过「清理登记」的任一个框（三个进程名框 + 两个关键词框）。
+    ///
+    /// <para>【为什么五个框共用一个标志】这五个框回答的是同一件事 ——「停止时要清谁」。
+    /// 分开关会出现"关键词守住了、三栏被冲掉"的半对半错状态，而这种状态在日志里
+    /// 无法与"用户本来就没填"区分开。共用一个标志，语义只有一句：
+    /// 用户动过之后，预设一个字都不许改。</para>
+    ///
+    /// <para>置位时机：界面上手改并失焦、且值确实变了（见 TasksPage.MarkCleanupTouched）。
+    /// 还原推荐值时由界面显式清掉。</para>
+    /// </summary>
+    [JsonPropertyName("cleanup_touched")]
+    public bool CleanupTouched
+    {
+        get => _cleanupTouched;
+        set => SetProperty(ref _cleanupTouched, value);
+    }
+
     /// <summary>关键字的文本形态（分号分隔），专供 UI 两向绑定。</summary>    [JsonIgnore]
     public string ExternalLogKeywordsText
     {
@@ -477,6 +517,15 @@ public sealed class TaskConfig : ObservableObject, ICloneable
         ExternalLogKeywords = KeywordHelper.Normalize(ExternalLogKeywords);
         ExternalLogPresetId = (ExternalLogPresetId ?? string.Empty).Trim();
         ExternalLogRev = Math.Max(0, ExternalLogRev);
+
+        // 清理登记：三栏都允许分号分隔的多个名字（一个游戏常常要连同平台进程、
+        // Unity 崩溃处理器一起收尾），所以这里与两个关键词框同样规整一遍 ——
+        // 导入的旧配置、手写的尾随空格都在这一步收敛。
+        CleanupPresetId = (CleanupPresetId ?? string.Empty).Trim();
+        CleanupRev = Math.Max(0, CleanupRev);
+        LauncherProcess = KeywordHelper.ToText(KeywordHelper.Normalize(LauncherProcess));
+        MainProcess = KeywordHelper.ToText(KeywordHelper.Normalize(MainProcess));
+        GameProcess = KeywordHelper.ToText(KeywordHelper.Normalize(GameProcess));
 
     }
 }

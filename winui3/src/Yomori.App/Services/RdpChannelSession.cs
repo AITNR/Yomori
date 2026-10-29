@@ -164,6 +164,14 @@ public sealed class RdpChannelSession
 
     public int ElapsedSeconds { get; private set; }
 
+    /// <summary>
+    /// 最近一次从代理读到的「本次运行新出现的进程」候选。
+    ///
+    /// <para>为什么存在 Session 上：代理每次 Update 都会带上它（见 RdpAgentRunner.Update），
+    /// 而界面是在"任务页"里读的，没法自己去翻桥文件。存在这里等于把它跟着其余状态一起缓存。</para>
+    /// </summary>
+    public List<RdpCandidateProcess> LastCandidates { get; private set; } = new();
+
     /// <summary>心跳描述，例如「3 秒前」「已失联 8 分 12 秒」。</summary>
     public string HeartbeatText { get; private set; } = "－";
 
@@ -504,6 +512,13 @@ public sealed class RdpChannelSession
         ElapsedSeconds = status.ElapsedSeconds;
         CurrentTask = string.IsNullOrEmpty(status.CurrentTask) ? "－" : status.CurrentTask;
         StatusText = string.IsNullOrEmpty(status.StatusText) ? status.Phase : status.StatusText;
+
+        // 代理采集的「新出现的进程」候选：旧代理不写这个字段，此时保留上一次的值
+        // （空 → 空，本来就没有；非空 → 别因为一次空心跳把它抹掉）。
+        if (status.CandidateProcesses is { Count: > 0 })
+        {
+            LastCandidates = new List<RdpCandidateProcess>(status.CandidateProcesses);
+        }
 
         foreach (var ev in status.Events)
         {

@@ -504,6 +504,8 @@
 
                                 <TextBox Header="目标进程关键词"
                                          PlaceholderText="例如：Endfield.exe; OK-WW"
+                                         GotFocus="OnCleanupFieldGotFocus"
+                                         LostFocus="OnCleanupFieldLostFocus"
                                          Text="{Binding ProcessKeywordsText, Mode=TwoWay}">
                                     <ToolTipService.ToolTip>
                                         <ToolTip Content="脚本拉起 / 等待 / 需要清理的目标程序。用于等待判断、超时清理、停止执行和紧急停止。" />
@@ -512,13 +514,40 @@
 
                                 <TextBox Header="游戏窗口关键词"
                                          PlaceholderText="例如：鸣潮; 星穹铁道"
+                                         GotFocus="OnCleanupFieldGotFocus"
+                                         LostFocus="OnCleanupFieldLostFocus"
                                          Text="{Binding WindowKeywordsText, Mode=TwoWay}">
                                     <ToolTipService.ToolTip>
                                         <ToolTip Content="游戏窗口标题里的关键词。用于窗口出现 / 消失判断；清理时会按窗口 PID 兜底关闭。" />
                                     </ToolTipService.ToolTip>
                                 </TextBox>
 
-                                <TextBlock Text="进程清理登记（可选）" Opacity="0.7" FontSize="12" Margin="0,6,0,0" />
+                                <Grid Margin="0,6,0,0">
+                                    <TextBlock Text="进程清理登记（可选）" Opacity="0.7" FontSize="12"
+                                               VerticalAlignment="Center" />
+                                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="6">
+                                        <Button x:Name="CleanupFromRunButton"
+                                                Content="从上次运行填入"
+                                                Padding="8,2"
+                                                FontSize="12"
+                                                Click="OnFillCleanupFromRunClick">
+                                            <ToolTipService.ToolTip>
+                                                <ToolTip Content="把上次运行期间新出现的进程列出来，勾选后写进「游戏进程」。远程通道由代理采集后回传，需要代理已升级。" />
+                                            </ToolTipService.ToolTip>
+                                        </Button>
+                                        <Button x:Name="CleanupResetButton"
+                                                Content="按预设重填"
+                                                Padding="8,2"
+                                                FontSize="12"
+                                                Visibility="Collapsed"
+                                                Click="OnResetCleanupClick" />
+                                    </StackPanel>
+                                </Grid>
+
+                                <TextBlock x:Name="CleanupHint"
+                                           TextWrapping="Wrap"
+                                           Opacity="0.7"
+                                           FontSize="12" />
 
                                 <Grid ColumnSpacing="12">
                                     <Grid.ColumnDefinitions>
@@ -526,9 +555,18 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="*" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBox Grid.Column="0" Header="启动脚本进程" Text="{Binding LauncherProcess, Mode=TwoWay}" />
-                                    <TextBox Grid.Column="1" Header="主进程" Text="{Binding MainProcess, Mode=TwoWay}" />
-                                    <TextBox Grid.Column="2" Header="游戏进程" Text="{Binding GameProcess, Mode=TwoWay}" />
+                                    <TextBox Grid.Column="0" Header="启动脚本进程"
+                                             GotFocus="OnCleanupFieldGotFocus"
+                                             LostFocus="OnCleanupFieldLostFocus"
+                                             Text="{Binding LauncherProcess, Mode=TwoWay}" />
+                                    <TextBox Grid.Column="1" Header="主进程"
+                                             GotFocus="OnCleanupFieldGotFocus"
+                                             LostFocus="OnCleanupFieldLostFocus"
+                                             Text="{Binding MainProcess, Mode=TwoWay}" />
+                                    <TextBox Grid.Column="2" Header="游戏进程"
+                                             GotFocus="OnCleanupFieldGotFocus"
+                                             LostFocus="OnCleanupFieldLostFocus"
+                                             Text="{Binding GameProcess, Mode=TwoWay}" />
                                 </Grid>
                             </StackPanel>
                         </Expander>

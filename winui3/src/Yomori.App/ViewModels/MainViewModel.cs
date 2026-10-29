@@ -588,6 +588,59 @@ public sealed class MainViewModel : ObservableObject
 
     // ---------------- 运行状态 ----------------
 
+    /// <summary>
+    /// 取某任务「上次运行期间新出现的进程」候选（界面「从上次运行填入」用）。
+    ///
+    /// <para>两个来源合并：本地执行路径读本进程里的 <c>ScriptRunner</c>；远程通道读各通道
+    /// <c>status.json</c> 回传的候选（采集发生在代理进程，只能靠桥带回来）。
+    /// 按镜像名去重 —— 同一个进程在两条路上都被记到并不稀奇。</para>
+    /// </summary>
+    public IReadOnlyList<ProcessSnapshotEntry> CandidateProcessesFor(string? taskName)
+    {
+        var merged = new List<ProcessSnapshotEntry>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var name = (taskName ?? string.Empty).Trim();
+
+        void Add(int pid, string imageName)
+        {
+            var text = (imageName ?? string.Empty).Trim();
+            if (text.Length == 0 || !seen.Add(text))
+            {
+                return;
+            }
+
+            merged.Add(new ProcessSnapshotEntry(pid, 0, text));
+        }
+
+        foreach (var item in _runner?.CandidatesFor(name) ?? Array.Empty<ProcessSnapshotEntry>())
+        {
+            Add(item.Pid, item.Name);
+        }
+
+        foreach (var session in _sessions)
+        {
+            var candidates = session.LastCandidates;
+            if (candidates is null)
+            {
+                continue;
+            }
+
+            foreach (var candidate in candidates)
+            {
+                // 旧代理不带任务名：宁可给出来让用户判断，也不要静默丢掉
+                if (candidate.Task.Length > 0
+                    && !string.Equals(candidate.Task, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Add(candidate.Pid, candidate.Name);
+            }
+        }
+
+        return merged;
+    }
+
     public bool IsRunning
     {
         get => _isRunning;

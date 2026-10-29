@@ -99,6 +99,18 @@ public sealed class ScriptRunner
     private const double LaunchConfirmSeconds = 2.0;
 
     /// <summary>
+    /// 执行期间登记脚本后代的间隔（秒）。
+    ///
+    /// <para>只取 2 秒的理由：一次 Toolhelp32 快照在正常机器上 2-5ms，2 秒一次的摊薄开销可忽略；
+    /// 而"启动器 → 游戏"这一跳的可观测窗口实测约 5 秒（2026-10-29 终末地：22:04:46 起 MaaEnd，
+    /// 22:04:51 Games.exe 创建），2 秒足以在中间层退出前把下一层记进册。</para>
+    ///
+    /// <para>不取更密的另一个原因：每轮都要对已入册节点做存活检查（各开一次进程句柄），
+    /// 密度再高就变成和清理动作抢句柄了。</para>
+    /// </summary>
+    private const double DescendantSweepSeconds = 2.0;
+
+    /// <summary>
     /// 直接进程秒退后确认"是否由新进程接力"的最长等待（秒）。
     /// 提权重启要过 UAC、新实例要初始化，给 10 秒足够；太长会把真崩溃的判定拖慢。
     /// </summary>
@@ -161,6 +173,19 @@ public sealed class ScriptRunner
     private volatile bool _emergencyRequested;
     private int _liveTaskWorkers;
     private volatile bool _runFinished;
+
+    /// <summary>
+    /// 「本次运行期间新出现的进程」候选，按任务名分组。
+    ///
+    /// <para>【为什么需要它】预设只能覆盖有数据的项目，48 款游戏里绝大多数（尤其手游走模拟器）
+    /// 没有可靠的镜像名可预置。与其猜，不如把"这台机器上真的冒出来了什么"递给用户勾一下 ——
+    /// 用户不需要知道 `Endfield.exe` 长什么样，点一下就把名字填进「游戏进程」。</para>
+    ///
+    /// <para>只在**本地执行**路径有意义：远程通道的采集发生在代理进程里，本进程读不到。
+    /// 界面据此提示「远程通道请到目标会话里看」。</para>
+    /// </summary>
+    private readonly Dictionary<string, List<ProcessSnapshotEntry>> _candidateProcesses =
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>当前实际执行 <see cref="RunOneTask"/> 的任务 worker 数，可供主界面采样。</summary>
     public static int LiveTaskWorkers => Volatile.Read(ref s_liveTaskWorkers);
@@ -467,6 +492,14 @@ public sealed class ScriptRunner
     private void RunCore()
     {
         var stopped = false;
+
+        // 候选进程按"本轮"重算：上一轮的候选留到新一轮开始前都还能被界面读到
+        // （用户可能跑完才想起来去点「从上次运行填入」），但不能跨轮混。
+        lock (_sync)
+        {
+            _candidateProcesses.Clear();
+        }
+
         try
         {
             RaiseStatus("运行中");
@@ -785,12 +818,18 @@ public sealed class ScriptRunner
     {
         Interlocked.Increment(ref s_liveTaskWorkers);
         Interlocked.Increment(ref _liveTaskWorkers);
+
+        // 「本次运行新出现了哪些进程」的基准：必须在真正起进程**之前**拍。
+        // 放在 wrapper 里而不是 Core 里，是因为 Core 有多条 return 路径（正常完成 /
+        // 停止 / 超时 / 失败），只有 finally 能一次盖全。
+        var beforePids = CapturePidSnapshot();
         try
         {
             return RunOneTaskCore(task, index, total);
         }
         finally
         {
+            RecordCandidateProcesses(task, beforePids);
             Interlocked.Decrement(ref s_liveTaskWorkers);
             var remaining = Interlocked.Decrement(ref _liveTaskWorkers);
             if (remaining == 0)
@@ -798,6 +837,168 @@ public sealed class ScriptRunner
                 QueueAllTrackedProcessesForDisposeIfFinished();
             }
         }
+    }
+
+    // ---------------- 「本次运行新出现的进程」采集 ----------------
+
+    /// <summary>
+    /// 出现在候选里只会误导用户的进程名：系统/公共宿主、以及本程序自己。
+    ///
+    /// <para>判据是"杀掉它或把它登记进清理名单，会波及与本任务无关的东西"。
+    /// 与既有《进程清理登记自动适配计划书》§2.3 的黑名单同源，另加 Yomori 自身与
+    /// 几个每次跑自动化都必然出现的壳（`conhost` / `WerFault` / `SearchApp`）。</para>
+    /// </summary>
+    private static readonly HashSet<string> CandidateProcessBlocklist = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "system", "idle", "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
+        "services.exe", "lsass.exe", "svchost.exe", "fontdrvhost.exe", "dwm.exe",
+        "explorer.exe", "sihost.exe", "ctfmon.exe", "conhost.exe", "dllhost.exe",
+        "runtimebroker.exe", "taskhostw.exe", "searchapp.exe", "startmenuexperiencehost.exe",
+        "shellexperiencehost.exe", "backgroundtaskhost.exe", "applicationframehost.exe",
+        "textinputhost.exe", "werfault.exe", "wmiprvse.exe", "taskmgr.exe",
+        "yomori.exe", "yomori.agent.exe", "msedgewebview2.exe",
+        "cmd.exe", "powershell.exe", "pwsh.exe", "python.exe", "pythonw.exe",
+        "node.exe", "java.exe", "javaw.exe", "dotnet.exe",
+    };
+
+    private static HashSet<int> CapturePidSnapshot()
+    {
+        var set = new HashSet<int>();
+        foreach (var item in ProcessHelper.SnapshotProcesses())
+        {
+            if (item.Pid > 0)
+            {
+                set.Add(item.Pid);
+            }
+        }
+
+        return set;
+    }
+
+    /// <summary>
+    /// 算出本次任务"新出现、且不像工具/系统"的进程，存进 <see cref="_candidateProcesses"/>。
+    ///
+    /// <para>**只记录、不写入任何配置**。这些名字会被拿去填「游戏进程」，而那一栏是
+    /// 按名全局匹配杀进程的 —— 猜错就是误杀别人的程序，必须由用户勾选确认。</para>
+    /// </summary>
+    private void RecordCandidateProcesses(TaskConfig task, HashSet<int> beforePids)
+    {
+        if (beforePids.Count == 0)
+        {
+            // 开工前拍不到快照（系统受限），此时"差集"就是全量进程表 —— 宁可没有候选，
+            // 也不能把几百个进程名糊到用户脸上。
+            return;
+        }
+
+        var after = ProcessHelper.SnapshotProcesses();
+        if (after.Count == 0)
+        {
+            return;
+        }
+
+        // 已在册的脚本进程与后代不算候选：它们本来就会被清理，不需要用户登记
+        var knownPids = new HashSet<int>();
+        lock (_sync)
+        {
+            foreach (var process in _currentProcesses)
+            {
+                knownPids.Add(process.Pid);
+            }
+
+            foreach (var item in _scriptDescendants)
+            {
+                knownPids.Add(item.Pid);
+            }
+        }
+
+        // 工具自己的名字也不算：那正是"清理登记"里已经自动覆盖的部分
+        var toolNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var scriptPath = task.ScriptPath.Trim().Length > 0
+            ? Path.GetFullPath(Environment.ExpandEnvironmentVariables(task.ScriptPath.Trim()))
+            : null;
+        foreach (var name in ProcessNamesForTask(task, scriptPath))
+        {
+            foreach (var candidate in ProcessHelper.ProcessNameCandidates(name))
+            {
+                toolNames.Add(ProcessHelper.BareImageName(candidate));
+            }
+        }
+
+        var picked = new List<ProcessSnapshotEntry>();
+        var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in after)
+        {
+            if (item.Pid <= 0 || beforePids.Contains(item.Pid) || knownPids.Contains(item.Pid))
+            {
+                continue;
+            }
+
+            var bare = ProcessHelper.BareImageName(item.Name);
+            if (bare.Length == 0
+                || CandidateProcessBlocklist.Contains(bare)
+                || CandidateProcessBlocklist.Contains(item.Name)
+                || toolNames.Contains(bare)
+                || !seenNames.Add(bare))
+            {
+                continue;
+            }
+
+            picked.Add(item);
+            if (picked.Count >= CandidateProcessLimit)
+            {
+                break;
+            }
+        }
+
+        if (picked.Count == 0)
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            _candidateProcesses[task.DisplayName] = picked;
+        }
+
+        Log($"本次运行新出现 {picked.Count} 个进程，可作为「游戏进程」候选："
+            + string.Join("、", picked.ConvertAll(p => p.Name)));
+    }
+
+    /// <summary>单个任务最多给几个候选（再多用户就不看了，而且多半是噪音）。</summary>
+    private const int CandidateProcessLimit = 12;
+
+    /// <summary>取某个任务的候选进程（界面的「从上次运行填入」用）。</summary>
+    public IReadOnlyList<ProcessSnapshotEntry> CandidatesFor(string? taskName)
+    {
+        lock (_sync)
+        {
+            return _candidateProcesses.TryGetValue(taskName ?? string.Empty, out var list)
+                ? new List<ProcessSnapshotEntry>(list)
+                : new List<ProcessSnapshotEntry>();
+        }
+    }
+
+    /// <summary>
+    /// 全部候选（任务名 + 镜像名 + PID），供代理写进 <c>status.json</c> 回传主控端。
+    ///
+    /// <para>为什么要带任务名：一次运行可能有多个任务，主控端要按"用户当前选中的那条任务"
+    /// 过滤候选 —— 把 A 任务的候选填到 B 任务里，等于给 B 配了它根本不认识的进程名。</para>
+    /// </summary>
+    public List<(string Task, string Name, int Pid)> CandidateSnapshot()
+    {
+        var result = new List<(string, string, int)>();
+        lock (_sync)
+        {
+            foreach (var pair in _candidateProcesses)
+            {
+                foreach (var item in pair.Value)
+                {
+                    result.Add((pair.Key, item.Name, item.Pid));
+                }
+            }
+        }
+
+        return result;
     }
 
     private RunOutcome RunOneTaskCore(TaskConfig task, int index, int total)
@@ -936,6 +1137,11 @@ public sealed class ScriptRunner
         var monitorWaitLogged = false;
         double? monitorAbsentSince = null;
 
+        // 后代扫描的节拍：轮询是 200～350ms，扫描取 2 秒（一次 Toolhelp32 快照，2-5ms）。
+        // 为什么不能只在停止那一刻扫：中间层（启动器）拉起游戏后自己就退了，
+        // 等用户按停止时它早已不在进程表里，BFS 从那一步就断（见 LearnScriptDescendants 的增量爬升）。
+        var lastDescendantSweep = stopwatch.Elapsed;
+
         RunOutcome FinishWithLog(string status, bool checkEarlyExit = true, bool abnormal = false)
         {
             var elapsedDone = (int)stopwatch.Elapsed.TotalSeconds;
@@ -982,6 +1188,15 @@ public sealed class ScriptRunner
 
             var exitCode = PollTrackedProcess(process);
             var now = stopwatch.Elapsed.TotalSeconds;
+
+            // 执行期间持续登记后代（每 DescendantSweepSeconds 一次）。
+            // LearnScriptDescendants 内部有去重，只在发现新进程时才写日志，不会刷屏。
+            if ((stopwatch.Elapsed - lastDescendantSweep).TotalSeconds >= DescendantSweepSeconds)
+            {
+                lastDescendantSweep = stopwatch.Elapsed;
+                LearnScriptDescendants(null);
+            }
+
             var monitorKind = monitorSpec.Kind;
 
             if (monitorKind is MonitorKinds.Window or MonitorKinds.Process or MonitorKinds.Cmdline)
@@ -999,7 +1214,7 @@ public sealed class ScriptRunner
 
                         // 监控命中 = 目标真的起来了，此刻它的**真实镜像名**是可查的。
                         // 记下来，停止时按它清理和复查，不再依赖窗口标题（见 LearnMonitorImageNames）。
-                        LearnMonitorImageNames(monitorSpec);
+                        LearnMonitorImageNames(task);
                     }
                 }
                 else if (monitorSeen)
@@ -1367,6 +1582,29 @@ public sealed class ScriptRunner
             }
         }
 
+        // 【增量爬升】已经记录、而且现在还活着的后代，也当作新的起点。
+        //
+        // 为什么必须这样：BFS 每轮都从"根"出发，而它只能沿**本次快照里存在的节点**往下走。
+        // 中间层（启动器）一旦先退出，它的 PID 就永远进不了队列，孙辈从此访问不到 ——
+        // 2026-10-29 终末地实测：`Endfield.exe` ← `Games.exe`(3964) ← `57696`(已退出)，
+        // 从 MaaEnd 的 PID 出发一步就断，游戏本体始终取不到。
+        // 把"已入册且还活着"的节点补成根，下一轮就能从中断处继续往下爬：
+        // 第 1 轮学到启动器 → 第 2 轮从中断处学到 Games → 第 3 轮学到 Endfield。
+        List<ProcessSnapshotEntry> knownDescendants;
+        lock (_sync)
+        {
+            knownDescendants = new List<ProcessSnapshotEntry>(_scriptDescendants);
+        }
+
+        foreach (var item in knownDescendants)
+        {
+            if (item.Pid > 0 && !rootPids.Contains(item.Pid)
+                && ProcessHelper.IsSameProcessAlive(item.Pid, item.Name))
+            {
+                rootPids.Add(item.Pid);
+            }
+        }
+
         if (rootPids.Count == 0)
         {
             return;
@@ -1465,16 +1703,23 @@ public sealed class ScriptRunner
     ///   ① 杀不掉：<c>taskkill /IM "原神"</c> 打不中英文镜像名；
     ///   ② 复查不出：按中文名字查进程永远是"不在"，明明还在跑也会报"已结束"。
     /// 监控命中的那一刻真实镜像名是可查的，记下来就能绕开窗口标题这条脆弱链路。
+    ///
+    /// <para>【为什么条件从"监控类型是窗口"改成"有窗口关键词"】原先只在
+    /// <c>monitor.kind == window</c> 时学，而 MaaEnd 这类预设的监控类型是 <c>process</c>
+    /// （关键词写的是工具名 <c>MaaEnd</c>）—— 于是这条"绕开配置写错"的路一直没启用。
+    /// 现在只要任务配了窗口关键词就学，与监控类型无关：学到的名字只进
+    /// <c>_learnedImageNames</c>，不改变 <c>BuildMonitorSpec</c> 的任何判定。</para>
     /// </summary>
-    private void LearnMonitorImageNames(MonitorSpec monitorSpec)
+    private void LearnMonitorImageNames(TaskConfig task)
     {
-        if (monitorSpec.Kind != MonitorKinds.Window)
+        var keywords = KeywordHelper.Normalize(task.WindowKeywords);
+        if (keywords.Count == 0)
         {
-            // 进程 / 命令行模式下配置里写的就是真实镜像名，没什么可学的
+            // 没有窗口关键词就没有反查的入口（靠窗口标题找 PID 必须先有标题片段）
             return;
         }
 
-        foreach (var keyword in monitorSpec.Keywords)
+        foreach (var keyword in keywords)
         {
             foreach (var pid in ProcessHelper.WindowPidsByKeyword(keyword))
             {
@@ -1517,11 +1762,19 @@ public sealed class ScriptRunner
     {
         var leftovers = new List<string>();
 
+        // 本轮"名单里到底有几个名字"。为 0 时不能报 ✓ —— 复查用的是同一份名单，
+        // 名单空 → 什么都查不到 → 打出「已确认，相关进程都已结束」，而目标（比如游戏）
+        // 明明还在跑。2026-09-27 那次假 ✓ 是"清了一半漏了另一半"，这一次更彻底：名单是空的。
+        var planNameCount = 0;
+        var gameStageCount = 0;
+
         List<string> learned;
         lock (_sync)
         {
             learned = new List<string>(_learnedImageNames);
         }
+
+        planNameCount += learned.Count;
 
         foreach (var name in learned)
         {
@@ -1550,6 +1803,8 @@ public sealed class ScriptRunner
             AddUnique(leftovers, $"{item}（脚本进程派生的子进程）");
         }
 
+        planNameCount += descendants.Count;
+
         foreach (var task in tasks)
         {
             var scriptPath = task.ScriptPath.Trim().Length > 0
@@ -1558,6 +1813,15 @@ public sealed class ScriptRunner
 
             foreach (var (stage, rawNames) in BuildCleanupPlan(task, scriptPath))
             {
+                if (rawNames.Count > 0)
+                {
+                    planNameCount += rawNames.Count;
+                    if (string.Equals(stage, GameCleanupStage, StringComparison.Ordinal))
+                    {
+                        gameStageCount += rawNames.Count;
+                    }
+                }
+
                 foreach (var rawName in rawNames)
                 {
                     foreach (var candidate in ProcessHelper.ProcessNameCandidates(rawName))
@@ -1597,7 +1861,23 @@ public sealed class ScriptRunner
 
         if (leftovers.Count == 0)
         {
+            // 名单空 → 这次复查什么也没查（它查的就是这份名单），不能报 ✓。
+            if (planNameCount == 0)
+            {
+                Log($"{scopeLabel}：⚠ 本次清理名单为空（进程关键词、主进程、游戏进程都没填），"
+                    + "无法确认目标是否已退出 —— 请到任务编辑页补「游戏进程」，或改用带预设的任务。");
+                return;
+            }
+
             Log($"{scopeLabel}：✓ 已复查确认，任务相关的进程都已结束。");
+
+            // 名字有、但没有一个是"游戏本体"：这类名单最容易让人误以为"游戏也会被关掉"。
+            if (includeWindowKeywords && gameStageCount == 0)
+            {
+                Log($"{scopeLabel}：⚠ 名单里没有「游戏/扩展进程」，游戏本体不在本次清理范围内"
+                    + "（若任务没配游戏窗口关键词，游戏会继续运行）。");
+            }
+
             return;
         }
 
@@ -1758,6 +2038,9 @@ public sealed class ScriptRunner
     /// 清理与复查**共用这一份计划** —— 只清不查会漏，只查不清会误报，
     /// 两边用的名字必须来自同一个函数（2026-09-27 假 ✓ 事故的教训）。
     /// </summary>
+    /// <summary>清理计划里「游戏/扩展进程」这一层的阶段名（清理、复查、告警三处共用一份）。</summary>
+    private const string GameCleanupStage = "游戏/扩展进程";
+
     private static List<(string Stage, List<string> Names)> BuildCleanupPlan(TaskConfig task, string? scriptPath)
     {
         var launcherNames = new List<string>();
@@ -1778,16 +2061,29 @@ public sealed class ScriptRunner
             AddUnique(launcherNames, task.Name.Trim());
         }
 
-        AddUnique(launcherNames, task.LauncherProcess);
+        // 三栏都按分号展开：一个游戏往往要连同平台进程 / Unity 崩溃处理器一起收尾，
+        // 只写一个名字会留下"游戏关了、崩溃处理器还占着文件"的尾巴。
+        // 单值配置展开后仍是原来那个名字，行为不变。
+        foreach (var item in KeywordHelper.Normalize(task.LauncherProcess))
+        {
+            AddUnique(launcherNames, item);
+        }
 
         AddUnique(mainNames, task.WaitProcessName);
-        AddUnique(mainNames, task.MainProcess);
+        foreach (var item in KeywordHelper.Normalize(task.MainProcess))
+        {
+            AddUnique(mainNames, item);
+        }
+
         foreach (var item in KeywordHelper.Normalize(task.ProcessKeywords))
         {
             AddUnique(mainNames, item);
         }
 
-        AddUnique(gameNames, task.GameProcess);
+        foreach (var item in KeywordHelper.Normalize(task.GameProcess))
+        {
+            AddUnique(gameNames, item);
+        }
         foreach (var item in KeywordHelper.Normalize(task.WindowKeywords))
         {
             if (item.Trim().EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
@@ -1809,7 +2105,7 @@ public sealed class ScriptRunner
 
         if (gameNames.Count > 0)
         {
-            plan.Add(("游戏/扩展进程", gameNames));
+            plan.Add((GameCleanupStage, gameNames));
         }
 
         return plan;

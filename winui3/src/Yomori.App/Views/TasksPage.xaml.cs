@@ -956,7 +956,7 @@ public sealed partial class TasksPage : Page
             choice, task, ApplyRecommendedCheck.IsChecked == true, _argsLogPlan, LaunchPresetStore.Library.Rev);
 
         RefreshArgsHint();
-        RefreshLogProfileHint();
+        RefreshProfileHints();
     }
 
     /// <summary>
@@ -1014,7 +1014,7 @@ public sealed partial class TasksPage : Page
         }
 
         RefreshArgsHint();
-        RefreshLogProfileHint();
+        RefreshProfileHints();
     }
 
     // ---------------------------------------------------------------- 外部日志推荐值
@@ -1033,7 +1033,7 @@ public sealed partial class TasksPage : Page
         var task = VM.SelectedTask;
         if (task is null || _argsLogPlan is null || !_argsLogPlan.Enabled || !_argsLogPlan.HasDirectory)
         {
-            RefreshLogProfileHint();
+            RefreshProfileHints();
             return;
         }
 
@@ -1061,7 +1061,7 @@ public sealed partial class TasksPage : Page
             _suppressExternalLogEvents = saved;
         }
 
-        RefreshLogProfileHint();
+        RefreshProfileHints();
     }
 
     private void OnApplyLogPresetClick(object sender, RoutedEventArgs e) => ApplyLogPlan();
@@ -1099,7 +1099,7 @@ public sealed partial class TasksPage : Page
         }
 
         task.ExternalLogTouched = true;
-        RefreshLogProfileHint();
+        RefreshProfileHints();
     }
 
     private static bool SameAsPlan(TaskConfig task, LaunchLogPlan plan) =>
@@ -1155,6 +1155,262 @@ public sealed partial class TasksPage : Page
 
         var name = string.IsNullOrWhiteSpace(_argsLogPlan.PresetName) ? string.Empty : $" · {_argsLogPlan.PresetName}";
         LogProfileHint.Text = $"{_argsLogPlan.Basis}{name}：{target}";
+    }
+
+    // ---------------- 进程清理登记 ----------------
+
+    /// <summary>
+    /// 焦点进入某个框时的值快照。**只有"值确实变了"才算用户手改** ——
+    /// 光点进去又出来（Tab 划过、点一下看看）不该把自动填写锁死，否则用户
+    /// 只是浏览一遍，预设就再也不填了，而界面上看不出发生过什么。
+    /// </summary>
+    private string _cleanupSnapshot = string.Empty;
+
+    /// <summary>五个框（两个关键词 + 三栏）的联合指纹：它们回答的是同一件事 —— 停止时要清谁。</summary>
+    private static string CleanupFingerprint(TaskConfig? task)
+    {
+        if (task is null)
+        {
+            return string.Empty;
+        }
+
+        return string.Join("\u0001",
+            task.ProcessKeywordsText,
+            task.WindowKeywordsText,
+            task.LauncherProcess,
+            task.MainProcess,
+            task.GameProcess);
+    }
+
+    private void OnCleanupFieldGotFocus(object sender, RoutedEventArgs e)
+        => _cleanupSnapshot = CleanupFingerprint(VM.SelectedTask);
+
+    private void OnCleanupFieldLostFocus(object sender, RoutedEventArgs e)
+    {
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        var current = CleanupFingerprint(task);
+        if (string.Equals(current, _cleanupSnapshot, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _cleanupSnapshot = current;
+        task.CleanupTouched = true;
+        RefreshCleanupHint();
+    }
+
+    /// <summary>
+    /// 「按预设重填」：丢弃手改、回到预设值。
+    ///
+    /// <para>【为什么必须先清空再 Apply】`Apply` 的清理三栏是"只填空"的 ——
+    /// 不清空的话，用户改过的值会让它一个都不写，按钮点了没反应。
+    /// 关键词也一起清：它们与三栏共用 <see cref="TaskConfig.CleanupTouched"/>。</para>
+    /// </summary>
+    private void OnResetCleanupClick(object sender, RoutedEventArgs e)
+    {
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        var match = LaunchPresetResolver.Match(_argsChoices, task.Args);
+        var cleanup = match?.Cleanup;
+        if (cleanup is null || !cleanup.IsUsable || ApplyRecommendedCheck.IsChecked != true)
+        {
+            // 没勾「同时套用推荐设置」时不清空：清了就再也填不回来，等于把用户的配置抹掉
+            task.CleanupTouched = false;
+            RefreshCleanupHint();
+            return;
+        }
+
+        task.CleanupTouched = false;
+        task.LauncherProcess = string.Empty;
+        task.MainProcess = string.Empty;
+        task.GameProcess = string.Empty;
+        task.ProcessKeywords = new List<string>();
+        task.WindowKeywords = new List<string>();
+
+        ApplyChoice(match!);
+    }
+
+    /// <summary>
+    /// 说明行：只如实说来源，不做"填错"判定（这里没有判定能力）。
+    /// 「游戏进程为空」单独点出来 —— 那是"停止后游戏还在跑"最常见的原因。
+    /// </summary>
+    private void RefreshCleanupHint()
+    {
+        var task = VM.SelectedTask;
+        CleanupResetButton.Visibility = Visibility.Collapsed;
+
+        if (task is null)
+        {
+            CleanupHint.Text = "选完脚本后，这里会显示该项目建议登记的清理进程";
+            return;
+        }
+
+        var hasGame = task.GameProcess.Trim().Length > 0;
+        var gameTail = hasGame ? string.Empty : "；游戏进程为空，停止时不会清理游戏本体";
+
+        if (task.CleanupTouched)
+        {
+            var cleanupOfTouched = CurrentCleanup();
+            CleanupResetButton.Visibility =
+                cleanupOfTouched is { IsUsable: true } && ApplyRecommendedCheck.IsChecked == true
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            CleanupHint.Text = $"已手动登记，不再随启动方式变化{gameTail}";
+            return;
+        }
+
+        var cleanup = CurrentCleanup();
+        if (cleanup is null || !cleanup.IsUsable)
+        {
+            // 没有预设建议时别再让用户自己想办法：直接告诉他"跑一次 + 点采集"。
+            // 55 个项目里 46 个属于这种情况（本机没装那些游戏，无法预置名字）。
+            var candidateCount = VM.CandidateProcessesFor(task.DisplayName).Count;
+            CleanupHint.Text = candidateCount > 0
+                ? $"上次运行记到 {candidateCount} 个新进程，可点「从上次运行填入」挑出游戏本体{gameTail}"
+                : $"这个脚本没有清理登记建议：先跑一次任务，再用「从上次运行填入」采集游戏进程{gameTail}";
+            return;
+        }
+
+        var basis = string.IsNullOrWhiteSpace(cleanup.Summary) ? cleanup.Source : cleanup.Summary;
+        CleanupHint.Text = $"已按预设登记：{basis}{gameTail}";
+    }
+
+    /// <summary>
+    /// 已知模拟器进程名。候选里出现时单独标注、默认不勾 ——
+    /// 它们是多开共用的，按名清等于把所有实例一起关掉。
+    /// </summary>
+    private static readonly string[] SimulatorProcessNames =
+    {
+        "MuMuNxDevice", "MuMuPlayer", "HD-Player", "LdVBoxHeadless",
+        "NemuPlayer", "MEmuHeadless", "BlueStacks", "dnplayer", "NoxVMHandle",
+    };
+
+    /// <summary>
+    /// 「从上次运行填入」：把上次任务运行期间**新出现**的进程列出来，勾一下写进「游戏进程」。
+    ///
+    /// <para>【为什么是"勾选"而不是自动写】这一栏会被 <c>TerminateProcessKeyword</c> 按名全局匹配，
+    /// 填错等于杀别人的程序。采集只能回答"它确实在这段时间冒出来了"，回答不了"它就是游戏"——
+    /// 最后这一步必须由人确认。</para>
+    /// </summary>
+    private void OnFillCleanupFromRunClick(object sender, RoutedEventArgs e)
+    {
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        var candidates = VM.CandidateProcessesFor(task.DisplayName);
+        if (candidates.Count == 0)
+        {
+            CleanupHint.Text = "上次运行没有记录到新进程：本地任务要先跑一次；"
+                + "远程通道还需要代理升级到带采集回传的版本并重新连上。";
+            return;
+        }
+
+        var panel = new StackPanel { Spacing = 8, MinWidth = 300 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "上次运行期间新出现的进程，勾选后写入「游戏进程」：",
+            TextWrapping = TextWrapping.Wrap,
+        });
+
+        foreach (var candidate in candidates)
+        {
+            var bare = ProcessHelper.BareImageName(candidate.Name);
+            var isSimulator = SimulatorProcessNames.Any(
+                n => string.Equals(n, bare, StringComparison.OrdinalIgnoreCase));
+
+            panel.Children.Add(new CheckBox
+            {
+                Content = isSimulator
+                    ? $"{candidate.Name}（模拟器：会连带关掉里面的其他游戏）"
+                    : candidate.Name,
+                IsChecked = !isSimulator,
+                Tag = candidate.Name,
+            });
+        }
+
+        var apply = new Button
+        {
+            Content = "写入游戏进程",
+            HorizontalAlignment = HorizontalAlignment.Right,
+        };
+        panel.Children.Add(apply);
+
+        var flyout = new Flyout { Content = panel };
+        apply.Click += (_, _) =>
+        {
+            var picked = new List<string>();
+            foreach (var child in panel.Children)
+            {
+                if (child is CheckBox { IsChecked: true, Tag: string name })
+                {
+                    picked.Add(name);
+                }
+            }
+
+            if (picked.Count > 0)
+            {
+                task.GameProcess = MergeProcessNames(task.GameProcess, picked);
+                // 这是用户主动写入的，与手打等价：置位后预设不再覆盖
+                task.CleanupTouched = true;
+                RefreshCleanupHint();
+            }
+
+            flyout.Hide();
+        };
+
+        flyout.ShowAt((FrameworkElement)sender);
+    }
+
+    /// <summary>把新名字并进已有的分号串（去重、保持原有顺序）。</summary>
+    private static string MergeProcessNames(string existing, List<string> added)
+    {
+        var parts = new List<string>(KeywordHelper.Normalize(existing));
+        foreach (var name in added)
+        {
+            var text = name.Trim();
+            if (text.Length == 0)
+            {
+                continue;
+            }
+
+            if (!parts.Any(p => string.Equals(p, text, StringComparison.OrdinalIgnoreCase)))
+            {
+                parts.Add(text);
+            }
+        }
+
+        return KeywordHelper.ToText(parts);
+    }
+
+    /// <summary>当前参数命中的那条预设所带的清理建议（手打参数时可能没有）。</summary>
+    private LaunchCleanup? CurrentCleanup()
+    {
+        var task = VM.SelectedTask;
+        if (task is null)
+        {
+            return null;
+        }
+
+        return LaunchPresetResolver.Match(_argsChoices, task.Args)?.Cleanup;
+    }
+
+    /// <summary>两个说明行一起刷（调用方原先只刷日志那行）。</summary>
+    private void RefreshProfileHints()
+    {
+        RefreshCleanupHint();
+        RefreshLogProfileHint();
     }
 
     /// <summary>
