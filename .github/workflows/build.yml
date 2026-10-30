@@ -495,19 +495,49 @@ jobs:
           }
           Write-Host '✅ 安装时自动部署会话代理：已接线'
 
-          # Inno 的官方包不带 Unofficial 语言文件，中文要另外取；
-          # 取不到就用默认英文向导（不给 LangFile 参数），别因此判红
-          $langDir = Join-Path $env:GITHUB_WORKSPACE 'isl'
-          $lang = Join-Path $langDir 'ChineseSimplified.isl'
-          $haveLang = $false
-          try {
-            New-Item -ItemType Directory -Force $langDir | Out-Null
-            Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl' `
-              -OutFile $lang -UseBasicParsing -ErrorAction Stop
-            $haveLang = (Test-Path $lang) -and ((Get-Item $lang).Length -gt 5000)
-          } catch {
-            Write-Host '::warning::中文语言文件没取到，安装向导用默认英文'
+          # 代理载荷按版本号跳过（2026-10-30）：主通配必须把 agent\* 排出去，否则
+          # 「代理没变就不重铺 73MB」这件事根本没发生 —— 而两种写法都不会报错，
+          # 只能等到有人量安装耗时才发现。Check 少了同理：条目还在，判据形同虚设。
+          # ⚠️ 断言只认「Excludes 里出现 \agent\*」，别把整串写死：后来又加了
+          #    uu_session_fix.dll，写死的锚点会误红（冒烟那边已经踩过一次）。
+          if (-not ($issLines -match 'Excludes:\s*"[^"]*\\agent\\\*')) {
+            throw 'installer.iss 的主通配没有排除 agent\*：代理载荷会被无条件重写'
           }
+          if (-not ($issLines -match 'Check:\s*ShouldInstallAgent')) {
+            throw 'installer.iss 里找不到 Check: ShouldInstallAgent：代理版本判据没接上'
+          }
+          # UU 修复载荷必须走 dontcopy：只要它回到安装列表，占用检查就会把
+          # GameViewerService 列出来，用户又被逼着停服务（= 断远控）。
+          if (-not ($issLines -match 'Excludes:\s*"[^"]*uu_session_fix\.dll')) {
+            throw 'installer.iss 的主通配没有排除 uu_session_fix.dll：占用提示会回来'
+          }
+          if (-not ($issLines -match 'Flags:\s*dontcopy')) {
+            throw 'installer.iss 里找不到 dontcopy：UU 修复载荷落盘链路没接上'
+          }
+          Write-Host '✅ 载荷落盘判据：代理按版本号、UU 修复按内容'
+
+          # 代理端版本号的唯一来源是 csproj 的 <AgentVersion>，安装器靠它判断
+          # 「{app}\agent 要不要重写」。读不到就判红：判据缺失时安装器会退回
+          # 「每次都写」，等于静默退回旧行为，而这正是本次改动要消掉的东西。
+          [xml]$agentProject = Get-Content 'winui3/src/Yomori.Agent/Yomori.Agent.csproj'
+          $agentVersion = @($agentProject.Project.PropertyGroup.AgentVersion) |
+            Where-Object { $_ } | Select-Object -First 1
+          if (-not $agentVersion) { throw 'Yomori.Agent.csproj 里找不到 <AgentVersion>' }
+          if ($agentVersion -notmatch '^\d+(\.\d+){1,3}$') {
+            throw "AgentVersion 必须是纯点分数字（2.0.0 这种），实际是：$agentVersion"
+          }
+          Write-Host "✅ 代理端版本：$agentVersion"
+
+          # 中文语言文件已随仓库入库（winui3/tools/lang/ChineseSimplified.isl）。
+          #
+          # ⚠️ 不要再改成「构建时下载」：以前从 issrc 的 Unofficial 目录拉，上游 2026-06-23
+          #    把这个翻译提升为正式翻译并挪到了 Files\Languages\ 下，旧地址从此 404；
+          #    而失败只打一条 warning，于是之后每一个安装包都是英文向导，长期没人发现。
+          #    现在缺文件就判红 —— 界面语言不该取决于一次 HTTP 请求。
+          $lang = Join-Path $env:GITHUB_WORKSPACE 'winui3\tools\lang\ChineseSimplified.isl'
+          if (-not (Test-Path $lang)) { throw "缺少中文语言文件：$lang" }
+          if ((Get-Item $lang).Length -lt 5000) { throw "中文语言文件内容不完整：$lang" }
+          Write-Host "✅ 中文语言文件：$lang"
 
           # ⚠️ 一律传绝对路径：ISCC 会把相对路径按「脚本所在目录」解析
           # ⚠️ 别用 $args —— 那是 PowerShell 的自动变量，赋值会报错
@@ -516,9 +546,10 @@ jobs:
             "/DMyAppVersion=${{ steps.ver.outputs.version }}",
             "/DSrcDir=$(Join-Path $env:GITHUB_WORKSPACE 'dist\app')",
             "/DOutDir=$(Join-Path $env:GITHUB_WORKSPACE 'dist')",
-            "/DIconFile=$(Join-Path $env:GITHUB_WORKSPACE 'assets\icon.ico')"
+            "/DIconFile=$(Join-Path $env:GITHUB_WORKSPACE 'assets\icon.ico')",
+            "/DAgentVersion=$agentVersion",
+            "/DLangFile=$lang"
           )
-          if ($haveLang) { $isccArgs += "/DLangFile=$lang" }
           & $iscc @isccArgs
           if ($LASTEXITCODE -ne 0) { throw "ISCC 编译失败（exit $LASTEXITCODE）" }
 

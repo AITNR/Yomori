@@ -79,7 +79,18 @@ public static class AgentAutoDeploy
     {
         lines.Add("账户：" + Environment.UserName);
         lines.Add("程序目录：" + AppPaths.BaseDir);
-        lines.Add("代理载荷：" + Path.Combine(RdpSessionService.ShippedAgentDir, RdpSessionService.AgentExeName));
+        var shippedExe = Path.Combine(RdpSessionService.ShippedAgentDir, RdpSessionService.AgentExeName);
+        lines.Add("代理载荷：" + shippedExe);
+
+        // 版本号是「要不要替换代理」的唯一判据（2026-10-30）：代理端自己有版本，
+        // 没动过就不该因为主程序发版而重铺一遍。判据读不出来时按「需要替换」处理。
+        var shippedVersion = RdpSessionService.ReadAgentExeVersion(shippedExe);
+        var deployedVersion = ReadDeployedVersion();
+        lines.Add("代理版本（随包）：" + (shippedVersion.Length > 0 ? shippedVersion : "未知（载荷缺失或无版本号）"));
+        if (deployedVersion.Length > 0)
+        {
+            lines.Add("代理版本（已部署）：" + deployedVersion);
+        }
 
         // 写 ProgramData 与公共启动目录都要管理员。安装器本身是提权的，
         // 走到这里说不是管理员，只可能是有人手动跑了这个开关 —— 说清楚就好，别去弹 UAC。
@@ -91,8 +102,15 @@ public static class AgentAutoDeploy
 
         if (RdpSessionService.IsAgentDeployed() && RdpSessionService.IsAgentPayloadCurrent())
         {
-            lines.Add("已部署且载荷与本次安装一致，无需重复部署。");
+            lines.Add($"已部署且代理版本一致（{shippedVersion}），不替换。");
             return ExitOk;
+        }
+
+        if (shippedVersion.Length > 0)
+        {
+            lines.Add(deployedVersion.Length > 0
+                ? $"代理版本 {deployedVersion} → {shippedVersion}，需要替换。"
+                : "已部署副本读不到版本号（改动前的老载荷，或文件正被占用），按需要替换处理。");
         }
 
         if (TryFindBusyAgent(out var busy))
@@ -118,6 +136,28 @@ public static class AgentAutoDeploy
         }
 
         return ExitOk;
+    }
+
+    /// <summary>
+    /// 已部署副本的代理版本（两个槽里谁先读出来就用谁）。都没部署或都读不到时返回空串。
+    ///
+    /// 只用于日志里说清「从哪个版本换到哪个版本」，<b>不参与判定</b> ——
+    /// 判定统一走 <see cref="RdpSessionService.IsAgentPayloadCurrent"/>，
+    /// 两套口径迟早会一个说"要更新"一个说"不用"，那种矛盾最难查。
+    /// </summary>
+    private static string ReadDeployedVersion()
+    {
+        foreach (var slot in RdpSessionService.PayloadSlotDirs())
+        {
+            var version = RdpSessionService.ReadAgentExeVersion(
+                Path.Combine(slot, RdpSessionService.AgentExeName));
+            if (version.Length > 0)
+            {
+                return version;
+            }
+        }
+
+        return string.Empty;
     }
 
     /// <summary>

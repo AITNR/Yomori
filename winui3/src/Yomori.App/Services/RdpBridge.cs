@@ -371,6 +371,16 @@ public sealed class RdpBridge
             }
 
             status = mutator(status);
+
+            // 代理端版本号：取自**当前程序集**的元数据（见 AgentVersionInfo）。
+            // 代理进程里非空；主控端写这条路径时为空串，于是原样保留，不覆盖别人的值。
+            // 每次回写都刷新（而不是只在缺失时写）：升级后第一帧就该把老代理留下的号纠正过来。
+            var agentVersion = AgentVersionInfo.Current;
+            if (agentVersion.Length > 0)
+            {
+                status.AgentVersion = agentVersion;
+            }
+
             status.UpdatedAt = DateTimeOffset.Now.ToString("o");
             status.Events = TrimEvents(status.Events);
 

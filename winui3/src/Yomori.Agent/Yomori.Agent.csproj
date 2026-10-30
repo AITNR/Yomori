@@ -29,12 +29,41 @@
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Version Condition="'$(Version)' == '' Or '$(Version)' == '1.0.0'">2.0.0-dev.local</Version>
+
+    <!-- ── 代理端版本号（手工维护，2026-10-30 起）─────────────────────────────
+         与主程序版本号**故意解耦**：主程序的版本每次发版都变，而代理载荷大部分时候
+         一个字节都没动。装个新主程序就把 73MB 代理副本重铺一遍、把正在跑的代理顶掉，
+         是纯粹的浪费与风险。
+
+         规则：
+           · 只有在**改动代理载荷**（本工程、以及被它链接的 Models/Services 里代理实际
+             用到的代码）时才 +1；
+           · 只改主程序、代理没动 → 这个数字保持不变；
+           · 安装器与部署逻辑（deploy-agent 开关）都以它作为「要不要替换代理」的唯一判据。
+
+         ⚠️ 忘了 +1 的后果：升级安装里代理不更新，而程序侧看不出任何异常
+            （新功能在代理里，却还是老代理在跑）。冒烟里有一条断言盯着这个数字存在。
+
+         ⚠️ 不能用 $(Version) 代替：CI 传的是 2.4.1-dev.184 这种带预发布后缀的版本，
+            FileVersion 只保留数字段（2.4.1.0），dev 序号丢失 —— 两个不同的 dev 构建
+            会拿到同一个号，判据直接失效。 -->
+    <AgentVersion>2.0.0</AgentVersion>
+    <FileVersion>$(AgentVersion)</FileVersion>
+    <AssemblyVersion>$(AgentVersion).0</AssemblyVersion>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <!-- 不产出 pdb：代理是分发到目标账户的常驻进程，符号文件既没用又白占体积。
          真要排查崩溃，用同版本 CI 产物里的 pdb 配上即可。 -->
     <DebugType>none</DebugType>
     <NoWarn>$(NoWarn);CA1416;CS1591;NU1701</NoWarn>
   </PropertyGroup>
+
+  <!-- 版本号写进程序集元数据（AssemblyMetadataAttribute），供 AgentVersionInfo 运行时读取。
+       走元数据而不是「代码里再写一个 const」，是为了让 csproj 成为唯一来源 —— 两份数字
+       迟早会漂移，而漂移的表现是「版本号没变但代理行为变了」，最难查的那种。
+       主控端程序集里没有这条元数据，读出来是空串，正好用来区分「这是代理进程吗」。 -->
+  <ItemGroup>
+    <AssemblyMetadata Include="AgentVersion" Value="$(AgentVersion)" />
+  </ItemGroup>
 
   <!-- 源文件复用 Yomori.App，不复制一份：代理跑的就是同一套桥协议 / 任务执行 / 日志代码，
        复制会立刻分叉。这里按「链接源码 + 排除界面文件」的方式共享，

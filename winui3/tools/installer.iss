@@ -45,18 +45,30 @@
   #define IconFile ""
 #endif
 
-; 留空 = 不加载语言文件（向导用默认英文）。
-; Inno Setup 6.7 的 choco 包不带 Languages 目录，中文 isl 得另外下载 ——
-; CI 里下载到了才传这个参数，下载不到就退回英文，别让这一步把构建搞红。
+; 中文语言文件：**随仓库入库**（winui3/tools/lang/ChineseSimplified.isl），不在构建时下载。
+;
+; 教训（2026-10-30）：以前从 issrc 仓库的 Unofficial 目录现场拉这个文件，拉不到就静默
+; 退回英文向导、构建照样通过。而 2026-06-23 上游把这个翻译提升为**正式翻译**、挪到了
+; Files\Languages\ 下 —— 旧地址从此 404，于是之后每一个安装包都是英文的，没人发现。
+; 现在文件在仓库里，缺了就是编译错误（而不是"悄悄变英文"）。
+;
+; 相对路径按**脚本所在目录**解析（与 Source 一致），所以本地编译不需要额外参数；
+; CI 仍传绝对路径。
 #ifndef LangFile
-  #define LangFile ""
+  #define LangFile "lang\ChineseSimplified.isl"
 #endif
 
 #define MyAppName "Yomori"
 #define MyAppExe "Yomori.exe"
+#define MyAgentExe "Yomori.Agent.exe"
 #define MyAppPublisher "AITNR"
 ; 仓库地址（产品已从 Anigame-script-manager 改名为 Yomori，旧名会 301 跳转 —— 这里写新名）
 #define MyAppURL "https://github.com/AITNR/Yomori"
+
+; 代理端版本号，由 CI 从 Yomori.Agent.csproj 的 <AgentVersion> 读出来传进来
+; （/DAgentVersion=2.0.0）。留空 = 判据不可用，代理载荷按「每次都写」处理 ——
+; 手头没有版本号时宁可多写一次，不要留下一个来路不明的旧代理。
+#define AgentVersion ""
 
 ; 改名前（v2.1.1 及更早）的安装目录名。仅用于升级后收掉旧目录的空壳，
 ; 不参与任何路径安装逻辑 —— 见 [Setup] 里 UsePreviousAppDir 的说明。
@@ -118,16 +130,45 @@ SetupLogging=yes
 SetupIconFile={#IconFile}
 #endif
 
-#if LangFile != ""
+; 恒有中文（单语言 → 不弹语言选择框）。文件缺失时 ISCC 会直接报错，
+; 这正是要的：宁可构建红，也不要再发出一个英文向导的安装包。
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "{#LangFile}"
-#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标："
 
 [Files]
-Source: "{#SrcDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
+; 主程序与其余文件：照旧全部覆盖（ignoreversion 是有意的 —— 界面/服务里的时间戳不可靠）。
+; 代理载荷与 UU 修复载荷各自单列，按判据决定写不写（见下两条）。
+Source: "{#SrcDir}\*"; DestDir: "{app}"; Excludes: "\agent\*,\uu_session_fix.dll"; Flags: recursesubdirs createallsubdirs ignoreversion
+
+; 代理载荷（{app}\agent\，约 73 MB、几百个文件）
+;
+; 为什么要单列：代理端有自己的版本号（Yomori.Agent.csproj 的 <AgentVersion>），
+; 升级安装十有八九只是主程序动了、代理一个字节没变，把 73MB 重写一遍纯属浪费；
+; 而且写完后 --deploy-agent 还会再拿版本比一次才决定要不要重铺 ProgramData 里的副本，
+; 于是同一次安装要为同一批没变的文件搬两遍。
+;
+; 判据只看版本号（ShouldInstallAgent）：
+;   · 已安装 exe 的版本 == 本次随包版本 → 整块跳过；
+;   · 读不到 / 不同 / 没装过 → 照常写入。
+; 忘给 <AgentVersion> +1 的后果是「代理不更新」，不是安装失败 —— 见 csproj 里的说明。
+Source: "{#SrcDir}\agent\*"; DestDir: "{app}\agent"; Flags: recursesubdirs createallsubdirs ignoreversion; Check: ShouldInstallAgent
+
+; UU 远程修复载荷（uu_session_fix.dll）——**刻意不放进普通 [Files] 条目**。
+;
+; 这个 DLL 在「UU 远程修复」开启时会被注入 `GameViewerService`（SYSTEM 常驻服务）。
+; 只要它出现在安装列表里，Inno 的占用检查（关闭应用/重启管理器）就会把该服务列进
+; 「需要关闭的应用」，用户被迫停服务 —— 而停 UU 服务 = 断远控，正好是修复功能要治的那件事；
+; 更荒唐的是，多数升级里这个 DLL 根本没有变化。
+;
+; 所以改成 dontcopy 提取到临时目录，由 [Code] 的 InstallUuFixPayload 比对内容后决定是否落盘：
+;   · 文件不在安装列表 ⇒ 不参与占用检查 ⇒ 不会出现那条提示；
+;   · 内容一致 ⇒ 一个字节都不写，服务不受影响；
+;   · 内容不同 ⇒ 直接覆盖；被占用则排到下次启动时替换（不停服务、不断远控）。
+; 代价：手工落盘的文件不进卸载日志，所以 [UninstallDelete] 里补了登记。
+Source: "{#SrcDir}\uu_session_fix.dll"; DestDir: "{tmp}"; Flags: dontcopy
 
 [Icons]
 ; 图标统一指向 exe 自己（ApplicationIcon 编译期嵌入 icon.ico），不再依赖外部 .ico 副本 ——
@@ -165,7 +206,89 @@ Type: files; Name: "{commonstartup}\YukinoChan RDP 会话代理.lnk"
 Type: filesandordirs; Name: "{commonappdata}\Yomori\agent"
 Type: filesandordirs; Name: "{commonappdata}\Yomori\agent_b"
 
+; UU 修复载荷是 [Code] 手工落盘的（见 [Files] 里那条 dontcopy），不在 Inno 的卸载日志里，
+; 不补这两条的话卸载会把它们留在 Program Files 里。
+; .new 是「被占用、已排到下次启动替换」时的临时件，正常情况下不存在。
+Type: files; Name: "{app}\uu_session_fix.dll"
+Type: files; Name: "{app}\uu_session_fix.dll.new"
+
 [Code]
+// ── 代理载荷：按版本号决定要不要重写 ─────────────────────────────────────
+// 判据与主程序的 RdpSessionService.ReadAgentExeVersion 同一口径：读 exe 的**文件版本
+// 资源**（安装器读不到托管程序集属性），按四段数字比较、缺位补 0，
+// 免得 "2.0.0" 与 "2.0.0.0" 被当成两个不同的版本而白写一遍 73MB。
+//
+// 结果缓存进 AgentSkipDecision：通配条目会展开成几百个文件，每个都重新读一次版本
+// 既慢又可能因为中途文件被替换而前后不一致。
+var
+  AgentSkipDecision: Integer;   // -1 = 还没算过；0 = 需要写入；1 = 跳过
+
+function VersionPart(const Value: String; Index: Integer): Integer;
+var
+  I, Part, Start: Integer;
+begin
+  Result := 0;
+  Part := 1;
+  Start := 1;
+  for I := 1 to Length(Value) + 1 do
+  begin
+    if (I > Length(Value)) or (Value[I] = '.') then
+    begin
+      if Part = Index then
+      begin
+        if I > Start then
+          Result := StrToIntDef(Copy(Value, Start, I - Start), 0);
+        Exit;
+      end;
+      Inc(Part);
+      Start := I + 1;
+    end;
+  end;
+end;
+
+function SameVersion(const A, B: String): Boolean;
+begin
+  Result := (VersionPart(A, 1) = VersionPart(B, 1))
+        and (VersionPart(A, 2) = VersionPart(B, 2))
+        and (VersionPart(A, 3) = VersionPart(B, 3))
+        and (VersionPart(A, 4) = VersionPart(B, 4));
+end;
+
+function ShouldInstallAgent(): Boolean;
+var
+  InstalledExe, Installed: String;
+begin
+  if AgentSkipDecision < 0 then
+  begin
+    // 默认：写入。判据不可用（没传 /DAgentVersion、或读不到版本）时宁可多写一次。
+    AgentSkipDecision := 0;
+    // ⚠️ 这里用**运行时**的字符串比较而不是 #if：ISPP 的 #if 对字符串比较不可靠
+    //    （写成 #if AgentVersion != "" 时整段会被静默丢掉，变量变成"从未使用"，
+    //     编译照样成功 —— 判据就这么没了，只有 ISCC 的 Hint 里能看出端倪）。
+    if '{#AgentVersion}' <> '' then
+    begin
+      InstalledExe := ExpandConstant('{app}\agent\{#MyAgentExe}');
+      if FileExists(InstalledExe) then
+      begin
+        if GetVersionNumbersString(InstalledExe, Installed)
+           and SameVersion(Installed, '{#AgentVersion}') then
+        begin
+          AgentSkipDecision := 1;
+          Log('代理载荷版本未变（{#AgentVersion}），跳过写入：' + ExpandConstant('{app}\agent'));
+        end
+        else
+          Log('代理载荷需要更新：已安装 ' + Installed + ' → 本次 {#AgentVersion}');
+      end
+      else
+        Log('代理载荷未安装过，按首次安装写入：' + InstalledExe);
+    end
+    else
+      Log('未传 /DAgentVersion，代理载荷按「每次写入」处理');
+  end;
+
+  Result := AgentSkipDecision = 0;
+end;
+
 // 兜底：万一谁用「没打补丁的编译器模板」编出这个安装包（外层清单还是 asInvoker），
 // 至少别让它静默地以普通用户身份往 Program Files 里写 —— 那样会装一半失败，报错还看不懂。
 // ⚠️ [Code] 是 Pascal Script：注释只能写 // 或 { }，不能用分号（分号是语句分隔符）。
@@ -177,6 +300,74 @@ begin
     MsgBox('本安装程序需要管理员权限，才能把程序装到 Program Files。' + #13#10 + #13#10 +
            '请右键点击安装包，选择「以管理员身份运行」。', mbError, MB_OK);
     Result := False;
+  end;
+end;
+
+// ── UU 远程修复载荷：内容没变就不碰 ─────────────────────────────────────
+// 判据是内容（SHA-256）—— 这个 DLL 没有版本号可用，也不该为它另发明一个。
+// 为什么用 dontcopy 而不是普通 [Files] 条目、为什么被占用时不停服务：
+// 见 [Files] 里那条注释。
+function IsSameFile(const Left, Right: String): Boolean;
+var
+  A, B: String;
+begin
+  Result := False;
+  if (not FileExists(Left)) or (not FileExists(Right)) then
+    Exit;
+
+  try
+    A := GetSHA256OfFile(Left);
+    B := GetSHA256OfFile(Right);
+  except
+    // 读不出来（被独占、权限不足）就当「不同」：宁可多写一次，不能少写一次
+    Exit;
+  end;
+
+  Result := (A <> '') and (A = B);
+end;
+
+procedure InstallUuFixPayload();
+var
+  Temp, Target, Pending: String;
+begin
+  ExtractTemporaryFile('uu_session_fix.dll');
+  Temp := ExpandConstant('{tmp}\uu_session_fix.dll');
+  if not FileExists(Temp) then
+  begin
+    Log('取不出 uu_session_fix.dll（安装包不完整？），跳过这一步');
+    Exit;
+  end;
+
+  Target := ExpandConstant('{app}\uu_session_fix.dll');
+
+  if IsSameFile(Target, Temp) then
+  begin
+    Log('uu_session_fix.dll 内容未变，保留现有文件（不停 UU 服务、不断远控）');
+    Exit;
+  end;
+
+  if FileCopy(Temp, Target, False) then
+  begin
+    Log('uu_session_fix.dll 已更新：' + Target);
+    Exit;
+  end;
+
+  // 覆盖失败 = 文件正被映像锁定（「UU 远程修复」注入着 GameViewerService）。
+  // ⚠️ 这里**不要**去停服务：停 UU 服务 = 断掉用户可能正在用的远控，而这正是修复要治的事。
+  // 改为排到下次启动时替换。在那之前旧 DLL 继续用，行为与新版本一致（内容差异只在被替换那一刻生效）。
+  Pending := Target + '.new';
+  if not FileCopy(Temp, Pending, True) then
+  begin
+    Log('uu_session_fix.dll 无法更新，临时件也写不进去：' + Pending);
+    Exit;
+  end;
+
+  try
+    RestartReplace(Pending, Target);
+    Log('uu_session_fix.dll 被占用（多半是 UU 服务正在运行），已排到下次启动时替换：' + Pending);
+  except
+    // 同一个目标已经有挂起的替换操作时会冲突；那就留着 .new 让人看得见
+    Log('uu_session_fix.dll 被占用，登记「重启后替换」失败，保留临时件：' + Pending);
   end;
 end;
 
@@ -232,6 +423,7 @@ begin
 
     // 放在 ssPostInstall：此时文件已全部落地，而 [Run] 里那条「安装完成后启动」还没跑 ——
     // 主程序起来时代理已经就位，首次连接的预检就能直接看到"已部署"。
+    InstallUuFixPayload();
     DeploySessionAgent();
   end;
 end;

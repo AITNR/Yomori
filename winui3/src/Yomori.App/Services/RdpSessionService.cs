@@ -1553,29 +1553,66 @@ public static class RdpSessionService
     }
 
     /// <summary>
-    /// 已部署的副本是不是就是随包分发的这一份（<see cref="ShippedAgentDir"/> 里的载荷）。
+    /// 已部署的副本是不是与随包载荷**同一个代理版本**（判据是版本号，不是文件内容）。
     ///
-    /// 只用于"安装时自动部署"的幂等判断：内容一致就跳过整套搬运与快捷方式重建。
-    /// 比对走 <see cref="AgentPayloadIdentity"/>，不看时间戳 —— 全量副本时代那个 exe
-    /// 会被 mt.exe 就地改写，时间戳说明不了版本。
+    /// <para>【为什么改成只看版本号】（2026-10-30 决定）</para>
+    /// 代理端有独立版本号（<see cref="AgentVersionInfo"/>，起始 2.0.0），每次发版由人决定
+    /// 要不要动它。判据跟着它走，语义才是「代理没更新就不替换」——以前比内容哈希，
+    /// 结果是「主程序装一次就把 73MB 代理副本重铺一遍」，哪怕代理一个字节没变。
+    ///
+    /// <para>【代价，写在这里免得以后有人当成 bug】</para>
+    /// 改了代理代码却忘了给 <c>&lt;AgentVersion&gt;</c> +1，升级后代理不会替换。
+    /// 这是刻意的取舍：宁可漏一次（用户会看到新功能没生效，重新点一次部署即可），
+    /// 也不要为了兜住这种情况，把每次安装都变成一次 73MB 的搬运。
+    /// 冒烟里有一条断言盯着版本号存在，CI 也把它传进安装包。
+    ///
+    /// <para>【读不到版本号时一律判「不最新」】</para>
+    /// 老载荷（本改动之前编出来的 exe）没有这个版本号，只能替换一次；
+    /// 复制过程中被截断/权限异常同理 —— 宁可多做一次，不可留下来路不明的旧代理。
     /// </summary>
     public static bool IsAgentPayloadCurrent()
     {
-        var shippedExe = Path.Combine(ShippedAgentDir, AgentExeName);
-        if (!File.Exists(shippedExe))
+        var shippedVersion = ReadAgentExeVersion(Path.Combine(ShippedAgentDir, AgentExeName));
+        if (shippedVersion.Length == 0)
         {
             return false;
         }
 
         foreach (var slot in PayloadSlotDirs())
         {
-            if (AgentPayloadIdentity.Matches(shippedExe, Path.Combine(slot, AgentExeName)))
+            var deployedVersion = ReadAgentExeVersion(Path.Combine(slot, AgentExeName));
+            if (deployedVersion.Length > 0 && AgentVersionInfo.Same(shippedVersion, deployedVersion))
             {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// 读一个代理 exe 的版本号（规范化成 <c>2.0.0</c> 这种形状）。读不到返回空串。
+    ///
+    /// <para>读的是**文件版本资源**而不是程序集元数据：安装器（Inno 的
+    /// <c>GetVersionNumbersString</c>）与主控端要能按同一口径判断，
+    /// 而安装器根本读不到托管程序集属性。两处数值来自 csproj 同一个属性，不会漂移。</para>
+    /// </summary>
+    public static string ReadAgentExeVersion(string exePath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
+            {
+                return string.Empty;
+            }
+
+            return AgentVersionInfo.Normalize(FileVersionInfo.GetVersionInfo(exePath).FileVersion);
+        }
+        catch
+        {
+            // 文件被独占到读不出属性：当作没有版本号（调用方会判「需要替换」）
+            return string.Empty;
+        }
     }
 
     /// <summary>

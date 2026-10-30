@@ -1014,7 +1014,15 @@ public sealed class RdpStatus
 {
     public string CommandId { get; set; } = string.Empty;
     public string AgentUser { get; set; } = string.Empty;
-    public string AgentVersion { get; set; } = "v2.0 WinUI";
+    /// <summary>
+    /// 代理端版本号（形如 <c>2.0.0</c>），由代理进程每次回写状态时填入
+    /// （见 <c>RdpBridge.UpdateStatusCore</c>，取自 <see cref="AgentVersionInfo.Current"/>）。
+    ///
+    /// <para>旧代理不写这个字段 → 反序列化为空串。**空串只能表达「未知」**，
+    /// 不要拿它当 "没有问题"：主控端想判断"在线代理是不是落后了"，
+    /// 必须用空串判失败（不知道就先不提示）。</para>
+    /// </summary>
+    public string AgentVersion { get; set; } = string.Empty;
 
     /// <summary>idle / running / done / stopped / error</summary>
     public string Phase { get; set; } = "idle";
