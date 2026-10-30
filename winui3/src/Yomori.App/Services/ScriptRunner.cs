@@ -90,7 +90,7 @@ internal sealed class ExternalLogTailState
 
 /// <summary>
 /// 任务队列执行器。完整移植 Python 版 ScriptRunnerWorker 的调度语义：
-/// 顺序执行 / 并发组 / 暂停 / 停止 / 紧急停止 / 三层清理 / 超时兜底 / 过早退出识别。
+/// 顺序执行 / 并发组 / 暂停 / 停止 / 紧急停止 / 三层清理 / 超时兜底。
 /// </summary>
 public sealed class ScriptRunner
 {
@@ -648,15 +648,15 @@ public sealed class ScriptRunner
             {
                 RaiseStatus("已完成（有异常）");
                 RaiseProgress(total, total);
-                Log("任务队列执行结束，但存在启动失败、过早退出、超时强退等异常。");
-                Log("异常已写入上次运行报告；下次启动会主动汇报。");
+                Log("任务队列执行结束，但存在启动失败、脚本缺失、超时强退等异常。");
+                Log($"异常已写入上次运行报告：{Path.GetFileName(AbnormalReportPath)}（位于日志目录）。");
             }
             else if (_abnormalEvents.Count > 0)
             {
                 RaiseStatus("已完成（有提醒）");
                 RaiseProgress(total, total);
                 Log("任务队列执行结束，存在配置或监控目标提醒，但未判定为严重异常。");
-                Log("提醒已写入上次运行报告；下次启动会主动汇报。");
+                Log($"提醒已写入上次运行报告：{Path.GetFileName(AbnormalReportPath)}（位于日志目录）。");
             }
             else
             {
@@ -1261,7 +1261,6 @@ public sealed class ScriptRunner
         }
 
         var lastEmitSecond = -1;
-        var earlyExitThreshold = timeoutSeconds > 0 ? timeoutSeconds / 6.0 : 0;
 
         var monitorSeen = false;
         var monitorWaitLogged = false;
@@ -1272,22 +1271,14 @@ public sealed class ScriptRunner
         // 等用户按停止时它早已不在进程表里，BFS 从那一步就断（见 LearnScriptDescendants 的增量爬升）。
         var lastDescendantSweep = stopwatch.Elapsed;
 
-        RunOutcome FinishWithLog(string status, bool checkEarlyExit = true, bool abnormal = false)
+        // 这里原本还有一条「疑似过早退出」判据（实际耗时 < 超时上限的 1/6 即记异常），
+        // 已移除：阈值随超时配置浮动，正常结束的短脚本很容易被误判成故障。
+        RunOutcome FinishWithLog(string status, bool abnormal = false)
         {
             var elapsedDone = (int)stopwatch.Elapsed.TotalSeconds;
             RaiseElapsed(elapsedDone);
             Log(FileLogger.BuildSessionMarker(name, "END"));
             Log($"任务「{name}」{status}，耗时：{FormatHelper.FormatSeconds(elapsedDone)}。");
-
-            if (checkEarlyExit && earlyExitThreshold > 0 && elapsedDone < earlyExitThreshold)
-            {
-                var message =
-                    $"任务「{name}」疑似过早退出：实际耗时 {FormatHelper.FormatSeconds(elapsedDone)}，" +
-                    $"低于预估/最大时间 1/6（{FormatHelper.FormatSeconds((long)earlyExitThreshold)}）。";
-                Log(message);
-                MarkTaskError(message, name);
-                abnormal = true;
-            }
 
             // 最后一次抽水：脚本退出前的最后几行别漏掉
             StopExternalLogTail(task);
@@ -1371,7 +1362,7 @@ public sealed class ScriptRunner
                         var message = $"直接进程已结束，180 秒内未检测到{label}「{keywords}」，按提醒处理：可能是配置不匹配";
                         Log(message);
                         MarkTaskWarning(message, name);
-                        return FinishWithLog(message, checkEarlyExit: false);
+                        return FinishWithLog(message);
                     }
                 }
             }

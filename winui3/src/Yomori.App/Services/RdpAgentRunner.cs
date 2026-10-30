@@ -262,7 +262,7 @@ public sealed class RdpAgentRunner
             // 只看这个参数会把用户点停止也写成「已完成（有异常）」——
             // 真机日志里出现过：紧急停止 → 两个通道都报「已完成（有异常）」，
             // 界面上只写了"有异常"、没有任何原因，用户根本看不出那是自己按的停止。
-            // 真异常以 HadTaskError 为准（启动失败 / 脚本缺失 / 超时强退 / 过早退出都会置它）。
+            // 真异常以 HadTaskError 为准（启动失败 / 脚本缺失 / 超时强退都会置它）。
             hadError = stoppedOrError && runner.HadTaskError;
 
             // 统计是在 RaiseFinished 之前刚写好的（ScriptRunner 先 SaveStatsQuietly 再 RaiseFinished），

@@ -8,34 +8,18 @@
          版式参考「横幅图 + 卡片区」：顶部一张通栏图（贴窗口左右边、撑满剩余高度），
          图从 assets/home_banners/ 里随机抽，每次进首页重抽，右键可换/钉死；
          图左上角叠应用名；图下方是内容区，标题行 + 四张功能入口卡。
-         原来的「总览」标题 + 描述 + 状态四格换成了这张图，底部「会话通道」概览整块删除。 -->
+         原来的「总览」标题 + 描述 + 状态四格换成了这张图，底部「会话通道」概览整块删除。
+         2026-10-30：删掉顶部「上次运行存在需要注意的情况」InfoBar ——
+         异常原因改由左侧状态面板的「异常原因」框与运行日志承担，首屏不再压一条常驻提示。 -->
     <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />
             <!-- 横幅吃满剩余高度：卡片区之下不再留一大片空背景 -->
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
         </Grid.RowDefinitions>
 
-        <!-- 上次运行异常报告（有才占位，单独一行，不压在图上面） -->
-        <InfoBar x:Name="ProblemReportBar"
-                 Grid.Row="0"
-                 Margin="16,12,16,0"
-                 IsOpen="False"
-                 Severity="Warning"
-                 Title="上次运行存在需要注意的情况"
-                 IsClosable="True"
-                 CloseButtonClick="OnProblemReportClosed">
-            <InfoBar.Content>
-                <TextBlock x:Name="ProblemReportText" TextWrapping="Wrap" />
-            </InfoBar.Content>
-            <InfoBar.ActionButton>
-                <Button Content="打开日志目录" Click="OnOpenLogFolder" />
-            </InfoBar.ActionButton>
-        </InfoBar>
-
         <!-- 横幅图：贴内容区左右边、吃掉剩余高度，整块右键可换 -->
-        <Grid x:Name="BannerHost" Grid.Row="1" MinHeight="160">
+        <Grid x:Name="BannerHost" Grid.Row="0" MinHeight="160">
             <Image x:Name="BannerImage"
                    Stretch="UniformToFill"
                    Visibility="Collapsed" />
@@ -102,7 +86,7 @@
         </Grid>
 
         <!-- 图下方的内容区 -->
-        <ScrollViewer Grid.Row="2" Padding="20,14,20,20">
+        <ScrollViewer Grid.Row="1" Padding="20,14,20,20">
             <StackPanel Spacing="12">
 
                 <!-- 小节标题行 -->

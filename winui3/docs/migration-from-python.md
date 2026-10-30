@@ -108,7 +108,6 @@ window_keywords  >  process_keywords  >  legacy wait_mode  >  direct_process
 | 监控目标连续消失宽限 | 15 秒 |
 | 监控目标出现截止 | 180 秒 |
 | 启动成功确认窗口 | 2 秒 |
-| 过早退出阈值 | 超时时间 / 6 |
 
 **看板娘状态机**
 

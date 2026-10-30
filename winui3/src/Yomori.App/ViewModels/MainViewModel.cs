@@ -2420,57 +2420,6 @@ public sealed class MainViewModel : ObservableObject
 
     public void Navigate(string target) => RequestNavigation?.Invoke(this, target);
 
-    // ---------------- 异常报告 ----------------
-
-    public AbnormalReport? LoadAbnormalReport()
-    {
-        var path = Path.Combine(_logger.LogDir, "last_abnormal_report.json");
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        try
-        {
-            var text = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<AbnormalReport>(text, new JsonSerializerOptions
-            {
-                PropertyNameCaseInsensitive = true,
-            });
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    public void OpenStartupProblemReportIfNeeded()
-    {
-        var report = LoadAbnormalReport();
-        if (report is null)
-        {
-            return;
-        }
-
-        AppendLog($"上次运行报告：{report.Summary}");
-    }
-
-    public void DismissAbnormalReport()
-    {
-        var path = Path.Combine(_logger.LogDir, "last_abnormal_report.json");
-        try
-        {
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"删除已读异常报告失败：{ex.Message}");
-        }
-    }
-
     private void Post(Action action)
     {
         if (_dispatcher.HasThreadAccess)

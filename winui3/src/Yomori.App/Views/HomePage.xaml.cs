@@ -46,7 +46,6 @@ public sealed partial class HomePage : Page
     public HomePage()
     {
         InitializeComponent();
-        ShowProblemReportIfNeeded();
     }
 
     /// <summary>
@@ -63,25 +62,6 @@ public sealed partial class HomePage : Page
     }
 
     public MainViewModel VM => App.ViewModel;
-
-    // ---------------- 上次运行异常报告 ----------------
-
-    private void ShowProblemReportIfNeeded()
-    {
-        var report = VM.LoadAbnormalReport();
-        if (report is null)
-        {
-            ProblemReportBar.IsOpen = false;
-            return;
-        }
-
-        ProblemReportText.Text = report.Summary;
-        ProblemReportBar.IsOpen = true;
-    }
-
-    private void OnProblemReportClosed(InfoBar sender, object args) => VM.DismissAbnormalReport();
-
-    private void OnOpenLogFolder(object sender, RoutedEventArgs e) => VM.OpenDirectory(AppPaths.LogDir);
 
     // ---------------- 四张入口卡 ----------------
 
