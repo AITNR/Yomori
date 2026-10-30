@@ -974,6 +974,10 @@ public sealed partial class MainWindow : Window
         // 集合内容不可靠；属性赋值则一定会让 ItemsControl 重新取一次。
         SideRowList.ItemsSource = SideStatusRows;
 
+        // 收起态那份用的是**同一个集合**：两套界面显示同一批行，才不会出现
+        // "收起时 3/7、展开时 5/7" 这种对不上的情况。
+        SideCollapsedRows.ItemsSource = SideStatusRows;
+
         SetSideStatusCollapsed(VM.Config.Window.SidebarCollapsed, persist: false);
 
         _sideStatusTimer = DispatcherQueue.CreateTimer();
@@ -1171,6 +1175,8 @@ public sealed partial class MainWindow : Window
             .Append(ratio.ToString("F4")).Append('\n')
             .Append(anyActive ? '1' : '0')
             .Append(anyAbnormal ? '1' : '0')
+            // 收起态的各通道进度只在执行中出现，这个开关也属于"看得见的取值"
+            .Append(vm.IsRunning ? '1' : '0')
             .Append('\n')
             .Append(abnormalReason).Append('\n')
             .Append(abnormalMore).Append('\n')
@@ -1205,6 +1211,10 @@ public sealed partial class MainWindow : Window
         SideCollapsedProgressText.Text = progressText
             .Replace(" ", string.Empty, StringComparison.Ordinal)
             .Replace("合计", string.Empty, StringComparison.Ordinal);
+
+        // 各通道进度只在执行中出现：空闲时没有进度可看，留着只会把 44px 的窄条塞满数字。
+        // 行内容本身跟着 SideStatusRows 走（与展开态同一集合），这里只开关整块。
+        SideCollapsedRows.Visibility = vm.IsRunning ? Visibility.Visible : Visibility.Collapsed;
 
         SideProgressBar.Value = ratio;
 

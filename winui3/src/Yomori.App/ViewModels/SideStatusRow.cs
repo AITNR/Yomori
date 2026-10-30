@@ -20,6 +20,7 @@ public sealed class SideStatusRow : ObservableObject
 {
     private string _name = string.Empty;
     private string _progressText = string.Empty;
+    private string _shortText = string.Empty;
     private string _stateText = string.Empty;
     private double _progressRatio;
     private Visibility _activeDot = Visibility.Collapsed;
@@ -58,6 +59,33 @@ public sealed class SideStatusRow : ObservableObject
         set => SetProperty(ref _stateText, value);
     }
 
+    /// <summary>
+    /// 收起态那一行用的短文本，形如 <c>z 3/7</c>。
+    ///
+    /// <para>44px 的窄条放不下通道名，只留**名字的第一个字**做区分 —— 纯数字会变成一串
+    /// 没法对号的进度（三条通道都还没开始时全是 <c>0/0</c>，看着完全一样）。
+    /// 完整名字挂在悬浮提示上，拿不准时悬停一下就知道。</para>
+    /// </summary>
+    public string ShortText
+    {
+        get => _shortText;
+        set => SetProperty(ref _shortText, value);
+    }
+
+    /// <summary>收起态用来区分通道的那个字：「本地执行」→「本」，「zdh」→「z」。</summary>
+    private static string ShortName(string? name)
+    {
+        var text = (name ?? string.Empty).Trim();
+        if (text.Length == 0)
+        {
+            return "－";
+        }
+
+        // 代理对（emoji 之类的通道名）要按码点取，切掉半个字符会显示成方块
+        var length = char.IsHighSurrogate(text[0]) && text.Length > 1 ? 2 : 1;
+        return text[..length];
+    }
+
     /// <summary>正在跑的那一行前面亮一个色点，方便一眼扫到。</summary>
     public Visibility ActiveDot
     {
@@ -80,6 +108,7 @@ public sealed class SideStatusRow : ObservableObject
         // 总数是 0（还没下发 / 刚复位）时给 0 而不是 NaN —— ProgressBar 拿到 NaN 会把值拦在旧值上
         ProgressRatio = total > 0 ? Math.Clamp((double)progress / total, 0d, 1d) : 0d;
         ProgressText = $"{progress} / {total}";
+        ShortText = $"{ShortName(name)} {progress}/{total}";
         StateText = stateText;
         ActiveDot = active ? Visibility.Visible : Visibility.Collapsed;
         Visible = Visibility.Visible;

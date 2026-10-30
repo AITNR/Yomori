@@ -496,6 +496,35 @@
                                            TextWrapping="Wrap"
                                            TextAlignment="Center"
                                            HorizontalAlignment="Center" />
+
+                                <!-- 各通道进度：**只在执行中出现**。
+                                     空闲时这串数字没有意义，44px 的窄条不该被它常驻占着；
+                                     ItemsSource 与展开态那份是同一个集合（代码里赋值），
+                                     行数、显隐、活动色点全都跟着展开态走，不会两套数据对不上。
+                                     通道名放不下（窄条只有 44px），挂悬浮提示补齐。 -->
+                                <ItemsControl x:Name="SideCollapsedRows"
+                                              Margin="0,2,0,0"
+                                              Visibility="Collapsed">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Orientation="Horizontal"
+                                                        Spacing="3"
+                                                        Margin="0,1"
+                                                        HorizontalAlignment="Center"
+                                                        Visibility="{Binding Visible}"
+                                                        ToolTipService.ToolTip="{Binding Name}">
+                                                <Ellipse Width="5" Height="5"
+                                                         VerticalAlignment="Center"
+                                                         Fill="{StaticResource YomoriAccentBrush}"
+                                                         Visibility="{Binding ActiveDot}" />
+                                                <TextBlock Text="{Binding ShortText}"
+                                                           FontSize="10"
+                                                           Opacity="0.7"
+                                                           VerticalAlignment="Center" />
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
                             </StackPanel>
                         </Grid>
                     </Border>
