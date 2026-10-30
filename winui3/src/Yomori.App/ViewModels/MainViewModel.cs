@@ -2708,6 +2708,19 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     public event EventHandler? SessionsChanged;
 
+    /// <summary>
+    /// 「左侧菜单里该列哪些通道」的输入变了 —— 主窗口据此重建「会话通道」下的子项。
+    ///
+    /// <para>刻意与 <see cref="SessionsChanged"/> 分开：那个说的是"本轮会话集合变了"，
+    /// 只挂在它上面时，"关掉一条没在跑的通道"这种纯配置变更会悄悄漏过刷新
+    /// （2026-10-30 实测：在任务执行页把通道开关关掉，左下角「会话通道」里那一条还在）。
+    /// 这里只发「需要重算菜单内容」的信号，具体列谁仍由窗口按「配置 + 在跑会话」现算，
+    /// 不做第二份数据源。</para>
+    /// </summary>
+    public event EventHandler? ChannelMenuChanged;
+
+    private void RaiseChannelMenuChanged() => ChannelMenuChanged?.Invoke(this, EventArgs.Empty);
+
     // ================= 任务编排：按执行通道（docs/tasks-by-channel-plan.md） =================
 
     /// <summary>
@@ -2822,6 +2835,10 @@ public sealed class MainViewModel : ObservableObject
 
             AppendLog($"[会话通道] 通道「{channel.DisplayName}」已{(enabled ? "启用" : "停用")}"
                       + "，改动在下一次「开始执行」生效。");
+
+            // 左侧「会话通道」子项只列启用中的通道 → 开关一拨就得重算。
+            // 事件在 finally 之前发，但窗口那边自己会延后一拍重建，不会落在 Toggled 栈里。
+            RaiseChannelMenuChanged();
         }
         finally
         {

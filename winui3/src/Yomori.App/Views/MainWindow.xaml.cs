@@ -138,7 +138,14 @@ public sealed partial class MainWindow : Window
         //   子项「通道名」  = 该通道单独的画面页；
         //   子项「通道管理…」= 配置 / 凭据 / 部署代理 / 预检。
         // 子项按「配置里启用的通道 + 本轮在跑的通道」重建，配置一改就跟着变。
+        //
+        // ⚠️ 三条信号缺一不可：
+        //   SessionsChanged        = 本轮会话集合变了（开始/结束）；
+        //   Channels.CollectionChanged = 通道管理页增删通道（ReloadChannels 重建镜像）；
+        //   ChannelMenuChanged     = 只改了某条通道的 enabled（任务执行页那个开关），
+        //                            集合一点没动 —— 少了它就会出现「通道关掉了，左下角还挂着」。
         VM.SessionsChanged += (_, _) => RebuildChannelMenuItems();
+        VM.ChannelMenuChanged += (_, _) => RebuildChannelMenuItems();
         VM.PropertyChanged += OnViewModelPropertyChanged;
         VM.Channels.CollectionChanged += (_, _) => RebuildChannelMenuItems();
 
