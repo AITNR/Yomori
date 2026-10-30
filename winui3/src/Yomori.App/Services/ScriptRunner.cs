@@ -860,6 +860,11 @@ public sealed class ScriptRunner
         "msmpeng.exe", "securityhealthservice.exe", "securityhealthsystray.exe",
         "smartscreen.exe", "wudfhost.exe", "useroobebroker.exe", "dcomlaunch.exe",
         "igfxem.exe", "nvcontainer.exe", "nvngx_update.exe", "nvsphelper64.exe",
+        // 游戏栏与浏览器：跑自动化时被系统顺手拉起，或用户自己开着，都不是游戏本体
+        "gamebar.exe", "gamebarftserver.exe", "gamebarpresencewriter.exe",
+        "xboxgamebarwidgets.exe", "msedge.exe", "chrome.exe", "firefox.exe",
+        // 本程序自己起的检测进程（TasklistHasImage）也会被采集到
+        "tasklist.exe",
     };
 
     private static HashSet<int> CapturePidSnapshot()
@@ -2037,6 +2042,20 @@ public sealed class ScriptRunner
         Log($"  ↳ 强制结束被拒，且没有可发送关闭请求的窗口。{result.Hint}");
     }
 
+    /// <summary>关键词里是否含非 ASCII 字符（中文等）：这类词不可能出现在进程镜像名里。</summary>
+    private static bool HasNonAscii(string text)
+    {
+        foreach (var ch in text)
+        {
+            if (ch > 127)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private void TerminateProcessKeyword(string keyword)
     {
         var text = keyword.Trim();
@@ -2070,9 +2089,9 @@ public sealed class ScriptRunner
 
         try
         {
-            // 关键词要剥掉扩展名才能匹配标题与镜像名（理由见 ProcessHelper.TitleMatchKey）。
-            // 这一路兜底是把游戏本体（YuanShen / StarRail）清掉的**唯一**手段 ——
-            // 按名字 taskkill 用的是中文关键词，注定打不中英文镜像名。
+            // 关键词要剥掉扩展名才能匹配镜像名（理由见 ProcessHelper.TitleMatchKey）。
+            // 这一路兜底是把游戏本体（YuanShen / StarRail）清掉的手段 —— 按名字 taskkill
+            // 用的是中文关键词，注定打不中英文镜像名。
             var lower = ProcessHelper.TitleMatchKey(text);
             if (lower.Length == 0)
             {
@@ -2080,6 +2099,7 @@ public sealed class ScriptRunner
             }
 
             var currentPid = Environment.ProcessId;
+            var matched = 0;
             foreach (var proc in Process.GetProcesses())
             {
                 try
@@ -2090,18 +2110,34 @@ public sealed class ScriptRunner
                     }
 
                     var procName = proc.ProcessName;
-                    var title = proc.MainWindowTitle;
-                    if (procName.ToLowerInvariant().Contains(lower)
-                        || (!string.IsNullOrEmpty(title) && title.ToLowerInvariant().Contains(lower)))
+
+                    // 【只按镜像名匹配，不再看窗口标题】2026-10-30 真机：关键词「星穹铁道」
+                    // 命中的其实是 **StarRail 的窗口标题**（进程名里没有中文）。保留标题匹配的代价是
+                    // "任何标题含这几个字的进程都会被当成目标杀掉" —— 当时若开着浏览器搜攻略、
+                    // 或挂着直播页标题带游戏名，Edge 会被一起关掉。
+                    // 按窗口标题清理有专门的一条路（window_keywords → TerminateProcessesByWindowKeyword，
+                    // 先反查 PID 再杀树），职责分清楚，这里不再兼任。
+                    if (!procName.ToLowerInvariant().Contains(lower))
                     {
-                        Log($"按目标进程关键词兜底结束：{text} -> PID {proc.Id} ({procName})");
-                        KillWithFallback(proc.Id, procName);
+                        continue;
                     }
+
+                    matched++;
+                    Log($"按目标进程关键词兜底结束：{text} -> PID {proc.Id} ({procName})");
+                    KillWithFallback(proc.Id, procName);
                 }
                 catch
                 {
                     // 进程已退出或拒绝访问
                 }
+            }
+
+            // 纯中文关键词在这里注定一个都匹配不到（中文不会出现在镜像名里）。
+            // 必须明确说出来 —— 否则用户只看到「未在运行」，会以为程序根本没认真清。
+            if (matched == 0 && HasNonAscii(lower))
+            {
+                Log($"按目标进程关键词「{text}」没有匹配到任何进程镜像名（中文不会出现在 exe 名里）；"
+                    + "要按窗口标题清理，请把它填进「游戏窗口关键词」。");
             }
         }
         catch (Exception ex)

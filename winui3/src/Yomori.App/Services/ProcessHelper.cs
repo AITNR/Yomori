@@ -294,7 +294,7 @@ public static class ProcessHelper
         return false;
     }
 
-    /// <summary>单个镜像名（可带 .exe）的检测：托管 API 优先，tasklist 兜底。</summary>
+    /// <summary>单个镜像名（可带 .exe）的检测：托管枚举为主，只有枚举本身失败才回落 tasklist。</summary>
     private static bool IsExactImageRunning(string imageName)
     {
         var bare = imageName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
@@ -307,17 +307,17 @@ public static class ProcessHelper
 
         try
         {
-            if (Process.GetProcessesByName(bare).Length > 0)
-            {
-                return true;
-            }
+            // 【枚举成功且为空 = 确实不在，不要再回落 tasklist】
+            // 原先无论命中与否都会落到 TasklistHasImage —— 而 tasklist 是外部进程，
+            // 一次约 2 秒。清理名单里绝大多数名字在停止那一刻早就退出了，
+            // 于是每条「未在运行」都要白等 2-3 秒：真机一次停止有 8 次，光这就 20 秒。
+            return Process.GetProcessesByName(bare).Length > 0;
         }
         catch
         {
-            // 某些受保护进程枚举会抛异常，落到 tasklist 兜底
+            // 只有枚举本身抛异常（受保护进程 / 权限不足）才回落外部命令确认
+            return TasklistHasImage(imageName);
         }
-
-        return TasklistHasImage(imageName);
     }
 
     /// <summary>tasklist /FI 兜底检测（对应 Python 版实现）。</summary>
