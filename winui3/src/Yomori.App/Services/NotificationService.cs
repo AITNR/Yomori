@@ -96,6 +96,10 @@ public static class NotificationService
             return;
         }
 
+        // 旧版本在「窗口失焦时」把错过的通知落盘等回前台补发（pending_notification.json）。
+        // 该机制已删除 —— 通知现在直接投递、与窗口焦点无关，这里顺手清掉升级残留。
+        RemoveLegacyPendingFile();
+
         try
         {
             // 先给 AUMID 补一条显示名 —— 只影响 Toast 里显示的应用名，失败无所谓。
@@ -113,6 +117,25 @@ public static class NotificationService
             _disabled = true;
             _lastError = $"{ex.Message}（0x{ex.HResult:X8}）";
             _disabledStack = ex.ToString();
+        }
+    }
+
+    /// <summary>
+    /// 清掉旧版本遗留的待补发文件。失败无所谓（只读目录 / 被占用），下次启动再试。
+    /// </summary>
+    private static void RemoveLegacyPendingFile()
+    {
+        try
+        {
+            var leftover = Path.Combine(AppPaths.BaseDir, "pending_notification.json");
+            if (File.Exists(leftover))
+            {
+                File.Delete(leftover);
+            }
+        }
+        catch
+        {
+            // 删不掉不影响任何功能
         }
     }
 
@@ -170,8 +193,8 @@ public static class NotificationService
     /// <summary>
     /// 任务完成通知的标题（带序号，形如「任务已完成（2/5）」）。
     ///
-    /// 单独拆出来是为了让调用方在「窗口没激活、横幅不会显示」时，能把<b>同一份</b>
-    /// 标题与正文原样落进 PendingNotificationStore 等回前台补发 —— 文案只在这里定义一次。
+    /// 单独拆出来是为了让标题文案只在主控端这一处定义：任务完成事件、本地执行、
+    /// 日志摘要都要拼同一份说法，散在调用点会各写一套。
     /// </summary>
     public static string TaskDoneTitle(int index, int total, bool abnormal)
     {

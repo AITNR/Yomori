@@ -172,12 +172,6 @@ public sealed partial class MainWindow : Window
             VM.DisposeEmbedClient();
         };
 
-        // 激活态跟踪 + 错过通知的补发：本地多用户 RDP 接管期间主控端会话被锁，
-        // 锁定会话不弹 Toast 横幅（通知只进操作中心）。
-        // 完成时 MainViewModel 会把通知落盘（PendingNotificationStore），
-        // 这里在窗口重新激活（用户切回来 / 应用重启）时消费补发。
-        Activated += OnWindowActivated;
-
         if (Content is FrameworkElement root)
         {
             root.KeyDown += OnRootKeyDown;
@@ -208,19 +202,6 @@ public sealed partial class MainWindow : Window
     }
 
     public MainViewModel VM => App.ViewModel;
-
-    /// <summary>窗口当前是否处于激活态（会话锁定时会失活）。</summary>
-    public static bool IsWindowActive { get; private set; }
-
-    private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
-    {
-        IsWindowActive = args.WindowActivationState != WindowActivationState.Deactivated;
-
-        if (IsWindowActive)
-        {
-            VM.PresentPendingNotification();
-        }
-    }
 
     // ---------------- 窗口位置 / 尺寸记忆 ----------------
 

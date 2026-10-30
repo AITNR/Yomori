@@ -6568,21 +6568,18 @@ public sealed class MainViewModel : ObservableObject
             AppendLog($"[通道：{tag}] {ev.Time} {ev.Headline}");
 
             // 通知只在这里（主控端）发：目标会话里弹的 Toast 在主控端桌面上看不到，
-            // 所以代理侧已经完全不发通知了，全部由主控端轮询到事件后补发，
-            // 锁屏期间先落暂存、回前台补发（见 PendingNotificationStore）。
+            // 所以代理侧已经完全不发通知了，全部由主控端轮询到事件后补发。
+            //
+            // 不做「窗口是否在前台」判断：Toast 由系统通知平台投递，与应用窗口焦点无关。
+            // 真正会吞掉横幅的只有会话锁定、专注助手、系统设置里关掉本应用的横幅 ——
+            // 这些都与焦点无关，按焦点拦截只会把「切到别的窗口」这种正常场景一起吞掉。
             if (ev.Kind == RdpEventKinds.TaskDone && RdpSettings.NotifyOnTaskDone)
             {
                 var title = NotificationService.TaskDoneTitle(ev.Index, ev.Total, ev.IsAbnormal);
                 var body = NotificationService.TaskDoneBody(ev.TaskName, ev.ElapsedSeconds);
 
-                // 窗口没激活时横幅不会显示（锁屏 / 被 mstsc 顶掉），落暂存等回前台补发。
-                // 窗口是激活的却投递失败 = 通知注册本身就是坏的（见 NotificationService），
-                // 窗口不在前台时先落暂存，回到前台再补发；前台投递失败只提醒一次。
-                if (!MainWindow.IsWindowActive)
-                {
-                    PendingNotificationStore.Save(title, body);
-                }
-                else if (!NotificationService.Show(title, body))
+                // 投递失败 = 通知注册本身就是坏的（见 NotificationService），只提醒一次。
+                if (!NotificationService.Show(title, body))
                 {
                     WarnNotificationOnce();
                 }
@@ -6750,14 +6747,9 @@ public sealed class MainViewModel : ObservableObject
         {
             var title = $"Yomori：通道「{tag}」任务结束";
 
-            // 本地多用户场景下主控端会话大概率处于锁定状态（mstsc 接管了控制台），
-            // 锁定会话不弹 Toast 横幅，通知只会静默进操作中心 → 落暂存等回前台补发。
-            // 窗口激活却发不出去 = 通知注册坏了（桌面横幅不会出现），这时只能退到应用内提示。
-            if (!MainWindow.IsWindowActive)
-            {
-                PendingNotificationStore.Save(title, summary);
-            }
-            else if (!NotificationService.ShowSummary(title, summary))
+            // 直接投递，不看窗口焦点（理由同 ApplyChannelTick 里的任务完成通知）。
+            // 投递失败 = 通知注册坏了（桌面横幅不会出现），这时只能退到应用内提示。
+            if (!NotificationService.ShowSummary(title, summary))
             {
                 WarnNotificationOnce();
             }
@@ -6968,39 +6960,15 @@ public sealed class MainViewModel : ObservableObject
             if (RdpSettings.NotifyOnAllDone)
             {
                 var body = RunSummary.ComposeHeadline(parts);
-                if (!MainWindow.IsWindowActive)
-                {
-                    PendingNotificationStore.Save(RunSummary.Title, body);
-                }
-                else if (!NotificationService.ShowSummary(RunSummary.Title, body))
+
+                // 直接投递，不看窗口焦点（理由同上）。
+                if (!NotificationService.ShowSummary(RunSummary.Title, body))
                 {
                     WarnNotificationOnce();
                 }
             }
         }
 
-    }
-
-    /// <summary>
-    /// 窗口重新激活（用户切回主用户桌面 / 应用重启）时补发锁屏期间错过的完成通知。
-    /// 由 MainWindow 的 Activated 事件调用；TryConsume 天然幂等（取出即删）。
-    /// </summary>
-    public void PresentPendingNotification()
-    {
-        var pending = PendingNotificationStore.TryConsume();
-        if (pending is null)
-        {
-            return;
-        }
-
-        var posted = NotificationService.ShowSummary(pending.Value.Title, pending.Value.Body);
-        AppendLog(posted
-            ? "窗口重新激活，已补发锁屏期间错过的完成通知。"
-            : "窗口重新激活，锁屏期间错过的完成通知未能投递到系统通知（注册不可用），已用应用内气泡提示。");
-        if (!posted)
-        {
-            WarnNotificationOnce();
-        }
     }
 
     /// <summary>系统通知注册不可用这件事只提示一次，免得每条任务完成都往日志里灌一行。</summary>
