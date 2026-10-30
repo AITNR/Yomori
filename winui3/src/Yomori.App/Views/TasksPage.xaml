@@ -223,10 +223,20 @@
                                                    FontSize="11" Opacity="0.55" TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
 
+                                    <!-- 任务行开关：普通任务是"这条要不要执行"，收尾任务恒启用、
+                                         开关置灰 —— 它决定跑完之后怎么处置会话（断开 / 注销），
+                                         关掉等于把配置里写明的处置静默丢掉，事后无从发现。
+                                         判定收在 Models（TaskConfig.CanToggleEnabled + Sanitize 兜底），
+                                         这里只绑结果，不在界面里判断类型。 -->
                                     <ToggleSwitch Grid.Column="3"
+                                                  IsEnabled="{x:Bind CanToggleEnabled, Mode=OneWay}"
                                                   IsOn="{x:Bind Enabled, Mode=TwoWay}"
                                                   OnContent="" OffContent=""
-                                                  MinWidth="0" />
+                                                  MinWidth="0">
+                                        <ToolTipService.ToolTip>
+                                            <ToolTip Content="{x:Bind EnabledToggleHint, Mode=OneWay}" />
+                                        </ToolTipService.ToolTip>
+                                    </ToggleSwitch>
                                 </Grid>
                             </DataTemplate>
                         </ListView.ItemTemplate>
@@ -335,7 +345,7 @@
                                       DisplayMemberPath="Value" SelectedValuePath="Key"
                                       SelectionChanged="OnPostTaskActionChanged" />
                             <TextBlock FontSize="12" Opacity="0.65" TextWrapping="Wrap"
-                                       Text="收尾任务固定存在：跑在本通道最后一位，不可上移/下移/删除/移动，也不能改类型。注销通道会销毁目标会话，里面正在跑的代理与脚本会被系统一并终止。" />
+                                       Text="收尾任务固定存在：跑在本通道最后一位，不可上移/下移/删除/移动，也不能改类型与关闭（选定动作就一定会执行）。注销通道会销毁目标会话，里面正在跑的代理与脚本会被系统一并终止。" />
                         </StackPanel>
 
                         <!-- 基础 -->

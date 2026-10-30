@@ -113,6 +113,8 @@ public sealed class TaskConfig : ObservableObject, ICloneable
                 OnPropertyChanged(nameof(IsScriptTask));
                 OnPropertyChanged(nameof(IsWaitTask));
                 OnPropertyChanged(nameof(IsFinishTask));
+                OnPropertyChanged(nameof(CanToggleEnabled));
+                OnPropertyChanged(nameof(EnabledToggleHint));
                 OnPropertyChanged(nameof(DisplayName));
             }
         }
@@ -190,6 +192,22 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     /// <summary>「等待时机」下拉当前值的中文（TextBox 里不绑键值，直接给文本）。</summary>
     [JsonIgnore]
     public string WaitTimingLabel => WaitTimings.Label(_waitTiming);
+
+    /// <summary>
+    /// 列表行那个「启用」开关能不能拨 —— 收尾任务恒为启用，故不给拨。
+    ///
+    /// <para>为什么不是"允许关掉、执行时再兜底"：收尾动作（断开 / 注销）决定这一轮跑完之后
+    /// 通道怎么处置，关掉它等于把配置里写明要做的处置静默丢掉，事后无从发现。
+    /// 与「上移 / 下移 / 删除 / 移动」同一档：收尾由系统固定维护，用户只挑动作，不挑跑不跑。</para>
+    /// </summary>
+    [JsonIgnore]
+    public bool CanToggleEnabled => !IsFinishTask;
+
+    /// <summary>列表行开关的提示文案：收尾说明为什么拨不动，其余说明拨它的后果。</summary>
+    [JsonIgnore]
+    public string EnabledToggleHint => IsFinishTask
+        ? "收尾任务固定执行：本通道跑完之后按这里的「收尾动作」处置会话，不能关闭。"
+        : "这条任务本轮要不要执行：关掉后它会跳过。改动即时保存，下一次「开始执行」生效。";
 
     [JsonPropertyName("script_path")]
     public string ScriptPath
@@ -620,6 +638,15 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     {
         // 类型必须先收敛：后面几项要不要按类型做额外处理，都看它
         TaskKind = TaskKinds.Normalize(TaskKind);
+
+        // 收尾任务恒启用：界面上不给拨（CanToggleEnabled=false），但导入的配置、
+        // 手改的 json 都可能带着 enabled=false —— 这里收回来。否则就是
+        // 「配置里写着跑完注销、实际没注销」这类静默回归，事后无从发现。
+        if (IsFinishTask)
+        {
+            Enabled = true;
+        }
+
         WaitSeconds = Math.Clamp(WaitSeconds, 0, 3600);
         WaitTiming = WaitTimings.Normalize(WaitTiming);
         PostTaskAction = SessionFinishModes.Normalize(PostTaskAction);
@@ -659,6 +686,9 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     /// <summary>
     /// 造一条"收尾任务"（每通道固定一条，由 <c>TaskScopePlanner.EnsureFinishTask</c> 维护）。
     /// 动作默认无操作 —— 与老配置读出来时的默认行为一致。
+    ///
+    /// <para>恒启用：界面上这条不给关闭（<see cref="CanToggleEnabled"/> 为 false，
+    /// <see cref="Sanitize"/> 里也会把 enabled=false 收回来）。</para>
     /// </summary>
     public static TaskConfig CreateFinish(string channelId, int order) => new()
     {
