@@ -35,12 +35,19 @@ public static class TaskScopePlanner
 
     // ---------------- 分组读取 ----------------
 
-    /// <summary>某条通道下的任务，按 <see cref="TaskConfig.Order"/> 升序（与执行顺序一致）。</summary>
+    /// <summary>
+    /// 某条通道下的任务，按 <see cref="TaskConfig.Order"/> 升序，**收尾任务恒排最后**。
+    ///
+    /// <para>收尾是通道里固定的一步（每通道恰好一条、不可增删改），它的语义就是"队尾"，
+    /// 所以排序键里直接带上它 —— 追加、移动、导入、改类型都靠这一次排序收敛，
+    /// 不需要在每个操作里各写一遍"记得把它挪到最后"。</para>
+    /// </summary>
     public static List<TaskConfig> TasksForScope(IEnumerable<TaskConfig>? tasks, string? scopeId)
     {
         return (tasks ?? Enumerable.Empty<TaskConfig>())
             .Where(t => t is not null && SameId(t.ChannelId, scopeId))
-            .OrderBy(t => t.Order)
+            .OrderBy(t => TaskTypeResolver.IsFinish(t) ? 1 : 0)
+            .ThenBy(t => t.Order)
             .ToList();
     }
 
@@ -173,7 +180,8 @@ public static class TaskScopePlanner
     // ---------------- 编排操作 ----------------
 
     /// <summary>
-    /// 把 order 重编成 1..N 连续唯一：先按（本地 → 通道配置序 → 孤儿）分组，组内按现有 order 升序。
+    /// 把 order 重编成 1..N 连续唯一：先按（本地 → 通道配置序 → 孤儿）分组，
+    /// 组内**先普通任务、后收尾任务**，再按现有 order 升序。
     /// **只改 order 的值，不改集合的物理顺序** —— 执行侧只看 order。
     /// </summary>
     public static void NormalizeOrdersByChannel(IList<TaskConfig> tasks, IReadOnlyList<RdpChannel>? channels)
@@ -188,6 +196,7 @@ public static class TaskScopePlanner
         var ordered = tasks
             .Where(t => t is not null)
             .OrderBy(t => RankOf(t.ChannelId, rank))
+            .ThenBy(t => TaskTypeResolver.IsFinish(t) ? 1 : 0)
             .ThenBy(t => t.Order)
             .ToList();
 
@@ -200,6 +209,10 @@ public static class TaskScopePlanner
     /// <summary>
     /// 通道内上移/下移（delta = -1 / +1）：**只与同通道内相邻的一项交换 order**。
     /// 别的通道的顺序不受影响 —— 这正是"执行顺序等价"的关键。
+    ///
+    /// <para>收尾任务不参与：它恒在末位、位置由系统保证，所以只要涉及它（自己动、或被挤到它后面）
+    /// 就返回 false。界面据此把按钮置灰，方法内再拒一次 —— 置灰只说明"按钮该灰"，
+    /// 不是闸门。</para>
     /// </summary>
     public static bool TryMoveInScope(
         IList<TaskConfig> tasks,
@@ -208,6 +221,11 @@ public static class TaskScopePlanner
         IReadOnlyList<RdpChannel>? channels)
     {
         if (tasks is null || task is null || delta == 0)
+        {
+            return false;
+        }
+
+        if (TaskTypeResolver.IsFinish(task))
         {
             return false;
         }
@@ -222,6 +240,12 @@ public static class TaskScopePlanner
         var target = index + delta;
 
         if (index < 0 || target < 0 || target >= scope.Count)
+        {
+            return false;
+        }
+
+        // 不许把普通任务挤到收尾之后
+        if (TaskTypeResolver.IsFinish(scope[target]))
         {
             return false;
         }
@@ -265,6 +289,13 @@ public static class TaskScopePlanner
             return;
         }
 
+        // 收尾任务与通道绑定：它属于"这条通道跑完做什么"，换通道没有意义，
+        // 而且会让源通道少一条、目标通道多一条（两边都破坏"恰好一条"）。
+        if (TaskTypeResolver.IsFinish(task))
+        {
+            return;
+        }
+
         var id = NormalizeId(targetScopeId);
         if (SameId(task.ChannelId, id))
         {
@@ -276,7 +307,199 @@ public static class TaskScopePlanner
         var max = tasks.Where(t => t is not null).Select(t => t.Order).DefaultIfEmpty(0).Max();
         task.Order = max + 1;
 
+        // 目标通道已有收尾时，重编会把它排到收尾之前（排序键带 IsFinish）
         NormalizeOrdersByChannel(tasks, channels ?? Array.Empty<RdpChannel>());
+    }
+
+    // ---------------- 收尾任务：保底、类型闸门、拖放夹取 ----------------
+
+    /// <summary>
+    /// 保证某条通道**恰好一条**收尾任务：一条都没有就补一条（排在末位），
+    /// 出现两条以上就收敛成 order 最大的那条。
+    ///
+    /// <para>返回新补的那一条（没有补则 null），调用方可据此写日志。</para>
+    ///
+    /// <para>空通道不动 —— 没任务时显示"无任务"比显示一条幽灵收尾任务更符合直觉；
+    /// 收尾行是在"这条通道第一次有任务"时补上的。</para>
+    /// </summary>
+    public static TaskConfig? EnsureFinishTask(
+        IList<TaskConfig> tasks,
+        string? scopeId,
+        IReadOnlyList<RdpChannel>? channels,
+        out List<TaskConfig> removed)
+    {
+        removed = new List<TaskConfig>();
+
+        if (tasks is null)
+        {
+            return null;
+        }
+
+        var id = NormalizeId(scopeId);
+        var inScope = tasks
+            .Where(t => t is not null && SameId(t.ChannelId, id))
+            .ToList();
+
+        if (inScope.Count == 0)
+        {
+            return null;
+        }
+
+        var finishes = inScope
+            .Where(TaskTypeResolver.IsFinish)
+            .OrderBy(t => t.Order)
+            .ToList();
+
+        if (finishes.Count == 1)
+        {
+            return null;
+        }
+
+        if (finishes.Count > 1)
+        {
+            // 收敛：留下 order 最大的那条，其余移除（导入的脏配置 / 手工改坏）
+            var keep = finishes[^1];
+            foreach (var extra in finishes.Take(finishes.Count - 1))
+            {
+                tasks.Remove(extra);
+                removed.Add(extra);
+            }
+
+            NormalizeOrdersByChannel(tasks, channels);
+            return null;
+        }
+
+        var created = TaskConfig.CreateFinish(id, tasks.Select(t => t.Order).DefaultIfEmpty(0).Max() + 1);
+        tasks.Add(created);
+        NormalizeOrdersByChannel(tasks, channels);
+        return created;
+    }
+
+    /// <summary><see cref="EnsureFinishTask"/> 的简化重载（不关心被收敛掉的副本）。</summary>
+    public static TaskConfig? EnsureFinishTask(
+        IList<TaskConfig> tasks,
+        string? scopeId,
+        IReadOnlyList<RdpChannel>? channels) =>
+        EnsureFinishTask(tasks, scopeId, channels, out _);
+
+    /// <summary>
+    /// 所有执行单元都过一遍收尾保底：本地组 + 每个已配置通道。
+    /// 配置加载后调一次（<c>AppConfig.Sanitize</c>），保证任何一条通道都有那条收尾行。
+    /// </summary>
+    public static void EnsureFinishForAllScopes(
+        IList<TaskConfig> tasks,
+        IReadOnlyList<RdpChannel>? channels,
+        Action<string, TaskConfig>? onCreated = null)
+    {
+        if (tasks is null)
+        {
+            return;
+        }
+
+        var created = EnsureFinishTask(tasks, LocalScopeId, channels);
+        if (created is not null)
+        {
+            onCreated?.Invoke(LocalScopeId, created);
+        }
+
+        foreach (var channel in channels ?? Array.Empty<RdpChannel>())
+        {
+            if (channel is null || string.IsNullOrWhiteSpace(channel.Id))
+            {
+                continue;
+            }
+
+            created = EnsureFinishTask(tasks, channel.Id, channels);
+            if (created is not null)
+            {
+                onCreated?.Invoke(channel.Id, created);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 改任务类型的**唯一闸门**。    ///
+    /// <para>拒绝两种改动：改成 <c>finish</c>（收尾身份唯一且由系统维护，界面上根本没有这个选项），
+    /// 以及把收尾任务改成别的类型。界面那边连入口都没有，这一层是给导入配置与将来的代码路径兜底的
+    /// —— 少一层就是"某天一个批量操作把收尾改没了"。</para>
+    /// </summary>
+    public static bool SetTaskKind(
+        IList<TaskConfig>? tasks,
+        TaskConfig? task,
+        string? kind,
+        IReadOnlyList<RdpChannel>? channels)
+    {
+        if (tasks is null || task is null)
+        {
+            return false;
+        }
+
+        var target = TaskKinds.Normalize(kind);
+
+        if (TaskKinds.IsFinish(target) || TaskTypeResolver.IsFinish(task))
+        {
+            return false;
+        }
+
+        if (task.TaskKind == target)
+        {
+            return true;
+        }
+
+        task.TaskKind = target;
+
+        // 名称还停在默认值（"新任务3"/"等待"）时顺手改成新类型的默认名，用户改过就别动。
+        if (string.IsNullOrWhiteSpace(task.Name)
+            || task.Name.StartsWith("新任务", StringComparison.Ordinal)
+            || task.Name == "等待")
+        {
+            task.Name = TaskKinds.IsWait(target) ? "等待" : $"新任务{task.Order}";
+        }
+
+        NormalizeOrdersByChannel(tasks, channels ?? Array.Empty<RdpChannel>());
+        return true;
+    }
+
+    /// <summary>
+    /// 拖放的落点夹取：插入位置不能越过收尾任务（它恒在末位）。
+    ///
+    /// <para>拖放（<see cref="ApplyScopeSequence"/>）只重排已占用的 order 槽位、**不调**
+    /// <see cref="NormalizeOrdersByChannel"/>，所以这里必须自己夹一次 —— 否则收尾会被拖到中间，
+    /// 而"收尾恒在末位"是所有收尾动作成立的前提。</para>
+    /// </summary>
+    public static int ClampInsertIndex(IReadOnlyList<TaskConfig>? scopeTasks, int index)
+    {
+        if (scopeTasks is null || scopeTasks.Count == 0)
+        {
+            return Math.Max(0, index);
+        }
+
+        var finishIndex = -1;
+        for (var i = 0; i < scopeTasks.Count; i++)
+        {
+            if (TaskTypeResolver.IsFinish(scopeTasks[i]))
+            {
+                finishIndex = i;
+                break;
+            }
+        }
+
+        var clamped = Math.Max(0, Math.Min(index, scopeTasks.Count));
+
+        if (finishIndex >= 0 && clamped > finishIndex)
+        {
+            clamped = finishIndex;
+        }
+
+        return clamped;
+    }
+
+    /// <summary>某通道里某类任务的数量（冒烟与界面计数用）。</summary>
+    public static int CountOf(IEnumerable<TaskConfig>? tasks, string? scopeId, string kind)
+    {
+        var normalized = TaskKinds.Normalize(kind);
+        return (tasks ?? Enumerable.Empty<TaskConfig>())
+            .Count(t => t is not null && SameId(t.ChannelId, scopeId) && TaskKinds.Normalize(t.TaskKind) == normalized);
     }
 
     // ---------------- 并发组（只在通道内生效） ----------------

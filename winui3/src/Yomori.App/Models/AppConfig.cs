@@ -1,6 +1,7 @@
 // -*- coding: utf-8 -*-
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json.Serialization;
 using Yomori.Helpers;
 
@@ -253,6 +254,56 @@ public sealed class AppConfig : ObservableObject
         }
 
         MigrateLegacyChannel();
+
+        // 收尾从通道搬到任务（见《任务类型与收尾计划书》§3 D4/D8）：
+        //   1) 每个执行单元补齐那条固定的收尾任务（空通道跳过）；
+        //   2) 把通道上的旧 session_finish 写进它；
+        //   3) 垫片归位，下次读盘即幂等。
+        // 顺序不能换：迁移要写的那条收尾任务必须先存在。
+        TaskScopePlanner.EnsureFinishForAllScopes(Tasks, Rdp.Channels);
+        MigrateSessionFinishToTasks();
+    }
+
+    /// <summary>
+    /// 旧配置迁移：把通道级的 <c>session_finish</c> 搬进任务级收尾任务。
+    ///
+    /// <para>为什么必须做：不迁的话，用户原本配着"跑完注销用户"的通道，升级后会静默变成
+    /// "无操作" —— 表现是目标会话不再释放，而且没有任何提示。这种回归最难查，因为
+    /// 界面上一切正常。</para>
+    ///
+    /// <para>幂等靠两条：只写"动作仍是 keep"的收尾任务（用户显式选过就不覆盖），
+    /// 写完把垫片归位成 keep。</para>
+    /// </summary>
+    private void MigrateSessionFinishToTasks()
+    {
+        foreach (var channel in Rdp.Channels)
+        {
+            if (channel is null)
+            {
+                continue;
+            }
+
+            var legacy = SessionFinishModes.Normalize(channel.SessionFinish);
+            if (legacy == SessionFinishModes.Keep)
+            {
+                continue;
+            }
+
+            var finish = TaskScopePlanner.TasksForScope(Tasks, channel.Id)
+                .FirstOrDefault(TaskTypeResolver.IsFinish);
+
+            // 空通道（连收尾行都没有）→ 无处安放，丢弃；与"空通道保持空"的约定一致
+            if (finish is not null
+                && SessionFinishModes.Normalize(finish.PostTaskAction) == SessionFinishModes.Keep)
+            {
+                finish.PostTaskAction = legacy;
+            }
+
+            channel.SessionFinish = SessionFinishModes.Keep;
+        }
+
+        // 旧全局节的垫片同样归位：它的值在上面的 MigrateLegacyChannel 里已经搬进通道
+        Rdp.SessionFinish = SessionFinishModes.Keep;
     }
 
     /// <summary>

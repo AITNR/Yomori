@@ -49,6 +49,12 @@ public sealed partial class TasksPage : Page
         WaitModeBox.ItemsSource = VM.WaitModeItems;
         ConcurrentPolicyBox.ItemsSource = VM.ConcurrentPolicyItems;
 
+        // 任务类型只有两项（脚本 / 等待）。用字符串而不是 KeyValuePair：
+        // RadioButtons 会把 pair 显示成 "Key: Value"。
+        TaskKindOptions.ItemsSource = new[] { "脚本", "等待时间" };
+        WaitTimingBox.ItemsSource = VM.WaitTimingItems;
+        PostTaskActionBox.ItemsSource = VM.PostTaskActionItems;
+
         _vmPropertyChanged = OnViewModelPropertyChanged;
         VM.PropertyChanged += _vmPropertyChanged;
 
@@ -589,6 +595,14 @@ public sealed partial class TasksPage : Page
     /// </summary>
     private void OnMoveToChannelClick(object sender, RoutedEventArgs e)
     {
+        // 收尾任务与通道绑定（"这条通道跑完做什么"），换通道没有意义
+        if (VM.SelectedTask is { } current && current.IsFinishTask)
+        {
+            _ = DialogHelper.ShowMessageAsync("收尾任务不能换通道",
+                "收尾任务固定属于它所在的那条通道。如果不想让这条通道参与本轮执行，关掉左栏它那一行的开关即可。");
+            return;
+        }
+
         var flyout = new MenuFlyout();
 
         foreach (var scope in VM.ChannelScopes)
@@ -689,13 +703,123 @@ public sealed partial class TasksPage : Page
             SelectByKey(WaitModeBox, task.WaitMode);
             SelectByKey(ConcurrentPolicyBox, task.ConcurrentPolicy);
 
+            SyncTaskKindChrome(task);
+
             // 换任务或首次进入时刷新启动参数候选：候选依赖脚本路径，路径没变则走缓存（不重复读盘）。
-            ReloadArgsForCurrentTask(autoFillPrimary: false);
+            // 非脚本任务没有路径，直接跳过（否则每次切类型都白读一遍盘）。
+            if (task.IsScriptTask)
+            {
+                ReloadArgsForCurrentTask(autoFillPrimary: false);
+            }
         }
         finally
         {
             _syncing = false;
         }
+    }
+
+    /// <summary>
+    /// 按任务类型刷详情面板：类型单选 / 只读标识 / 三个分区 / 等待区 / 收尾区。
+    ///
+    /// <para>一律用 <c>Visibility</c> 切换，**不用 <c>x:Load</c>** —— 本项目在
+    /// 「x:Load 卸载控件 × Toggled 改绑定属性」交叉处崩过（见左栏开关那段注释），
+    /// 控件始终留在树上就没有那条路径。</para>
+    /// </summary>
+    private void SyncTaskKindChrome(TaskConfig task)
+    {
+        var isFinish = task.IsFinishTask;
+        var isWait = task.IsWaitTask;
+
+        // 收尾任务没有类型可选：整块单选隐藏，换一行只读标识
+        TaskKindSection.Visibility = isFinish ? Visibility.Collapsed : Visibility.Visible;
+        TaskKindReadOnly.Visibility = isFinish ? Visibility.Visible : Visibility.Collapsed;
+
+        if (!isFinish)
+        {
+            // 0 = 脚本，1 = 等待时间（与 TaskKindOptions.ItemsSource 一一对应）
+            var index = isWait ? 1 : 0;
+            if (TaskKindOptions.SelectedIndex != index)
+            {
+                TaskKindOptions.SelectedIndex = index;
+            }
+
+            TaskKindHint.Text = isWait
+                ? "只等一段时间，不启动任何程序。等待会计入任务耗时，但不受「最大运行时间」限制。"
+                : "启动一个外部程序，并按「完成判断」等它结束。";
+        }
+
+        WaitSection.Visibility = isWait ? Visibility.Visible : Visibility.Collapsed;
+        FinishSection.Visibility = isFinish ? Visibility.Visible : Visibility.Collapsed;
+
+        var showScriptParts = task.IsScriptTask ? Visibility.Visible : Visibility.Collapsed;
+        BasicSection.Visibility = showScriptParts;
+        JudgeSection.Visibility = showScriptParts;
+        AdvancedSection.Visibility = showScriptParts;
+
+        if (isWait)
+        {
+            WaitSecondsBox.Value = Math.Clamp(task.WaitSeconds, 0, 3600);
+            SelectByKey(WaitTimingBox, task.WaitTiming);
+        }
+
+        if (isFinish)
+        {
+            SelectByKey(PostTaskActionBox, task.PostTaskAction);
+        }
+    }
+
+    private void OnTaskKindChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncing || VM.SelectedTask is not TaskConfig task)
+        {
+            return;
+        }
+
+        // 0 = 脚本，1 = 等待时间。索引越界（清空 / 重设 ItemsSource）时按脚本处理。
+        var kind = TaskKindOptions.SelectedIndex == 1 ? TaskKinds.Wait : TaskKinds.Script;
+        if (string.Equals(task.TaskKind, kind, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        VM.SetSelectedTaskKind(kind);
+        SyncTaskKindChrome(task);
+    }
+
+    private void OnWaitSecondsChanged(NumberBox sender, NumberBoxValueChangedEventArgs args)
+    {
+        if (_syncing || VM.SelectedTask is not TaskConfig task || double.IsNaN(args.NewValue))
+        {
+            return;
+        }
+
+        task.WaitSeconds = (int)Math.Clamp(args.NewValue, 0, 3600);
+    }
+
+    private void OnWaitTimingChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncing
+            || VM.SelectedTask is not TaskConfig task
+            || WaitTimingBox.SelectedValue is not string key
+            || string.Equals(task.WaitTiming, key, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        task.WaitTiming = key;
+    }
+
+    private void OnPostTaskActionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncing
+            || VM.SelectedTask is not TaskConfig task
+            || PostTaskActionBox.SelectedValue is not string key
+            || string.Equals(task.PostTaskAction, key, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        task.PostTaskAction = key;
     }
 
     private static void SelectByKey(ComboBox box, string key)

@@ -141,7 +141,9 @@ public sealed class RdpAgentRunner
             _command.ShutdownDelaySeconds,
             _logger,
             _stats,
-            _command.EnableTimeoutScreenshot);
+            _command.EnableTimeoutScreenshot,
+            preWaitDoneForOrder: _command.PreWaitDoneForOrder,
+            runsInRemoteSession: true);
 
         // 交给状态写入用：采集到的「本次运行新出现的进程」要回传主控端，
         // 否则「从上次运行填入」在远程通道上永远是空的（采集发生在代理进程里，主控端读不到）。
@@ -475,7 +477,14 @@ public sealed class RdpAgentRunner
             return status;
         });
 
-        var mode = SessionFinishModes.Normalize(_command.SessionFinish);
+        // 收尾动作由任务级收尾任务登记（ScriptRunner.SessionFinishOverride）。
+        // 指令里不再有 session_finish —— 那是通道级的老设计，已迁到任务（见计划书 §3 D5）。
+        var mode = SessionFinishModes.Normalize(_currentRunner?.SessionFinishOverride);
+
+        if (mode != SessionFinishModes.Keep)
+        {
+            Log($"[收尾] 本通道任务已结束，按收尾任务配置执行：{SessionFinishModes.Describe(mode)}。");
+        }
         var session = RdpSessionService.FindSession(Environment.UserName);
 
         switch (mode)

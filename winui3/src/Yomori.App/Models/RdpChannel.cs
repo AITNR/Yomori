@@ -112,7 +112,17 @@ public sealed class RdpChannel : ObservableObject, ICloneable
         }
     }
 
-    /// <summary>该通道任务全部结束后的会话处理方式，见 <see cref="SessionFinishModes"/>。</summary>
+    /// <summary>
+    /// 【迁移垫片，不参与执行】该通道是否曾被设置过"跑完注销 / 断开"。
+    ///
+    /// <para>收尾已迁到**任务的收尾行**（<see cref="TaskConfig.PostTaskAction"/>，
+    /// 见《任务类型与收尾计划书》§3 D5/D8）。这个字段保留只为读得懂老配置：
+    /// <c>AppConfig.Sanitize</c> 会把非 <c>keep</c> 的值搬进该通道的收尾任务，然后把这里归位成
+    /// <c>keep</c> —— 所以正常运行时它恒为 <c>keep</c>。</para>
+    ///
+    /// <para>⚠️ 不要在任何界面或执行路径上读它。要拿"这条通道最终怎么收尾"，
+    /// 用 <c>TaskTypeResolver.ResolveSessionFinish</c>。</para>
+    /// </summary>
     [JsonPropertyName("session_finish")]
     public string SessionFinish
     {

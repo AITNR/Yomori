@@ -115,6 +115,33 @@ public static class AgentVersionInfo
         return true;
     }
 
+    /// <summary>
+    /// <paramref name="version"/> 是否 ≥ <paramref name="minimum"/>。
+    ///
+    /// <para><b>任一读不出来就返回 false</b>：调用方用它决定"这个代理能不能认新字段"，
+    /// 判不清时宁可走保守分支（拒绝下发 + 提示重部署），也不要让旧代理把等待/收尾任务
+    /// 当成"脚本路径为空"标异常 —— 那种错误看起来像配置坏了，实际是版本不匹配。</para>
+    /// </summary>
+    public static bool IsAtLeast(string? version, string minimum)
+    {
+        var a = Parse(version);
+        var b = Parse(minimum);
+        if (a is null || b is null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < 4; i++)
+        {
+            if (a[i] != b[i])
+            {
+                return a[i] > b[i];
+            }
+        }
+
+        return true;
+    }
+
     /// <summary>解析成四段数字（缺位补 0）；完全不像版本号时返回 <c>null</c>。</summary>
     private static int[]? Parse(string? text)
     {

@@ -47,7 +47,7 @@
          ⚠️ 不能用 $(Version) 代替：CI 传的是 2.4.1-dev.184 这种带预发布后缀的版本，
             FileVersion 只保留数字段（2.4.1.0），dev 序号丢失 —— 两个不同的 dev 构建
             会拿到同一个号，判据直接失效。 -->
-    <AgentVersion>2.0.0</AgentVersion>
+    <AgentVersion>2.1.0</AgentVersion>
     <FileVersion>$(AgentVersion)</FileVersion>
     <AssemblyVersion>$(AgentVersion).0</AssemblyVersion>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>

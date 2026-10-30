@@ -14,6 +14,17 @@ namespace Yomori.Models;
 public sealed class TaskConfig : ObservableObject, ICloneable
 {
     private bool _enabled = true;
+
+    // ---------- 任务类型（见《任务类型与收尾计划书》§3） ----------
+    // 三种类型共用这一张表，由 task_kind 决定"看哪些字段、跑什么行为"：
+    //   script —— 起外部程序（原有全部字段）
+    //   wait   —— 只等一段时间（wait_seconds / wait_timing）
+    //   finish —— 对通道做处置（post_task_action），由系统自动维护、不可增删
+    private string _taskKind = TaskKinds.Script;
+    private int _waitSeconds = 30;
+    private string _waitTiming = WaitTimings.AfterConnect;
+    private string _postTaskAction = SessionFinishModes.Keep;
+
     private string _name = "新任务";
     private string _scriptPath = string.Empty;
     private int _order = 1;
@@ -71,8 +82,114 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     public string Name
     {
         get => _name;
-        set => SetProperty(ref _name, value);
+        set
+        {
+            if (SetProperty(ref _name, value))
+            {
+                OnPropertyChanged(nameof(DisplayName));
+            }
+        }
     }
+
+    /// <summary>
+    /// 任务类型：<c>script</c>（默认）/ <c>wait</c> / <c>finish</c>。
+    ///
+    /// <para><b>老配置没有这个键 → 读成 <c>script</c></b>，即改造前的项目脚本任务。
+    /// 切换类型不会清空其它类型的字段（切回脚本时路径还在），这是有意的：
+    /// 用户误点一下不该丢配置。</para>
+    /// </summary>
+    [JsonPropertyName("task_kind")]
+    public string TaskKind
+    {
+        get => _taskKind;
+        set
+        {
+            if (SetProperty(ref _taskKind, TaskKinds.Normalize(value)))
+            {
+                // 列表行的类型标签、第二行摘要、详情面板分区都跟着类型走，一次全通知
+                OnPropertyChanged(nameof(KindTag));
+                OnPropertyChanged(nameof(HasKindTag));
+                OnPropertyChanged(nameof(RowSummary));
+                OnPropertyChanged(nameof(IsScriptTask));
+                OnPropertyChanged(nameof(IsWaitTask));
+                OnPropertyChanged(nameof(IsFinishTask));
+                OnPropertyChanged(nameof(DisplayName));
+            }
+        }
+    }
+
+    /// <summary>等待时长（秒），仅 <c>wait</c> 类型使用；0 = 不等待。</summary>
+    [JsonPropertyName("wait_seconds")]
+    public int WaitSeconds
+    {
+        get => _waitSeconds;
+        set
+        {
+            if (SetProperty(ref _waitSeconds, Math.Clamp(value, 0, 3600)))
+            {
+                OnPropertyChanged(nameof(RowSummary));
+            }
+        }
+    }
+
+    /// <summary>等待时机，仅 <c>wait</c> 类型使用：<c>before_connect</c> / <c>after_connect</c>。</summary>
+    [JsonPropertyName("wait_timing")]
+    public string WaitTiming
+    {
+        get => _waitTiming;
+        set
+        {
+            if (SetProperty(ref _waitTiming, WaitTimings.Normalize(value)))
+            {
+                OnPropertyChanged(nameof(RowSummary));
+                OnPropertyChanged(nameof(WaitTimingLabel));
+            }
+        }
+    }
+
+    /// <summary>
+    /// 收尾动作，仅 <c>finish</c> 类型使用：<c>keep</c> / <c>disconnect</c> / <c>logoff</c>。
+    /// 默认 <c>keep</c>（无操作）—— 老配置没有这个键时行为与改造前一致。
+    /// </summary>
+    [JsonPropertyName("post_task_action")]
+    public string PostTaskAction
+    {
+        get => _postTaskAction;
+        set
+        {
+            if (SetProperty(ref _postTaskAction, SessionFinishModes.Normalize(value)))
+            {
+                OnPropertyChanged(nameof(RowSummary));
+            }
+        }
+    }
+
+    // ---------- 仅供界面绑定的派生属性（不落盘） ----------
+
+    [JsonIgnore]
+    public bool IsScriptTask => TaskKinds.IsScript(_taskKind);
+
+    [JsonIgnore]
+    public bool IsWaitTask => TaskKinds.IsWait(_taskKind);
+
+    [JsonIgnore]
+    public bool IsFinishTask => TaskKinds.IsFinish(_taskKind);
+
+    /// <summary>列表行左侧的小标签：脚本不显示（默认），等待/收尾各一个词。</summary>
+    [JsonIgnore]
+    public string KindTag => TaskTypeResolver.TagOf(this);
+
+    /// <summary>有没有标签要显示（x:Bind 不能直接把空串转成 Visibility）。</summary>
+    [JsonIgnore]
+    public bool HasKindTag => KindTag.Length > 0;
+
+    /// <summary>列表行第二行：脚本显示路径，等待显示时长与时机，收尾显示动作。</summary>
+    [JsonIgnore]
+    public string RowSummary => TaskTypeResolver.Describe(this);
+
+    /// <summary>「等待时机」下拉当前值的中文（TextBox 里不绑键值，直接给文本）。</summary>
+    [JsonIgnore]
+    public string WaitTimingLabel => WaitTimings.Label(_waitTiming);
 
     [JsonPropertyName("script_path")]
     public string ScriptPath
@@ -474,7 +591,11 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     public string ScopeOrderText => _scopeOrder.ToString();
 
     [JsonIgnore]
-    public string DisplayName => string.IsNullOrWhiteSpace(Name) ? $"任务{Order}" : Name;
+    public string DisplayName => !string.IsNullOrWhiteSpace(Name)
+        ? Name
+        : IsFinishTask ? "收尾"
+        : IsWaitTask ? "等待"
+        : $"任务{Order}";
 
     [JsonIgnore]
     public bool IsConfigured => !string.IsNullOrWhiteSpace(ScriptPath);
@@ -497,6 +618,12 @@ public sealed class TaskConfig : ObservableObject, ICloneable
     /// <summary>把当前实例规整为合法值（枚举兜底、序号连续）。</summary>
     public void Sanitize(int fallbackOrder)
     {
+        // 类型必须先收敛：后面几项要不要按类型做额外处理，都看它
+        TaskKind = TaskKinds.Normalize(TaskKind);
+        WaitSeconds = Math.Clamp(WaitSeconds, 0, 3600);
+        WaitTiming = WaitTimings.Normalize(WaitTiming);
+        PostTaskAction = SessionFinishModes.Normalize(PostTaskAction);
+
         TimeoutAction = TimeoutActions.Normalize(TimeoutAction);
         WaitMode = WaitModes.Normalize(WaitMode);
         ConcurrentPolicy = ConcurrentPolicies.Normalize(ConcurrentPolicy);
@@ -528,4 +655,30 @@ public sealed class TaskConfig : ObservableObject, ICloneable
         GameProcess = KeywordHelper.ToText(KeywordHelper.Normalize(GameProcess));
 
     }
+
+    /// <summary>
+    /// 造一条"收尾任务"（每通道固定一条，由 <c>TaskScopePlanner.EnsureFinishTask</c> 维护）。
+    /// 动作默认无操作 —— 与老配置读出来时的默认行为一致。
+    /// </summary>
+    public static TaskConfig CreateFinish(string channelId, int order) => new()
+    {
+        Enabled = true,
+        TaskKind = TaskKinds.Finish,
+        Name = "收尾",
+        ChannelId = channelId,
+        Order = order,
+        PostTaskAction = SessionFinishModes.Keep,
+    };
+
+    /// <summary>造一条"等待任务"（用户点「添加」后再把类型改成等待时复用）。</summary>
+    public static TaskConfig CreateWait(string channelId, int order) => new()
+    {
+        Enabled = true,
+        TaskKind = TaskKinds.Wait,
+        Name = "等待",
+        ChannelId = channelId,
+        Order = order,
+        WaitSeconds = 30,
+        WaitTiming = WaitTimings.AfterConnect,
+    };
 }

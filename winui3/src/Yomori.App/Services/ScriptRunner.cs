@@ -127,6 +127,18 @@ public sealed class ScriptRunner
     private readonly FileLogger _logger;
     private readonly RuntimeStatsManager _stats;
 
+    /// <summary>
+    /// 已经在**主控端**完成「连接前等待」的任务序号（0 = 没有）。
+    /// 代理侧遇到同一个序号就直接跳过那条等待，否则同一次等待会执行两遍。
+    /// </summary>
+    private readonly int _preWaitDoneForOrder;
+
+    /// <summary>
+    /// 本轮是否跑在目标会话的代理进程里。只影响收尾任务的日志措辞：
+    /// 本地执行组没有通道，注销 / 断开无处落地，要明确说"已忽略"而不是让它看起来生效了。
+    /// </summary>
+    private readonly bool _runsInRemoteSession;
+
     private readonly object _sync = new();
     private readonly List<IMonitoredProcess> _currentProcesses = new();
     private readonly Queue<IMonitoredProcess> _processDisposalQueue = new();
@@ -198,7 +210,9 @@ public sealed class ScriptRunner
         int shutdownDelaySeconds,
         FileLogger logger,
         RuntimeStatsManager stats,
-        bool enableTimeoutScreenshot)
+        bool enableTimeoutScreenshot,
+        int preWaitDoneForOrder = 0,
+        bool runsInRemoteSession = false)
     {
         _tasks = new List<TaskConfig>(tasks);
         _shutdownAfterDone = shutdownAfterDone;
@@ -206,8 +220,20 @@ public sealed class ScriptRunner
         _enableTimeoutScreenshot = enableTimeoutScreenshot;
         _logger = logger;
         _stats = stats;
+        _preWaitDoneForOrder = preWaitDoneForOrder;
+        _runsInRemoteSession = runsInRemoteSession;
         AbnormalReportPath = Path.Combine(logger.LogDir, "last_abnormal_report.json");
     }
+
+    /// <summary>
+    /// 【收尾】本轮的会话处置动作，由收尾任务登记，队列结束后由
+    /// <c>RdpAgentRunner.FinishSession</c> 读取执行。没有收尾任务时保持 <c>keep</c>。
+    ///
+    /// <para>为什么用属性而不是事件：主控端本地执行组根本没有订阅者，事件会变成"发了没人听"；
+    /// 而代理侧是在 runner 跑完之后才需要这个值，读属性最直接，也不会跨轮残留
+    /// （代理每轮新建一个 <c>ScriptRunner</c>）。</para>
+    /// </summary>
+    public string SessionFinishOverride { get; private set; } = SessionFinishModes.Keep;
 
     // ---------------- 外部脚本实时日志 ----------------
 
@@ -504,7 +530,14 @@ public sealed class ScriptRunner
                 }
             }
 
-            enabledTasks.Sort((a, b) => a.Order.CompareTo(b.Order));
+            // 收尾任务恒排最后（与 TaskScopePlanner.TasksForScope 同一口径）：
+            // 配置层已经保证过，这里再兜一次，免得指令是旧版主控端拼的、或导入的脏配置。
+            enabledTasks.Sort((a, b) =>
+            {
+                var ra = TaskTypeResolver.IsFinish(a) ? 1 : 0;
+                var rb = TaskTypeResolver.IsFinish(b) ? 1 : 0;
+                return ra != rb ? ra.CompareTo(rb) : a.Order.CompareTo(b.Order);
+            });
 
             var total = enabledTasks.Count;
             if (total == 0)
@@ -1007,8 +1040,99 @@ public sealed class ScriptRunner
         return result;
     }
 
-    private RunOutcome RunOneTaskCore(TaskConfig task, int index, int total)
+    /// <summary>
+    /// 等待任务：只等一段时间。等待本身走 <see cref="WaitPoll"/>，暂停与停止都和脚本任务一致。
+    ///
+    /// <para>「连接前」的等待由主控端在写指令之前完成（那条通道只有首条任务能兑现），
+    /// 所以这里遇到"连接前"的配置只有两种可能：它不是首条，或者主控端是老版本。
+    /// 两种情况都按队列内等待处理，并留一行日志说明 —— 不静默降级。</para>
+    /// </summary>
+    private RunOutcome RunWaitTask(TaskConfig task, int index, int total)
     {
+        var name = task.DisplayName;
+        var seconds = Math.Clamp(task.WaitSeconds, 0, 3600);
+
+        Log($"开始执行任务：{name}（等待任务）");
+        Log(FileLogger.BuildSessionMarker(name, "START"));
+
+        if (_preWaitDoneForOrder > 0 && task.Order == _preWaitDoneForOrder)
+        {
+            Log("[等待] 本条已在通道连接前等待过，跳过重复等待。");
+            RaiseTaskCompleted(name, index, total, 0, "已在连接前等待", abnormal: false);
+            return RunOutcome.Continue;
+        }
+
+        if (WaitTimings.IsBeforeConnect(task.WaitTiming))
+        {
+            Log("[等待] 配置为「连接前」，但本次未在连接前执行（不是本通道首条，或主控端未安排），按队列内等待处理。");
+        }
+
+        if (seconds <= 0)
+        {
+            Log("[等待] 时长为 0，不等待。");
+            RaiseTaskCompleted(name, index, total, 0, "未设置等待时长", abnormal: false);
+            return RunOutcome.Continue;
+        }
+
+        Log($"[等待] 等待 {seconds} 秒。");
+        RaiseStatus($"等待 {seconds} 秒");
+
+        var stopwatch = Stopwatch.StartNew();
+        WaitPoll(seconds * 1000);
+
+        if (_stopRequested)
+        {
+            Log("[等待] 等待被停止请求打断。");
+            return RunOutcome.StopRequested;
+        }
+
+        var elapsed = (int)stopwatch.Elapsed.TotalSeconds;
+        Log($"[等待] 等待结束，用时 {elapsed} 秒。");
+        _stats.AddRecord(name, elapsed, "等待完成", string.Empty);
+        RaiseTaskCompleted(name, index, total, elapsed, "等待完成", abnormal: false);
+        return RunOutcome.Continue;
+    }
+
+    /// <summary>
+    /// 收尾任务：只登记"跑完之后对通道做什么"，真正的注销 / 断开仍在
+    /// <c>RdpAgentRunner.FinishSession</c> 里执行（那里已经有两条现成的会话操作路径）。
+    ///
+    /// <para>不在这里动作的理由：收尾跑完时队列还没真正结束（还有日志落盘、报告保存），
+    /// 此刻注销会把写盘也一起带走；让队列自然收束、由代理统一收尾才安全。</para>
+    /// </summary>
+    private RunOutcome RunFinishTask(TaskConfig task, int index, int total)
+    {
+        var name = task.DisplayName;
+        var action = SessionFinishModes.Normalize(task.PostTaskAction);
+
+        Log($"开始执行任务：{name}（收尾任务）");
+        Log(FileLogger.BuildSessionMarker(name, "START"));
+        Log($"[收尾] 本通道跑完后：{SessionFinishModes.Describe(action)}。");
+
+        SessionFinishOverride = action;
+
+        if (!_runsInRemoteSession && action != SessionFinishModes.Keep)
+        {
+            Log($"[收尾] 本地执行组没有通道，收尾动作（{SessionFinishModes.Label(action)}）已忽略。");
+        }
+
+        RaiseTaskCompleted(name, index, total, 0, "已登记收尾", abnormal: false);
+        return RunOutcome.Continue;
+    }
+
+    private RunOutcome RunOneTaskCore(TaskConfig task, int index, int total)
+    {        // 先按任务类型分流：等待与收尾都不起进程，只有脚本任务走下面那条完整链路。
+        // 判据放在最前面，是为了不让"脚本路径为空"的分支误伤这两类任务。
+        if (TaskKinds.IsWait(task.TaskKind))
+        {
+            return RunWaitTask(task, index, total);
+        }
+
+        if (TaskKinds.IsFinish(task.TaskKind))
+        {
+            return RunFinishTask(task, index, total);
+        }
+
         var name = task.DisplayName;
         var scriptText = task.ScriptPath.Trim();
         var timeoutSeconds = task.TimeoutSeconds;

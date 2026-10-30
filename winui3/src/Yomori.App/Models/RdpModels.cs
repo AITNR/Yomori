@@ -67,36 +67,8 @@ public static class RenderBackends
 }
 
 /// <summary>RDP 会话在任务全部结束后的处理方式。</summary>
-public static class SessionFinishModes
-{    public const string Keep = "keep";
-    public const string Disconnect = "disconnect";
-    public const string Logoff = "logoff";
-    public static readonly IReadOnlyList<KeyValuePair<string, string>> Items =
-        new List<KeyValuePair<string, string>>
-        {
-            new(Keep, "保持连接（方便随时切过去看结果）"),
-            new(Disconnect, "断开会话（后台继续运行）"),
-            new(Logoff, "注销目标用户（释放资源）"),
-        };
-
-    public static string Normalize(string? value)
-    {
-        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
-        return text switch
-        {
-            Disconnect => Disconnect,
-            Logoff => Logoff,
-            _ => Keep,
-        };
-    }
-
-    public static string Label(string? value) => Normalize(value) switch
-    {
-        Disconnect => "断开会话",
-        Logoff => "注销用户",
-        _ => "保持连接",
-    };
-}
+// SessionFinishModes 已迁到 Models/TaskTypeModels.cs —— 收尾从通道级搬到了任务级
+// （见《任务类型与收尾计划书》§3）。这里保留位置说明，避免以后有人在本文件重定义一份。
 
 /// <summary>远程桌面分辨率档位。0 表示“自适应”，即按Yomori窗口里的画面区域大小来定。</summary>
 public static class RdpResolutions
@@ -583,6 +555,15 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     [JsonPropertyName("password")]
     public string ExportPassword { get; set; } = string.Empty;
 
+    /// <summary>
+    /// 【迁移垫片，不参与执行】旧版全局的"跑完怎么处置会话"。
+    ///
+    /// <para>收尾已迁到任务的收尾行。这个字段只为让**升级前的配置**读得懂：老配置只有
+    /// 这一处写着 <c>logoff</c> / <c>disconnect</c>，<c>MigrateLegacyChannel</c> 会把它带进
+    /// 默认通道、再由 <c>MigrateSessionFinishToTasks</c> 搬进收尾任务，最后归位成 <c>keep</c>。</para>
+    ///
+    /// <para>⚠️ 不要在任何界面或执行路径上读它。</para>
+    /// </summary>
     [JsonPropertyName("session_finish")]
     public string SessionFinish
     {
@@ -900,8 +881,15 @@ public sealed class RdpCommand
     public int ShutdownDelaySeconds { get; set; } = 60;
     public bool EnableTimeoutScreenshot { get; set; } = true;
 
-    /// <summary>任务全部结束后的会话处理方式，见 <see cref="SessionFinishModes"/>。</summary>
-    public string SessionFinish { get; set; } = SessionFinishModes.Keep;
+    /// <summary>
+    /// 已在**主控端**完成「连接前等待」的那条任务的序号（<see cref="TaskConfig.Order"/>）。
+    /// 0 = 没有。
+    ///
+    /// <para>为什么必须显式传：连接前的等待发生在主控端写指令之前，代理拿到指令时那段等待
+    /// 已经过去了；若代理再按同一个 <c>wait_timing</c> 等一遍，就会等两次。
+    /// 这里记"哪一条已经等过"，代理只认这一个来源，不靠顺序去猜。</para>
+    /// </summary>
+    public int PreWaitDoneForOrder { get; set; }
 
     /// <summary>
     /// 已废弃：通知一律在主控端发，目标会话里的代理不再弹任何 Toast。

@@ -140,10 +140,19 @@
 
             <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="6" Margin="0,0,0,8">
                 <Button Content="添加" Click="OnAddTask"
-                        IsEnabled="{x:Bind VM.CanAddTaskToScope, Mode=OneWay}" />
-                <Button Content="删除" Click="OnDeleteTask" />
-                <Button Content="上移" Click="OnMoveUp" />
-                <Button Content="下移" Click="OnMoveDown" />
+                        IsEnabled="{x:Bind VM.CanAddTaskToScope, Mode=OneWay}">
+                    <ToolTipService.ToolTip>
+                        <ToolTip Content="新建一个「脚本」任务。这条通道第一次添加任务时，会自动补上固定那一条「收尾」任务。" />
+                    </ToolTipService.ToolTip>
+                </Button>
+                <Button Content="删除" Click="OnDeleteTask"
+                        IsEnabled="{x:Bind VM.CanDeleteSelected, Mode=OneWay}">
+                    <ToolTipService.ToolTip>
+                        <ToolTip Content="收尾任务固定存在，不可删除。" />
+                    </ToolTipService.ToolTip>
+                </Button>
+                <Button Content="上移" Click="OnMoveUp" IsEnabled="{x:Bind VM.CanMoveSelected, Mode=OneWay}" />
+                <Button Content="下移" Click="OnMoveDown" IsEnabled="{x:Bind VM.CanMoveSelected, Mode=OneWay}" />
             </StackPanel>
 
             <Grid Grid.Row="1">
@@ -198,9 +207,19 @@
                                                VerticalAlignment="Center"
                                                FontSize="12" />
 
-                                    <StackPanel Grid.Column="2" VerticalAlignment="Center">
-                                        <TextBlock Text="{x:Bind DisplayName, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
-                                        <TextBlock Text="{x:Bind ScriptPath, Mode=OneWay}"
+                                    <StackPanel Grid.Column="2" VerticalAlignment="Center" Spacing="1">
+                                        <StackPanel Orientation="Horizontal" Spacing="6">
+                                            <!-- 类型标签：脚本是默认，不显示；等待/收尾各一个词。 -->
+                                            <Border Background="{ThemeResource SubtleFillColorSecondaryBrush}"
+                                                    CornerRadius="4" Padding="4,0"
+                                                    VerticalAlignment="Center"
+                                                    Visibility="{x:Bind helpers:XamlHelpers.ToVisibility(HasKindTag), Mode=OneWay}">
+                                                <TextBlock Text="{x:Bind KindTag, Mode=OneWay}"
+                                                           FontSize="10" Opacity="0.75" />
+                                            </Border>
+                                            <TextBlock Text="{x:Bind DisplayName, Mode=OneWay}" TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                        <TextBlock Text="{x:Bind RowSummary, Mode=OneWay}"
                                                    FontSize="11" Opacity="0.55" TextTrimming="CharacterEllipsis" />
                                     </StackPanel>
 
@@ -265,8 +284,62 @@
                 <Border x:Name="FormHost" Padding="16" Style="{StaticResource YomoriCardStyle}">
                     <StackPanel Spacing="14">
 
+                        <!-- ===== 任务类型（最上方，常驻） =====
+                             只有两项：脚本 / 等待时间。「收尾」不出现在这里 ——
+                             每通道恰好一条收尾任务、由系统固定维护，它不是一种"可选类型"
+                             （见《任务类型与收尾计划书》§3 D4）。选中收尾任务时本块整体隐藏，
+                             换成下面那行只读标识。 -->
+                        <StackPanel x:Name="TaskKindSection" Spacing="6">
+                            <TextBlock Text="任务类型" FontWeight="SemiBold" />
+                            <RadioButtons x:Name="TaskKindOptions"
+                                          MaxColumns="2"
+                                          SelectionChanged="OnTaskKindChanged" />
+                            <TextBlock x:Name="TaskKindHint"
+                                       FontSize="12" Opacity="0.65" TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <TextBlock x:Name="TaskKindReadOnly"
+                                   FontSize="12" Opacity="0.7" TextWrapping="Wrap"
+                                   Visibility="Collapsed"
+                                   Text="收尾任务 · 由系统固定在通道最后一位（不可添加、删除、改类型或移动）" />
+
+                        <!-- ===== 等待时间（仅等待任务） ===== -->
+                        <StackPanel x:Name="WaitSection" Spacing="10" Visibility="Collapsed">
+                            <TextBlock Text="等待时间" FontWeight="SemiBold" />
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <NumberBox x:Name="WaitSecondsBox" Grid.Column="0"
+                                           Header="等待时长（秒）"
+                                           Minimum="0" Maximum="3600"
+                                           SpinButtonPlacementMode="Compact"
+                                           ValueChanged="OnWaitSecondsChanged" />
+                                <ComboBox x:Name="WaitTimingBox" Grid.Column="1"
+                                          Header="等待时机"
+                                          HorizontalAlignment="Stretch"
+                                          DisplayMemberPath="Value" SelectedValuePath="Key"
+                                          SelectionChanged="OnWaitTimingChanged" />
+                            </Grid>
+                            <TextBlock FontSize="12" Opacity="0.65" TextWrapping="Wrap"
+                                       Text="选「连接前」时，这段等待在本通道建立连接之前完成，只对通道内第一条任务有效；其余情况按队列内等待处理。" />
+                        </StackPanel>
+
+                        <!-- ===== 收尾（仅收尾任务） ===== -->
+                        <StackPanel x:Name="FinishSection" Spacing="10" Visibility="Collapsed">
+                            <TextBlock Text="收尾" FontWeight="SemiBold" />
+                            <ComboBox x:Name="PostTaskActionBox"
+                                      Header="收尾动作"
+                                      HorizontalAlignment="Stretch"
+                                      DisplayMemberPath="Value" SelectedValuePath="Key"
+                                      SelectionChanged="OnPostTaskActionChanged" />
+                            <TextBlock FontSize="12" Opacity="0.65" TextWrapping="Wrap"
+                                       Text="收尾任务固定存在：跑在本通道最后一位，不可上移/下移/删除/移动，也不能改类型。注销通道会销毁目标会话，里面正在跑的代理与脚本会被系统一并终止。" />
+                        </StackPanel>
+
                         <!-- 基础 -->
-                        <Expander Header="基础设置" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <Expander x:Name="BasicSection" Header="基础设置" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                             <StackPanel Spacing="12">
                                 <TextBox Header="游戏 / 脚本名称" Text="{Binding Name, Mode=TwoWay}" />
 
@@ -358,7 +431,7 @@
                         </Expander>
 
                         <!-- 完成判断 -->
-                        <Expander Header="完成判断" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
+                        <Expander x:Name="JudgeSection" Header="完成判断" IsExpanded="True" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                             <StackPanel Spacing="12">
                                 <ComboBox x:Name="WaitModeBox" Header="完成判断（等待模式）"
                                           HorizontalAlignment="Stretch"
@@ -373,7 +446,7 @@
                         </Expander>
 
                         <!-- 进阶：并发与守护 -->
-                        <Expander Header="进阶设置（并发 / 守护 / 监控关键词）"
+                        <Expander x:Name="AdvancedSection" Header="进阶设置（并发 / 守护 / 监控关键词）"
                                   HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch">
                             <StackPanel Spacing="12">
                                 <Grid ColumnSpacing="12">

@@ -199,23 +199,9 @@
                               SelectedValue="{x:Bind VM.ChannelResolutionKey, Mode=TwoWay}"
                               HorizontalAlignment="Stretch" />
 
-                    <!-- 会话处理：数据源与选中值都由代码管（见 ChannelsPage.xaml.cs 的
-                         SyncSessionFinishSelection），不要改回 x:Bind。
-                         x:Bind 的路径是 VM.SelectedChannel.SessionFinish（两级），
-                         首次求值时 SelectedChannel 为空 / ItemsSource 还没填，那次赋值会被
-                         ComboBox 直接丢弃，之后就再也匹配不上 —— 表现就是下拉框一片空白。 -->
-                    <ComboBox x:Name="SessionFinishCombo"
-                              Header="该通道任务全部结束后的会话处理"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectionChanged="OnChannelFinishChanged"
-                              HorizontalAlignment="Stretch" />
-
-                    <ToggleSwitch Header="启用该通道"
-                                  OnContent="启用（参与并行执行）"
-                                  OffContent="停用（该通道的任务不会下发）"
-                                  IsOn="{x:Bind VM.SelectedChannel.Enabled, Mode=TwoWay}"
-                                  Toggled="OnChannelEnabledToggled" />
+                    <!-- 「该通道任务全部结束后的会话处理」与「启用该通道」已移除：
+                         收尾动作迁到任务的收尾行（任务执行页最后一行），
+                         通道启停改由任务执行页左栏每行的开关承担 —— 那是唯一入口。 -->
 
                     <StackPanel Orientation="Horizontal" Spacing="8">
                         <Button Content="保存通道设置" Click="OnSaveChannelEdits"
@@ -223,7 +209,7 @@
                     </StackPanel>
 
                     <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="文本框失焦时会自动落盘，按钮只是让你能确认一次。选「注销用户」收尾要注意：注销会销毁目标会话，里面正在跑的代理与脚本会被系统一并终止。" />
+                               Text="文本框失焦时会自动落盘，按钮只是让你能确认一次。通道要不要参与本轮执行，在「任务执行」页左栏每行的开关上设置；跑完之后的收尾动作（注销 / 断开）在任务列表最后那条收尾任务里选。" />
                 </StackPanel>
             </Border>
 

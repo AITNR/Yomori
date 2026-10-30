@@ -560,6 +560,9 @@ public sealed class MainViewModel : ObservableObject
             {
                 OnPropertyChanged(nameof(HasSelection));
                 OnPropertyChanged(nameof(HasNoSelection));
+                OnPropertyChanged(nameof(CanDeleteSelected));
+                OnPropertyChanged(nameof(CanMoveSelected));
+                OnPropertyChanged(nameof(CanChangeSelectedKind));
             }
         }
     }
@@ -568,8 +571,29 @@ public sealed class MainViewModel : ObservableObject
 
     public bool HasNoSelection => SelectedTask is null;
 
+    /// <summary>
+    /// 选中的任务能不能删。收尾任务恒为 false —— 每通道恰好一条、由系统维护
+    /// （见《任务类型与收尾计划书》§3 D4）。界面据此置灰，方法里再拒一次。
+    /// </summary>
+    public bool CanDeleteSelected => SelectedTask is not null && !TaskTypeResolver.IsFinish(SelectedTask);
+
+    /// <summary>选中任务能不能上移/下移：收尾恒在末位，不参与排序。</summary>
+    public bool CanMoveSelected => SelectedTask is not null && !TaskTypeResolver.IsFinish(SelectedTask);
+
+    /// <summary>选中任务能不能改类型：收尾任务不能改（它没有别的类型可选）。</summary>
+    public bool CanChangeSelectedKind => SelectedTask is not null && !TaskTypeResolver.IsFinish(SelectedTask);
+
     /// <summary>下拉选项源：Key 为配置值，Value 为中文显示名。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> WaitModeItems => WaitModes.Items;
+
+    /// <summary>任务类型单选的可选项：**只有脚本与等待**，收尾不在其中（系统维护）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> TaskKindItems => TaskKinds.Selectable;
+
+    /// <summary>等待任务的时机下拉（连接后 / 连接前）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> WaitTimingItems => WaitTimings.Items;
+
+    /// <summary>收尾动作下拉（无操作 / 断开通道 / 注销通道）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> PostTaskActionItems => SessionFinishModes.Items;
 
     public IReadOnlyList<KeyValuePair<string, string>> TimeoutActionItems => TimeoutActions.Items;
 
@@ -803,6 +827,7 @@ public sealed class MainViewModel : ObservableObject
         var task = new TaskConfig
         {
             Enabled = true,
+            TaskKind = TaskKinds.Script,
             Name = $"新任务{Tasks.Count + 1}",
             ScriptPath = string.Empty,
             Order = Tasks.Count + 1,
@@ -814,15 +839,64 @@ public sealed class MainViewModel : ObservableObject
         };
 
         Tasks.Add(task);
+
+        // 这条通道第一次有任务 → 同时补上那条固定的收尾任务（每通道恰好一条，见 §3 D4）
+        var created = TaskScopePlanner.EnsureFinishTask(Tasks, scope.Id, Config.Rdp.Channels);
+        if (created is not null)
+        {
+            AppendLog($"[任务] 已为「{scope.Name}」补上收尾任务（默认无操作），可随时在最后一行选择收尾动作。");
+        }
+
         TaskScopePlanner.NormalizeOrdersByChannel(Tasks, Config.Rdp.Channels);
         RefreshChannelScopes();
         SelectedTask = task;
+    }
+
+    /// <summary>
+    /// 改选中任务的类型。**收尾不在可选项里**（界面没有这个选项），这里再拒一次 ——
+    /// 界面没有入口不等于代码层面安全（导入、批量操作、将来的快捷键都可能绕过）。
+    /// </summary>
+    public void SetSelectedTaskKind(string kind)
+    {
+        var task = SelectedTask;
+        if (task is null)
+        {
+            return;
+        }
+
+        if (!TaskScopePlanner.SetTaskKind(Tasks, task, kind, Config.Rdp.Channels))
+        {
+            AppendLog($"[任务] 「{task.DisplayName}」的类型不能改成 {TaskKinds.Label(kind)}"
+                      + (TaskTypeResolver.IsFinish(task) ? "（收尾任务由系统固定维护）。" : "。"));
+            return;
+        }
+
+        SaveConfig();
+        RefreshScopeTasks();
+        RaiseTaskDerivedChanged();
+    }
+
+    /// <summary>改选中任务某条"按类型才有意义"的字段后，统一刷新界面派生文本。</summary>
+    public void RaiseTaskDerivedChanged()
+    {
+        OnPropertyChanged(nameof(SelectedTask));
+        OnPropertyChanged(nameof(CanDeleteSelected));
+        OnPropertyChanged(nameof(CanMoveSelected));
+        OnPropertyChanged(nameof(CanChangeSelectedKind));
     }
 
     public void DeleteSelectedTask()
     {
         if (SelectedTask is null)
         {
+            return;
+        }
+
+        // 收尾任务不可删：每通道恰好一条，删了队列就没有收尾这一步。
+        // 按钮已经置灰，这里是第二道闸（界面状态从来不是闸门）。
+        if (TaskTypeResolver.IsFinish(SelectedTask))
+        {
+            AppendLog("[任务] 收尾任务固定存在，不可删除。");
             return;
         }
 
@@ -851,6 +925,12 @@ public sealed class MainViewModel : ObservableObject
 
         if (!TaskScopePlanner.TryMoveInScope(Tasks, SelectedTask, delta, Config.Rdp.Channels))
         {
+            // 唯一的"拒绝"来源就是收尾任务（它恒在末位）—— 说一句，免得点了没反应
+            if (TaskTypeResolver.IsFinish(SelectedTask))
+            {
+                AppendLog("[任务] 收尾任务固定在通道最后一位，不能上移或下移。");
+            }
+
             return;
         }
 
@@ -870,13 +950,21 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
+        // 收尾任务不参与拖放：它恒在末位（拖动它等于自欺 —— 松手后会被重编 order 放回来）
+        if (TaskTypeResolver.IsFinish(task))
+        {
+            return;
+        }
+
         var from = ScopeTasks.IndexOf(task);
         if (from < 0)
         {
             return;
         }
 
-        var to = Math.Clamp(targetIndex, 0, ScopeTasks.Count - 1);
+        // 落点要夹在收尾之前：拖放不调 NormalizeOrdersByChannel（只重排已占用的 order 槽位），
+        // 不夹的话收尾会被挤到中间，而"收尾恒在末位"是所有收尾动作成立的前提。
+        var to = TaskScopePlanner.ClampInsertIndex(ScopeTasks, Math.Clamp(targetIndex, 0, ScopeTasks.Count - 1));
         if (to == from)
         {
             return;
@@ -912,18 +1000,13 @@ public sealed class MainViewModel : ObservableObject
         }
     }
 
-    public bool HasUsableTaskConfig()
-    {
-        foreach (var task in Tasks)
-        {
-            if (task.Enabled && !string.IsNullOrWhiteSpace(task.ScriptPath))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    /// <summary>
+    /// 有没有"真能跑起来"的脚本任务。
+    ///
+    /// <para>判据必须只看 <c>script</c> 类型：等待与收尾任务没有脚本路径，
+    /// 沿用"任意一条路径非空"会把只含等待/收尾的通道判成"没有可用配置"，直接不让开始执行。</para>
+    /// </summary>
+    public bool HasUsableTaskConfig() => TaskTypeResolver.HasRunnableScript(Tasks);
 
     // ---------------- 配置读写 ----------------
 
@@ -1636,6 +1719,8 @@ public sealed class MainViewModel : ObservableObject
 
         ResetSessions(plan);
 
+        // 新一轮：清掉上一轮可能残留的中止标志（否则"连接前等待"一进去就退出）
+        _runAbortRequested = false;
         _runStoppedOrError = false;
         ResetRunSummaryState();
         _runStartedAt = DateTimeOffset.Now;
@@ -1924,6 +2009,10 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     public void Stop()
     {
+        // 先置中止标志：还没下发指令的通道可能正卡在「连接前等待」里，
+        // 它们没有任何 runner / stop.json 可通知，只能靠这个标志醒过来。
+        _runAbortRequested = true;
+
         // 停止时先作废尚未提交的切回请求：用户要的是「停下」，不是把桌面再抢一次。
         _controllerSessionReturn.CancelPending();
         _runner?.RequestStop();
@@ -3052,7 +3141,7 @@ public sealed class MainViewModel : ObservableObject
             // 跟着画面区域变，同一套任务换台显示器就全错位，所以回落到固定的 1920 × 1080。
             Host = RdpSettings.TargetHost,
             BridgePath = RdpSettings.BridgePath,
-            SessionFinish = RdpSettings.SessionFinish,
+            // 收尾不再继承全局值：它已经归任务的收尾行所有（见《任务类型与收尾计划书》§3）
             DesktopWidth = RdpSettings.DesktopWidth > 0
                 ? RdpSettings.DesktopWidth
                 : RdpResolutions.DefaultWidth,
@@ -3106,6 +3195,19 @@ public sealed class MainViewModel : ObservableObject
 
         var affected = TaskScopePlanner.TasksForScope(Tasks, channel.Id);
 
+        // 收尾任务随通道一起消失：它表达的是"这条通道跑完做什么"，改派到别的通道会让目标
+        // 通道多出第二条收尾（破坏"每通道恰好一条"）。先摘掉，再问其余任务的归属。
+        var removedFinish = affected.Where(t => t is not null && TaskTypeResolver.IsFinish(t)).ToList();
+        foreach (var finish in removedFinish)
+        {
+            Tasks.Remove(finish);
+        }
+
+        if (removedFinish.Count > 0)
+        {
+            affected = affected.Where(t => t is not null && !TaskTypeResolver.IsFinish(t)).ToList();
+        }
+
         // 有任务指向它就先问清归属 —— 删完不管，那些任务会变成"未知通道"被静默跳过，
         // 而且在任务页里还找不到它们（计划书 D5/D6）。
         var reassignTo = TaskScopePlanner.LocalScopeId;
@@ -3126,6 +3228,8 @@ public sealed class MainViewModel : ObservableObject
                     task.ChannelId = TaskScopePlanner.NormalizeId(picked);
                 }
 
+                // 目标 scope 原本可能是空的（没有收尾行）—— 现在它有任务了，补上那条
+                TaskScopePlanner.EnsureFinishTask(Tasks, reassignTo, Config.Rdp.Channels);
                 TaskScopePlanner.NormalizeOrdersByChannel(Tasks, Config.Rdp.Channels);
             }
         }
@@ -3638,9 +3742,9 @@ public sealed class MainViewModel : ObservableObject
     }
 
     /// <summary>
-    /// 下拉框用的分辨率档位。注意「会话处理」那组选项不在这里 ——
-    /// 通道页直接绑 <see cref="SessionFinishModes.Items"/>，因为那个 ComboBox 的选中值
-    /// 由代码同步（见 ChannelsPage.xaml.cs 的 SyncSessionFinishSelection）。
+    /// 下拉框用的分辨率档位。「会话处理」那组选项也不在这里 ——
+    /// 收尾已迁到任务级，选项由 <see cref="PostTaskActionItems"/> 提供给任务的收尾行；
+    /// 通道页那个下拉框已经删掉了（见《任务类型与收尾计划书》§6.6）。
     /// </summary>
     public IReadOnlyList<KeyValuePair<string, string>> ResolutionItems => RdpResolutions.Items;
 
@@ -5492,7 +5596,6 @@ public sealed class MainViewModel : ObservableObject
         User = RdpSettings.TargetUser,
         BridgePath = RdpSettings.BridgePath,
         CredentialSaved = RdpSettings.CredentialSaved,
-        SessionFinish = RdpSettings.SessionFinish,
         DesktopWidth = RdpSettings.DesktopWidth,
         DesktopHeight = RdpSettings.DesktopHeight,
     };
@@ -5621,6 +5724,79 @@ public sealed class MainViewModel : ObservableObject
     /// 多通道并行时，每条通道各跑一份本方法（互不阻塞）；通道内部的任务仍按 order 串行
     /// —— 那是代理侧 <c>ScriptRunner</c> 的事，与主控端无关。
     /// </summary>
+    /// <summary>
+    /// 本轮是否已请求停止。
+    ///
+    /// <para>主控端原先没有这个标志：<see cref="Stop"/> 只调 <c>_runner?.RequestStop()</c> 与
+    /// <see cref="RequestRemoteStop"/>，两者都作用于"已经跑起来的任务"。而「连接前等待」
+    /// 发生在任何任务跑起来之前，需要一个本轮级的中止信号 —— 不能拿 <c>IsRunning</c> 代，
+    /// 它在整轮结束前一直是 true。</para>
+    /// </summary>
+    private volatile bool _runAbortRequested;
+
+    /// <summary>
+    /// 可中止的等待（连接前等待用）。按 200ms 切片检查中止标志，返回 true = 被中止。
+    ///
+    /// <para>不能 <c>Thread.Sleep</c>：<c>RunChannelAsync</c> 的续体可能落在 UI 线程上，
+    /// 同步阻塞会冻界面。也不能不检查标志：那样点「停止」要等整段等待走完才响应。</para>
+    /// </summary>
+    private async Task<bool> WaitAbortableAsync(int seconds)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(Math.Max(0, seconds));
+        while (DateTime.UtcNow < deadline)
+        {
+            if (_runAbortRequested)
+            {
+                return true;
+            }
+
+            var remainMs = (int)Math.Min(200, Math.Max(1, (deadline - DateTime.UtcNow).TotalMilliseconds));
+            await Task.Delay(remainMs).ConfigureAwait(true);
+        }
+
+        return _runAbortRequested;
+    }
+
+    /// <summary>
+    /// 目标会话里的代理能不能认"等待 / 收尾"任务（需要 ≥ 2.1.0）。
+    ///
+    /// <para>读的是桥里 `status.json` 的 `AgentVersion` —— 那是**正在跑的**代理自己报的，
+    /// 比读安装目录里的 exe 属性更可靠（远程主机的安装目录主控端根本看不到）。</para>
+    ///
+    /// <para>读不到（还没跑过代理 / 文件缺失）按"未知"放行：无法判断时不该阻止用户执行，
+    /// 真遇到旧代理会在结果里表现为"脚本路径为空，已跳过"，日志能看出来。</para>
+    ///
+    /// <returns>true = 可以下发；false = 已拦截（提示与计数都处理过了）。</returns>
+    /// </summary>
+    private bool EnsureAgentSupportsTypedTasks(RdpBridge bridge, RdpChannelSession session, string tag)
+    {
+        const string minimum = "2.1.0";
+        var reported = bridge.TryReadStatus()?.AgentVersion;
+
+        if (string.IsNullOrWhiteSpace(reported))
+        {
+            AppendLog($"[通道：{tag}] 未读到目标会话的代理版本，按最新版处理。");
+            return true;
+        }
+
+        if (AgentVersionInfo.IsAtLeast(reported, minimum))
+        {
+            return true;
+        }
+
+        AppendLog($"[通道：{tag}] 目标会话里的代理版本 {reported} 过旧（需 ≥ {minimum}）："
+                  + "它不认等待 / 收尾任务，本轮不下发。请重新部署代理后再执行。");
+        _ = DialogHelper.ShowMessageAsync("代理版本过旧",
+            $"通道「{tag}」目标账户里运行的代理是 {reported}，新版的等待 / 收尾任务需要 ≥ {minimum}。\n\n" +
+            "本轮这条通道不会下发。请在「通道管理」里重新部署代理（或重启目标会话让安装程序铺一次），再执行。");
+
+        session.SetStatusText("代理版本过旧");
+        MirrorSessionIfActive(session);
+        session.MarkCompletionReported();
+        FinishRunPart();
+        return false;
+    }
+
     private async Task RunChannelAsync(RdpChannelSession session, IReadOnlyList<TaskConfig> tasks)
     {
         var channel = session.Channel!;
@@ -5631,13 +5807,54 @@ public sealed class MainViewModel : ObservableObject
         var user = channel.User;
         var isLocal = RdpTargets.IsLocal(host);
 
+        // 本通道本轮的执行顺序（收尾恒在末位，与 TaskScopePlanner 同口径）
+        var orderedEnabled = tasks
+            .Where(t => t is not null && t.Enabled)
+            .OrderBy(t => TaskTypeResolver.IsFinish(t) ? 1 : 0)
+            .ThenBy(t => t.Order)
+            .ToList();
+
+        // 旧代理不认 task_kind —— 等待/收尾任务在它眼里就是"脚本路径为空"，会被逐个标异常跳过。
+        // 只要这批含这两类任务，就要求目标会话里的代理 ≥ 2.1.0，否则整批不下发。
+        if (orderedEnabled.Any(t => !TaskKinds.IsScript(t.TaskKind))
+            && !EnsureAgentSupportsTypedTasks(bridge, session, tag))
+        {
+            return;
+        }
+
+        // 连接前等待：只有本通道首条启用任务是「等待任务 + 连接前」时才发生。
+        // 必须放在写指令之前 —— 代理一拿到指令就会开跑，只有这里才配叫"连接前"。
+        var preWaitOrder = 0;
+        if (TaskTypeResolver.ShouldWaitBeforeConnect(orderedEnabled))
+        {
+            var first = orderedEnabled[0];
+            var seconds = Math.Clamp(first.WaitSeconds, 0, 3600);
+            preWaitOrder = first.Order;
+
+            session.SetStatusText($"等待 {seconds} 秒（通道连接前）…");
+            MirrorSessionIfActive(session);
+            AppendLog($"[通道：{tag}] [等待] 连接前等待 {seconds} 秒，之后下发指令。");
+
+            if (await WaitAbortableAsync(seconds))
+            {
+                session.SetStatusText("已停止");
+                MirrorSessionIfActive(session);
+                AppendLog($"[通道：{tag}] [等待] 连接前等待被停止请求打断，本条通道不下发。");
+                session.MarkCompletionReported();
+                FinishRunPart();
+                return;
+            }
+
+            AppendLog($"[通道：{tag}] [等待] 连接前等待结束，开始下发指令。");
+        }
+
         var command = new RdpCommand
         {
             Tasks = tasks.Select(t => (TaskConfig)t.Clone()).ToList(),
             ShutdownAfterDone = Config.ShutdownAfterDone,
             ShutdownDelaySeconds = Config.ShutdownDelaySeconds,
             EnableTimeoutScreenshot = Config.EnableTimeoutScreenshot,
-            SessionFinish = channel.SessionFinish,
+            PreWaitDoneForOrder = preWaitOrder,
             // 通知一律由主控端发（见下面的 ApplyChannelTick / ReportSessionCompletion）。
             // 这两个键现在只用来让"目标账户里仍部署着的旧版代理"闭嘴 —— 它的通知在主控端
             // 看不到，纯属噪音。所以这里**固定发 false**，不跟随设置开关。
@@ -6202,8 +6419,10 @@ public sealed class MainViewModel : ObservableObject
             summary = string.IsNullOrWhiteSpace(status?.StatusText) ? "全部任务结束" : status!.StatusText;
         }
 
-        // 收尾方式按通道自己的配置（多通道下每条通道可以不一样）
-        var finishMode = session.Channel?.SessionFinish ?? RdpSettings.SessionFinish;
+        // 收尾方式由本通道的收尾任务决定（收尾行恒在末位，一条通道只有一条）。
+        // 与代理侧同一个纯函数，两边不会各说一套。
+        var finishMode = TaskTypeResolver.ResolveSessionFinish(
+            TaskScopePlanner.TasksForScope(Tasks, session.ChannelId).Where(t => t.Enabled));
 
         // 「手动停止」不是异常：代理对停止请求同样以 abnormal 收尾
         // （旧副本更是直接把停止写成「已完成（有异常）」）。
