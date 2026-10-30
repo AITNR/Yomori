@@ -209,8 +209,8 @@ public sealed partial class SettingsPage : Page
 
     /// <summary>
     /// 开发者模式：改完立刻生效（主控端 <c>Config.PropertyChanged</c> 那边重排日志页）
-    /// 并立刻落盘 —— 它跟主题、更新渠道一样是"拨了就能看见"的开关，等用户想起来
-    /// 再点「保存配置」的话，重启后悄悄回到关闭状态会很难理解。
+    /// 并立刻落盘 —— 它跟主题、更新渠道一样是"拨了就能看见"的开关，等自动保存的去抖窗口
+    /// 走完再存的话，重启后悄悄回到关闭状态会很难理解。
     ///
     /// 两道 guard 各管一种情形：
     /// · <see cref="_syncing"/> —— 本页自己做的程序性赋值（构造期间的控件初始化）；
@@ -376,7 +376,6 @@ public sealed partial class SettingsPage : Page
         }
     }
 
-    private void OnSave(object sender, RoutedEventArgs e) => VM.SaveConfig();
     private async void OnExport(object sender, RoutedEventArgs e) => await VM.ExportConfigAsync();
 
     private async void OnImport(object sender, RoutedEventArgs e) => await VM.ImportConfigAsync();

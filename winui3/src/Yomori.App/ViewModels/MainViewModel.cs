@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
@@ -83,6 +84,29 @@ public sealed class MainViewModel : ObservableObject
     private ScriptRunner? _runner;
     private Task? _runTask;
     private DispatcherQueueTimer? _memorySampleTimer;
+
+    // ---------------- 自动保存（见《配置自动保存计划书》） ----------------
+
+    /// <summary>去抖 / 防重入状态机。纯逻辑，计时器在 <see cref="_autoSaveTimer"/>。</summary>
+    private readonly ConfigAutoSaver _autoSaver = new();
+
+    /// <summary>
+    /// 自动保存的延迟计时器。<b>必须挂字段</b> —— 局部变量建的
+    /// <c>DispatcherQueueTimer</c> 会被 GC，<c>Tick</c> 永远不来且完全静默（本项目踩过）。
+    /// </summary>
+    private DispatcherQueueTimer? _autoSaveTimer;
+
+    /// <summary>
+    /// 自动保存已启用。启用之前（构造、加载、初始化）发生的改动一律不排保存：
+    /// 那段流程里的赋值是程序自己做的规整（迁移、兜底），不是用户编辑。
+    /// </summary>
+    private bool _autoSaveEnabled;
+
+    /// <summary>正在执行落盘内核。期间到达的通知全部忽略（它们由落盘自己产生）。</summary>
+    private bool _applyingConfig;
+
+    /// <summary>最近一次自动保存失败的信息：同一条只写一次日志，免得刷屏。</summary>
+    private string _lastAutoSaveError = string.Empty;
 
     private bool _isRunning;
     private string _statusText = "空闲";
@@ -797,6 +821,10 @@ public sealed class MainViewModel : ObservableObject
         RefreshStats();
         ReloadChannels(refreshReadiness: false);
         SelectedTask = ScopeTasks.FirstOrDefault();
+
+        // 自动保存从这里开始生效：此前的一切赋值都是程序自己的加载与规整，不该写盘。
+        EnableAutoSave();
+
         _memorySampleTimer = _dispatcher.CreateTimer();
         _memorySampleTimer.Interval = TimeSpan.FromMinutes(1);
         _memorySampleTimer.Tick += (_, _) => LogMemorySample();
@@ -1009,23 +1037,329 @@ public sealed class MainViewModel : ObservableObject
     public bool HasUsableTaskConfig() => TaskTypeResolver.HasRunnableScript(Tasks);
 
     // ---------------- 配置读写 ----------------
+    //
+    // 落盘只有一条路：SaveConfigNow()。手动入口（开始执行 / 导入 / 通道结构变更）走
+    // SaveConfig()，用户编辑走自动保存（EnableAutoSave 里挂的三类通知 + 去抖计时器）。
+    // 两条路进的是同一个内核，"按通道重编 order" 因此只存在一处，不会两边不一致。
 
+    /// <summary>
+    /// 立即落盘（会写运行日志）。留给"确实需要当场写完"的位置：
+    /// 开始执行、导入配置、通道增删复制、设置页里那些拨了就该立刻生效的开关。
+    /// </summary>
     public void SaveConfig()
     {
-        // 按通道重编 order，保证落盘的序号连续唯一且分组有序（执行侧只看 order）
-        TaskScopePlanner.NormalizeOrdersByChannel(Tasks, Config.Rdp.Channels);
-        Config.Tasks = new List<TaskConfig>(Tasks);
-        WindowsStartupService.Apply(Config.WindowsStartup);
+        SaveConfigNow(announce: true);
 
+        // 刚把完整配置写下去了：作废排队中的那次自动保存，
+        // 否则 600 毫秒后会把同一个文件原样再写一遍。
+        _autoSaver.Clear();
+    }
+
+    /// <summary>
+    /// 落盘内核。
+    ///
+    /// <para><paramref name="announce"/> 为 false 时（自动保存）成功不写运行日志 ——
+    /// 每改一个字段就冒一行"配置已保存"会把任务调度那几条信息淹掉；失败则走
+    /// <see cref="ReportAutoSaveFailure"/>，一次失败只报一次。</para>
+    ///
+    /// <para>整个方法<b>同步</b>执行并置 <see cref="_applyingConfig"/>：它自己会改
+    /// <c>Order</c>、给 <c>Config.Tasks</c> 赋值、调 <c>Sanitize()</c>，这些都会发出通知；
+    /// 不挡住就会"落盘 → 通知 → 再排一次落盘"空转。</para>
+    /// </summary>
+    private void SaveConfigNow(bool announce)
+    {
+        if (_applyingConfig)
+        {
+            return;
+        }
+
+        _applyingConfig = true;
         try
         {
+            // 按通道重编 order，保证落盘的序号连续唯一且分组有序（执行侧只看 order）
+            var before = SnapshotOrders();
+            TaskScopePlanner.NormalizeOrdersByChannel(Tasks, Config.Rdp.Channels);
+            var ordersChanged = !OrdersMatch(before);
+
+            Config.Tasks = new List<TaskConfig>(Tasks);
+            WindowsStartupService.Apply(Config.WindowsStartup);
+
             _configManager.Save(Config);
-            AppendLog("配置已保存。");
+            _lastAutoSaveError = string.Empty;
+
+            if (announce)
+            {
+                AppendLog("配置已保存。");
+            }
+
+            // 序号被重排时界面上的序号还是旧的：就地刷当前通道的任务视图。
+            // 不重建 ChannelScopes —— 整体替换那个集合是已知崩法，这里也没有必要。
+            if (ordersChanged)
+            {
+                RefreshScopeTasks();
+            }
         }
         catch (Exception ex)
         {
-            AppendLog($"保存配置失败：{ex.Message}");
-            _ = DialogHelper.ShowMessageAsync("保存失败", $"保存配置失败：{ex.Message}");
+            if (announce)
+            {
+                AppendLog($"保存配置失败：{ex.Message}");
+                _ = DialogHelper.ShowMessageAsync("保存失败", $"保存配置失败：{ex.Message}");
+            }
+            else
+            {
+                ReportAutoSaveFailure(ex);
+            }
+        }
+        finally
+        {
+            _applyingConfig = false;
+        }
+    }
+
+    /// <summary>落盘前的 order 快照（用于判断"这次落盘是否真的重排了序号"）。</summary>
+    private int[] SnapshotOrders() => Tasks.Select(t => t.Order).ToArray();
+
+    private bool OrdersMatch(int[] before)
+    {
+        if (before.Length != Tasks.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < before.Length; i++)
+        {
+            if (before[i] != Tasks[i].Order)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // ---------------- 自动保存 ----------------
+
+    /// <summary>
+    /// 开启自动保存。调用时机：<see cref="Initialize"/> 末尾 —— 配置已加载、通道已重建，
+    /// 之后的每一次界面改动都会被排进落盘队列。
+    ///
+    /// <para>四个触发源见各订阅处；结构变更（通道增删、导入）走的是 <c>List</c> 与
+    /// <c>Clear()</c>，不产生可用的集合通知，那些位置本来就显式调 <see cref="SaveConfig"/>。</para>
+    /// </summary>
+    public void EnableAutoSave()
+    {
+        if (_autoSaveEnabled)
+        {
+            return;
+        }
+
+        _autoSaveEnabled = true;
+
+        Tasks.CollectionChanged += OnTasksCollectionChanged;
+        foreach (var task in Tasks)
+        {
+            HookTask(task);
+        }
+
+        Config.PropertyChanged += OnConfigChangedForAutoSave;
+        HookRdpForAutoSave();
+
+        _autoSaveTimer = _dispatcher.CreateTimer();
+        _autoSaveTimer.Interval = TimeSpan.FromMilliseconds(_autoSaver.DelayMs);
+        _autoSaveTimer.IsRepeating = false;
+        _autoSaveTimer.Tick += OnAutoSaveTick;
+    }
+
+    /// <summary>
+    /// 立即写完待存的改动（不等待去抖窗口）。退出前必须调一次 ——
+    /// 用户改完 0.3 秒就关窗口时，计时器还没触发。
+    /// </summary>
+    public void FlushAutoSave()
+    {
+        if (!_autoSaveEnabled || !_autoSaver.HasPending)
+        {
+            return;
+        }
+
+        _autoSaveTimer?.Stop();
+
+        if (!_autoSaver.BeginApply())
+        {
+            return;
+        }
+
+        try
+        {
+            SaveConfigNow(announce: false);
+        }
+        finally
+        {
+            _autoSaver.EndApply();
+        }
+    }
+
+    /// <summary>排一次落盘（去抖窗口内的多次调用合并成一次写盘）。</summary>
+    private void ScheduleAutoSave()
+    {
+        if (!_autoSaveEnabled || _applyingConfig)
+        {
+            return;
+        }
+
+        // 属性通知可能来自后台续体（例如预检回调改通道字段）：计时器只能在 UI 线程上操作
+        if (!_dispatcher.HasThreadAccess)
+        {
+            Post(ScheduleAutoSave);
+            return;
+        }
+
+        if (!_autoSaver.MarkDirty())
+        {
+            return;
+        }
+
+        _autoSaveTimer?.Stop();
+        _autoSaveTimer?.Start();
+    }
+
+    private void OnAutoSaveTick(DispatcherQueueTimer sender, object args)
+    {
+        sender.Stop();
+
+        if (!_autoSaver.BeginApply())
+        {
+            return;
+        }
+
+        try
+        {
+            SaveConfigNow(announce: false);
+        }
+        finally
+        {
+            _autoSaver.EndApply();
+        }
+    }
+
+    private void OnTasksCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (e.OldItems is not null)
+        {
+            foreach (var item in e.OldItems)
+            {
+                UnhookTask(item as TaskConfig);
+            }
+        }
+
+        if (e.NewItems is not null)
+        {
+            foreach (var item in e.NewItems)
+            {
+                HookTask(item as TaskConfig);
+            }
+        }
+
+        // Reset（导入配置时的 Clear）没有 OldItems，也无从摘订阅：旧对象随集合一起放掉即可，
+        // 紧接着的 Add 会各自挂上（HookTask 自身幂等）。
+        ScheduleAutoSave();
+    }
+
+    /// <summary>挂任务字段变更。先 <c>-=</c> 再 <c>+=</c>，重复挂载也只会有一份订阅。</summary>
+    private void HookTask(TaskConfig? task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        task.PropertyChanged -= OnTaskChangedForAutoSave;
+        task.PropertyChanged += OnTaskChangedForAutoSave;
+    }
+
+    private void UnhookTask(TaskConfig? task)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        task.PropertyChanged -= OnTaskChangedForAutoSave;
+    }
+
+    /// <summary>
+    /// 挂通道相关变更：<c>RdpConfig</c> 自身的字段（设置页的全局 RDP 选项）与每条通道的字段。
+    /// 通道列表本身是 <c>List</c>，增删不产生通知 —— 那些位置已显式落盘。
+    /// </summary>
+    private void HookRdpForAutoSave()
+    {
+        if (!_autoSaveEnabled)
+        {
+            return;
+        }
+
+        var rdp = Config.Rdp;
+        if (rdp is null)
+        {
+            return;
+        }
+
+        rdp.PropertyChanged -= OnNestedConfigChangedForAutoSave;
+        rdp.PropertyChanged += OnNestedConfigChangedForAutoSave;
+
+        foreach (var channel in rdp.Channels)
+        {
+            HookChannel(channel);
+        }
+    }
+
+    private void HookChannel(RdpChannel? channel)
+    {
+        if (channel is null)
+        {
+            return;
+        }
+
+        channel.PropertyChanged -= OnNestedConfigChangedForAutoSave;
+        channel.PropertyChanged += OnNestedConfigChangedForAutoSave;
+    }
+
+    private void OnTaskChangedForAutoSave(object? sender, PropertyChangedEventArgs e) => ScheduleAutoSave();
+
+    private void OnNestedConfigChangedForAutoSave(object? sender, PropertyChangedEventArgs e) => ScheduleAutoSave();
+
+    /// <summary>设置页直接绑到 <see cref="AppConfig"/> 的那些字段（关机 / 退出 / 自启 / 主题 / 更新…）。</summary>
+    private void OnConfigChangedForAutoSave(object? sender, PropertyChangedEventArgs e) => ScheduleAutoSave();
+
+    /// <summary>
+    /// 自动保存失败的处理：写运行日志 + 铃铛里留一条（同标题就地替换，不会堆叠）。
+    ///
+    /// <para>⛔ 不弹对话框 —— 这里是从计时器回调进来，弹窗会和已打开的 ContentDialog
+    /// 撞成 COMException（项目已知崩法）。失败意味着用户这次改动没进盘，所以必须留痕，
+    /// 不能只在日志里说一句。</para>
+    /// </summary>
+    private void ReportAutoSaveFailure(Exception ex)
+    {
+        var message = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+
+        if (string.Equals(message, _lastAutoSaveError, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _lastAutoSaveError = message;
+        AppendLog($"配置自动保存失败：{message}");
+
+        try
+        {
+            Notifications.AddIfNew(
+                "配置自动保存失败",
+                $"改动没能写入 config.json：{message}。程序仍在运行，但这部分改动会在退出后丢失。",
+                AppNotificationKinds.Warning);
+        }
+        catch
+        {
+            // 通知本身失败不该再抛（日志里已经有那一行了）
         }
     }
 
@@ -1058,7 +1392,8 @@ public sealed class MainViewModel : ObservableObject
     /// 否则最大化状态下退出会把整屏尺寸当成小窗尺寸记下来。
     ///
     /// 这是随时可能发生的后台动作，所以：不写运行日志、不弹窗，值没变时连盘都不写。
-    /// 注意它只改 <c>Config.Window</c>，不会把界面上尚未"保存配置"的任务改动一起落盘。
+    /// 注意它只改 <c>Config.Window</c>，不会顺带把任务列表的自动保存排队提前 ——
+    /// 那些改动有自己的去抖窗口，这条路径不该替它们抢写盘。
     /// </summary>
     public void SaveWindowPlacement(WindowPlacement.Placement? bounds, bool maximized)
     {
@@ -1130,7 +1465,7 @@ public sealed class MainViewModel : ObservableObject
     ///
     /// 与 <see cref="SaveWindowPlacement"/> 同一类动作：
     /// 随手发生、不写运行日志、不弹窗，值没变时连盘都不写；**只改 Config.Window**，
-    /// 界面上尚未"保存配置"的任务改动不会被顺带带走。
+    /// 不牵动任务列表的自动保存（那边有自己的去抖窗口）。
     /// </summary>
     public void SaveCloseAction(string action)
     {
@@ -3007,6 +3342,9 @@ public sealed class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(ChannelBridgeDir));
         OnPropertyChanged(nameof(Channels));
 
+        // 通道列表是 List，增删不产生集合通知 —— 重挂一次订阅，让新通道的字段改动也能自动保存
+        HookRdpForAutoSave();
+
         RefreshChannelScopes();
 
         if (refreshReadiness)
@@ -4261,8 +4599,8 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>
     /// 把当前这套运行期配置写回对应通道并立刻落盘。
-    /// 只改动目标通道本身，不触发 <see cref="SaveConfig"/> —— 那个入口会连同界面里
-    /// 尚未点「保存配置」的任务草稿一起写入，静音/锁定这种小开关不该有这种副作用。
+    /// 只改动目标通道本身，不走 <see cref="SaveConfig"/> 那条全量入口 —— 那条会重排 order、
+    /// 重新同步开机自启项，静音/锁定这种小开关不该有这种副作用。
     /// </summary>
     private void PersistSurfaceToggle(string key, Action<RdpChannel> apply)
     {

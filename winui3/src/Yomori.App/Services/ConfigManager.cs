@@ -91,7 +91,38 @@ public sealed class ConfigManager
         StripExportSecrets(config);
 
         var json = JsonSerializer.Serialize(config, SerializeOptions);
-        File.WriteAllText(ConfigPath, json, new UTF8Encoding(false));
+
+        // 先写临时文件再整体替换，不做原地覆盖。
+        //
+        // 自动保存把写盘频率从"用户点一次按钮"提高到"每次编辑停顿一次"：原地覆盖每多一次，
+        // 就有多一次"写到一半被杀 / 断电"的机会，结果是一个半截 JSON —— 下次启动读不动，
+        // 只能走 .broken.json 兜底并重置成默认配置，等于把用户的全部任务丢掉。
+        // File.Move(overwrite) 在 Windows 上是 MoveFileEx(REPLACE_EXISTING)，替换是原子的：
+        // 要么还是旧文件，要么就是完整的新文件。
+        var temp = ConfigPath + ".tmp";
+
+        try
+        {
+            File.WriteAllText(temp, json, new UTF8Encoding(false));
+            File.Move(temp, ConfigPath, overwrite: true);
+        }
+        catch
+        {
+            // 失败时把半截临时文件清掉（清不掉也不影响：下次写会覆盖它），原文件保持不动
+            try
+            {
+                if (File.Exists(temp))
+                {
+                    File.Delete(temp);
+                }
+            }
+            catch
+            {
+                // 忽略：删不掉临时文件不该掩盖真正的写盘失败
+            }
+
+            throw;
+        }
     }
 
     /// <summary>剥掉只属于导出产物的字段（当前就是明文密码与导出说明块）。</summary>

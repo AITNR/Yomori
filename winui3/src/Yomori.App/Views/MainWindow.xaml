@@ -122,7 +122,6 @@
                                             IsEnabled="{x:Bind VM.CanStop, Mode=OneWay}"
                                             Click="OnStopClicked"
                                             Background="{StaticResource YomoriDangerBrush}" />
-                                    <Button Content="保存配置" Click="OnSaveClicked" />
                                     <Button Content="取消关机" Click="OnCancelShutdownClicked" />
                                 </StackPanel>
 

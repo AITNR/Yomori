@@ -335,6 +335,8 @@ public sealed partial class MainWindow : Window
     {
         if (_exiting || _systemShuttingDown)
         {
+            // 系统关机/注销不会再走 RequestExit，自动保存的去抖窗口里的改动只能在这里落盘
+            TryFlushAutoSave();
             return;
         }
 
@@ -647,6 +649,10 @@ public sealed partial class MainWindow : Window
 
         _exiting = true;
 
+        // 自动保存走 600 毫秒去抖，这个窗口期内关程序会把最近的改动一起带走 —— 先落盘。
+        // 放在最前面：后面几步（摘托盘、关窗口）任何一步抛异常都不该让改动留在内存里。
+        TryFlushAutoSave();
+
         // 退出流程一开始就掐掉「切回主控会话」的排队请求：再等窗口 Closed 才处理，
         // 切换命令可能已经和关闭时序抢在一起了。
         try
@@ -688,6 +694,25 @@ public sealed partial class MainWindow : Window
         catch
         {
             Environment.Exit(0);
+        }
+    }
+
+    /// <summary>
+    /// 退出前把自动保存的待存改动写完。
+    ///
+    /// <para>失败只吞掉不抛：退出路径上任一步抛异常都会变成"程序关不掉"或
+    /// "改动留在内存里"两种糟糕结果，而落盘失败自有
+    /// <c>MainViewModel.ReportAutoSaveFailure</c> 那条链路留痕。</para>
+    /// </summary>
+    private void TryFlushAutoSave()
+    {
+        try
+        {
+            VM.FlushAutoSave();
+        }
+        catch
+        {
+            // 退出不因为落盘失败而中断
         }
     }
 
@@ -1786,8 +1811,6 @@ public sealed partial class MainWindow : Window
     private void OnResumeClicked(object sender, RoutedEventArgs e) => VM.Resume();
 
     private void OnStopClicked(object sender, RoutedEventArgs e) => VM.Stop();
-
-    private void OnSaveClicked(object sender, RoutedEventArgs e) => VM.SaveConfig();
 
     private void OnCancelShutdownClicked(object sender, RoutedEventArgs e) => VM.CancelShutdown();
 

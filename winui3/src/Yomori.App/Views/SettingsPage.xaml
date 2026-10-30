@@ -227,7 +227,6 @@
                 <StackPanel Spacing="12">
                     <TextBlock Text="配置" FontWeight="SemiBold" />
                     <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="保存配置" Click="OnSave" />
                         <Button Content="导出配置" Click="OnExport" />
                         <Button Content="导入配置" Click="OnImport" />
                     </StackPanel>
