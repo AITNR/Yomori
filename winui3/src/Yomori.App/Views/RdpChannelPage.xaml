@@ -91,7 +91,7 @@
             </views:SplitterThumb>
 
             <!-- 运行信息：运行事件 / 实时日志（竖排在右侧，可收起） -->
-            <Border Grid.Column="2" Padding="12,8" Style="{StaticResource YomoriCardStyle}">
+            <Border x:Name="EventsPanel" Grid.Column="2" Padding="12,8" Style="{StaticResource YomoriCardStyle}">
                 <Grid RowSpacing="6">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
@@ -100,15 +100,39 @@
                     </Grid.RowDefinitions>
 
                     <!-- 标题行：栏宽只有 360，跟随开关单独占一行，别全挤在这行 -->
-                    <Grid Grid.Row="0" ColumnSpacing="8">
+                    <Grid Grid.Row="0">
                         <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
                         </Grid.ColumnDefinitions>
-                        <TextBlock x:Name="EventsTitle" Grid.Column="0" Text="运行信息" VerticalAlignment="Center"
+
+                        <!-- 折叠开关：收起 / 展开两个状态都用 32×32 图标，且都占第 0 列 ——
+                             按钮必须停在同一个位置，不能一个在标题行、一个在窄条中间，
+                             否则每次切换都像"按钮跳走了"。
+                             E76C = ChevronRight（面板向右收），E76B = ChevronLeft（把它拉出来）。 -->
+                        <HyperlinkButton x:Name="CollapseEventsButton" Grid.Column="0"
+                                         Width="32" Height="32"
+                                         Padding="0" MinWidth="0"
+                                         HorizontalContentAlignment="Center"
+                                         VerticalContentAlignment="Center"
+                                         Click="OnToggleEventsClicked"
+                                         ToolTipService.ToolTip="收起运行信息">
+                            <FontIcon Glyph="&#xE76C;" FontSize="12" />
+                        </HyperlinkButton>
+                        <HyperlinkButton x:Name="ExpandEventsButton" Grid.Column="0"
+                                         Visibility="Collapsed"
+                                         Width="32" Height="32"
+                                         Padding="0" MinWidth="0"
+                                         HorizontalContentAlignment="Center"
+                                         VerticalContentAlignment="Center"
+                                         Click="OnToggleEventsClicked"
+                                         ToolTipService.ToolTip="展开运行信息">
+                            <FontIcon Glyph="&#xE76B;" FontSize="12" />
+                        </HyperlinkButton>
+
+                        <TextBlock x:Name="EventsTitle" Grid.Column="1" Text="运行信息"
+                                   Margin="8,0,0,0" VerticalAlignment="Center"
                                    Style="{StaticResource BodyStrongTextBlockStyle}" />
-                        <HyperlinkButton x:Name="ToggleEventsButton" Grid.Column="1" Content="收起"
-                                         HorizontalAlignment="Right" Click="OnToggleEventsClicked" />
                     </Grid>
 
                     <ToggleSwitch x:Name="FollowExternalLogsToggle" Grid.Row="1"

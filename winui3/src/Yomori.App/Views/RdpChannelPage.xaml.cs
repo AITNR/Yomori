@@ -94,12 +94,38 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     private const double ExpandedEventsColumnWidthMin = 260;
 
     /// <summary>
-    /// 收起后的宽度：只放得下「展开」按钮。
-    /// ⚠️ 不能收成 0 —— 那个按钮就在栏里，栏宽归零按钮跟着消失，就再也展不开了。
+    /// 收起后的宽度 = 左内边距 12 + 那个 32×32 的图标。
+    /// 为什么不是更窄：图标必须停在**展开时它所在的那个位置**（x=12），
+    /// 内边距一撤，图标就跟着往左跳 12px，切换时看着像"按钮挪窝了"。
+    /// ⚠️ 不能收成 0 —— 展开按钮就在栏里，栏宽归零按钮跟着消失，就再也展不开了。
     /// </summary>
-    private const double CollapsedEventsColumnWidth = 96;
+    private const double CollapsedEventsColumnWidth = 44;
 
-    /// <summary>运行信息栏是否收起（收起后整栏收窄，画面多占约 264px）。</summary>
+    /// <summary>
+    /// 展开态的内边距（与 XAML 里 <c>Padding="12,8"</c> 一致）。
+    /// 收起时改成只留左边 12px —— 图标位置不变，右半边整块省掉。
+    /// </summary>
+    private static readonly Thickness ExpandedEventsPanelPadding = new(12, 8, 12, 8);
+
+    /// <summary>收起态的内边距：左右不对称，就为了让图标停在展开时那个 x 上。</summary>
+    private static readonly Thickness CollapsedEventsPanelPadding = new(12, 8, 0, 8);
+
+    /// <summary>
+    /// 右栏宽度的动画时长（秒）。再长显得拖沓，再短就看不出是"滑"过去的。
+    /// 动画的是列宽本身（逐帧写 <see cref="EventsColumn"/>），不是视觉变换 ——
+    /// 因为要让画面真的跟着变宽，只动 Visual 会溢出到画面上去。
+    /// </summary>
+    private const double EventsWidthAnimationSeconds = 0.18;
+
+    /// <summary>右栏宽度动画的计时器。<b>必须挂字段</b> —— 局部变量会被 GC，Tick 就再也不来了。</summary>
+    private DispatcherQueueTimer? _eventsWidthAnimator;
+
+    private double _animFromWidth;
+    private double _animToWidth;
+    private DateTimeOffset _animStartedAt;
+    private Action? _animCompleted;
+
+    /// <summary>运行信息栏是否收起（收起后整栏只剩一个图标，画面多占约 332px）。</summary>
     private bool _eventsCollapsed;
 
     /// <summary>拖动分隔条：按下那一刻的右栏宽度（null = 当前没在拖）。</summary>
@@ -253,6 +279,10 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
         _pageAlive = false;
         _refreshTimer?.Stop();
         _refreshTimer = null;
+
+        // 宽度动画的 Tick 会改列定义，页面走了还跑就是白烧 CPU（也可能碰到已释放的控件）
+        StopEventsWidthAnimation();
+
         VM.SurfaceRefreshRequested -= OnSurfaceRefreshRequested;
 
         // 只解绑订阅、不结束全屏：全屏窗口是独立窗口，切页不该把它关掉
@@ -369,8 +399,11 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     /// 运行信息栏的收起 / 展开。
     ///
     /// 收起时**整栏一起收窄**（不只是隐藏列表）：这个栏在画面右边，留着 360px 的空白
-    /// 等于白占画面宽度。窄栏里只留「展开」按钮 —— 所以宽度不能收成 0，
-    /// 否则那个按钮跟着消失，就再也点不回来了。
+    /// 等于白占画面宽度。窄栏里只留一个图标 —— 所以宽度不能收成 0，
+    /// 否则那个图标跟着消失，就再也点不回来了。
+    ///
+    /// 宽度变化走动画（<see cref="AnimateEventsColumnWidth"/>），收起 / 展开两个图标
+    /// 都固定在同一格里，切换时位置不动，只换箭头方向。
     /// </summary>
     private void OnToggleEventsClicked(object sender, RoutedEventArgs e)
     {
@@ -379,13 +412,57 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
         EventsTabs.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
         EventsTitle.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
         FollowExternalLogsToggle.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
-        ToggleEventsButton.Content = _eventsCollapsed ? "展开" : "收起";
+        CollapseEventsButton.Visibility = _eventsCollapsed ? Visibility.Collapsed : Visibility.Visible;
+        ExpandEventsButton.Visibility = _eventsCollapsed ? Visibility.Visible : Visibility.Collapsed;
 
-        ApplyEventsColumnWidth();
+        if (_eventsCollapsed)
+        {
+            // 先让栏滑到窄位，到位后再撤卡片底与内边距 ——
+            // 反过来做的话，那一条会先"空掉"再慢慢收，看着像闪了一下。
+            AnimateEventsColumnWidth(CollapsedEventsColumnWidth, ApplyCollapsedPanelChrome);
+            return;
+        }
+
+        // 展开：卡片样式先装回去（否则长出来的是一块透明区域），再让宽度长出来
+        ApplyExpandedPanelChrome();
+        EventsSplitter.Visibility = Visibility.Visible;
+        AnimateEventsColumnWidth(ClampExpandedWidth(ExpandedEventsTargetWidth()));
+    }
+
+    /// <summary>展开态的目标宽度：用户拖过的值优先，否则按页面宽度取约 1/3。</summary>
+    private double ExpandedEventsTargetWidth()
+    {
+        var saved = VM.Config.Window.ChannelEventsWidth;
+        return saved > 0 ? saved : ActualWidth * 0.34;
+    }
+
+    /// <summary>把展开宽度钳到有效区间：下限保日志可读，上限保画面不被压没。</summary>
+    private double ClampExpandedWidth(double width) => Math.Clamp(
+        width,
+        ExpandedEventsColumnWidthMin,
+        Math.Min(ExpandedEventsColumnWidthMax, Math.Max(ExpandedEventsColumnWidthMin, ActualWidth * 0.6)));
+
+    /// <summary>展开态的外观：卡片底 + 边框 + 对称内边距，全部交给 YomoriCardStyle 与本地的 Padding。</summary>
+    private void ApplyExpandedPanelChrome()
+    {
+        EventsPanel.Padding = ExpandedEventsPanelPadding;
+        EventsPanel.ClearValue(Border.BackgroundProperty);
+        EventsPanel.ClearValue(Border.BorderThicknessProperty);
+    }
+
+    /// <summary>收起态的外观：只留左边 12px 内边距（图标位置与展开态一致），卡片底与边框撤掉。</summary>
+    private void ApplyCollapsedPanelChrome()
+    {
+        EventsPanel.Padding = CollapsedEventsPanelPadding;
+        EventsPanel.Background = null;
+        EventsPanel.BorderThickness = new Thickness(0);
+
+        // 分隔条此刻拖不动（见 OnSplitterPointerPressed），留着只是多占 8px
+        EventsSplitter.Visibility = Visibility.Collapsed;
     }
 
     /// <summary>
-    /// 按当前状态把右栏宽度落到列定义上。
+    /// 按当前状态把右栏宽度落到列定义上（无动画）。
     ///
     /// 三个来源按优先级：收起（固定窄条）→ 用户拖过的宽度（存配置里）→ 页面宽度的约 1/3。
     /// 挂在 SizeChanged 上，所以窗口缩放时不会跑出有效范围。**只在页面里生效的前提**是：
@@ -394,14 +471,100 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
     /// </summary>
     private void ApplyEventsColumnWidth()
     {
+        // 窗口缩放 / 重新布局时以最终值为准，进行中的动画让位（否则它会和新的目标值打架）
+        StopEventsWidthAnimation();
+
         if (_eventsCollapsed)
         {
+            ApplyCollapsedPanelChrome();
             SetEventsColumnWidth(CollapsedEventsColumnWidth);
             return;
         }
 
-        var saved = VM.Config.Window.ChannelEventsWidth;
-        SetEventsColumnWidth(saved > 0 ? saved : ActualWidth * 0.34);
+        ApplyExpandedPanelChrome();
+        EventsSplitter.Visibility = Visibility.Visible;
+        SetEventsColumnWidth(ExpandedEventsTargetWidth());
+    }
+
+    /// <summary>
+    /// 逐帧把列宽从当前值动画到目标值（ease-out cubic，180ms）。
+    ///
+    /// <para>为什么逐帧写列宽而不做 XAML 动画：<c>ColumnDefinition.Width</c> 不是依赖属性，
+    /// Storyboard 动不了；而动画 Visual 的尺寸只会让内容溢出到画面上 —— 这里要的是
+    /// **画面真的变宽**，只能改布局。</para>
+    ///
+    /// <para>逐帧写 <see cref="GridLength"/> 会触发布局，但一次动画只有十来帧、
+    /// 每次只算一列，代价可以忽略。</para>
+    /// </summary>
+    /// <param name="target">目标宽度（px）。</param>
+    /// <param name="onCompleted">动画到位后执行（放在这里是为了"缩完再撤样式"）。</param>
+    private void AnimateEventsColumnWidth(double target, Action? onCompleted = null)
+    {
+        StopEventsWidthAnimation();
+
+        var from = EventsColumn?.Width.IsAbsolute == true ? EventsColumn.Width.Value : 0;
+        if (Math.Abs(target - from) < 1)
+        {
+            SetEventsColumnWidthRaw(target);
+            onCompleted?.Invoke();
+            return;
+        }
+
+        _animFromWidth = from;
+        _animToWidth = target;
+        _animStartedAt = DateTimeOffset.UtcNow;
+        _animCompleted = onCompleted;
+
+        var timer = DispatcherQueue.GetForCurrentThread().CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(16);
+        timer.IsRepeating = true;
+        timer.Tick += (_, _) => OnEventsWidthAnimationTick();
+        _eventsWidthAnimator = timer;
+        timer.Start();
+    }
+
+    private void OnEventsWidthAnimationTick()
+    {
+        var elapsed = (DateTimeOffset.UtcNow - _animStartedAt).TotalSeconds;
+        var progress = Math.Clamp(elapsed / EventsWidthAnimationSeconds, 0, 1);
+        var eased = 1 - Math.Pow(1 - progress, 3);
+
+        SetEventsColumnWidthRaw(_animFromWidth + (_animToWidth - _animFromWidth) * eased);
+
+        if (progress < 1)
+        {
+            return;
+        }
+
+        var completed = _animCompleted;
+        StopEventsWidthAnimation();
+        completed?.Invoke();
+    }
+
+    /// <summary>停掉进行中的宽度动画（重复点击、窗口缩放、页面离开都要停）。</summary>
+    private void StopEventsWidthAnimation()
+    {
+        if (_eventsWidthAnimator is { } timer)
+        {
+            timer.Stop();
+            _eventsWidthAnimator = null;
+        }
+
+        _animCompleted = null;
+    }
+
+    /// <summary>动画专用的写入口：绕过钳制，保留帧间的小数宽度。</summary>
+    private void SetEventsColumnWidthRaw(double width)
+    {
+        if (EventsColumn is null)
+        {
+            return;
+        }
+
+        if (Math.Abs(EventsColumn.Width.Value - width) >= 0.1)
+        {
+            EventsColumn.Width = new GridLength(width);
+        }
     }
 
     /// <summary>
@@ -416,13 +579,7 @@ public sealed partial class RdpChannelPage : Page, System.ComponentModel.INotify
             return;
         }
 
-        var clamped = _eventsCollapsed
-            ? CollapsedEventsColumnWidth
-            : Math.Clamp(
-                width,
-                ExpandedEventsColumnWidthMin,
-                Math.Min(ExpandedEventsColumnWidthMax,
-                         Math.Max(ExpandedEventsColumnWidthMin, ActualWidth * 0.6)));
+        var clamped = _eventsCollapsed ? CollapsedEventsColumnWidth : ClampExpandedWidth(width);
 
         if (Math.Abs(EventsColumn.Width.Value - clamped) >= 0.5)
         {
