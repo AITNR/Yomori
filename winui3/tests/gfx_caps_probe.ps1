@@ -80,24 +80,15 @@ Assert-File (Join-Path $LibDir "winpr3.lib") "winpr3 import library"
 
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
-$launcherCandidates = @(
-    "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1",
-    "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1",
-    "C:\Program Files (x86)\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1",
-    "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"
-)
-$launcher = $launcherCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
-if (-not $launcher) {
-    $found = Get-ChildItem "C:\Program Files (x86)\Microsoft Visual Studio\2022" -Recurse -Filter Launch-VsDevShell.ps1 -ErrorAction SilentlyContinue |
-        Select-Object -First 1 -ExpandProperty FullName
-    if ($found) { $launcher = $found }
-}
-if (-not $launcher) {
-    throw "Launch-VsDevShell.ps1 not found; VS2022 Build Tools are required."
-}
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+if (-not (Test-Path -LiteralPath $vswhere)) { throw 'vswhere.exe not found; a Visual Studio C++ installation is required.' }
+$vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if (-not $vsRoot) { throw 'No Visual Studio installation with the C++ toolchain was found.' }
+$launcher = Join-Path ([string]$vsRoot).Trim() 'Common7\Tools\Launch-VsDevShell.ps1'
+Assert-File $launcher 'Visual Studio developer shell'
 
 Write-Host "SDK root: $ResolvedSdkRoot"
-Write-Host "Importing VS2022 developer environment: $launcher"
+Write-Host "Importing Visual Studio developer environment: $launcher"
 & $launcher -Arch amd64 -HostArch amd64 -SkipAutomaticLocation | Out-Null
 
 $cl = Get-Command cl.exe -ErrorAction SilentlyContinue

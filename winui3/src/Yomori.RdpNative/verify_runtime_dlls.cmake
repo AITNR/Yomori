@@ -74,7 +74,9 @@ if(YCN_PYTHON AND YCN_VERIFY_TOOL AND EXISTS "${YCN_VERIFY_TOOL}")
   endif()
 
   execute_process(
-    COMMAND "${YCN_PYTHON}" ${_verify_args}
+    COMMAND "${CMAKE_COMMAND}" -E env "PYTHONIOENCODING=utf-8" "PYTHONUTF8=1"
+            "${YCN_PYTHON}" ${_verify_args}
+    ENCODING UTF-8
     RESULT_VARIABLE _verify_rc
     OUTPUT_VARIABLE _verify_out
     ERROR_VARIABLE _verify_err)

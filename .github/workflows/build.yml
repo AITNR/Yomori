@@ -59,6 +59,8 @@ env:
   # （Yomori.RdpNative 是对着这个版本开发与真机验证的）。
   # 换提交 = 换 FreeRDP 版本，必须重新真机验收内嵌画面。
   VCPKG_COMMIT: 10541e317a660f4165ba4ac2851ab54a8d4577b1
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: '1'
   NUGET_PACKAGES: ${{ github.workspace }}\.nuget
 
 jobs:
@@ -89,7 +91,7 @@ jobs:
           path: |
             .native-work/vcpkg-installed
             .native-work/vcpkg-downloads
-          key: ycn-deps-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**', 'winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/*.c', 'winui3/src/Yomori.RdpNative/*.h', 'winui3/src/Yomori.RdpNative/*.cmake', 'winui3/tests/fixtures/*', 'winui3/tests/*decode*.py', 'winui3/tests/gfx_caps_probe.*', 'winui3/tools/build_native.ps1', 'winui3/tools/verify_native_runtime.py', 'winui3/tools/package_release.py') }}
+          key: ycn-deps-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**') }}
 
       - name: 构建 FreeRDP FFmpeg 硬解依赖与桥接
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -123,14 +125,14 @@ jobs:
           ./winui3/tests/gfx_caps_probe.ps1 -SdkRoot "$env:GITHUB_WORKSPACE/.native-work/vcpkg-installed/x64-windows"
 
       - name: 保存固定依赖缓存
-        if: steps.native-cache.outputs.cache-hit != 'true' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        if: ${{ !cancelled() && steps.native-cache.outputs.cache-hit != 'true' && steps.vcpkg-cache.outputs.cache-hit != 'true' && hashFiles('.native-work/vcpkg-installed/vcpkg/status') != '' }}
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
             .native-work/vcpkg-installed
             .native-work/vcpkg-downloads
-          key: ycn-deps-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**', 'winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/*.c', 'winui3/src/Yomori.RdpNative/*.h', 'winui3/src/Yomori.RdpNative/*.cmake', 'winui3/tests/fixtures/*', 'winui3/tests/*decode*.py', 'winui3/tests/gfx_caps_probe.*', 'winui3/tools/build_native.ps1', 'winui3/tools/verify_native_runtime.py', 'winui3/tools/package_release.py') }}
+          key: ycn-deps-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**') }}
 
       - name: 保存原生层产物缓存
         if: steps.native-cache.outputs.cache-hit != 'true'

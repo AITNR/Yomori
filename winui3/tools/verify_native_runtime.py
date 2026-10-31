@@ -31,6 +31,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Redirected Windows stdout can default to CP1252 on hosted runners.
+# Keep success and failure diagnostics printable regardless of locale.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 BASE_REQUIRED = (
     "ycn_rdp.dll",
     "freerdp3.dll",
@@ -466,7 +473,7 @@ print("YCN_H264_API=" + json.dumps(info, sort_keys=True))
     env.pop("PYTHONPATH", None)
     env.pop("PYTHONHOME", None)
     cmd = [sys.executable, "-I", "-S", "-c", child, str(directory)] + required_modules
-    proc = subprocess.run(cmd, cwd=str(directory), env=env, capture_output=True, text=True, timeout=30)
+    proc = subprocess.run(cmd, cwd=str(directory), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if proc.returncode != 0:
         detail = (proc.stdout or "") + (proc.stderr or "")
         problems.append("干净加载失败（exit %d）：%s" % (proc.returncode, detail.strip()))
