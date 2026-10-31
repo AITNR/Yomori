@@ -118,13 +118,24 @@ jobs:
           path: |
             .vcpkg/installed
             .vcpkg/downloads
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows-ffmpeghw
 
-      - name: 安装 freerdp[client]（首次约 20-40 分钟，之后命中缓存秒过）
+      - name: 安装 freerdp[client,ffmpeg]（首次约 30-50 分钟，之后命中缓存秒过）
         if: steps.native-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          & .\.vcpkg\vcpkg.exe install "freerdp[client]:x64-windows" --clean-after-build
+          # 为什么要 ffmpeg feature：没有它 WITH_GFX_H264 推导为 OFF，客户端不声明
+          # AVC caps，服务端只能发 GDI 全帧位图 —— 两路 1080p 实测 350–470% 单核。
+          # 为什么要 overlay port：vcpkg 上游 port 只开 WITH_FFMPEG，不开
+          # WITH_FFMPEG_HWACCEL（默认 OFF），那只有软解、没有 D3D11VA 硬解；
+          # overlay 里还带了 h264_ffmpeg.c 的 MSVC 语法补丁（上游标号后直接跟 }）。
+          $overlay = Join-Path $PWD 'winui3/third_party/vcpkg-ports'
+          $triplets = Join-Path $PWD 'winui3/third_party/vcpkg-triplets'
+          & .\.vcpkg\vcpkg.exe install "freerdp[client,ffmpeg]:x64-windows" `
+            --overlay-ports=$overlay `
+            --overlay-triplets=$triplets `
+            --clean-after-build
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg 安装 freerdp[client,ffmpeg] 失败" }
 
       - name: 保存 vcpkg 依赖缓存
         # 位置要紧：放在编译之前 —— 万一编译失败，这 10 分钟的依赖也不会白装
@@ -135,7 +146,7 @@ jobs:
           path: |
             .vcpkg/installed
             .vcpkg/downloads
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows
+          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows-ffmpeghw
 
       - name: CMake 配置 + 编译 ycn_rdp
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -205,11 +216,20 @@ jobs:
           $required = @(
             'ycn_rdp.dll', 'freerdp3.dll', 'freerdp-client3.dll', 'winpr3.dll',
             'z.dll', 'cjson.dll', 'libssl-3-x64.dll', 'libcrypto-3-x64.dll')
-          $missing = @($required | Where-Object { -not (Test-Path "native-out/$_") })
-          if ($missing.Count -gt 0) {
-            throw "原生层运行库不完整，缺少：$($missing -join ',') —— 请检查 vcpkg freerdp[client] 安装是否完整"
+          # FFmpeg 的 DLL 带 major 版本号（avcodec-63.dll 之类），升级 FFmpeg 就会变，
+          # 所以按通配校验。缺了它们 FreeRDP 的 H.264 后端整条链断开，画面退回 GDI 全帧。
+          $patterns = @('avcodec-*.dll', 'avutil-*.dll', 'swscale-*.dll', 'swresample-*.dll')
+
+          $missing = @()
+          $missing += @($required | Where-Object { -not (Test-Path "native-out/$_") })
+          foreach ($pat in $patterns) {
+            $hit = Get-ChildItem 'native-out' -Filter $pat -ErrorAction SilentlyContinue
+            if (-not $hit) { $missing += $pat }
           }
-          Write-Host "原生层运行库校验通过：$($required -join ',')"
+          if ($missing.Count -gt 0) {
+            throw "原生层运行库不完整，缺少：$($missing -join ',') —— 请检查 vcpkg 是否用 winui3/third_party/vcpkg-ports 这个 overlay 装了 freerdp[client,ffmpeg]"
+          }
+          Write-Host "原生层运行库校验通过：$($required -join ',') + $($patterns -join ',')"
           Write-Host ("ycn_rdp.dll 大小 {0:N0} 字节" -f (Get-Item $dll).Length)
 
       - name: 保存原生层产物缓存

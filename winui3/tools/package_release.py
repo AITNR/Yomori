@@ -255,6 +255,12 @@ def _verify(app_dir: Path, *, require_dotnet_runtime: bool, agent_included: bool
         if not (app_dir / rel).exists():
             problems.append(f"{rel}（{note}）")
 
+    def need_glob(pattern: str, note: str) -> None:
+        """按通配检查。FFmpeg 的 DLL 带 major 版本号（avcodec-63.dll 之类），
+        升级 FFmpeg 就变，写死文件名会让自检随着升级静默失效。"""
+        if not list(app_dir.glob(pattern)):
+            problems.append(f"{pattern}（{note}）")
+
     need("Yomori.exe", "主程序")
     need("Yomori.dll", "主程序集")
     need("Yomori.pri", "XAML 资源索引 —— 缺了界面打不开")
@@ -269,6 +275,13 @@ def _verify(app_dir: Path, *, require_dotnet_runtime: bool, agent_included: bool
     need("cjson.dll", "cJSON（FreeRDP 依赖）")
     need("libssl-3-x64.dll", "OpenSSL libssl（FreeRDP 依赖）")
     need("libcrypto-3-x64.dll", "OpenSSL libcrypto（FreeRDP 依赖）")
+    # FFmpeg：GFX 通道的 H.264 解码后端。缺了 FreeRDP 的 WITH_GFX_H264 就是 OFF，
+    # 客户端不声明 AVC caps，服务端退回 GDI 全帧 —— 功能不报错，只是 CPU 翻几倍，
+    # 属于最难发现的那种缺失，所以必须挡在发布前。
+    need_glob("avcodec-*.dll", "FFmpeg libavcodec（H.264 解码）")
+    need_glob("avutil-*.dll", "FFmpeg libavutil（FFmpeg 依赖）")
+    need_glob("swscale-*.dll", "FFmpeg libswscale（FFmpeg 依赖）")
+    need_glob("swresample-*.dll", "FFmpeg libswresample（FFmpeg 依赖）")
     need("assets/icon.ico", "应用图标（也是程序根目录的定位标记）")
 
     # 会话代理载荷（agent\ 子目录）：目标账户登录后跑的就是它。

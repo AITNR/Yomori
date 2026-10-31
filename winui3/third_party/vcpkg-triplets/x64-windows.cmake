@@ -37,13 +37,35 @@ set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 #
 # 显式钉死 CMAKE_SYSTEM_VERSION 不行 —— CMake 仍要靠注册表找该版本 SDK 的目录。
 # 直接把 SDK 的 include / lib 塞进环境变量，等价于 vcvarsall 做的事。
-# 版本号取本机实际安装的最高版本（与 tools/build_deps.ps1 的探测保持一致）。
-set(_ycn_sdk_root "C:/Program Files (x86)/Windows Kits/10")
-set(_ycn_sdk_ver "10.0.26100.0")
+#
+# 版本号**动态探测**：runner（windows-latest）与本机装的 SDK 版本不一定相同，
+# 写死会在 CI 上全部落空。取 bin 下带 x64\rc.exe 的最高版本。
+set(_ycn_kits "C:/Program Files (x86)/Windows Kits/10")
+set(_ycn_sdk_ver "")
 
-if(EXISTS "${_ycn_sdk_root}/Lib/${_ycn_sdk_ver}/um/x64")
-    set(CMAKE_SYSTEM_VERSION "${_ycn_sdk_ver}")
+if(EXISTS "${_ycn_kits}/bin")
+    file(GLOB _ycn_vers LIST_DIRECTORIES true "${_ycn_kits}/bin/10.*")
+    if(_ycn_vers)
+        list(SORT _ycn_vers COMPARE NATURAL ORDER DESCENDING)
+        foreach(_v IN LISTS _ycn_vers)
+            if(EXISTS "${_v}/x64/rc.exe")
+                get_filename_component(_ycn_sdk_ver "${_v}" NAME)
+                break()
+            endif()
+        endforeach()
+    endif()
+endif()
 
-    set(ENV{INCLUDE} "$ENV{INCLUDE};${_ycn_sdk_root}/Include/${_ycn_sdk_ver}/ucrt;${_ycn_sdk_root}/Include/${_ycn_sdk_ver}/um;${_ycn_sdk_root}/Include/${_ycn_sdk_ver}/shared;${_ycn_sdk_root}/Include/${_ycn_sdk_ver}/winrt")
-    set(ENV{LIB} "$ENV{LIB};${_ycn_sdk_root}/Lib/${_ycn_sdk_ver}/ucrt/x64;${_ycn_sdk_root}/Lib/${_ycn_sdk_ver}/um/x64")
+if(_ycn_sdk_ver)
+    message(STATUS "Yomori triplet: Windows SDK ${_ycn_sdk_ver}")
+
+    if(EXISTS "${_ycn_kits}/Lib/${_ycn_sdk_ver}/um/x64")
+        set(CMAKE_SYSTEM_VERSION "${_ycn_sdk_ver}")
+
+        set(ENV{INCLUDE} "$ENV{INCLUDE};${_ycn_kits}/Include/${_ycn_sdk_ver}/ucrt;${_ycn_kits}/Include/${_ycn_sdk_ver}/um;${_ycn_kits}/Include/${_ycn_sdk_ver}/shared;${_ycn_kits}/Include/${_ycn_sdk_ver}/winrt")
+        set(ENV{LIB} "$ENV{LIB};${_ycn_kits}/Lib/${_ycn_sdk_ver}/ucrt/x64;${_ycn_kits}/Lib/${_ycn_sdk_ver}/um/x64")
+    endif()
+else()
+    # 探测不到就让 CMake 走自己的常规查找（runner 上 reg 正常，能找到）。
+    message(STATUS "Yomori triplet: 未探测到 Windows SDK，交给 CMake 常规查找")
 endif()
