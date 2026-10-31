@@ -4,6 +4,11 @@
     "name": "cJSON",
     "version": "1.7.19"
   },
+  "ffmpeg": {
+    "license": "LGPL-2.1-or-later",
+    "name": "FFmpeg",
+    "version": "9.0.2"
+  },
   "freerdp": {
     "license": "Apache License 2.0",
     "name": "FreeRDP（含 WinPR）",
