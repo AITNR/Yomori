@@ -44,6 +44,7 @@
 #include <winpr/thread.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <limits.h>
@@ -225,6 +226,33 @@ static void setup_openssl_modules(void)
 	SetEnvironmentVariableW(L"OPENSSL_MODULES", path);
 }
 
+/* FFmpeg 的 H.264 后端在 Windows 上默认选 AV_HWDEVICE_TYPE_DXVA2 —— 见
+ * libfreerdp/codec/h264_ffmpeg.c 的 `#elif defined(_WIN32)` 分支，是硬编码的
+ * 平台默认值，不是「依次尝试」。而新版 FFmpeg 对 DXVA2 的支持在收敛，D3D11VA 更完整，
+ * 所以这里把设备类型钉到 d3d11va。
+ *
+ * 为什么用环境变量而不是 ffmpeg.json：后者的路径由 freerdp_GetConfigFilePath 按
+ * vendor/product/version 组合（还受 FREERDP_USE_VENDOR_PRODUCT_CONFIG_DIR、
+ * WITH_RESOURCE_VERSIONING、XDG_CONFIG_HOME 影响），随构建方式变化，本进程无从可靠
+ * 推断；环境变量是确定的，且 FreeRDP 的优先级链是
+ * 「ffmpeg.json(系统) → ffmpeg.json(用户) → 环境变量 → 编译默认」，本机没有前两者，
+ * 环境变量即生效。
+ *
+ * 双写 _wputenv_s + SetEnvironmentVariableW：与 OPENSSL_MODULES 同理，
+ * FFmpeg/winpr 走 getenv 读 UCRT 的 _environ，只调 SetEnvironmentVariable 读不到。
+ *
+ * 已存在时不覆盖：留一个诊断口子，排查软解回落时可临时设 FREERDP_HWCTX_TYPE=none。 */
+static void setup_h264_hwaccel_env(void)
+{
+	wchar_t cur[64];
+	DWORD n = GetEnvironmentVariableW(L"FREERDP_HWCTX_TYPE", cur, (DWORD)ARRAYSIZE(cur));
+	if (n > 0 && n < (DWORD)ARRAYSIZE(cur))
+		return;
+
+	_wputenv_s(L"FREERDP_HWCTX_TYPE", L"d3d11va");
+	SetEnvironmentVariableW(L"FREERDP_HWCTX_TYPE", L"d3d11va");
+}
+
 static BOOL CALLBACK init_once_cb(PINIT_ONCE once, PVOID param, PVOID* context)
 {
 	WSADATA wsa;
@@ -239,6 +267,7 @@ static BOOL CALLBACK init_once_cb(PINIT_ONCE once, PVOID param, PVOID* context)
 	/* 内建静态通道提供器：不注册则 rdpdr/rdpsnd 被当外部 DLL 找而失败 */
 	freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0);
 	setup_openssl_modules();
+	setup_h264_hwaccel_env();
 	return 0;
 }
 
@@ -1853,6 +1882,33 @@ static BOOL ycn_load_channels(freerdp* instance)
 	freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE);
+
+	/* ── GFX 编码协商：只声明 AVC420（H.264 4:2:0 单流）──
+	 *
+	 * 背景：本机原先编译的 FreeRDP 没有任何 H.264 后端（WITH_GFX_H264 推导为 OFF），
+	 * 客户端在 caps 里不声明 AVC → 服务端只能走 GDI 全帧位图 → 两路 1080p 每帧
+	 * 三次整帧拷贝、每秒约 1.2GB/s，CPU 到 350%+ 单核。
+	 *
+	 * 现在 overlay port 编进了 FFmpeg 后端 + WITH_FFMPEG_HWACCEL。这里显式把协商
+	 * 钉在 AVC420：
+	 *   - GfxH264     TRUE  → 声明 AVC420（单流，解码量最小）
+	 *   - GfxAVC444   FALSE → 不声明 v1 双流（解码量翻倍，且上游有色度位置缺陷）
+	 *   - GfxAVC444v2 FALSE → 不声明 v2（仍为双流 + 客户端色度合成）
+	 * 两路会话的内容是自动化任务的游戏画面，4:2:0 足够；若将来要锐利文字，
+	 * 只开 GfxAVC444v2 即可，无需改别处。
+	 *
+	 * 🔑 SoftwareGdi 是「硬解开关的输入」而不是界面开关：
+	 *  FreeRDP 的 gdi_SurfaceCommand_AVC444 里 HW_ACCEL = !SoftwareGdi，
+	 *  所以它必须是 FALSE 才能走硬解。不要把它接到任何 UI 勾选项上，
+	 *  否则关掉界面开关会连带改变 GDI 渲染后端（副作用未验证）。
+	 *  这里显式置 FALSE 只为把依赖关系写在明面上，与默认值一致、无行为变化。 */
+	freerdp_settings_set_bool(settings, FreeRDP_SoftwareGdi, FALSE);
+	/* 注意：不要给下面三行套 #ifdef WITH_GFX_H264 —— 那是 FreeRDP 库内部的编译宏，
+	 * 不在我们的编译单元里定义；套上去等于永远不设置。settings 键本身与库能力无关，
+	 * 设 TRUE 而无后端时库自会忽略（协商拿不到 AVC，退回 GDI），不需要条件编译。 */
+	freerdp_settings_set_bool(settings, FreeRDP_GfxH264, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2, FALSE);
 
 	/* 关掉 disp（Microsoft::Windows::RDS::DisplayControl，动态分辨率）：
 	 * 我们固定 1920×1080，不需要它；多一条通道只会多几次 ResetGraphics 协商，

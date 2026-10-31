@@ -205,7 +205,7 @@ LoginComplete → Disconnected / Failed），状态迁移函数做成纯函数�
 
 - **版本钉死**：FreeRDP **3.x**（M0 开工时锁定具体小版本，写死在构建脚本与 NOTICE 里）；
 - **获取顺序**：① 官方 GitHub Release 的 Windows 附件（若有）→ ② 官方 CI 产物 → ③ 自行 CMake + VS2022 构建（脚本放 `_tools/`，配置项：OpenSSL、zlib、**rdpsnd 音频（默认开，必须保留）**、**关 H.264**）；
-- **首期编解码策略**：**不开 GFX/AVC444/H.264**。本产品目标场景是环回与局域网（1080p 帧率要求低），NSCodec / ClearCodec / planar 足够；这条同时把 OpenH264/FFmpeg 的构建与许可复杂度全部推迟到确有需要时；
+- **首期编解码策略（已于 2026-10-31 修订）**：~~不开 GFX/AVC444/H.264~~ → **启用 AVC420 + D3D11VA 硬件解码**。原判断的前提是"环回 + 局域网 + 1080p 帧率要求低、NSCodec/ClearCodec/planar 足够"；实测两路 1080p 持续动态画面时该前提不成立 —— 客户端因未编入任何 H.264 后端（`WITH_GFX_H264` 推导为 OFF）而不声明 AVC caps，服务端只能走 GDI 全帧，主进程达到 350–470% 单核。代价与收益：安装包增加 15.0 MB（avcodec-63 / avutil-61 / swscale-10 / swresample-7）；FFmpeg 以 LGPL-2.1-or-later 链接，不含 GPL 组件。详见 `H.264硬解改造计划书.md`；
 - **许可证**：FreeRDP/winpr = Apache-2.0，OpenSSL = Apache-2.0 —— 与闭源分发兼容，发布时随包带 LICENSE/NOTICE 文件即可（放 `rdp-embed-freerdp-plan.md` 评审时确认清单）。
 
 ### 5.2 渲染：两步走
@@ -521,7 +521,7 @@ AutoLogon + 短停留导致画面停在登录过渡期属正常时序，M1 持�
 | 参考文档 | 本计划书 | 原因 |
 |---|---|---|
 | C++/WinRT Runtime Component 桥接 | C ABI 原生 DLL | §3.2：XAML 控件必须留 C# 侧，WinRT 封送对帧缓冲不友好 |
-| 建议 GFX/AVC444 硬解 | 首期关闭，NSCodec/ClearCodec | §5.1：场景是环回+局域网；规避 OpenH264/FFmpeg 构建与许可面 |
+| 建议 GFX/AVC444 硬解 | 首期关闭，NSCodec/ClearCodec；**2026-10-31 改为启用 AVC420 + D3D11VA 硬解** | 原理由（环回 + 局域网足够）在两路 1080p 动态画面下不成立，实测 CPU 达 350–470% 单核；AVC444 双流解码翻倍仍不采用，只开 AVC420 |
 | 渲染两方案并列 | 两步走（原型→生产） | 先解耦「解码对不对」与「渲染够不够快」两个问题 |
 | （未涉及） | 环回单会话可见性语义 §5.5 | 本项目主场景就是环回，必须先讲清再动手 |
 | （未涉及） | 与现有代理/桥/心跳机制的零改动红线 §5.4 | 会话侧机制已真机验证稳定，不重写 |

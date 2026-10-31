@@ -19,7 +19,14 @@ endif()
 
 set(missing "")
 foreach(name IN LISTS YCN_RUNTIME_DLLS)
-  if(NOT EXISTS "${YCN_OUT_DIR}/${name}")
+  # 名字里带 * 的按通配处理：FFmpeg 的 DLL 带 major 版本号后缀
+  # （avcodec-63.dll 之类），写死会在升级 FFmpeg 时误报。
+  if(name MATCHES "\\*")
+    file(GLOB _hits "${YCN_OUT_DIR}/${name}")
+    if(NOT _hits)
+      list(APPEND missing "${name}")
+    endif()
+  elseif(NOT EXISTS "${YCN_OUT_DIR}/${name}")
     list(APPEND missing "${name}")
   endif()
 endforeach()
@@ -29,8 +36,9 @@ if(missing)
   message(FATAL_ERROR
     "原生层运行库不完整，缺少：${joined}\n"
     "ycn_rdp.dll 会因缺依赖而加载失败，应用点「开始执行」会直接卡死。\n"
-    "请把 -DVCPKG_INST 指向**完整**的 freerdp[client]:x64-windows 安装目录\n"
-    "（其 bin 下应同时含 freerdp3 / winpr3 / freerdp-client3 / z / cjson / openssl），\n"
+    "请把 -DVCPKG_INST 指向**完整**的 freerdp[client,ffmpeg]:x64-windows 安装目录\n"
+    "（其 bin 下应同时含 freerdp3 / winpr3 / freerdp-client3 / z / cjson / openssl\n"
+    " 以及 avcodec-* / avutil-* / swscale-* / swresample-*），\n"
     "重新 cmake 配置并编译。")
 endif()
 

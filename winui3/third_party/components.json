@@ -53,6 +53,23 @@
       "purpose": "轻量 JSON 解析，用于 FreeRDP 桥接层的参数与状态交换",
       "homepage": "https://github.com/DaveGamble/cJSON",
       "mustContain": ["Permission is hereby granted"]
+    },
+    {
+      "key": "ffmpeg",
+      "name": "FFmpeg",
+      "license": "LGPL-2.1-or-later",
+      "files": [
+        "avcodec-63.dll",
+        "avutil-61.dll",
+        "swscale-10.dll",
+        "swresample-7.dll"
+      ],
+      "purpose": "内嵌远程桌面的 H.264（AVC420）解码后端，含 D3D11VA 硬件加速解码",
+      "homepage": "https://ffmpeg.org",
+      "mustContain": [
+        "GNU LESSER GENERAL PUBLIC LICENSE",
+        "Version 2.1"
+      ]
     }
   ],
 

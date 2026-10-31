@@ -64,7 +64,15 @@ set(YCN_RUNTIME_DLLS
   z.dll
   cjson.dll
   libssl-3-x64.dll
-  libcrypto-3-x64.dll)
+  libcrypto-3-x64.dll
+  # FFmpeg —— GFX 通道的 H.264 解码后端（overlay port 开 WITH_FFMPEG_HWACCEL）。
+  # 缺了它们，WITH_GFX_H264 会是 OFF，客户端不声明 AVC caps，服务端退回 GDI 全帧，
+  # 两路 1080p 的 CPU 会重新飙到 350%+ 单核。
+  # 名字带 FFmpeg major 版本号（avcodec-63.dll 之类），故用通配，见 verify_runtime_dlls.cmake。
+  avcodec-*.dll
+  avutil-*.dll
+  swscale-*.dll
+  swresample-*.dll)
 
 add_custom_command(TARGET ycn_rdp POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E echo "Deploying FreeRDP runtime DLLs <- ${VCPKG_INST}/bin"
