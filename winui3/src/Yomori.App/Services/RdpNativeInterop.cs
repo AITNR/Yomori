@@ -72,6 +72,24 @@ namespace Yomori.Services
         public const int Error = 3;   // 协议层错误
     }
 
+    /// <summary>ycn_rdp_connect_ex 的 decode_policy 取值（冻结契约）。</summary>
+    internal static class YcnDecodePolicies
+    {
+        public const uint LegacyNonAvc = 0;
+        public const uint AutoHardwarePreferred = 1;
+        public const uint SoftwareAvc = 2;
+    }
+
+    /// <summary>ycn_rdp_decode_capabilities 的位定义。</summary>
+    [Flags]
+    internal enum YcnDecodeCapabilities : uint
+    {
+        None = 0,
+        AvcDecode = 1u << 0,
+        HardwareDiagnostics = 1u << 1,
+        HardwareCompiled = 1u << 2,
+    }
+
     /// <summary>P/Invoke 入口（签名与 ycn_rdp.h 冻结版一致，勿单独改动）。</summary>
     internal static class RdpNativeInterop
     {
@@ -79,6 +97,16 @@ namespace Yomori.Services
         private const CallingConvention CC = CallingConvention.Cdecl;
 
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_connect(ref YcnRdpParams parameters, ref YcnRdpCallbacks callbacks, IntPtr user);
+
+        // 新入口必须通过版本/能力探测后才可调用。旧 DLL 没有这些导出时，
+        // 上面的 ycn_rdp_connect 仍是完整、可用的回退入口；不能给旧参数结构追加字段。
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_connect_ex")]
+        internal static extern int ycn_rdp_connect_ex(ref YcnRdpParams parameters, ref YcnRdpCallbacks callbacks, IntPtr user, uint decodePolicy);
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_decode_api_version")]
+        private static extern uint ycn_rdp_decode_api_version();
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_decode_capabilities")]
+        private static extern uint ycn_rdp_decode_capabilities();
+
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_disconnect(int session);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_mouse(int session, uint flags, ushort x, ushort y);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_key(int session, int down, int extended, ushort scancode);
@@ -95,5 +123,57 @@ namespace Yomori.Services
 
         /// <summary>静音链路自验证（本地构造假设备，不依赖服务器推音频）。返回位掩码，31=全过。</summary>
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_selftest_mute();
+
+        private static readonly object s_decodeProbeGate = new();
+        private static bool s_decodeProbeDone;
+        private static uint s_decodeApiVersion;
+        private static uint s_decodeCapabilities;
+
+        /// <summary>
+        /// 版本化连接入口是否可用。只有 API == 1 且构建同时声明 AVC 解码与真实硬件
+        /// 诊断补丁时才走 connect_ex；否则退回旧的非 AVC ycn_rdp_connect，包括旧 DLL
+        /// 缺导出、能力不完整的情况。HardwareCompiled 位只表示“编进了硬解”，
+        /// 没有诊断补丁时托管侧也不会把这条路径当成可观测的硬解链路。
+        /// </summary>
+        internal static bool ShouldUseVersionedConnect(uint apiVersion, uint capabilities) =>
+            apiVersion == 1
+            && (capabilities & (uint)YcnDecodeCapabilities.AvcDecode) != 0
+            && (capabilities & (uint)YcnDecodeCapabilities.HardwareDiagnostics) != 0;
+
+        /// <summary>
+        /// 探测新导出。缺导出/旧 DLL/坏镜像都按“不支持版本化入口”处理，随后完整走旧
+        /// ycn_rdp_connect；探测结果进程级缓存，DLL 本身也无法在已加载后安全热替换。
+        /// </summary>
+        internal static bool TryProbeDecodeApi(out uint apiVersion, out uint capabilities)
+        {
+            lock (s_decodeProbeGate)
+            {
+                if (!s_decodeProbeDone)
+                {
+                    uint version = 0;
+                    uint caps = 0;
+                    try
+                    {
+                        version = ycn_rdp_decode_api_version();
+                        caps = ycn_rdp_decode_capabilities();
+                    }
+                    catch (Exception ex) when (ex is EntryPointNotFoundException
+                                               || ex is DllNotFoundException
+                                               || ex is BadImageFormatException)
+                    {
+                        version = 0;
+                        caps = 0;
+                    }
+
+                    s_decodeApiVersion = version;
+                    s_decodeCapabilities = caps;
+                    s_decodeProbeDone = true;
+                }
+
+                apiVersion = s_decodeApiVersion;
+                capabilities = s_decodeCapabilities;
+                return ShouldUseVersionedConnect(apiVersion, capabilities);
+            }
+        }
     }
 }

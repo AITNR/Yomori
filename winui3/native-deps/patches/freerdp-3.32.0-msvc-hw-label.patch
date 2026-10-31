@@ -1,0 +1,8 @@
+diff --git a/libfreerdp/codec/h264_ffmpeg.c b/libfreerdp/codec/h264_ffmpeg.c
+--- a/libfreerdp/codec/h264_ffmpeg.c
++++ b/libfreerdp/codec/h264_ffmpeg.c
+@@ -1387,3 +1387,3 @@
+-	fail_hwdevice_create:
++	fail_hwdevice_create:;
+ 	}
+ #endif

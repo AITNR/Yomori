@@ -78,37 +78,30 @@ cp -rf <临时目录>/. bin/x64/Release/net8.0-windows10.0.19041.0/
 
 ### 原生层 `ycn_rdp.dll`（内嵌画面必需）
 
-应用依赖 `src/Yomori.RdpNative/` 编出来的 `ycn_rdp.dll`（FreeRDP 桥接层）。
-**它是构建产物、没有入库**，所以全新克隆之后要自己编一次：
+统一入口固定 vcpkg 提交、FreeRDP 3.32.0、FFmpeg 9.0.2 和仓库内补丁：
 
-```bash
-# 1) 装 vcpkg 的 freerdp（一次，之后复用）——需要 VS 2022 + C++ 工作负载
-git clone https://github.com/microsoft/vcpkg _tools/vcpkg
-_tools/vcpkg/bootstrap-vcpkg.bat -disableMetrics
-_tools/vcpkg/vcpkg.exe install "freerdp[client]:x64-windows"
-
-# 2) 编桥接层（CMakeLists 默认从 <仓库>/../_tools/vcpkg 找依赖，也可用 -DVCPKG_INST 覆盖）
-cmake -S winui3/src/Yomori.RdpNative -B winui3/src/Yomori.RdpNative/build \
-      -G "Visual Studio 17 2022" -A x64 \
-      "-DVCPKG_INST=<vcpkg>/installed/x64-windows"
-cmake --build winui3/src/Yomori.RdpNative/build --config Release
+```powershell
+./winui3/tools/build_native.ps1
+# 复用既有 vcpkg checkout，依赖安装到独立工作区，不覆盖其 installed：
+./winui3/tools/build_native.ps1 -VcpkgRoot C:/path/to/vcpkg
 ```
 
-产物是 `build/Release/ycn_rdp.dll` + 一批 FreeRDP 运行库（freerdp3 / winpr3 / openssl / zlib / cjson…），
-`dotnet build` 会把它们自动拷进应用输出目录。
+需 VS 2022 C++ 工具链、Python 和网络。含中文的仓库路径使用 ASCII 工作目录；默认本地产物位于 `winui3/src/Yomori.RdpNative/build/Release/`。CI 也调用该脚本，缓存身份包含固定依赖、补丁、桥接源码和验证工具。
 
-> 开发时对着的是 **FreeRDP 3.32.0**（对应 vcpkg 提交 `10541e31`）。CI 钉的就是这个提交；
-> 换版本要重新真机验收内嵌画面。
+内嵌画面默认 `decode_backend=auto`：使用带诊断补丁的 FFmpeg/DXVA2 优先解码 AVC420/AVC444，硬件初始化失败时软件回退。`decode_backend=software` 强制禁用视频硬解；`render_backend=software` 和 `--embed-nod3d` 同时禁止视频硬解。设置在下次连接生效。旧 DLL 缺少版本化接口时，回到原来的非 AVC 路径。
 
-**换 vcpkg / 换 FreeRDP 版本后，还要重跑一次许可证冻结**：
+日志区分请求策略、协商 codec、设备初始化和 `hw_frames`；只有成功硬件输出帧计数增加才算硬解。运行中硬解失败只尝试一次软件 decoder 恢复，等待关键帧超过 5 秒明确断开并报错，不重发任务。当前首版保留 CPU BGRA 回读和显示链，未实现 GPU 表面直显；CPU 降幅须在实际多路会话测量。
 
-```bash
-python winui3/tools/gen_third_party_notices.py --export-licenses
+D3D11VA 仅作诊断实验，当前本机测试曾出现初始化成功但帧解码失败，默认仍用 DXVA2。构建与发布守卫验证 PE 传递依赖、FFmpeg、真实补丁导出以及动态加载的 OpenSSL `legacy.dll`（MD4/RC4）；只拷贝运行所需 DLL，不打包系统显卡驱动。
+
+验证命令：
+
+```powershell
+dotnet run --project winui3/tests/DecodeChecks/DecodeChecks.csproj -c Release
+python winui3/tests/h264_decode_probe.py --dll winui3/src/Yomori.RdpNative/build/Release/freerdp3.dll --hardware --backend dxva2
 ```
 
-`winui3/third_party/licenses/` 里的许可证原文与 `sources.json` 里的版本号都取自这次导出的 vcpkg。
-不重跑的话，发布包里声明的仍是旧版本 —— 正文本身不会变（Apache-2.0 / zlib / MIT 的条款是固定的），
-但版本号会滞后。CI 原生层命中缓存时机器上没有 vcpkg，正是靠这份冻结副本出包，所以它不能缺。
+计划和验收范围见 [硬解实施计划](docs/rdp-hardware-decode-plan-2026-10-31.md)。真实会话仍使用 Progressive 时的协商修正、GFX 对照与 CPU 采样说明见 [CPU 反馈后续记录](docs/rdp-cpu-followup-2026-10-31.md)。
 
 ### GitHub Actions：自动编译 / 测试版 / 正式版
 
@@ -802,3 +795,5 @@ Python + PySide6 版原先共用这几份数据；它已于 2026-09-28 从仓库
 ## 十、后续建议
 
 已归档到 [docs/known-limits-and-roadmap.md](docs/known-limits-and-roadmap.md#后续建议)。
+
+2026-10-31真实会话跟进：AVC420-only会令此版本FreeRDP仅广告8.1，本机Windows确认时禁用了AVC；现已验证AVC444/v2双流解码并恢复10.x能力。实际发送、服务端确认和成功硬解帧均记录到日志；CPU降幅仍以同负载真实会话为准。见[CPU跟进记录](docs/rdp-cpu-followup-2026-10-31.md)。

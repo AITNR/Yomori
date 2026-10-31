@@ -70,147 +70,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 还原原生层产物缓存（只改 C# 时直接复用，整步跳过）
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 还原原生层产物缓存
         id: native-cache
         uses: actions/cache/restore@v4
         with:
-          # ⚠️ 目录名不能以 . 开头：upload-artifact 默认**跳过隐藏文件**，
-          #    早先用 .native-out 时上传报「No files were found」，CI 就在这卡了一轮。
           path: native-out
-          key: ycn-native-${{ runner.os }}-${{ hashFiles('winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/ycn_rdp.c', 'winui3/src/Yomori.RdpNative/ycn_rdp.h') }}
+          key: ycn-native-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**', 'winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/*.c', 'winui3/src/Yomori.RdpNative/*.h', 'winui3/src/Yomori.RdpNative/*.cmake', 'winui3/tests/fixtures/*', 'winui3/tests/*decode*.py', 'winui3/tests/gfx_caps_probe.*', 'winui3/tools/build_native.ps1', 'winui3/tools/verify_native_runtime.py', 'winui3/tools/package_release.py') }}
 
-      - name: 取 vcpkg（钉住提交，不用 vcpkg 默认分支）
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          git init .vcpkg
-          git -C .vcpkg remote add origin https://github.com/microsoft/vcpkg.git
-
-          # 优先：按提交号直接浅取（最快）
-          git -C .vcpkg fetch --depth 1 origin $env:VCPKG_COMMIT
-          $ok = ($LASTEXITCODE -eq 0)
-          if ($ok) { git -C .vcpkg checkout --detach FETCH_HEAD; $ok = ($LASTEXITCODE -eq 0) }
-
-          # 兜底：blobless 克隆（慢一点，但不怕按提交号取不到）
-          if (-not $ok) {
-            Write-Host '按提交号浅取失败 —— 退回 blobless 克隆'
-            Remove-Item .vcpkg -Recurse -Force -ErrorAction SilentlyContinue
-            git clone --filter=blob:none --no-checkout https://github.com/microsoft/vcpkg.git .vcpkg
-            git -C .vcpkg fetch --depth 1 origin $env:VCPKG_COMMIT
-            if ($LASTEXITCODE -eq 0) { git -C .vcpkg checkout --detach FETCH_HEAD }
-          }
-
-          if (-not (Test-Path '.vcpkg/ports/freerdp/vcpkg.json')) { throw '取不到 vcpkg 的 freerdp port' }
-
-          # 版本守卫：开发环境是对着 3.32.0 验证的，换版本必须重新真机验收画面
-          $port = Get-Content '.vcpkg/ports/freerdp/vcpkg.json' -Raw | ConvertFrom-Json
-          if ($port.version -ne '3.32.0') {
-            Write-Host "::warning::vcpkg 里的 freerdp 版本是 $($port.version)，与本机验证过的 3.32.0 不同 —— 画面相关改动需重新真机验收"
-          }
-
-          & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
-
-      - name: 还原 vcpkg 依赖缓存
+      - name: 还原固定依赖缓存
         id: vcpkg-cache
         if: steps.native-cache.outputs.cache-hit != 'true'
         uses: actions/cache/restore@v4
         with:
           path: |
-            .vcpkg/installed
-            .vcpkg/downloads
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows
+            .native-work/vcpkg-installed
+            .native-work/vcpkg-downloads
+          key: ycn-deps-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**', 'winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/*.c', 'winui3/src/Yomori.RdpNative/*.h', 'winui3/src/Yomori.RdpNative/*.cmake', 'winui3/tests/fixtures/*', 'winui3/tests/*decode*.py', 'winui3/tests/gfx_caps_probe.*', 'winui3/tools/build_native.ps1', 'winui3/tools/verify_native_runtime.py', 'winui3/tools/package_release.py') }}
 
-      - name: 安装 freerdp[client]（首次约 20-40 分钟，之后命中缓存秒过）
+      - name: 构建 FreeRDP FFmpeg 硬解依赖与桥接
         if: steps.native-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          & .\.vcpkg\vcpkg.exe install "freerdp[client]:x64-windows" --clean-after-build
+          ./winui3/tools/build_native.ps1 `
+            -VcpkgRoot "$env:GITHUB_WORKSPACE/.vcpkg" `
+            -WorkRoot "$env:GITHUB_WORKSPACE/.native-work" `
+            -InstallRoot "$env:GITHUB_WORKSPACE/.native-work/vcpkg-installed" `
+            -OutDir "$env:GITHUB_WORKSPACE/native-out"
 
-      - name: 保存 vcpkg 依赖缓存
-        # 位置要紧：放在编译之前 —— 万一编译失败，这 10 分钟的依赖也不会白装
+      - name: 校验原生层（含缓存命中产物）
+        shell: pwsh
+        run: |
+          python winui3/tools/verify_native_runtime.py --dir native-out `
+            --require-ffmpeg --expect-hwaccel --expect-ycn-h264-api `
+            --forbid-system-gpu --allow-vc-runtime-external --clean-load `
+            --capabilities native-out/ycn_rdp.capabilities.json `
+            --lock winui3/native-deps/native-deps.lock.json `
+            --patches-dir winui3/native-deps/patches
+          if ($LASTEXITCODE -ne 0) { throw '原生运行库验证失败' }
+          python winui3/tests/native_decode_checks.py --dll native-out/ycn_rdp.dll --policy 2
+          if ($LASTEXITCODE -ne 0) { throw '原生解码 ABI 验证失败' }
+          python winui3/tests/h264_decode_probe.py --dll native-out/freerdp3.dll
+          if ($LASTEXITCODE -ne 0) { throw '软件解码输出验证失败' }
+
+      - name: 验证真实 GFX 能力包
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          ./winui3/tests/gfx_caps_probe.ps1 -SdkRoot "$env:GITHUB_WORKSPACE/.native-work/vcpkg-installed/x64-windows"
+
+      - name: 保存固定依赖缓存
         if: steps.native-cache.outputs.cache-hit != 'true' && steps.vcpkg-cache.outputs.cache-hit != 'true'
-        continue-on-error: true # 并发跑时可能被别人抢先存了，不该因此判红
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
-            .vcpkg/installed
-            .vcpkg/downloads
-          key: vcpkg-${{ env.VCPKG_COMMIT }}-x64-windows
-
-      - name: CMake 配置 + 编译 ycn_rdp
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          # 拾生成器要按「VS 大版本」对齐，不能按字符串顺序取 ——
-          # `cmake --help` 里最老的（Visual Studio 14 2015）反而排在最后，
-          # 而那个版本压根没装 MSBuild，一律失败（CI 首次就是这么挂的）。
-          $cands = cmake --help |
-            Select-String -Pattern 'Visual Studio (\d{2}) (\d{4})' -AllMatches |
-            ForEach-Object { $_.Matches } |
-            ForEach-Object {
-              [pscustomobject]@{
-                Gen   = $_.Groups[0].Value.Trim()
-                Major = [int]$_.Groups[1].Value
-                Year  = [int]$_.Groups[2].Value
-              }
-            } |
-            Sort-Object Year -Descending
-
-          if (-not $cands) { throw 'runner 上没有任何 Visual Studio 生成器' }
-
-          # 首选：vswhere 报出来的、真正装了 C++ 工具的那套 VS
-          $gen = $null
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (Test-Path $vswhere) {
-            $vsVer = & $vswhere -latest -products * `
-              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
-              -property installationVersion
-            if ($vsVer) {
-              $vsMajor = [int]($vsVer -split '\.')[0]
-              $hit = $cands | Where-Object { $_.Major -eq $vsMajor } | Select-Object -First 1
-              if ($hit) { $gen = $hit.Gen }
-              Write-Host "vswhere 报告装好 C++ 工具的 VS 大版本：$vsMajor"
-            }
-          }
-
-          # 兜底：取年份最新的那个
-          if (-not $gen) {
-            $gen = ($cands | Select-Object -First 1).Gen
-            Write-Host '::warning::vswhere 没给出结论，退回"最新年份"的生成器'
-          }
-
-          Write-Host "使用生成器：$gen"
-          # 正斜杠交给 cmake（CMakeLists 侧还有 file(TO_CMAKE_PATH) 兜一层）
-          $inst = (Resolve-Path '.vcpkg/installed/x64-windows').Path.Replace('\', '/')
-          cmake -S winui3/src/Yomori.RdpNative -B .native-build -G $gen -A x64 "-DVCPKG_INST=$inst"
-          cmake --build .native-build --config Release --parallel
-
-      - name: 收集 DLL
-        if: steps.native-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force native-out | Out-Null
-          Copy-Item .native-build/Release/*.dll native-out/ -Force
-          Get-ChildItem native-out | Select-Object Name, @{n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
-
-      - name: 校验原生层产物
-        shell: pwsh
-        run: |
-          $dll = 'native-out/ycn_rdp.dll'
-          if (-not (Test-Path $dll)) { throw "原生层没有产出 $dll" }
-
-          # FreeRDP 是动态链接的，只有 ycn_rdp/freerdp3/winpr3 不足以运行；
-          # 缺 z / cjson / openssl 会让应用「开始执行」时 DllNotFoundException 卡死。
-          # 2026-10-09 就是这个原因崩的，所以 CI 必须在这里挡住，不能让残缺产物进包。
-          $required = @(
-            'ycn_rdp.dll', 'freerdp3.dll', 'freerdp-client3.dll', 'winpr3.dll',
-            'z.dll', 'cjson.dll', 'libssl-3-x64.dll', 'libcrypto-3-x64.dll')
-          $missing = @($required | Where-Object { -not (Test-Path "native-out/$_") })
-          if ($missing.Count -gt 0) {
-            throw "原生层运行库不完整，缺少：$($missing -join ',') —— 请检查 vcpkg freerdp[client] 安装是否完整"
-          }
-          Write-Host "原生层运行库校验通过：$($required -join ',')"
-          Write-Host ("ycn_rdp.dll 大小 {0:N0} 字节" -f (Get-Item $dll).Length)
+            .native-work/vcpkg-installed
+            .native-work/vcpkg-downloads
+          key: ycn-deps-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**', 'winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/*.c', 'winui3/src/Yomori.RdpNative/*.h', 'winui3/src/Yomori.RdpNative/*.cmake', 'winui3/tests/fixtures/*', 'winui3/tests/*decode*.py', 'winui3/tests/gfx_caps_probe.*', 'winui3/tools/build_native.ps1', 'winui3/tools/verify_native_runtime.py', 'winui3/tools/package_release.py') }}
 
       - name: 保存原生层产物缓存
         if: steps.native-cache.outputs.cache-hit != 'true'
@@ -218,13 +138,15 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: native-out
-          key: ycn-native-${{ runner.os }}-${{ hashFiles('winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/ycn_rdp.c', 'winui3/src/Yomori.RdpNative/ycn_rdp.h') }}
+          key: ycn-native-v2-${{ runner.os }}-${{ env.VCPKG_COMMIT }}-x64-windows-${{ hashFiles('winui3/native-deps/**', 'winui3/src/Yomori.RdpNative/CMakeLists.txt', 'winui3/src/Yomori.RdpNative/*.c', 'winui3/src/Yomori.RdpNative/*.h', 'winui3/src/Yomori.RdpNative/*.cmake', 'winui3/tests/fixtures/*', 'winui3/tests/*decode*.py', 'winui3/tests/gfx_caps_probe.*', 'winui3/tools/build_native.ps1', 'winui3/tools/verify_native_runtime.py', 'winui3/tools/package_release.py') }}
 
       - name: 上传原生层产物
         uses: actions/upload-artifact@v4
         with:
           name: native-dlls
-          path: native-out/*.dll
+          path: |
+            native-out/*.dll
+            native-out/ycn_rdp.capabilities.json
           retention-days: ${{ inputs.retention_days }}
           if-no-files-found: error
 

@@ -205,7 +205,7 @@ LoginComplete → Disconnected / Failed），状态迁移函数做成纯函数�
 
 - **版本钉死**：FreeRDP **3.x**（M0 开工时锁定具体小版本，写死在构建脚本与 NOTICE 里）；
 - **获取顺序**：① 官方 GitHub Release 的 Windows 附件（若有）→ ② 官方 CI 产物 → ③ 自行 CMake + VS2022 构建（脚本放 `_tools/`，配置项：OpenSSL、zlib、**rdpsnd 音频（默认开，必须保留）**、**关 H.264**）；
-- **首期编解码策略**：**不开 GFX/AVC444/H.264**。本产品目标场景是环回与局域网（1080p 帧率要求低），NSCodec / ClearCodec / planar 足够；这条同时把 OpenH264/FFmpeg 的构建与许可复杂度全部推迟到确有需要时；
+- **历史首期编解码策略**（2026-10-31 硬解接入前，现行方案见 `rdp-hardware-decode-plan-2026-10-31.md`）：**不开 GFX/AVC444/H.264**。本产品目标场景是环回与局域网（1080p 帧率要求低），NSCodec / ClearCodec / planar 足够；这条同时把 OpenH264/FFmpeg 的构建与许可复杂度全部推迟到确有需要时；
 - **许可证**：FreeRDP/winpr = Apache-2.0，OpenSSL = Apache-2.0 —— 与闭源分发兼容，发布时随包带 LICENSE/NOTICE 文件即可（放 `rdp-embed-freerdp-plan.md` 评审时确认清单）。
 
 ### 5.2 渲染：两步走

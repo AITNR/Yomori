@@ -40,6 +40,8 @@ public sealed partial class ChannelsPage : Page
         // 结果就是下拉框永远空白（"连接方式"没这毛病：它的 ItemsSource 恰好排在前面）。
         RenderBackendCombo.ItemsSource = RenderBackends.Items;
         SyncRenderBackendSelection();
+        DecodeBackendCombo.ItemsSource = DecodeBackends.Items;
+        SyncDecodeBackendSelection();
 
         // 会话处理（收尾动作）已迁到任务的收尾行 —— 本页不再有那个下拉框（见《任务类型与收尾计划书》§6.6）。
 
@@ -67,6 +69,7 @@ public sealed partial class ChannelsPage : Page
         // 于是下拉框永远显示空白（"连接方式"没这毛病：它的 ItemsSource 恰好排在前面）。
         // Loaded 在 x:Bind 全部 Loading 之后触发，在这里补一次即可保证每次进页面都看得见当前值。
         SyncRenderBackendSelection();
+        SyncDecodeBackendSelection();
 
         VM.RefreshRdpReadiness();
         VM.RefreshChannelReadiness();
@@ -149,6 +152,19 @@ public sealed partial class ChannelsPage : Page
         if (!string.Equals(RenderBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
         {
             RenderBackendCombo.SelectedValue = key;
+        }
+    }
+
+    /// <summary>
+    /// 解码方式下拉框与渲染后端一样受 x:Bind 求值顺序影响：SelectedValue 可能先于
+    /// ItemsSource 赋值而被空列表丢弃。ctor 和 Loaded 都补一次，保证进页面不会空白。
+    /// </summary>
+    private void SyncDecodeBackendSelection()
+    {
+        var key = DecodeBackends.Normalize(VM.RdpSettings.DecodeBackend);
+        if (!string.Equals(DecodeBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
+        {
+            DecodeBackendCombo.SelectedValue = key;
         }
     }
 

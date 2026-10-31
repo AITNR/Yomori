@@ -82,7 +82,7 @@ class YcnRdpCallbacks(ctypes.Structure):
 class NativeApi:
     """The small ABI surface used by this regression test."""
 
-    def __init__(self, dll_path: Path) -> None:
+    def __init__(self, dll_path: Path, decode_policy: int | None = None) -> None:
         if os.name != "nt":
             raise RuntimeError("ycn_rdp.dll lifecycle checks require Windows")
         if dll_path.name.casefold() != "ycn_rdp.dll":
@@ -101,6 +101,11 @@ class NativeApi:
             ctypes.c_void_p,
         ]
         self._dll.ycn_rdp_connect.restype = ctypes.c_int
+        self.decode_policy = decode_policy
+        if decode_policy is not None:
+            self._dll.ycn_rdp_connect_ex.argtypes = [ctypes.POINTER(YcnRdpParams),
+                ctypes.POINTER(YcnRdpCallbacks), ctypes.c_void_p, ctypes.c_uint32]
+            self._dll.ycn_rdp_connect_ex.restype = ctypes.c_int
         self._dll.ycn_rdp_disconnect.argtypes = [ctypes.c_int]
         self._dll.ycn_rdp_disconnect.restype = None
         self._dll.ycn_rdp_last_error.argtypes = [
@@ -113,6 +118,8 @@ class NativeApi:
     def connect(
         self, params: YcnRdpParams, callbacks: YcnRdpCallbacks
     ) -> int:
+        if self.decode_policy is not None:
+            return int(self._dll.ycn_rdp_connect_ex(ctypes.byref(params), ctypes.byref(callbacks), None, self.decode_policy))
         return int(self._dll.ycn_rdp_connect(ctypes.byref(params), ctypes.byref(callbacks), None))
 
     def disconnect(self, session: int) -> None:
@@ -158,8 +165,9 @@ class Observation:
 
 
 class LifecycleCheck:
-    def __init__(self, api: NativeApi, port: int, iterations: int, timeout: float) -> None:
+    def __init__(self, api: NativeApi, port: int, iterations: int, timeout: float, use_gfx: bool = False) -> None:
         self.api = api
+        self.use_gfx = use_gfx
         self.port = port
         self.iterations = iterations
         self.timeout = timeout
@@ -245,7 +253,7 @@ class LifecycleCheck:
             0,
             1,
             0,
-            0,
+            int(self.use_gfx),
         )
 
     def _connect(self) -> tuple[int, Observation]:
@@ -424,6 +432,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=15.0,
         help="seconds to wait for each terminal callback (default: 15)",
     )
+    parser.add_argument("--decode-policy", type=int, choices=(0, 1, 2), default=None,
+                        help="exercise the versioned connect_ex entry (default: legacy connect)")
+    parser.add_argument("--gfx", action="store_true", help="request GFX for versioned connection lifecycle coverage")
     return parser.parse_args(argv)
 
 
@@ -438,8 +449,8 @@ def main(argv: list[str]) -> int:
 
     dll_path = args.dll.expanduser().resolve(strict=True)
     confirm_unused_loopback_port(args.port)
-    api = NativeApi(dll_path)
-    LifecycleCheck(api, args.port, args.iterations, args.timeout).run()
+    api = NativeApi(dll_path, args.decode_policy)
+    LifecycleCheck(api, args.port, args.iterations, args.timeout, args.gfx).run()
     return 0
 
 

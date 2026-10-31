@@ -281,6 +281,14 @@
                     <CheckBox Content="内嵌模式下在本机播放远端声音"
                               IsChecked="{x:Bind VM.RdpSettings.AudioEnabled, Mode=TwoWay}" />
 
+                    <ComboBox x:Name="DecodeBackendCombo"
+                              Header="内嵌画面解码方式"
+                              DisplayMemberPath="Value"
+                              SelectedValuePath="Key"
+                              SelectedValue="{x:Bind VM.RdpSettings.DecodeBackend, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch"
+                              ToolTipService.ToolTip="自动会优先尝试硬件视频解码，失败后回退软件/非 AVC；软件强制禁用硬件视频解码。实际解码方式以会话日志诊断为准，连接刚开始时尚未判定为硬解。两种选择都在下次连接生效。--embed-nod3d 或 render_backend=software 会强制软件解码。" />
+
                     <!-- ItemsSource 在代码里（构造函数）显式赋值，不用 x:Bind：
                          x:Bind 的求值顺序会把 SelectedValue 排在 ItemsSource 之前，
                          列表还空着时那次赋值被直接丢弃，之后再填选项也不会重新匹配 → 下拉框显示空白。 -->
@@ -291,9 +299,10 @@
                               SelectedValue="{x:Bind VM.RdpSettings.RenderBackend, Mode=TwoWay}"
                               HorizontalAlignment="Stretch"
                               ToolTipService.ToolTip="D3D 在某些显卡 / 虚拟显示驱动组合下可能把整个窗口卡死（进程还活着但点不动）。碰到就切到软渲染，不用等新版本。改完下次连接生效。" />
-                    <CheckBox Content="GFX 全帧管线（撕裂根治，需重连生效）"
+                    <CheckBox Content="GFX 图形管线（支持 H.264，需重连生效）"
                               IsChecked="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
-                              ToolTipService.ToolTip="走 RDP 图形管道协商 progressive 全帧，远端快速变化时不再撕裂；默认开启，个别显卡驱动下画面异常时再关掉" />
+                              ToolTipService.ToolTip="默认开启，H.264 硬解需要此管线。关闭后使用旧位图路径，仅用于性能与兼容性对照，CPU 是否降低需实测。"
+                              />
 
                     <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
                                Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />

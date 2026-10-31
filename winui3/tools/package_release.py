@@ -78,6 +78,10 @@ _PUBLISH_AUTHORITATIVE = {
     "yomori.deps.json",
 }
 
+# 最小 FFmpeg 组件。DLL 文件名带 ABI 数字（avcodec-63.dll 之类），
+# 因此这里只登记组件前缀，实际文件名由 PE 依赖守卫发现并校验。
+_FFMPEG_COMPONENTS = ("avcodec", "avutil", "swscale", "swresample")
+
 _JUNK_NAMES = {
     "input.json",
     "output.json",
@@ -255,6 +259,10 @@ def _verify(app_dir: Path, *, require_dotnet_runtime: bool, agent_included: bool
         if not (app_dir / rel).exists():
             problems.append(f"{rel}（{note}）")
 
+    def need_glob(pattern: str, note: str) -> None:
+        if not list(app_dir.glob(pattern)):
+            problems.append(f"{pattern}（{note}）")
+
     need("Yomori.exe", "主程序")
     need("Yomori.dll", "主程序集")
     need("Yomori.pri", "XAML 资源索引 —— 缺了界面打不开")
@@ -269,6 +277,11 @@ def _verify(app_dir: Path, *, require_dotnet_runtime: bool, agent_included: bool
     need("cjson.dll", "cJSON（FreeRDP 依赖）")
     need("libssl-3-x64.dll", "OpenSSL libssl（FreeRDP 依赖）")
     need("libcrypto-3-x64.dll", "OpenSSL libcrypto（FreeRDP 依赖）")
+    need("legacy.dll", "OpenSSL legacy provider（NTLM/标准 RDP 安全）")
+    # FFmpeg 只要求最小组件；文件名带 ABI 数字，不能写死 avcodec-63.dll。
+    for _component in _FFMPEG_COMPONENTS:
+        need_glob(f"{_component}-*.dll", f"FFmpeg {_component}（FreeRDP 解码依赖）")
+    need("ycn_rdp.capabilities.json", "原生层能力信息（与固定依赖/补丁绑定）")
     need("assets/icon.ico", "应用图标（也是程序根目录的定位标记）")
 
     # 会话代理载荷（agent\ 子目录）：目标账户登录后跑的就是它。
@@ -416,6 +429,62 @@ Yomori · WinUI 3 版
 """
 
 
+def _verify_native_runtime(
+    app_dir: Path,
+    capabilities_path: Path,
+    *,
+    clean_load: bool,
+) -> None:
+    """发布包级原生守卫：PE 传递依赖 + FFmpeg 组件 + HWACCEL/H264 API 实证。
+
+    这一步与 IDE/构建机无关：它在最终 dist/app 上重新走一遍真实 PE 导入表。
+    静态 capabilities.json 只能说明构建脚本**声明**了什么；这里还会实际加载
+    ycn_rdp.dll，调用 overlay patch 导出的 ycn_h264_decode_api_version /
+    ycn_h264_decode_capabilities，确认补丁真的编进了 freerdp3.dll。
+    """
+    import sys as _sys
+
+    here = str(Path(__file__).resolve().parent)
+    if here not in _sys.path:
+        _sys.path.insert(0, here)
+    import verify_native_runtime
+
+    winui3 = Path(__file__).resolve().parents[1]
+    lock_path = winui3 / "native-deps" / "native-deps.lock.json"
+    patch_dir = winui3 / "native-deps" / "patches"
+
+    problems, report = verify_native_runtime.verify(
+        app_dir,
+        require_ffmpeg=True,
+        expect_hwaccel=True,
+        expect_ycn_h264_api=clean_load,
+        forbid_system_gpu=True,
+        allow_vc_runtime=True,
+        clean_load=clean_load,
+        capabilities_path=capabilities_path,
+        lock_path=lock_path,
+        patch_dir=patch_dir,
+    )
+    if problems:
+        print("发布包原生运行验证未通过：", file=sys.stderr)
+        for item in problems:
+            print("  - " + item, file=sys.stderr)
+        raise SystemExit(1)
+
+    ffmpeg = report.get("ffmpeg_dlls") or {}
+    names = [name for values in ffmpeg.values() for name in values]
+    print("✅ 发布包原生守卫通过")
+    print("   FFmpeg: " + ", ".join(names))
+    print("   HWACCEL 导入: " + ", ".join(report.get("hwaccel_imports") or []))
+    if report.get("clean_load"):
+        load = report["clean_load"]
+        print("   干净加载: ycn_rdp_version=%s, decode_api=%s, caps=0x%x" % (
+            load.get("version"), load.get("decode_api_version"),
+            load.get("decode_capabilities") or 0))
+    elif not clean_load:
+        print("   ⚠️ 已跳过干净加载/ H264 API 实证（--no-clean-load）", file=sys.stderr)
+
+
 def _write_help(app_dir: Path, version: str, package_kind: str, built_at: str) -> None:
     (app_dir / "使用说明.txt").write_text(
         _HELP_TEXT.format(version=version, package_kind=package_kind, built_at=built_at),
@@ -499,6 +568,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--keep-pdb", action="store_true", help="保留 pdb 符号（排查崩溃用）")
     parser.add_argument("--no-zip", action="store_true", help="只铺目录，不压缩（本地调试用）")
     parser.add_argument(
+        "--capabilities",
+        default=None,
+        help="build_native.ps1 生成的 ycn_rdp.capabilities.json（默认自动找 build 输出/本地原生构建目录）",
+    )
+    parser.add_argument(
+        "--no-clean-load",
+        action="store_true",
+        help="跳过发布包干净加载与 H264 API 实证（仅在无法加载 DLL 的诊断环境使用）",
+    )
+    parser.add_argument(
         "--license",
         default=None,
         help="本程序的许可证文件（默认取仓库根的 LICENSE）",
@@ -528,6 +607,23 @@ def main(argv: list[str] | None = None) -> int:
     for path, label in ((build_dir, "build 输出"), (assets_dir, "assets")):
         if not path.is_dir():
             raise SystemExit(f"{label}目录不存在：{path}")
+
+    capabilities_src = None
+    if args.capabilities:
+        capabilities_src = Path(args.capabilities).resolve()
+    else:
+        for candidate in (
+            build_dir / "ycn_rdp.capabilities.json",
+            Path(__file__).resolve().parents[1] / "src" / "Yomori.RdpNative" / "build" / "Release" / "ycn_rdp.capabilities.json",
+        ):
+            if candidate.is_file():
+                capabilities_src = candidate.resolve()
+                break
+    if capabilities_src is None or not capabilities_src.is_file():
+        raise SystemExit(
+            "找不到 ycn_rdp.capabilities.json —— 必须先运行 winui3/tools/build_native.ps1，"
+            "或用 --capabilities 指向该文件。拒绝产出一个无法证明固定依赖/补丁的发布包。"
+        )
     if publish_dir is not None and not publish_dir.is_dir():
         raise SystemExit(f"publish 输出目录不存在：{publish_dir}")
     if agent_dir is not None and not agent_dir.is_dir():
@@ -586,10 +682,18 @@ def main(argv: list[str] | None = None) -> int:
     _write_license(app_dir, license_src)
     _write_third_party_notices(app_dir, args.version, args.vcpkg_inst)
 
+    capability_dst = app_dir / "ycn_rdp.capabilities.json"
+    shutil.copyfile(capabilities_src, capability_dst)
+
     _verify(
         app_dir,
         require_dotnet_runtime=publish_dir is not None,
         agent_included=agent_dir is not None,
+    )
+    _verify_native_runtime(
+        app_dir,
+        capability_dst,
+        clean_load=not args.no_clean_load,
     )
 
     total_mb = sum(f.stat().st_size for f in app_dir.rglob("*") if f.is_file()) / 1024 / 1024

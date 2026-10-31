@@ -1,0 +1,859 @@
+diff --git a/include/freerdp/codec/h264.h b/include/freerdp/codec/h264.h
+index 16fc8cc..97874a8 100644
+--- a/include/freerdp/codec/h264.h
++++ b/include/freerdp/codec/h264.h
+@@ -63,8 +63,73 @@ extern "C"
+ 		H264_CONTEXT_OPTION_USAGETYPE, /** @since version 3.6.0 */
+ 		H264_CONTEXT_OPTION_HW_ACCEL,  /** set to request hw accel, get to check if hw accel is on,
+ 		                                  @since version 3.11.0 */
++		H264_CONTEXT_OPTION_YCN_DECODE_POLICY = 0x59434E01, /** Yomori per-context decode policy */
+ 	} H264_CONTEXT_OPTION;
+ 
++	/* Yomori bridge extension: versioned, append-only diagnostics.
++	 * The public H264_CONTEXT layout is intentionally unchanged. */
++#define YCN_H264_DECODE_API_VERSION 1U
++#define YCN_H264_DIAGNOSTICS_VERSION 1U
++
++#define YCN_H264_DECODE_CAP_AVC              0x00000001U
++#define YCN_H264_DECODE_CAP_DIAGNOSTICS      0x00000002U
++#define YCN_H264_DECODE_CAP_HW_COMPILED      0x00000004U
++
++#define YCN_H264_DECODE_POLICY_LEGACY        0U
++#define YCN_H264_DECODE_POLICY_AUTO_HW       1U
++#define YCN_H264_DECODE_POLICY_SOFTWARE      2U
++
++#define YCN_H264_BACKEND_UNKNOWN             0U
++#define YCN_H264_BACKEND_SOFTWARE            1U
++#define YCN_H264_BACKEND_DXVA2               2U
++#define YCN_H264_BACKEND_D3D11VA             3U
++#define YCN_H264_BACKEND_OTHER_HW            4U
++
++#define YCN_H264_FALLBACK_NONE               0U
++#define YCN_H264_FALLBACK_POLICY_SOFTWARE    1U
++#define YCN_H264_FALLBACK_HW_UNAVAILABLE     2U
++#define YCN_H264_FALLBACK_HW_INIT_FAILED     3U
++#define YCN_H264_FALLBACK_RUNTIME_FAILED     4U
++
++	typedef struct ycn_h264_diagnostics
++	{
++		UINT32 size;
++		UINT32 version;
++		UINT32 policy;
++		UINT32 capabilities;
++		UINT32 hardwareRequested;
++		UINT32 hardwareInitialized;
++		UINT32 activeBackend;
++		UINT32 fallbackReason;
++		UINT64 successfulFrames;
++		UINT64 successfulHardwareFrames;
++		UINT64 successfulSoftwareFrames;
++		UINT64 decodeFailures;
++		INT32 lastError;
++		UINT32 recoveryAttempts;
++		UINT32 recoveryPending;
++		UINT32 reserved;
++		char backendName[32];
++		char lastErrorPhase[32];
++		UINT32 reserved2[2];
++	} YCN_H264_DIAGNOSTICS;
++
++	FREERDP_API UINT32 ycn_h264_decode_api_version(void);
++	FREERDP_API UINT32 ycn_h264_decode_capabilities(void);
++
++	WINPR_ATTR_MALLOC(h264_context_free, 1)
++	WINPR_ATTR_NODISCARD
++	FREERDP_API H264_CONTEXT* ycn_h264_context_new_ex(BOOL Compressor, UINT32 decodePolicy);
++
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL ycn_h264_context_recover_software(H264_CONTEXT* h264);
++
++	/* Caller must initialize diagnostics->size to sizeof(YCN_H264_DIAGNOSTICS)
++	 * and diagnostics->version to YCN_H264_DIAGNOSTICS_VERSION. */
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL ycn_h264_get_diagnostics(H264_CONTEXT* h264,
++	                                          YCN_H264_DIAGNOSTICS* diagnostics);
++
+ 	FREERDP_API void free_h264_metablock(RDPGFX_H264_METABLOCK* meta);
+ 
+ 	WINPR_ATTR_NODISCARD
+diff --git a/include/freerdp/gdi/gfx.h b/include/freerdp/gdi/gfx.h
+index 14b2b33..88ad5c6 100644
+--- a/include/freerdp/gdi/gfx.h
++++ b/include/freerdp/gdi/gfx.h
+@@ -22,6 +22,7 @@
+ 
+ #include <freerdp/api.h>
+ #include <freerdp/gdi/gdi.h>
++#include <freerdp/codec/h264.h>
+ 
+ #ifdef __cplusplus
+ extern "C"
+@@ -76,6 +77,11 @@ extern "C"
+ 	                                               pcRdpgfxUpdateSurfaceArea update);
+ 	FREERDP_API void gdi_graphics_pipeline_uninit(rdpGdi* gdi, RdpgfxClientContext* gfx);
+ 
++	FREERDP_API BOOL ycn_gdi_set_thread_h264_decode_policy(UINT32 decodePolicy);
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL ycn_gdi_get_h264_diagnostics(rdpGdi* gdi, UINT16 surfaceId,
++	                                              YCN_H264_DIAGNOSTICS* diagnostics);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libfreerdp/codec/h264.c b/libfreerdp/codec/h264.c
+index da7f7dc..07eae72 100644
+--- a/libfreerdp/codec/h264.c
++++ b/libfreerdp/codec/h264.c
+@@ -145,6 +145,104 @@ static BOOL areRectsValid(wLog* log, UINT32 width, UINT32 height, const RECTANGL
+ 	return TRUE;
+ }
+ 
++static void ycn_h264_copy_string(char* dst, size_t dstSize, const char* src)
++{
++	if (!dst || (dstSize == 0))
++		return;
++	if (!src)
++		src = "";
++	strncpy(dst, src, dstSize - 1);
++	dst[dstSize - 1] = '\0';
++}
++
++static UINT32 ycn_h264_backend_from_name(const char* name, BOOL hardware)
++{
++	if (!hardware)
++		return YCN_H264_BACKEND_SOFTWARE;
++	if (!name)
++		return YCN_H264_BACKEND_OTHER_HW;
++	if (strcmp(name, "dxva2") == 0)
++		return YCN_H264_BACKEND_DXVA2;
++	if (strcmp(name, "d3d11va") == 0)
++		return YCN_H264_BACKEND_D3D11VA;
++	return YCN_H264_BACKEND_OTHER_HW;
++}
++
++void ycn_h264_diag_begin_frame(H264_CONTEXT* h264)
++{
++	if (h264)
++		h264->ycnFrameWasHardware = FALSE;
++}
++
++void ycn_h264_diag_mark_frame(H264_CONTEXT* h264, BOOL hardware, const char* backendName)
++{
++	if (!h264)
++		return;
++	h264->ycnFrameWasHardware = hardware ? TRUE : FALSE;
++	if (backendName)
++		ycn_h264_copy_string(h264->ycnBackendName, sizeof(h264->ycnBackendName), backendName);
++}
++
++void ycn_h264_diag_frame_success(H264_CONTEXT* h264)
++{
++	if (!h264)
++		return;
++	h264->ycnSuccessfulFrames++;
++	if (h264->ycnFrameWasHardware)
++	{
++		h264->ycnSuccessfulHardwareFrames++;
++		h264->ycnActiveBackend = ycn_h264_backend_from_name(h264->ycnBackendName, TRUE);
++		if (h264->ycnActiveBackend == YCN_H264_BACKEND_UNKNOWN)
++			h264->ycnActiveBackend = YCN_H264_BACKEND_OTHER_HW;
++	}
++	else
++	{
++		h264->ycnSuccessfulSoftwareFrames++;
++		h264->ycnActiveBackend = YCN_H264_BACKEND_SOFTWARE;
++	}
++	if (h264->ycnRecoveryAttempts != 0)
++		h264->ycnRecoveryPending = FALSE;
++}
++
++void ycn_h264_diag_set_error(H264_CONTEXT* h264, INT32 error, const char* phase)
++{
++	if (!h264)
++		return;
++	h264->ycnLastError = error;
++	ycn_h264_copy_string(h264->ycnLastErrorPhase, sizeof(h264->ycnLastErrorPhase), phase);
++}
++
++void ycn_h264_diag_frame_failure(H264_CONTEXT* h264, INT32 error, const char* phase)
++{
++	if (!h264)
++		return;
++	h264->ycnDecodeFailures++;
++	ycn_h264_diag_set_error(h264, error, phase);
++}
++
++void ycn_h264_diag_set_hw_initialized(H264_CONTEXT* h264, BOOL initialized,
++                                     const char* backendName)
++{
++	if (!h264)
++		return;
++	/* Device creation is only a candidate. activeBackend changes after a
++	 * successful hardware output frame. */
++	h264->ycnHardwareInitialized = initialized ? TRUE : FALSE;
++	WINPR_UNUSED(backendName);
++}
++
++void ycn_h264_diag_set_fallback(H264_CONTEXT* h264, UINT32 fallbackReason, const char* detail)
++{
++	if (!h264)
++		return;
++	if ((h264->ycnFallbackReason == YCN_H264_FALLBACK_RUNTIME_FAILED) &&
++	    (fallbackReason != YCN_H264_FALLBACK_RUNTIME_FAILED))
++		return;
++	h264->ycnFallbackReason = fallbackReason;
++	h264->ycnHardwareInitialized = FALSE;
++	WINPR_UNUSED(detail);
++}
++
+ WINPR_ATTR_NODISCARD
+ static int log_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize,
+                           const RECTANGLE_16* rects, UINT32 nrRects)
+@@ -157,15 +255,26 @@ static int log_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSi
+ 	if (status < 0)
+ 	{
+ 		WLog_Print(h264->log, WLOG_WARN, "H264 decompress failed with %d", status);
++		ycn_h264_diag_set_error(h264, status, "subsystem");
+ 		return status;
+ 	}
+ 
++	/* EAGAIN produces no picture yet; do not validate stale/zero dimensions. */
++	if (status == 0)
++		return 0;
++
+ 	/* some server implementations (krdc) use H264 frames smaller than the surface sizes,
+ 	 * validate the regions against this size as well */
+ 	if (!areRectsValid(h264->log, h264->YUVWidth, h264->YUVHeight, rects, nrRects))
++	{
++		ycn_h264_diag_set_error(h264, -1015, "region-yuv");
+ 		return -1015;
++	}
+ 	if (!areRectsValid(h264->log, h264->width, h264->height, rects, nrRects))
++	{
++		ycn_h264_diag_set_error(h264, -1016, "region-surface");
+ 		return -1016;
++	}
+ 	return status;
+ }
+ 
+@@ -181,7 +290,10 @@ INT32 avc420_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize
+ 		return -1001;
+ 
+ 	if (!areRectsValid(h264->log, nDstWidth, nDstHeight, regionRects, numRegionRects))
++	{
++		ycn_h264_diag_frame_failure(h264, -1013, "region-input");
+ 		return -1013;
++	}
+ 
+ 	status = log_decompress(h264, pSrcData, SrcSize, regionRects, numRegionRects);
+ 
+@@ -189,15 +301,22 @@ INT32 avc420_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize
+ 		return 1;
+ 
+ 	if (status < 0)
++	{
++		ycn_h264_diag_frame_failure(h264, status, "decode");
+ 		return status;
++	}
+ 
+ 	pYUVData[0] = h264->pYUVData[0];
+ 	pYUVData[1] = h264->pYUVData[1];
+ 	pYUVData[2] = h264->pYUVData[2];
+ 	if (!yuv420_context_decode(h264->yuv, pYUVData, h264->iStride, h264->YUVHeight, DstFormat,
+ 	                           pDstData, nDstStep, regionRects, numRegionRects))
++	{
++		ycn_h264_diag_frame_failure(h264, -1002, "yuv-convert");
+ 		return -1002;
++	}
+ 
++	ycn_h264_diag_frame_success(h264);
+ 	return 1;
+ }
+ 
+@@ -649,9 +768,15 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
+ 		return -1001;
+ 
+ 	if (!areRectsValid(h264->log, nDstWidth, nDstHeight, regionRects, numRegionRects))
++	{
++		ycn_h264_diag_frame_failure(h264, -1013, "avc444-region-main");
+ 		return -1013;
++	}
+ 	if (!areRectsValid(h264->log, nDstWidth, nDstHeight, auxRegionRects, numAuxRegionRect))
++	{
++		ycn_h264_diag_frame_failure(h264, -1014, "avc444-region-aux");
+ 		return -1014;
++	}
+ 
+ 	switch (op)
+ 	{
+@@ -718,6 +843,11 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
+ 	           " [avg=%lf]",
+ 	           op1, op1sum, op2, op2sum, op3, op3sum);
+ #endif
++	if (status < 0)
++		ycn_h264_diag_frame_failure(h264, status, "avc444-decode");
++	else
++		ycn_h264_diag_frame_success(h264);
++
+ 	return status;
+ }
+ 
+@@ -781,6 +911,21 @@ static BOOL h264_context_init(H264_CONTEXT* h264)
+ 			h264->subsystem = subsystem;
+ 			return TRUE;
+ 		}
++		/* Decoder initialization can fail after device creation (for example
++		 * avcodec_open2). Retry once with hardware disabled before rejecting
++		 * this surface. The failed Init owns and frees its partial state. */
++		if (!h264->Compressor && h264->ycnDecodePolicy == YCN_H264_DECODE_POLICY_AUTO_HW)
++		{
++			h264->ycnDecodePolicy = YCN_H264_DECODE_POLICY_SOFTWARE;
++			h264->hwAccel = 0;
++			ycn_h264_diag_set_fallback(h264, YCN_H264_FALLBACK_HW_INIT_FAILED,
++			                           "ffmpeg-software");
++			if (subsystem->Init(h264))
++			{
++				h264->subsystem = subsystem;
++				return TRUE;
++			}
++		}
+ 	}
+ 
+ 	return FALSE;
+@@ -802,18 +947,27 @@ BOOL h264_context_reset(H264_CONTEXT* h264, UINT32 width, UINT32 height)
+ 	return yuv_context_reset(h264->yuv, width, height);
+ }
+ 
+-H264_CONTEXT* h264_context_new(BOOL Compressor)
++static H264_CONTEXT* ycn_h264_context_alloc(BOOL Compressor, UINT32 decodePolicy)
+ {
+ 	H264_CONTEXT* h264 = (H264_CONTEXT*)calloc(1, sizeof(H264_CONTEXT));
+ 	if (!h264)
+ 		return nullptr;
+ 
+ 	h264->log = WLog_Get(TAG);
+-
+ 	if (!h264->log)
+ 		goto fail;
+ 
+ 	h264->Compressor = Compressor;
++	h264->ycnDecodePolicy = decodePolicy;
++	h264->ycnActiveBackend = YCN_H264_BACKEND_UNKNOWN;
++	h264->ycnFallbackReason =
++	    (decodePolicy == YCN_H264_DECODE_POLICY_SOFTWARE) ? YCN_H264_FALLBACK_POLICY_SOFTWARE
++	                                                      : YCN_H264_FALLBACK_NONE;
++	if (decodePolicy == YCN_H264_DECODE_POLICY_AUTO_HW)
++		h264->hwAccel = 1;
++	else if (decodePolicy == YCN_H264_DECODE_POLICY_SOFTWARE)
++		h264->hwAccel = 0;
++
+ 	if (Compressor)
+ 	{
+ 		/* Default compressor settings, may be changed by caller */
+@@ -823,6 +977,9 @@ H264_CONTEXT* h264_context_new(BOOL Compressor)
+ 
+ 	if (!h264_context_init(h264))
+ 		goto fail;
++	if (h264->subsystem && h264->subsystem->name)
++		ycn_h264_copy_string(h264->ycnBackendName, sizeof(h264->ycnBackendName),
++		                     h264->subsystem->name);
+ 
+ 	h264->yuv = yuv_context_new(Compressor, 0);
+ 	if (!h264->yuv)
+@@ -838,6 +995,18 @@ fail:
+ 	return nullptr;
+ }
+ 
++H264_CONTEXT* h264_context_new(BOOL Compressor)
++{
++	return ycn_h264_context_alloc(Compressor, YCN_H264_DECODE_POLICY_LEGACY);
++}
++
++H264_CONTEXT* ycn_h264_context_new_ex(BOOL Compressor, UINT32 decodePolicy)
++{
++	if (decodePolicy > YCN_H264_DECODE_POLICY_SOFTWARE)
++		return nullptr;
++	return ycn_h264_context_alloc(Compressor, decodePolicy);
++}
++
+ void h264_context_free(H264_CONTEXT* h264)
+ {
+ 	if (h264)
+@@ -911,7 +1080,16 @@ BOOL h264_context_set_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option, UIN
+ 			h264->UsageType = value;
+ 			return TRUE;
+ 		case H264_CONTEXT_OPTION_HW_ACCEL:
+-			h264->hwAccel = (value);
++			h264->hwAccel = (h264->ycnDecodePolicy == YCN_H264_DECODE_POLICY_SOFTWARE) ? 0 : value;
++			return TRUE;
++		case H264_CONTEXT_OPTION_YCN_DECODE_POLICY:
++			if (value > YCN_H264_DECODE_POLICY_SOFTWARE)
++				return FALSE;
++			h264->ycnDecodePolicy = value;
++			if (value == YCN_H264_DECODE_POLICY_SOFTWARE)
++				h264->hwAccel = 0;
++			else if (value == YCN_H264_DECODE_POLICY_AUTO_HW)
++				h264->hwAccel = 1;
+ 			return TRUE;
+ 		default:
+ 			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
+@@ -937,9 +1115,91 @@ UINT32 h264_context_get_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option)
+ 			return h264->UsageType;
+ 		case H264_CONTEXT_OPTION_HW_ACCEL:
+ 			return h264->hwAccel;
++		case H264_CONTEXT_OPTION_YCN_DECODE_POLICY:
++			return h264->ycnDecodePolicy;
+ 		default:
+ 			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
+ 			           option);
+ 			return 0;
+ 	}
+ }
++
++UINT32 ycn_h264_decode_api_version(void)
++{
++	return YCN_H264_DECODE_API_VERSION;
++}
++
++UINT32 ycn_h264_decode_capabilities(void)
++{
++	UINT32 caps = YCN_H264_DECODE_CAP_DIAGNOSTICS;
++#ifdef WITH_GFX_H264
++	caps |= YCN_H264_DECODE_CAP_AVC;
++#endif
++#ifdef WITH_FFMPEG_HWACCEL
++	caps |= YCN_H264_DECODE_CAP_HW_COMPILED;
++#endif
++	return caps;
++}
++
++BOOL ycn_h264_get_diagnostics(H264_CONTEXT* h264, YCN_H264_DIAGNOSTICS* diagnostics)
++{
++	if (!h264 || !diagnostics)
++		return FALSE;
++	if ((diagnostics->size < sizeof(*diagnostics)) ||
++	    (diagnostics->version != YCN_H264_DIAGNOSTICS_VERSION))
++		return FALSE;
++
++	memset(diagnostics, 0, sizeof(*diagnostics));
++	diagnostics->size = sizeof(*diagnostics);
++	diagnostics->version = YCN_H264_DIAGNOSTICS_VERSION;
++	diagnostics->policy = h264->ycnDecodePolicy;
++	diagnostics->capabilities = ycn_h264_decode_capabilities();
++	diagnostics->hardwareRequested = h264->hwAccel ? TRUE : FALSE;
++	diagnostics->hardwareInitialized = h264->ycnHardwareInitialized;
++	diagnostics->activeBackend = h264->ycnActiveBackend;
++	diagnostics->fallbackReason = h264->ycnFallbackReason;
++	diagnostics->successfulFrames = h264->ycnSuccessfulFrames;
++	diagnostics->successfulHardwareFrames = h264->ycnSuccessfulHardwareFrames;
++	diagnostics->successfulSoftwareFrames = h264->ycnSuccessfulSoftwareFrames;
++	diagnostics->decodeFailures = h264->ycnDecodeFailures;
++	diagnostics->lastError = h264->ycnLastError;
++	diagnostics->recoveryAttempts = h264->ycnRecoveryAttempts;
++	diagnostics->recoveryPending = h264->ycnRecoveryPending;
++	ycn_h264_copy_string(diagnostics->backendName, sizeof(diagnostics->backendName),
++	                     h264->ycnBackendName);
++	ycn_h264_copy_string(diagnostics->lastErrorPhase, sizeof(diagnostics->lastErrorPhase),
++	                     h264->ycnLastErrorPhase);
++	return TRUE;
++}
++
++BOOL ycn_h264_context_recover_software(H264_CONTEXT* h264)
++{
++	if (!h264 || h264->Compressor)
++		return FALSE;
++	if (h264->ycnDecodePolicy != YCN_H264_DECODE_POLICY_AUTO_HW)
++		return FALSE;
++	if (h264->ycnRecoveryAttempts != 0)
++		return FALSE;
++	if (!h264->ycnHardwareInitialized && (h264->ycnSuccessfulHardwareFrames == 0) &&
++	    (h264->ycnActiveBackend != YCN_H264_BACKEND_DXVA2) &&
++	    (h264->ycnActiveBackend != YCN_H264_BACKEND_D3D11VA) &&
++	    (h264->ycnActiveBackend != YCN_H264_BACKEND_OTHER_HW))
++		return FALSE;
++
++	h264->ycnRecoveryAttempts++;
++	if (!h264_context_set_option(h264, H264_CONTEXT_OPTION_YCN_DECODE_POLICY,
++	                             YCN_H264_DECODE_POLICY_SOFTWARE))
++		return FALSE;
++	if (!h264_context_reset(h264, h264->width, h264->height))
++		return FALSE;
++
++	/* The failed packet is intentionally not replayed: it may be a P frame
++	 * whose reference frame is unavailable after rebuilding the decoder. */
++	h264->ycnFallbackReason = YCN_H264_FALLBACK_RUNTIME_FAILED;
++	h264->ycnHardwareInitialized = FALSE;
++	h264->ycnRecoveryPending = TRUE;
++	h264->ycnActiveBackend = YCN_H264_BACKEND_UNKNOWN;
++	ycn_h264_copy_string(h264->ycnBackendName, sizeof(h264->ycnBackendName),
++	                     "software-recovering");
++	return TRUE;
++}
+diff --git a/libfreerdp/codec/h264.h b/libfreerdp/codec/h264.h
+index af1c4fd..874d14f 100644
+--- a/libfreerdp/codec/h264.h
++++ b/libfreerdp/codec/h264.h
+@@ -65,6 +65,23 @@ extern "C"
+ 		UINT32 hwAccel;
+ 		UINT32 NumberOfThreads;
+ 
++		/* Yomori diagnostics: these fields are private, the public H264_CONTEXT
++		 * remains opaque and retains its existing ABI. */
++		UINT32 ycnDecodePolicy;
++		UINT32 ycnActiveBackend;
++		UINT32 ycnHardwareInitialized;
++		UINT32 ycnFallbackReason;
++		UINT32 ycnRecoveryAttempts;
++		UINT32 ycnRecoveryPending;
++		UINT32 ycnFrameWasHardware;
++		UINT64 ycnSuccessfulFrames;
++		UINT64 ycnSuccessfulHardwareFrames;
++		UINT64 ycnSuccessfulSoftwareFrames;
++		UINT64 ycnDecodeFailures;
++		INT32 ycnLastError;
++		char ycnBackendName[32];
++		char ycnLastErrorPhase[32];
++
+ 		UINT32 iStride[3];
+ 		BYTE* pOldYUVData[3];
+ 		BYTE* pYUVData[3];
+@@ -94,6 +111,19 @@ extern "C"
+ 	FREERDP_LOCAL BOOL avc420_ensure_buffer(H264_CONTEXT* h264, UINT32 stride, UINT32 width,
+ 	                                        UINT32 height);
+ 
++	FREERDP_LOCAL void ycn_h264_diag_begin_frame(H264_CONTEXT* h264);
++	FREERDP_LOCAL void ycn_h264_diag_mark_frame(H264_CONTEXT* h264, BOOL hardware,
++	                                             const char* backendName);
++	FREERDP_LOCAL void ycn_h264_diag_frame_success(H264_CONTEXT* h264);
++	FREERDP_LOCAL void ycn_h264_diag_frame_failure(H264_CONTEXT* h264, INT32 error,
++	                                                const char* phase);
++	FREERDP_LOCAL void ycn_h264_diag_set_error(H264_CONTEXT* h264, INT32 error,
++	                                            const char* phase);
++	FREERDP_LOCAL void ycn_h264_diag_set_hw_initialized(H264_CONTEXT* h264, BOOL initialized,
++	                                                     const char* backendName);
++	FREERDP_LOCAL void ycn_h264_diag_set_fallback(H264_CONTEXT* h264, UINT32 fallbackReason,
++	                                               const char* detail);
++
+ #ifdef WITH_MEDIACODEC
+ 	extern const H264_CONTEXT_SUBSYSTEM g_Subsystem_mediacodec;
+ #endif
+diff --git a/libfreerdp/codec/h264_ffmpeg.c b/libfreerdp/codec/h264_ffmpeg.c
+index 563305f..b4934d0 100644
+--- a/libfreerdp/codec/h264_ffmpeg.c
++++ b/libfreerdp/codec/h264_ffmpeg.c
+@@ -638,6 +638,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 	UINT32* iStride = h264->iStride;
+ 
+ 	WINPR_ASSERT(sys);
++	ycn_h264_diag_begin_frame(h264);
+ 
+ #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 133, 100)
+ 	packet = &sys->bufferpacket;
+@@ -664,6 +665,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 	if (status < 0)
+ 	{
+ 		WLog_Print(h264->log, WLOG_ERROR, "Failed to decode video frame (status=%d)", status);
++		ycn_h264_diag_set_error(h264, status, "send_packet");
+ 		goto fail;
+ 	}
+ 
+@@ -684,6 +686,8 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 
+ 	if (status == 0)
+ 		gotFrame = 1;
++	else
++		ycn_h264_diag_set_error(h264, status, "receive_frame");
+ #else
+ #if defined(WITH_FFMPEG_HWACCEL)
+ 	status =
+@@ -696,6 +700,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 	if (status < 0)
+ 	{
+ 		WLog_Print(h264->log, WLOG_ERROR, "Failed to decode video frame (status=%d)", status);
++		ycn_h264_diag_set_error(h264, status, "decode_legacy");
+ 		goto fail;
+ 	}
+ 
+@@ -743,6 +748,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 		{
+ 			WLog_Print(h264->log, WLOG_ERROR, "Failed to transfer video frame (status=%d) (%s)",
+ 			           status, av_err2str(status));
++			ycn_h264_diag_set_error(h264, status, "transfer");
+ 			goto fail;
+ 		}
+ 
+@@ -767,6 +773,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 			{
+ 				WLog_Print(h264->log, WLOG_ERROR, "Failed to convert video frame (status=%d) (%s)",
+ 				           status, av_err2str(status));
++				ycn_h264_diag_set_error(h264, status, "swscale");
+ 				goto fail;
+ 			}
+ 		}
+@@ -778,6 +785,19 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+ 	{
+ 		WINPR_ASSERT(sys->videoFrame);
+ 
++#if defined(WITH_FFMPEG_HWACCEL)
++		const BOOL hardware =
++		    (sys->useHwDecoder && sys->hwctx && sys->hwVideoFrame &&
++		     (sys->hwVideoFrame->format == sys->hw_pix_fmt))
++		        ? TRUE
++		        : FALSE;
++		ycn_h264_diag_mark_frame(
++		    h264, hardware,
++		    hardware ? av_hwdevice_get_type_name(sys->type) : "ffmpeg-software");
++#else
++		ycn_h264_diag_mark_frame(h264, FALSE, "ffmpeg-software");
++#endif
++
+ 		pYUVData[0] = sys->videoFrame->data[0];
+ 		pYUVData[1] = sys->videoFrame->data[1];
+ 		pYUVData[2] = sys->videoFrame->data[2];
+@@ -1220,6 +1240,16 @@ WINPR_ATTR_NODISCARD
+ static BOOL load_config(H264_CONTEXT_LIBAVCODEC* sys, BOOL enabled, wLog* log)
+ {
+ 	WINPR_ASSERT(sys);
++	/* Explicit software policy must not parse hardware-only overrides or
++	 * create a device, including when a user override is invalid. */
++	if (!enabled)
++	{
++#if defined(WITH_FFMPEG_HWACCEL)
++		sys->useHwDecoder = FALSE;
++		sys->useHwEncoder = FALSE;
++#endif
++		return TRUE;
++	}
+ 
+ #if defined(WITH_FFMPEG_HWACCEL)
+ 	sys->useHwDecoder = TRUE;
+@@ -1311,9 +1341,20 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+ 	if (!sys)
+ 		goto EXCEPTION;
+ 
++	h264->pSystemData = (void*)sys;
++	h264->ycnHardwareInitialized = FALSE;
+ 	if (!load_config(sys, h264->hwAccel > 0, h264->log))
+ 		goto EXCEPTION;
+ 
++#if defined(WITH_FFMPEG_HWACCEL)
++	if (h264->hwAccel && (!sys->useHwDecoder || (sys->type == AV_HWDEVICE_TYPE_NONE)))
++		ycn_h264_diag_set_fallback(h264, YCN_H264_FALLBACK_HW_UNAVAILABLE, "ffmpeg-software");
++#else
++	if (h264->hwAccel)
++		ycn_h264_diag_set_fallback(h264, YCN_H264_FALLBACK_HW_UNAVAILABLE, "ffmpeg-software");
++#endif
++	ycn_h264_diag_set_hw_initialized(h264, FALSE, nullptr);
++
+ 	h264->pSystemData = (void*)sys;
+ 
+ #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 10, 100)
+@@ -1370,12 +1411,15 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+ 					           "Could not initialize hardware decoder for %s, falling back to "
+ 					           "software: %s",
+ 					           get_hwctx_device(sys), av_err2str(ret));
++					ycn_h264_diag_set_fallback(h264, YCN_H264_FALLBACK_HW_INIT_FAILED,
++					                           "ffmpeg-software");
+ 					sys->hwctx = nullptr;
+ 					goto fail_hwdevice_create;
+ 				}
+ 			}
+ 			WLog_Print(h264->log, WLOG_INFO, "Using %s [%s|%s] for accelerated H264 decoding",
+ 			           av_hwdevice_get_type_name(type), get_hwctx_device(sys), vaapi_vendor(sys));
++			ycn_h264_diag_set_hw_initialized(h264, TRUE, av_hwdevice_get_type_name(type));
+ 
+ 			sys->codecDecoderContext->get_format = libavcodec_get_format;
+ 			sys->hw_pix_fmt = get_hwctx_image_format(sys, h264->log);
+@@ -1392,6 +1436,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+ 		if (avcodec_open2(sys->codecDecoderContext, sys->codecDecoder, nullptr) < 0)
+ 		{
+ 			WLog_Print(h264->log, WLOG_ERROR, "Failed to open libav codec");
++			ycn_h264_diag_set_error(h264, -1, "avcodec_open");
+ 			goto EXCEPTION;
+ 		}
+ 
+@@ -1400,6 +1445,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+ 		if (!sys->codecParser)
+ 		{
+ 			WLog_Print(h264->log, WLOG_ERROR, "Failed to initialize libav parser");
++			ycn_h264_diag_set_error(h264, -1, "parser_init");
+ 			goto EXCEPTION;
+ 		}
+ 	}
+diff --git a/libfreerdp/gdi/gfx.c b/libfreerdp/gdi/gfx.c
+index 8d9d708..ea0d0d9 100644
+--- a/libfreerdp/gdi/gfx.c
++++ b/libfreerdp/gdi/gfx.c
+@@ -25,6 +25,7 @@
+ 
+ #include <winpr/assert.h>
+ #include <winpr/cast.h>
++#include <winpr/platform.h>
+ 
+ #include <freerdp/api.h>
+ #include <freerdp/log.h>
+@@ -35,6 +36,24 @@
+ 
+ #define TAG FREERDP_TAG("gdi")
+ 
++/* The bridge invokes this from the GFX callback on the same thread before the
++ * GDI SurfaceCommand. This is session-local because each FreeRDP session owns
++ * its event-loop thread, and avoids a process-global rdpGdi lookup table. */
++static WINPR_TLS UINT32 g_YcnThreadH264DecodePolicy = YCN_H264_DECODE_POLICY_LEGACY;
++
++BOOL ycn_gdi_set_thread_h264_decode_policy(UINT32 decodePolicy)
++{
++	if (decodePolicy > YCN_H264_DECODE_POLICY_SOFTWARE)
++		return FALSE;
++	g_YcnThreadH264DecodePolicy = decodePolicy;
++	return TRUE;
++}
++
++static UINT32 ycn_gdi_thread_h264_policy(void)
++{
++	return g_YcnThreadH264DecodePolicy;
++}
++
+ static BOOL is_rect_valid(const RECTANGLE_16* rect, size_t width, size_t height)
+ {
+ 	if (!rect)
+@@ -671,6 +690,38 @@ fail:
+ 	return status;
+ }
+ 
++static void ycn_gdi_request_full_refresh(rdpGdi* gdi, const gdiGfxSurface* surface)
++{
++	if (!gdi || !gdi->context || !gdi->context->update || !gdi->context->update->RefreshRect ||
++	    !surface)
++		return;
++
++	const RECTANGLE_16 rect = { .left = 0,
++		                        .top = 0,
++		                        .right = (UINT16)MIN(UINT16_MAX, surface->width),
++		                        .bottom = (UINT16)MIN(UINT16_MAX, surface->height) };
++	gdi->context->update->RefreshRect(gdi->context, 1, &rect);
++}
++
++/* A failed packet is never replayed: it may be a P frame whose reference was
++ * lost while rebuilding the decoder. Drop it, request a full refresh, and wait
++ * for a keyframe. Subsequent failures while recovery is pending are counted
++ * but do not rebuild again. */
++static BOOL ycn_gdi_handle_h264_failure(rdpGdi* gdi, gdiGfxSurface* surface)
++{
++	if (!gdi || !surface || !surface->h264)
++		return FALSE;
++
++	const BOOL recovered = ycn_h264_context_recover_software(surface->h264);
++	YCN_H264_DIAGNOSTICS diagnostics = WINPR_C_ARRAY_INIT;
++	diagnostics.size = sizeof(diagnostics);
++	diagnostics.version = YCN_H264_DIAGNOSTICS_VERSION;
++	const BOOL haveDiagnostics = ycn_h264_get_diagnostics(surface->h264, &diagnostics);
++	if (recovered)
++		ycn_gdi_request_full_refresh(gdi, surface);
++	return recovered || (haveDiagnostics && diagnostics.recoveryPending);
++}
++
+ /**
+  * Function description
+  *
+@@ -701,7 +752,8 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+ 
+ 	if (!surface->h264)
+ 	{
+-		surface->h264 = h264_context_new(FALSE);
++		const UINT32 decodePolicy = ycn_gdi_thread_h264_policy();
++		surface->h264 = ycn_h264_context_new_ex(FALSE, decodePolicy);
+ 
+ 		if (!surface->h264)
+ 		{
+@@ -709,9 +761,13 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+ 			return ERROR_NOT_ENOUGH_MEMORY;
+ 		}
+ 
+-		if (!h264_context_set_option(
+-		        surface->h264, H264_CONTEXT_OPTION_HW_ACCEL,
+-		        (UINT32)freerdp_settings_get_bool(gdi->context->settings, FreeRDP_SoftwareGdi)))
++		const UINT32 requestHw = (decodePolicy == YCN_H264_DECODE_POLICY_SOFTWARE)
++		                             ? FALSE
++		                             : ((decodePolicy == YCN_H264_DECODE_POLICY_AUTO_HW)
++		                                    ? TRUE
++		                                    : freerdp_settings_get_bool(gdi->context->settings,
++		                                                                FreeRDP_SoftwareGdi));
++		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_HW_ACCEL, requestHw))
+ 			return ERROR_INTERNAL_ERROR;
+ 
+ 		if (!h264_context_reset(surface->h264, surface->width, surface->height))
+@@ -736,8 +792,10 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+ 
+ 	if (rc < 0)
+ 	{
+-		WLog_WARN(TAG, "avc420_decompress failure: %" PRId32 ", ignoring update.", rc);
+-		return CHANNEL_RC_OK;
++		WLog_WARN(TAG, "avc420_decompress failure: %" PRId32 ", dropping packet.", rc);
++		if (ycn_gdi_handle_h264_failure(gdi, surface))
++			return CHANNEL_RC_OK; /* packet dropped; diagnostics retain the failure */
++		return ERROR_INTERNAL_ERROR;
+ 	}
+ 
+ 	for (UINT32 i = 0; i < meta->numRegionRects; i++)
+@@ -795,7 +853,8 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+ 
+ 	if (!surface->h264)
+ 	{
+-		surface->h264 = h264_context_new(FALSE);
++		const UINT32 decodePolicy = ycn_gdi_thread_h264_policy();
++		surface->h264 = ycn_h264_context_new_ex(FALSE, decodePolicy);
+ 
+ 		if (!surface->h264)
+ 		{
+@@ -803,10 +862,15 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+ 			return ERROR_NOT_ENOUGH_MEMORY;
+ 		}
+ 
+-		if (!h264_context_set_option(
+-		        surface->h264, H264_CONTEXT_OPTION_HW_ACCEL,
+-		        (UINT32)freerdp_settings_get_bool(gdi->context->settings, FreeRDP_SoftwareGdi)))
++		const UINT32 requestHw = (decodePolicy == YCN_H264_DECODE_POLICY_SOFTWARE)
++		                             ? FALSE
++		                             : ((decodePolicy == YCN_H264_DECODE_POLICY_AUTO_HW)
++		                                    ? TRUE
++		                                    : freerdp_settings_get_bool(gdi->context->settings,
++		                                                                FreeRDP_SoftwareGdi));
++		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_HW_ACCEL, requestHw))
+ 			return ERROR_INTERNAL_ERROR;
++
+ 		if (!h264_context_reset(surface->h264, surface->width, surface->height))
+ 			return ERROR_INTERNAL_ERROR;
+ 	}
+@@ -833,8 +897,10 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+ 
+ 	if (rc < 0)
+ 	{
+-		WLog_WARN(TAG, "avc444_decompress failure: %" PRId32 ", ignoring update.", rc);
+-		return CHANNEL_RC_OK;
++		WLog_WARN(TAG, "avc444_decompress failure: %" PRId32 ", dropping packet.", rc);
++		if (ycn_gdi_handle_h264_failure(gdi, surface))
++			return CHANNEL_RC_OK; /* packet dropped; diagnostics retain the failure */
++		return ERROR_INTERNAL_ERROR;
+ 	}
+ 
+ 	for (UINT32 i = 0; i < meta1->numRegionRects; i++)
+@@ -2092,3 +2158,18 @@ void gdi_graphics_pipeline_uninit(rdpGdi* gdi, RdpgfxClientContext* gfx)
+ 	PROFILER_PRINT_FOOTER
+ 	PROFILER_FREE(gfx->SurfaceProfiler)
+ }
++
++BOOL ycn_gdi_get_h264_diagnostics(rdpGdi* gdi, UINT16 surfaceId,
++                                  YCN_H264_DIAGNOSTICS* diagnostics)
++{
++	if (!gdi || !gdi->gfx || !gdi->gfx->GetSurfaceData || !diagnostics)
++		return FALSE;
++
++	BOOL rc = FALSE;
++	EnterCriticalSection(&gdi->gfx->mux);
++	gdiGfxSurface* surface = (gdiGfxSurface*)gdi->gfx->GetSurfaceData(gdi->gfx, surfaceId);
++	if (surface && surface->h264)
++		rc = ycn_h264_get_diagnostics(surface->h264, diagnostics);
++	LeaveCriticalSection(&gdi->gfx->mux);
++	return rc;
++}

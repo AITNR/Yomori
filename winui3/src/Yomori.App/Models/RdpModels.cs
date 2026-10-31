@@ -66,6 +66,70 @@ public static class RenderBackends
     };
 }
 
+/// <summary>
+/// 内嵌画面的视频解码方式（decode_backend）。
+/// auto = 优先尝试硬件视频解码，失败由原生侧回退软件/非 AVC 图形路径；
+/// software = 禁用硬件视频解码，用于诊断、对照和完全避开 GPU 的逃生路径。
+/// </summary>
+public static class DecodeBackends
+{
+    public const string Auto = "auto";
+    public const string Software = "software";
+
+    public static readonly IReadOnlyList<KeyValuePair<string, string>> Items =
+        new List<KeyValuePair<string, string>>
+        {
+            new(Auto, "自动（优先硬件，失败回退软件）"),
+            new(Software, "软件（禁用硬件视频解码）"),
+        };
+
+    public static string Normalize(string? value)
+    {
+        var text = (value ?? string.Empty).Trim().ToLowerInvariant();
+        return text == Software ? Software : Auto;
+    }
+
+    public static string Label(string? value) => Normalize(value) switch
+    {
+        Software => "软件解码",
+        _ => "自动（优先硬件）",
+    };
+}
+
+/// <summary>
+/// 传给版本化原生入口的连接策略。数值是 ycn_rdp_connect_ex 的冻结契约：
+/// 0 = 旧的非 AVC 路径，1 = 自动优先 AVC 硬解，2 = AVC 软件解码并禁止硬件。
+/// </summary>
+public static class RdpDecodePolicy
+{
+    public const uint LegacyNonAvc = 0;
+    public const uint Auto = 1;
+    public const uint Software = 2;
+
+    /// <summary>
+    /// 按用户配置解析本次连接策略。完全避开 GPU 的渲染/命令行逃生门优先于
+    /// decode_backend；非法或缺失的配置由各自 Normalize 收敛。
+    /// </summary>
+    public static uint Resolve(string? decodeBackend, string? renderBackend, bool noD3D)
+    {
+        if (noD3D
+            || RenderBackends.Normalize(renderBackend) == RenderBackends.Software
+            || DecodeBackends.Normalize(decodeBackend) == DecodeBackends.Software)
+        {
+            return Software;
+        }
+
+        return Auto;
+    }
+
+    public static string Label(uint policy) => policy switch
+    {
+        LegacyNonAvc => "旧非 AVC",
+        Software => "软件解码（禁硬解）",
+        _ => "自动（优先硬件）",
+    };
+}
+
 /// <summary>RDP 会话在任务全部结束后的处理方式。</summary>
 // SessionFinishModes 已迁到 Models/TaskTypeModels.cs —— 收尾从通道级搬到了任务级
 // （见《任务类型与收尾计划书》§3）。这里保留位置说明，避免以后有人在本文件重定义一份。
@@ -487,6 +551,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private string _clientMode = ClientModes.Embedded;
     private bool _audioEnabled = true;
     private bool _gfxEnabled = true;
+    private string _decodeBackend = DecodeBackends.Auto;
     private string _renderBackend = RenderBackends.Auto;
     private int _desktopWidth = RdpResolutions.DefaultWidth;
     private int _desktopHeight = RdpResolutions.DefaultHeight;
@@ -668,12 +733,23 @@ public sealed class RdpConfig : ObservableObject, ICloneable
         set => SetProperty(ref _audioEnabled, value);
     }
 
-    /// <summary>内嵌 GFX 全帧管线（gfx_enabled；撕裂根治，自动协商 progressive）。默认开启。</summary>
+    /// <summary>内嵌 GFX 图形管线（gfx_enabled）。默认开启；关闭后使用旧位图路径并禁用 AVC。</summary>
     [JsonPropertyName("gfx_enabled")]
     public bool GfxEnabled
     {
         get => _gfxEnabled;
         set => SetProperty(ref _gfxEnabled, value);
+    }
+
+    /// <summary>
+    /// 内嵌画面的视频解码方式：auto = 优先硬件、失败回退；software = 禁用硬件视频解码。
+    /// 实际成功解码后端以会话诊断为准，连接刚建立时不能据此判定已经硬解。
+    /// </summary>
+    [JsonPropertyName("decode_backend")]
+    public string DecodeBackend
+    {
+        get => _decodeBackend;
+        set => SetProperty(ref _decodeBackend, DecodeBackends.Normalize(value));
     }
 
     /// <summary>
@@ -738,6 +814,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
         TargetUser = (TargetUser ?? string.Empty).Trim();
         SessionFinish = SessionFinishModes.Normalize(SessionFinish);
         ClientMode = ClientModes.Normalize(ClientMode);
+        DecodeBackend = DecodeBackends.Normalize(DecodeBackend);
         RenderBackend = RenderBackends.Normalize(RenderBackend);
         ConnectTimeoutSeconds = Math.Clamp(ConnectTimeoutSeconds, 15, 600);
         DesktopWidth = RdpResolutions.Normalize(DesktopWidth, RdpResolutions.MinWidth, RdpResolutions.MaxWidth);

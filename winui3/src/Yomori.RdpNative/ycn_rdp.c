@@ -45,6 +45,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <wchar.h>
 #include <stdarg.h>
 #include <limits.h>
 
@@ -57,6 +58,7 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  * 每路约 1 个事件循环线程 + 帧缓冲，再高没有实际收益。
  * 改动此处必须同步 C# 侧 RdpNativeLimits.MaxSessions（Models/RdpChannelPlanner.cs）。 */
 #define YCN_MAX_SESSIONS 8
+#define YCN_GFX_ADV_CAP_MAX 16
 #define YCN_ERRBUF_LEN   512
 #define TAG "ycn.rdpnative"
 
@@ -177,6 +179,69 @@ typedef struct
 	int gfx_init_rc;               /* gdi_graphics_pipeline_init 返回值：0 未调用 / 1 成功 / 2 失败 */
 	int gfx_codecs_null;           /* 接入后 gfx->codecs 是否为 NULL（-1 未测）：1 = NULL（解码器没准备好） */
 	int gfx_progressive_null;      /* gfx->codecs->progressive 是否为 NULL：1 = NULL（GFX 帧处理会崩的嫌疑点） */
+
+	/* GFX hook 必须按会话保存；进程级函数指针会在多会话间串线。 */
+	RdpgfxClientContext* gfx;
+	pcRdpgfxSurfaceCommand orig_gfx_surface;
+	pcRdpgfxResetGraphics orig_gfx_reset;
+	pcRdpgfxStartFrame orig_gfx_start;
+	pcRdpgfxEndFrame orig_gfx_end;
+	pcRdpgfxCapsConfirm orig_gfx_caps_confirm;
+	pcRdpgfxCapsAdvertise orig_gfx_caps_advertise;
+
+	/* 本次会话实际下发的 GFX/AVC 设置与服务器 CAPSCONFIRM 结果。 */
+	uint32_t gfx_cfg_support_pipeline;
+	uint32_t gfx_cfg_thin_client;
+	uint32_t gfx_cfg_h264;
+	uint32_t gfx_cfg_avc444;
+	uint32_t gfx_cfg_progressive;
+	uint32_t gfx_caps_confirm_count;
+	uint32_t gfx_caps_version;
+	uint32_t gfx_caps_length;
+	uint32_t gfx_caps_flags;
+	/* CAPSADVERTISE hook：即将序列化发出的 caps（actual），以及发送瞬间设置里的
+	 * request（GfxH264/GfxAVC444）。用来区分 requested / advertised / server-confirmed。 */
+	uint32_t gfx_adv_count;
+	uint32_t gfx_adv_req_h264;
+	uint32_t gfx_adv_req_avc444;
+	uint32_t gfx_adv_req_avc444v2;
+	uint32_t gfx_adv_version[YCN_GFX_ADV_CAP_MAX];
+	uint32_t gfx_adv_flags[YCN_GFX_ADV_CAP_MAX];
+	uint32_t gfx_adv_send_rc;          /* 原 CapsAdvertise(send) 的返回值 */
+	uint64_t gfx_codec_counts[16];       /* 收到的 RDPGFX_SURFACE_COMMAND，按 codecId */
+	uint64_t gfx_codec_bytes[16];        /* 按 codec 累计 cmd->length（编码负载字节） */
+	uint64_t gfx_codec_ticks[16];        /* 按 codec 累计 SurfaceCommand 耗时（QPC ticks） */
+	uint64_t gfx_avc_surface_count;      /* codec 11/14/15 */
+	uint64_t gfx_non_avc_surface_count;  /* 其他 codec */
+
+	/* 原生聚合计时（QPC；仅内存累加，不写盘、不逐帧日志）。 */
+	uint64_t endpaint_memcpy_count;
+	uint64_t endpaint_memcpy_bytes;
+	uint64_t endpaint_memcpy_ticks;
+	uint64_t copy_frame_count;
+	uint64_t copy_frame_bytes;
+	uint64_t copy_frame_ticks;
+
+	/* 解码策略与真实诊断（g_lock 保护；稳定路径零 I/O）。 */
+	uint32_t decode_request_policy;
+	uint32_t decode_effective_policy;
+	uint32_t decode_hw_compiled;
+	uint32_t decode_last_codec;
+	uint32_t decode_backend;
+	uint32_t decode_fallback;
+	uint32_t decode_hw_initialized;
+	uint32_t decode_recovery_pending;
+	ULONGLONG decode_recovery_started;
+	uint32_t decode_recovery_surface;
+	uint32_t decode_last_surface;
+	int32_t decode_last_error;
+	uint64_t decode_frames;
+	uint64_t decode_hw_frames;
+	uint64_t decode_sw_frames;
+	uint64_t decode_failures;
+	char decode_backend_name[32];
+	char decode_error_phase[32];
+	char decode_fallback_detail[48];
 } YcnSession;
 
 static YcnSession g_sessions[YCN_MAX_SESSIONS];
@@ -186,6 +251,7 @@ static int64_t g_next_session_id = 1;
 static volatile LONG g_total_created = 0;
 static volatile LONG g_total_released = 0;
 static char g_global_error[YCN_ERRBUF_LEN]; /* session 未找到时的兜底 */
+static uint64_t g_qpc_freq = 0;
 
 /* ---------------- 工具 ---------------- */
 
@@ -199,6 +265,20 @@ static void set_session_error(YcnSession* s, const char* fmt, ...)
 	_vsnprintf_s(s->last_error, sizeof(s->last_error), _TRUNCATE, fmt, ap);
 	va_end(ap);
 	LeaveCriticalSection(&g_lock);
+}
+
+static uint64_t ycn_qpc_now(void)
+{
+	LARGE_INTEGER t;
+	QueryPerformanceCounter(&t);
+	return (uint64_t)t.QuadPart;
+}
+
+static double ycn_ticks_to_ms(uint64_t ticks)
+{
+	if (g_qpc_freq == 0)
+		return 0.0;
+	return (double)ticks * 1000.0 / (double)g_qpc_freq;
 }
 
 static void set_global_error(const char* fmt, ...)
@@ -232,6 +312,11 @@ static BOOL CALLBACK init_once_cb(PINIT_ONCE once, PVOID param, PVOID* context)
 	(void)param;
 	(void)context;
 
+	{
+		LARGE_INTEGER freq;
+		if (QueryPerformanceFrequency(&freq))
+			g_qpc_freq = (uint64_t)freq.QuadPart;
+	}
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
 	{
 		set_global_error("WSAStartup 失败");
@@ -246,6 +331,207 @@ static BOOL process_init(void)
 {
 	InitOnceExecuteOnce(&g_init_once, init_once_cb, NULL, NULL);
 	return TRUE;
+}
+
+/* ---- GFX/AVC 设置决策（纯函数，PreConnect / LoadChannels / 自检共用） ----
+ *
+ * FreeRDP 3.32 rdpgfx_main.c 的事实：
+ *   - CAPVERSION_81 的 flags 直接由 GfxThinClient / GfxSmallCache / GfxH264 生成；
+ *   - GfxH264=true 且 GfxAVC444=false 时不会广告 10.x，只广告 8/8.1；
+ *   - GfxH264=false 时会广告 10.x 并带 AVC_DISABLED；
+ *   - THINCLIENT 在 8.1 是规范 flag，客户端的 cmdline `/gfx-progressive:off`
+ *     正是用 GfxThinClient=!enable 来表达“不要 progressive”。
+ *
+ * 这里不设置 GfxCapsFilter，因此不会强制服务器只选 AVC；服务器仍可按 caps
+ * 选择 CLEAR/PLANAR 等 non-AVC codec。
+ *
+ * 现代 AVC 路径必须置 GfxAVC444=TRUE：FreeRDP 3.32 的 rdpgfx_main.c 只有在
+ * (!GfxH264 || GfxAVC444) 时才广告 10.x；GfxH264=TRUE 且 GfxAVC444=FALSE
+ * 只会广告 8/8.1；8.1 本身有 AVC420(0x10) 位，但本次服务器确认
+ * 0x03（THINCLIENT|SMALL_CACHE，无 AVC），于是实际只能走 non-AVC。
+ * 注意：rdpgfx_main.c 完全不读取 GfxAVC444v2，10.7 等现代版本本身就可能让
+ * 服务器选择 AVC444v2(codec 15)。因此 GfxAVC444v2=FALSE 只是设置值，
+ * 不能声称“服务器不会发 15”；实际必须以 CAPSADVERTISE/CAPS确认与 codec 统计为准。 */
+typedef struct
+{
+	BOOL gfx_enabled;
+	BOOL avc_enabled;
+	BOOL support_graphics_pipeline;
+	BOOL support_dynamic_channels;
+	BOOL thin_client;
+	BOOL small_cache;
+	BOOL h264;
+	BOOL avc444;
+	BOOL avc444v2;
+	BOOL progressive;
+	BOOL progressivev2;
+	BOOL planar;
+} YcnGfxConfig;
+
+static void ycn_calc_gfx_config(uint32_t use_gfx, uint32_t decode_policy, uint32_t legacy_entry,
+                                YcnGfxConfig* cfg)
+{
+	memset(cfg, 0, sizeof(*cfg));
+	cfg->gfx_enabled = use_gfx ? TRUE : FALSE;
+	/* AVC 只能走 GFX；旧入口/显式关闭 GFX 都保持 non-AVC。 */
+	cfg->avc_enabled = (cfg->gfx_enabled && !legacy_entry &&
+	                    decode_policy > YCN_DECODE_POLICY_LEGACY) ? TRUE : FALSE;
+	cfg->support_graphics_pipeline = cfg->gfx_enabled;
+	cfg->support_dynamic_channels = TRUE;
+	cfg->thin_client = cfg->avc_enabled;
+	cfg->small_cache = cfg->gfx_enabled;
+	cfg->h264 = cfg->avc_enabled;
+	/* 现代入口（auto/software + GFX）走 AVC444/v2；legacy/GFX-off 仍 non-AVC。
+	 * 真双流 codec14/15 已过软件+DXVA2 离线验证；但 rdpgfx_main 不读取 v2 设置，
+	 * 服务器是否实际发 14/15 仍以 CAPSADVERTISE/CONFIRM 与 codec 统计为准。 */
+	cfg->avc444 = cfg->avc_enabled;
+	cfg->avc444v2 = cfg->avc_enabled;
+	cfg->progressive = FALSE;
+	cfg->progressivev2 = FALSE;
+	cfg->planar = TRUE;
+
+}
+
+/* 进程级回滚诊断：命令行含 --embed-avc420-only 时只关 AVC444 广告，
+ * 保留 AVC420(GfxH264)。不改 config、不改导出 ABI；便于失败时 A/B 对照。
+ * 只解析本进程命令行一次。 */
+static BOOL ycn_avc420_only_requested(void)
+{
+	static volatile LONG cached = -1;
+	LONG v = InterlockedCompareExchange(&cached, 0, 0);
+	const wchar_t token[] = L"--embed-avc420-only";
+	const wchar_t* cmd;
+
+	if (v >= 0)
+		return v ? TRUE : FALSE;
+	v = 0;
+	cmd = GetCommandLineW();
+	if (cmd)
+	{
+		const wchar_t* p = cmd;
+		while (*p)
+		{
+			const wchar_t* start;
+			size_t len;
+			BOOL quoted = FALSE;
+			while (*p == L' ' || *p == 9)
+				p++;
+			if (*p == L'"')
+			{
+				quoted = TRUE;
+				p++;
+			}
+			start = p;
+			while (*p && (quoted ? *p != L'"' : (*p != L' ' && *p != 9)))
+				p++;
+			len = (size_t)(p - start);
+			if (len == (sizeof(token) / sizeof(token[0]) - 1) &&
+			    _wcsnicmp(start, token, len) == 0)
+			{
+				v = 1;
+				break;
+			}
+			if (quoted && *p == L'"')
+				p++;
+		}
+	}
+	InterlockedExchange(&cached, v ? 1 : 0);
+	return v ? TRUE : FALSE;
+}
+
+static void ycn_apply_gfx_config(rdpSettings* settings, const YcnGfxConfig* cfg)
+{
+	BOOL avc444;
+	if (!settings || !cfg)
+		return;
+	avc444 = (cfg->avc444 && !ycn_avc420_only_requested()) ? TRUE : FALSE;
+	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
+	                          cfg->support_graphics_pipeline ? TRUE : FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxThinClient, cfg->thin_client);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxSmallCache, cfg->small_cache);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxH264, cfg->h264);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444, avc444);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxAVC444v2,
+	                          (cfg->avc444v2 && avc444) ? TRUE : FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE);
+	freerdp_settings_set_bool(settings, FreeRDP_GfxPlanar, TRUE);
+}
+
+typedef struct
+{
+	uint32_t size;
+	uint32_t version;
+	uint32_t policy;
+	uint32_t capabilities;
+	uint32_t hardwareRequested;
+	uint32_t hardwareInitialized;
+	uint32_t activeBackend;
+	uint32_t fallbackReason;
+	uint64_t successfulFrames;
+	uint64_t successfulHardwareFrames;
+	uint64_t successfulSoftwareFrames;
+	uint64_t decodeFailures;
+	int32_t lastError;
+	uint32_t recoveryAttempts;
+	uint32_t recoveryPending;
+	uint32_t reserved;
+	char backendName[32];
+	char lastErrorPhase[32];
+	uint32_t reserved2[2];
+} YcnFreeRdpH264Diag;
+
+typedef uint32_t(__cdecl* YcnFn_U32Void)(void);
+typedef BOOL(__cdecl* YcnFn_SetThreadPolicy)(uint32_t);
+typedef BOOL(__cdecl* YcnFn_GetGdiDiag)(rdpGdi*, uint16_t, YcnFreeRdpH264Diag*);
+
+typedef struct
+{
+	YcnFn_U32Void getApiVersion;
+	YcnFn_U32Void getCapabilities;
+	YcnFn_SetThreadPolicy setThreadPolicy;
+	YcnFn_GetGdiDiag getGdiDiag;
+	uint32_t capabilities;
+	BOOL ready;
+} YcnFreeRdpDecodeProbe;
+
+static INIT_ONCE g_decode_probe_once = INIT_ONCE_STATIC_INIT;
+static YcnFreeRdpDecodeProbe g_decode_probe;
+
+static BOOL CALLBACK init_decode_probe(PINIT_ONCE once, PVOID param, PVOID* context)
+{
+	HMODULE module;
+	(void)once;
+	(void)param;
+	(void)context;
+
+	module = GetModuleHandleW(L"freerdp3.dll");
+	if (!module)
+		return TRUE;
+	g_decode_probe.getApiVersion =
+	    (YcnFn_U32Void)GetProcAddress(module, "ycn_h264_decode_api_version");
+	g_decode_probe.getCapabilities =
+	    (YcnFn_U32Void)GetProcAddress(module, "ycn_h264_decode_capabilities");
+	g_decode_probe.setThreadPolicy = (YcnFn_SetThreadPolicy)GetProcAddress(
+	    module, "ycn_gdi_set_thread_h264_decode_policy");
+	g_decode_probe.getGdiDiag =
+	    (YcnFn_GetGdiDiag)GetProcAddress(module, "ycn_gdi_get_h264_diagnostics");
+	if (g_decode_probe.getApiVersion && g_decode_probe.getCapabilities &&
+	    g_decode_probe.setThreadPolicy && g_decode_probe.getGdiDiag &&
+	    g_decode_probe.getApiVersion() == 1)
+	{
+		g_decode_probe.capabilities = g_decode_probe.getCapabilities();
+		g_decode_probe.ready =
+		    ((g_decode_probe.capabilities & 3u) == 3u) ? TRUE : FALSE;
+	}
+	return TRUE;
+}
+
+static const YcnFreeRdpDecodeProbe* decode_probe(void)
+{
+	InitOnceExecuteOnce(&g_decode_probe_once, init_decode_probe, NULL, NULL);
+	return &g_decode_probe;
 }
 
 static YcnSession* find_session(int id)
@@ -341,8 +627,14 @@ static BOOL ycn_end_paint(rdpContext* context)
 		}
 		if (s->frame)
 		{
-			memcpy(s->frame, gdi->primary_buffer, (size_t)s->frame_stride * s->frame_height);
+			const size_t bytes = (size_t)s->frame_stride * s->frame_height;
+			const uint64_t t0 = ycn_qpc_now();
+			memcpy(s->frame, gdi->primary_buffer, bytes);
+			const uint64_t t1 = ycn_qpc_now();
 			s->frame_valid = TRUE;
+			s->endpaint_memcpy_count++;
+			s->endpaint_memcpy_bytes += (uint64_t)bytes;
+			s->endpaint_memcpy_ticks += t1 - t0;
 		}
 	}
 	LeaveCriticalSection(&g_lock);
@@ -365,18 +657,300 @@ static void ycn_debug_dump_gfx(const YcnSession* s, const char* tag);
  *          11=AVC420 13=CAPROGRESSIVE_V2 14=AVC444 15=AVC444v2
  * 若日志里出现 11/14/15，而本机 freerdp 是 WITH_GFX_H264=OFF（没有 h264 解码器），
  * 那就是崩溃的直接原因 —— 服务器无视 AVC_DISABLED 强推 AVC。 */
-static pcRdpgfxSurfaceCommand g_orig_gfx_surface = NULL;
-static volatile LONG g_gfx_last_codec = -1;
+static YcnSession* ycn_find_session_for_gfx(RdpgfxClientContext* ctx)
+{
+	YcnSession* s = NULL;
+	rdpGdi* gdi;
+	int i;
 
-/* 链式挂在 gdi 的实现之前：只记账（诊断已确认服务器发 CAPROGRESSIVE + CLEARCODEC），
- * 不再每帧写文件 —— 同步 I/O 会拖垮帧率。 */
+	if (!ctx || !ctx->custom)
+		return NULL;
+	gdi = (rdpGdi*)ctx->custom;
+	if (!gdi || !gdi->context)
+		return NULL;
+
+	EnterCriticalSection(&g_lock);
+	for (i = 0; i < YCN_MAX_SESSIONS; i++)
+	{
+		if (g_sessions[i].used && g_sessions[i].instance &&
+		    g_sessions[i].instance->context == gdi->context)
+		{
+			s = &g_sessions[i];
+			break;
+		}
+	}
+	LeaveCriticalSection(&g_lock);
+	return s;
+}
+
+static void ycn_update_decode_diag(YcnSession* s, RdpgfxClientContext* ctx,
+                                   const RDPGFX_SURFACE_COMMAND* cmd)
+{
+	const YcnFreeRdpDecodeProbe* probe = decode_probe();
+	YcnFreeRdpH264Diag diag;
+	rdpGdi* gdi;
+	const char* fallbackDetail = "none";
+	int id;
+
+	if (!s || !ctx || !cmd)
+		return;
+	if (cmd->codecId != 11u && cmd->codecId != 14u && cmd->codecId != 15u)
+	{
+		/* 真实服务器选 non-AVC（日志里常见 codec 8 CLEAR / 9 PROGRESSIVE）时，
+		 * 不能永远显示 pending。等到 AVC 成功帧后再由解码器诊断覆盖。 */
+		id = s->id;
+		EnterCriticalSection(&g_lock);
+		if (s->used && s->id == id && s->gfx_avc_surface_count == 0)
+		{
+			s->decode_last_surface = cmd->surfaceId;
+			strncpy_s(s->decode_fallback_detail, sizeof(s->decode_fallback_detail),
+			          "server-selected-non-avc", _TRUNCATE);
+		}
+		LeaveCriticalSection(&g_lock);
+		return;
+	}
+	if (!probe->ready || !probe->getGdiDiag)
+		return;
+	gdi = (rdpGdi*)ctx->custom;
+	if (!gdi)
+		return;
+
+	memset(&diag, 0, sizeof(diag));
+	diag.size = (uint32_t)sizeof(diag);
+	diag.version = 1u;
+	if (!probe->getGdiDiag(gdi, (uint16_t)(cmd->surfaceId > UINT16_MAX ? UINT16_MAX
+	                                                                   : cmd->surfaceId),
+	                       &diag))
+		return;
+
+	id = s->id;
+	EnterCriticalSection(&g_lock);
+	if (s->used && s->id == id)
+	{
+		s->decode_last_surface = cmd->surfaceId;
+		s->decode_backend = diag.activeBackend;
+		s->decode_fallback = diag.fallbackReason;
+		s->decode_hw_initialized = diag.hardwareInitialized;
+		if (diag.recoveryPending && !s->decode_recovery_pending)
+		{
+			s->decode_recovery_started = GetTickCount64();
+			s->decode_recovery_surface = cmd->surfaceId;
+			s->decode_recovery_pending = TRUE;
+		}
+		else if (!diag.recoveryPending && cmd->surfaceId == s->decode_recovery_surface)
+		{
+			s->decode_recovery_started = 0;
+			s->decode_recovery_pending = FALSE;
+		}
+		s->decode_last_error = diag.lastError;
+		s->decode_frames = diag.successfulFrames;
+		s->decode_hw_frames = diag.successfulHardwareFrames;
+		s->decode_sw_frames = diag.successfulSoftwareFrames;
+		s->decode_failures = diag.decodeFailures;
+		fallbackDetail = "none";
+		if (diag.recoveryPending)
+			fallbackDetail = "runtime-waiting-keyframe";
+		else if (diag.fallbackReason == 1u)
+			fallbackDetail = "policy-software";
+		else if (diag.fallbackReason == 2u)
+			fallbackDetail = "hw-unavailable";
+		else if (diag.fallbackReason == 3u)
+			fallbackDetail = "hw-init-failed";
+		else if (diag.fallbackReason == 4u)
+			fallbackDetail = "runtime-decoder-failure";
+		else if (diag.successfulFrames == 0)
+			fallbackDetail = "avc-inflight-no-successful-frame";
+		strncpy_s(s->decode_backend_name, sizeof(s->decode_backend_name), diag.backendName,
+		          _TRUNCATE);
+		strncpy_s(s->decode_error_phase, sizeof(s->decode_error_phase), diag.lastErrorPhase,
+		          _TRUNCATE);
+		strncpy_s(s->decode_fallback_detail, sizeof(s->decode_fallback_detail), fallbackDetail,
+		          _TRUNCATE);
+	}
+	LeaveCriticalSection(&g_lock);
+}
+
+static void ycn_request_full_refresh(YcnSession* s)
+{
+	freerdp* instance = NULL;
+	rdpUpdate* update = NULL;
+	rdpSettings* settings = NULL;
+	uint32_t width = 0;
+	uint32_t height = 0;
+	RECTANGLE_16 rect;
+
+	EnterCriticalSection(&g_lock);
+	if (s && s->used && s->instance && s->instance->context)
+	{
+		instance = s->instance;
+		settings = instance->context->settings;
+	}
+	LeaveCriticalSection(&g_lock);
+	if (!instance || !settings || !instance->context->update)
+		return;
+	update = instance->context->update;
+	if (!update->RefreshRect)
+		return;
+
+	width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	rect.left = 0;
+	rect.top = 0;
+	rect.right = (uint16_t)(width > UINT16_MAX ? UINT16_MAX : width);
+	rect.bottom = (uint16_t)(height > UINT16_MAX ? UINT16_MAX : height);
+	update->RefreshRect(instance->context, 1, &rect);
+}
+
+/* 链式挂在即将序列化的 CAPSADVERTISE 之前：只记录 PDU 与当时设置，
+ * 然后原样调用上游 send（不改包）。FreeRDP 3.32 的 rdpgfx_send_supported_caps
+ * 会先填好 pdu->capsSets，再 IFCALLRESULT(context->CapsAdvertise,...)，
+ * 因此这里看到的就是实际会发到线上的 versions/flags。 */
+static UINT ycn_gfx_caps_advertise(RdpgfxClientContext* ctx,
+                                   const RDPGFX_CAPS_ADVERTISE_PDU* pdu)
+{
+	YcnSession* s = ycn_find_session_for_gfx(ctx);
+	pcRdpgfxCapsAdvertise orig = NULL;
+
+	if (s && pdu && pdu->capsSets)
+	{
+		rdpSettings* settings = NULL;
+		BOOL reqH264 = FALSE;
+		BOOL reqA444 = FALSE;
+		BOOL reqA444v2 = FALSE;
+		uint32_t i;
+		uint32_t n;
+
+		EnterCriticalSection(&g_lock);
+		if (s->used && s->instance && s->instance->context)
+			settings = s->instance->context->settings;
+		LeaveCriticalSection(&g_lock);
+		if (settings)
+		{
+			reqH264 = freerdp_settings_get_bool(settings, FreeRDP_GfxH264);
+			reqA444 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444);
+			reqA444v2 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444v2);
+		}
+
+		n = pdu->capsSetCount;
+		if (n > YCN_GFX_ADV_CAP_MAX)
+			n = YCN_GFX_ADV_CAP_MAX;
+		EnterCriticalSection(&g_lock);
+		if (s->used)
+		{
+			s->gfx_adv_count = pdu->capsSetCount;
+			s->gfx_adv_req_h264 = reqH264 ? 1u : 0u;
+			s->gfx_adv_req_avc444 = reqA444 ? 1u : 0u;
+			s->gfx_adv_req_avc444v2 = reqA444v2 ? 1u : 0u;
+			for (i = 0; i < n; i++)
+			{
+				s->gfx_adv_version[i] = pdu->capsSets[i].version;
+				s->gfx_adv_flags[i] = pdu->capsSets[i].flags;
+			}
+		}
+		LeaveCriticalSection(&g_lock);
+	}
+	if (s)
+	{
+		EnterCriticalSection(&g_lock);
+		orig = s->orig_gfx_caps_advertise;
+		LeaveCriticalSection(&g_lock);
+	}
+	{
+		UINT rc = orig ? orig(ctx, pdu) : ERROR_BAD_CONFIGURATION;
+		if (s)
+		{
+			EnterCriticalSection(&g_lock);
+			if (s->used)
+				s->gfx_adv_send_rc = (uint32_t)rc;
+			LeaveCriticalSection(&g_lock);
+		}
+		return rc;
+	}
+}
+
+/* 链式挂在 gdi 的实现之前：按会话取原函数、设置本线程策略、只更新内存诊断。
+ * 不写文件，不持 g_lock 调 FreeRDP。 */
+static UINT ycn_gfx_caps_confirm(RdpgfxClientContext* ctx,
+                                 const RDPGFX_CAPS_CONFIRM_PDU* pdu)
+{
+	YcnSession* s = ycn_find_session_for_gfx(ctx);
+	pcRdpgfxCapsConfirm orig = NULL;
+
+	if (s && pdu && pdu->capsSet)
+	{
+		const RDPGFX_CAPSET* caps = pdu->capsSet;
+		EnterCriticalSection(&g_lock);
+		if (s->used)
+		{
+			s->gfx_caps_confirm_count++;
+			s->gfx_caps_version = caps->version;
+			s->gfx_caps_length = caps->length;
+			s->gfx_caps_flags = caps->flags;
+		}
+		LeaveCriticalSection(&g_lock);
+	}
+	if (s)
+	{
+		EnterCriticalSection(&g_lock);
+		orig = s->orig_gfx_caps_confirm;
+		LeaveCriticalSection(&g_lock);
+	}
+	/* 原实现为 NULL 时，FreeRDP 的 IFCALLRESULT 语义也是 CHANNEL_RC_OK。 */
+	return orig ? orig(ctx, pdu) : CHANNEL_RC_OK;
+}
+
 static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFACE_COMMAND* cmd)
 {
-	if (cmd)
-		InterlockedExchange(&g_gfx_last_codec, (LONG)cmd->codecId);
-	if (g_orig_gfx_surface)
-		return g_orig_gfx_surface(ctx, cmd);
-	return CHANNEL_RC_OK;
+	const YcnFreeRdpDecodeProbe* probe = decode_probe();
+	YcnSession* s = ycn_find_session_for_gfx(ctx);
+	pcRdpgfxSurfaceCommand orig = NULL;
+	uint32_t policy = YCN_DECODE_POLICY_LEGACY;
+	BOOL recoveryWasPending = FALSE;
+	BOOL recoveryNowPending = FALSE;
+	uint64_t t0;
+	UINT rc;
+
+	if (!s || !cmd)
+		return ERROR_INTERNAL_ERROR;
+	EnterCriticalSection(&g_lock);
+	orig = s->orig_gfx_surface;
+	policy = s->decode_effective_policy;
+	recoveryWasPending = s->decode_recovery_pending ? TRUE : FALSE;
+	s->decode_last_codec = cmd->codecId;
+	if (cmd->codecId < 16u)
+	{
+		s->gfx_codec_counts[cmd->codecId]++;
+		s->gfx_codec_bytes[cmd->codecId] += cmd->length;
+	}
+	if (cmd->codecId == 11u || cmd->codecId == 14u || cmd->codecId == 15u)
+		s->gfx_avc_surface_count++;
+	else
+		s->gfx_non_avc_surface_count++;
+	LeaveCriticalSection(&g_lock);
+
+	if (probe->setThreadPolicy)
+		probe->setThreadPolicy(policy);
+	if (!orig)
+		return ERROR_INTERNAL_ERROR;
+
+	t0 = ycn_qpc_now();
+	rc = orig(ctx, cmd);
+	{
+		const uint64_t t1 = ycn_qpc_now();
+		EnterCriticalSection(&g_lock);
+		if (s->used && cmd->codecId < 16u)
+		{
+			s->gfx_codec_ticks[cmd->codecId] += t1 - t0;
+		}
+		LeaveCriticalSection(&g_lock);
+	}
+	ycn_update_decode_diag(s, ctx, cmd);
+	EnterCriticalSection(&g_lock);
+	recoveryNowPending = s->decode_recovery_pending ? TRUE : FALSE;
+	LeaveCriticalSection(&g_lock);
+	if (!recoveryWasPending && recoveryNowPending)
+		ycn_request_full_refresh(s);
+	return rc;
 }
 
 /* ---- 诊断面包屑：**内存环形缓冲**，稳态零 I/O ----
@@ -418,9 +992,7 @@ static void ycn_note_av(const char* tag);
 /* ---- 诊断：GFX 各阶段「面包屑」（只经 ycn_bc 记内存，不落盘）----
  * 崩溃点定位：钩住 ResetGraphics / StartFrame / EndFrame，
  * 崩溃前最后一行就是元凶所在的那一步。 */
-static pcRdpgfxResetGraphics g_orig_reset_graphics = NULL;
-static pcRdpgfxStartFrame g_orig_start_frame = NULL;
-static pcRdpgfxEndFrame g_orig_end_frame = NULL;
+/* 原函数指针保存在 YcnSession 内；下方钩子按 gfx context 查会话。 */
 
 
 /* 把环形缓冲里最后 ≤YCN_BC_SLOTS 行面包屑**一次性**落盘。
@@ -463,15 +1035,19 @@ static void ycn_note_av(const char* tag)
 static UINT ycn_gfx_reset_graphics(RdpgfxClientContext* ctx, const RDPGFX_RESET_GRAPHICS_PDU* pdu)
 {
 	UINT rc = CHANNEL_RC_OK;
-	if (g_orig_reset_graphics)
+	YcnSession* s = ycn_find_session_for_gfx(ctx);
+	pcRdpgfxResetGraphics orig = NULL;
+	if (s)
 	{
-		/* ⚠️ gdi_ResetGraphics 在本机这份 freerdp 上**必然 AV**（已用面包屑钉死：
-		 * 进去就出不来，异常码 0xC0000005）。SEH 兜住之后 GFX 全帧管线照常工作
-		 * （实测帧到达 ~37 次/秒、codec = CAPROGRESSIVE + CLEARCODEC、画面正常），
-		 * 所以这里先兜底保证可用；治本要等定位到 gdi_ResetGraphics 内部的具体行。 */
+		EnterCriticalSection(&g_lock);
+		orig = s->orig_gfx_reset;
+		LeaveCriticalSection(&g_lock);
+	}
+	if (orig)
+	{
 		__try
 		{
-			rc = g_orig_reset_graphics(ctx, pdu);
+			rc = orig(ctx, pdu);
 		}
 		__except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
 		              ? EXCEPTION_EXECUTE_HANDLER
@@ -487,11 +1063,19 @@ static UINT ycn_gfx_reset_graphics(RdpgfxClientContext* ctx, const RDPGFX_RESET_
 static UINT ycn_gfx_start_frame(RdpgfxClientContext* ctx, const RDPGFX_START_FRAME_PDU* pdu)
 {
 	UINT rc = CHANNEL_RC_OK;
-	if (g_orig_start_frame)
+	YcnSession* s = ycn_find_session_for_gfx(ctx);
+	pcRdpgfxStartFrame orig = NULL;
+	if (s)
+	{
+		EnterCriticalSection(&g_lock);
+		orig = s->orig_gfx_start;
+		LeaveCriticalSection(&g_lock);
+	}
+	if (orig)
 	{
 		__try
 		{
-			rc = g_orig_start_frame(ctx, pdu);
+			rc = orig(ctx, pdu);
 		}
 		__except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
 		              ? EXCEPTION_EXECUTE_HANDLER
@@ -507,11 +1091,19 @@ static UINT ycn_gfx_start_frame(RdpgfxClientContext* ctx, const RDPGFX_START_FRA
 static UINT ycn_gfx_end_frame(RdpgfxClientContext* ctx, const RDPGFX_END_FRAME_PDU* pdu)
 {
 	UINT rc = CHANNEL_RC_OK;
-	if (g_orig_end_frame)
+	YcnSession* s = ycn_find_session_for_gfx(ctx);
+	pcRdpgfxEndFrame orig = NULL;
+	if (s)
+	{
+		EnterCriticalSection(&g_lock);
+		orig = s->orig_gfx_end;
+		LeaveCriticalSection(&g_lock);
+	}
+	if (orig)
 	{
 		__try
 		{
-			rc = g_orig_end_frame(ctx, pdu);
+			rc = orig(ctx, pdu);
 		}
 		__except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
 		              ? EXCEPTION_EXECUTE_HANDLER
@@ -1753,10 +2345,20 @@ static void ycn_on_channel_connected(void* ctx, const ChannelConnectedEventArgs*
 	}
 	LeaveCriticalSection(&g_lock);
 
-	if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && context->gdi)
+	if (strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && context->gdi && s && s->use_gfx)
 	{
 		RdpgfxClientContext* gfx = (RdpgfxClientContext*)e->pInterface;
-		const BOOL ok = gdi_graphics_pipeline_init(context->gdi, gfx);
+		const YcnFreeRdpDecodeProbe* probe = decode_probe();
+		BOOL ok = FALSE;
+		uint32_t policy = YCN_DECODE_POLICY_LEGACY;
+
+		if (s)
+			policy = s->decode_effective_policy;
+		if (probe->setThreadPolicy)
+			probe->setThreadPolicy(policy);
+
+		if (gfx)
+			ok = gdi_graphics_pipeline_init(context->gdi, gfx);
 		WLog_INFO(TAG, "gfx pipeline: attached to GDI (full-frame mode)");
 		if (s)
 		{
@@ -1768,17 +2370,23 @@ static void ycn_on_channel_connected(void* ctx, const ChannelConnectedEventArgs*
 
 			if (ok)
 			{
-				/* 链式挂钩：记录收到的 GFX 帧用的编解码器（判断是不是 AVC） */
-				g_orig_gfx_surface = gfx->SurfaceCommand;
-				gfx->SurfaceCommand = ycn_gfx_surface_command;
+				/* 原回调按会话保存，避免多会话互相覆盖函数指针。 */
+				EnterCriticalSection(&g_lock);
+				s->gfx = gfx;
+				s->orig_gfx_surface = gfx->SurfaceCommand;
+				s->orig_gfx_reset = gfx->ResetGraphics;
+				s->orig_gfx_start = gfx->StartFrame;
+				s->orig_gfx_end = gfx->EndFrame;
+				s->orig_gfx_caps_confirm = gfx->CapsConfirm;
+				s->orig_gfx_caps_advertise = gfx->CapsAdvertise;
+				LeaveCriticalSection(&g_lock);
 
-				/* 面包屑：把崩溃点夹到具体某一步 */
-				g_orig_reset_graphics = gfx->ResetGraphics;
+				gfx->SurfaceCommand = ycn_gfx_surface_command;
 				gfx->ResetGraphics = ycn_gfx_reset_graphics;
-				g_orig_start_frame = gfx->StartFrame;
 				gfx->StartFrame = ycn_gfx_start_frame;
-				g_orig_end_frame = gfx->EndFrame;
 				gfx->EndFrame = ycn_gfx_end_frame;
+				gfx->CapsConfirm = ycn_gfx_caps_confirm;
+				gfx->CapsAdvertise = ycn_gfx_caps_advertise;
 			}
 		}
 	}
@@ -1814,6 +2422,9 @@ static BOOL ycn_load_channels(freerdp* instance)
 	YcnSession* s = NULL;
 	int i;
 	BOOL wantAudio;
+	BOOL useGfx = FALSE;
+	uint32_t decodePolicy = YCN_DECODE_POLICY_LEGACY;
+	YcnGfxConfig gfxCfg;
 
 	if (!instance || !instance->context || !instance->context->channels)
 	{
@@ -1837,6 +2448,8 @@ static BOOL ycn_load_channels(freerdp* instance)
 		}
 	}
 	wantAudio = (s && s->enable_audio) ? TRUE : FALSE;
+	useGfx = (s && s->use_gfx) ? TRUE : FALSE;
+	decodePolicy = s ? s->decode_effective_policy : YCN_DECODE_POLICY_LEGACY;
 	LeaveCriticalSection(&g_lock);
 
 	/* 放行 GFX 需要的两条通道：
@@ -1851,8 +2464,21 @@ static BOOL ycn_load_channels(freerdp* instance)
 	freerdp_settings_set_bool(settings, FreeRDP_AudioCapture, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_DeviceRedirection, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_RedirectClipboard, FALSE);
-	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
-	freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE);
+	/* PreConnect 与 LoadChannels 必须用同一个纯函数，禁止这里再无条件写 TRUE：
+	 * gfx_enabled=false 是要能当 A/B 对照真实关闭 GFX 的。 */
+	ycn_calc_gfx_config(useGfx, decodePolicy,
+	                    decodePolicy == YCN_DECODE_POLICY_LEGACY ? 1u : 0u, &gfxCfg);
+	ycn_apply_gfx_config(settings, &gfxCfg);
+	if (s)
+	{
+		/* 记录生产 setter 落到真实 settings 的 actual 值（含进程级 AVC420-only 回滚）。 */
+		s->gfx_cfg_support_pipeline =
+		    freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline) ? 1u : 0u;
+		s->gfx_cfg_thin_client = freerdp_settings_get_bool(settings, FreeRDP_GfxThinClient) ? 1u : 0u;
+		s->gfx_cfg_h264 = freerdp_settings_get_bool(settings, FreeRDP_GfxH264) ? 1u : 0u;
+		s->gfx_cfg_avc444 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444) ? 1u : 0u;
+		s->gfx_cfg_progressive = freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive) ? 1u : 0u;
+	}
 
 	/* 关掉 disp（Microsoft::Windows::RDS::DisplayControl，动态分辨率）：
 	 * 我们固定 1920×1080，不需要它；多一条通道只会多几次 ResetGraphics 协商，
@@ -1905,6 +2531,9 @@ static BOOL ycn_pre_connect(freerdp* instance)
 {
 	YcnSession* s = NULL;
 	int i;
+	uint32_t decode_policy = YCN_DECODE_POLICY_LEGACY;
+	BOOL use_gfx = FALSE;
+	YcnGfxConfig gfxCfg;
 	rdpSettings* settings = instance->context->settings;
 
 	EnterCriticalSection(&g_lock);
@@ -1914,6 +2543,8 @@ static BOOL ycn_pre_connect(freerdp* instance)
 		    g_sessions[i].instance->context == instance->context)
 		{
 			s = &g_sessions[i];
+			decode_policy = s->decode_effective_policy;
+			use_gfx = s->use_gfx ? TRUE : FALSE;
 			break;
 		}
 	}
@@ -1924,12 +2555,19 @@ static BOOL ycn_pre_connect(freerdp* instance)
 	freerdp_settings_set_bool(settings, FreeRDP_NetworkAutoDetect, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, FALSE);
 
-	/* GFX 全帧管线（M6）：服务器在 AVC 被禁时会协商 progressive（内置解码），
-	 * EndFrame 语义 = 整帧完成 → 帧回调拿到的永远是完整帧（撕裂根治）。
-	 * 解码器缺失时 caps 自动不含 AVC444，无需外部依赖 */
-	if (s->use_gfx)
+	/* GFX/AVC 设置统一由纯函数生成：use_gfx 优先。旧入口（effective=legacy）
+	 * 可继续开 GFX，但不声明 ThinClient/AVC；版本化 auto/software 才声明
+	 * AVC420 + ThinClient。GFX 关闭时只关 GFX/AVC，动态通道/音频保持不变。 */
+	ycn_calc_gfx_config(use_gfx ? 1u : 0u, decode_policy,
+	                    decode_policy == YCN_DECODE_POLICY_LEGACY ? 1u : 0u, &gfxCfg);
+	ycn_apply_gfx_config(settings, &gfxCfg);
+	if (s)
 	{
-		freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
+		s->gfx_cfg_support_pipeline = gfxCfg.support_graphics_pipeline ? 1u : 0u;
+		s->gfx_cfg_thin_client = gfxCfg.thin_client ? 1u : 0u;
+		s->gfx_cfg_h264 = gfxCfg.h264 ? 1u : 0u;
+		s->gfx_cfg_avc444 = gfxCfg.avc444 ? 1u : 0u;
+		s->gfx_cfg_progressive = gfxCfg.progressive ? 1u : 0u;
 	}
 	freerdp_settings_set_uint32(settings, FreeRDP_MultitransportFlags, 0);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportHeartbeatPdu, FALSE);
@@ -1963,7 +2601,8 @@ static BOOL ycn_pre_connect(freerdp* instance)
 		{
 			code |= 2;
 		}
-		if (freerdp_channels_load_static_addin_entry("rdpgfx", NULL, NULL,
+		if (gfxCfg.support_graphics_pipeline &&
+		    freerdp_channels_load_static_addin_entry("rdpgfx", NULL, NULL,
 		        YCN_ADDIN_CHANNEL_STATIC | YCN_ADDIN_CHANNEL_ENTRYEX))
 		{
 			code |= 4;
@@ -1985,15 +2624,9 @@ static BOOL ycn_pre_connect(freerdp* instance)
 	 * （M1 冒烟：0 延迟注入稳定/N 秒后注入必掉线，服务器日志 #97 实证）。
 	 * 禁掉后重连退化为全新登录（AutoLogon），加密状态两端一致 */
 	freerdp_settings_set_bool(settings, FreeRDP_AutoReconnectionEnabled, FALSE);
-	/* GFX 管道（无 H.264，仅 planar/thin-client caps）：服务器组策略开了
-	 * AVC444ModePreferred，会「等待图形子系统」并卡在会话 passthrough 状态，
-	 * 期间任何输入 PDU 都触发服务器 RDP_SEC 状态机错误断开（日志 #97/#226）。
-	 * 开 GFX 让图形通道能握手完成。首期仍不解码 H.264（GfxH264 关），
-	 * 编码由服务器按 caps 回退到 planar */
-	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline, TRUE);
-	freerdp_settings_set_bool(settings, FreeRDP_GfxH264, FALSE);
-	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
-	freerdp_settings_set_bool(settings, FreeRDP_GfxPlanar, TRUE);
+	/* 这里不再重复设置 GFX/AVC：ycn_apply_gfx_config() 已按 use_gfx 优先级
+	 * 写入；再无条件置 SupportGraphicsPipeline=TRUE 会破坏 gfx_enabled=false 的
+	 * A/B 对照，也会让 LoadChannels 的同一份决策失真。 */
 	return TRUE;
 }
 
@@ -2186,6 +2819,24 @@ static DWORD WINAPI event_loop(LPVOID arg)
 				break;
 			}
 
+			/* A full refresh is not guaranteed to contain an IDR. Bound recovery
+			 * even when the server stops sending packets, rather than retaining
+			 * an apparently connected black surface indefinitely. */
+			BOOL decodeRecoveryExpired = FALSE;
+			EnterCriticalSection(&g_lock);
+			decodeRecoveryExpired = s->decode_recovery_pending &&
+			    s->decode_recovery_started != 0 &&
+			    GetTickCount64() - s->decode_recovery_started >= 5000;
+			LeaveCriticalSection(&g_lock);
+			if (decodeRecoveryExpired)
+			{
+				_snprintf_s(detail, sizeof(detail), _TRUNCATE,
+				            "video decode recovery timed out waiting for a keyframe; reconnect with software decode");
+				set_session_error(s, "%s", detail);
+				fail_reason = YCN_DISCONNECT_ERROR;
+				break;
+			}
+
 			/* 消费输入队列（必须在本线程发送，见 YcnMouseReq 注释） */
 			for (;;)
 			{
@@ -2366,20 +3017,37 @@ teardown:
 
 /* ---------------- 导出实现 ---------------- */
 
-YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks, void* user)
+static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
+                            void* user, uint32_t requested_decode_policy)
 {
 	int slot = -1;
 	int id;
 	YcnSession* s;
 	freerdp* instance;
 	rdpSettings* settings;
+	const YcnFreeRdpDecodeProbe* probe;
+	uint32_t effective_decode_policy = YCN_DECODE_POLICY_LEGACY;
+	YcnGfxConfig gfxCfg;
 
 	if (!params || !params->host || !params->username || !params->password || !callbacks)
 	{
 		set_global_error("invalid argument: params/callbacks 为空");
 		return YCN_ERR_INVALID_ARG;
 	}
+	if (requested_decode_policy > YCN_DECODE_POLICY_SOFTWARE)
+	{
+		set_global_error("invalid decode_policy: %u", (unsigned)requested_decode_policy);
+		return YCN_ERR_INVALID_ARG;
+	}
 	process_init();
+	probe = decode_probe();
+	if (requested_decode_policy > YCN_DECODE_POLICY_LEGACY && probe->ready &&
+	    ((probe->capabilities & YCN_DECODE_CAP_AVC) != 0) && params->use_gfx)
+		effective_decode_policy = requested_decode_policy;
+	/* p.use_gfx 优先：GFX 关闭时 AVC 无承载通道，明确退回 non-AVC，
+	 * 不留下一个永远 pending 的伪 AVC 会话语义。 */
+	if (!params->use_gfx)
+		effective_decode_policy = YCN_DECODE_POLICY_LEGACY;
 
 	EnterCriticalSection(&g_lock);
 	for (id = 0; id < YCN_MAX_SESSIONS; id++)
@@ -2428,7 +3096,32 @@ YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callback
 	s->allow_selfsigned = params->allow_selfsigned;
 	s->enable_audio = params->enable_audio;
 	s->use_gfx = params->use_gfx;
+	s->decode_request_policy = requested_decode_policy;
+	s->decode_effective_policy = effective_decode_policy;
+	s->decode_hw_compiled = (probe->capabilities & YCN_DECODE_CAP_HW_COMPILED) ? 1u : 0u;
+	s->decode_backend = 0;
+	s->decode_fallback = 0;
+	if ((requested_decode_policy > YCN_DECODE_POLICY_LEGACY) && !params->use_gfx)
+		strncpy_s(s->decode_fallback_detail, sizeof(s->decode_fallback_detail),
+		          "gfx-disabled", _TRUNCATE);
+	else if ((requested_decode_policy > YCN_DECODE_POLICY_LEGACY) &&
+	         (effective_decode_policy == YCN_DECODE_POLICY_LEGACY))
+		strncpy_s(s->decode_fallback_detail, sizeof(s->decode_fallback_detail),
+		          "upstream-patch-unavailable", _TRUNCATE);
+	else if (requested_decode_policy == YCN_DECODE_POLICY_SOFTWARE)
+		strncpy_s(s->decode_fallback_detail, sizeof(s->decode_fallback_detail),
+		          "policy-software", _TRUNCATE);
+	else if (requested_decode_policy == YCN_DECODE_POLICY_AUTO_HW)
+		strncpy_s(s->decode_fallback_detail, sizeof(s->decode_fallback_detail),
+		          "awaiting-first-gfx-surface", _TRUNCATE);
 	InterlockedExchange(&s->muted, 0); /* 新会话默认不静音（C# 侧若记住状态会在连上后立刻设一次） */
+	ycn_calc_gfx_config(params->use_gfx ? 1u : 0u, effective_decode_policy,
+	                    effective_decode_policy == YCN_DECODE_POLICY_LEGACY ? 1u : 0u, &gfxCfg);
+	s->gfx_cfg_support_pipeline = gfxCfg.support_graphics_pipeline ? 1u : 0u;
+	s->gfx_cfg_thin_client = gfxCfg.thin_client ? 1u : 0u;
+	s->gfx_cfg_h264 = gfxCfg.h264 ? 1u : 0u;
+	s->gfx_cfg_avc444 = gfxCfg.avc444 ? 1u : 0u;
+	s->gfx_cfg_progressive = gfxCfg.progressive ? 1u : 0u;
 	s->gfx_state = params->use_gfx ? 1 : 0;
 	s->dvc_connected = 0;
 	s->dvc_names[0] = '\0';
@@ -2457,25 +3150,8 @@ YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callback
 	s->instance = instance;
 	instance->PreConnect = ycn_pre_connect;
 	instance->PostConnect = ycn_post_connect;
-	/* ⚠️ GFX 全帧管线（instance->LoadChannels）**暂时不挂**，回退到 legacy 更新。
-	 *
-	 * 已查实的事实链（2026-10-04）：
-	 *   1) 挂上它之后通道确实能加载（load_addins 成功、drdynvc 就位），
-	 *      服务器也确实切到了 GFX 编码 —— 但帧一帧都进不来（帧到达 0/秒，画面静止）。
-	 *   2) gdi_graphics_pipeline_init 内部用 FREERDP_CODEC_ALL 调
-	 *      freerdp_client_codecs_prepare；本机 vcpkg 的 freerdp **没编 H.264 解码器**
-	 *      （端口无 h264 feature），这一步大概率直接失败 → GFX 接不上 GDI。
-	 *   3) 于是"声明了 GFX 能力 + 建了 DVC"反而让服务器不再走 legacy，退化成零帧。
-	 *
-	 * 结论：要真正打开 GFX，得先在 vcpkg 里重装带 h264 的 freerdp 再编原生层，
-	 * 属于独立一步（不是改几行代码能收口的）。在此之前保持通道不加载 =
-	 * 服务器走 legacy bitmap 更新（有画面），撕裂由 C# 侧的**锁内整帧拷贝**兜住。
-	 *
-	 * 【2026-10-04 00:48 验证结果】挂上它之后进程在连接建立数秒内 **AV 崩溃**
-	 * （退出码 0xC0000005），不是"解码器为空"这么温和 —— GFX 路径在本机这份
-	 * freerdp 上有更硬的兼容问题（大概率就是缺 H.264/AVC 解码器，GFX 帧处理时踩到
-	 * 半初始化的编解码上下文）。下次要动这块，先 vcpkg 装 h264 再复测。 */
-	/* ⚠️ 这一行是 GFX 全帧管线的**命门**：不挂它 = 通道一条都加载不上（见 ycn_load_channels 注释） */
+	/* LoadChannels is required for drdynvc/rdpgfx and audio. AVC is
+	 * advertised only when the versioned decoder capability probe succeeds. */
 	instance->LoadChannels = ycn_load_channels;
 	instance->VerifyX509Certificate = ycn_verify_x509;
 	instance->AuthenticateEx = ycn_authenticate_ex;
@@ -2552,6 +3228,92 @@ YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callback
 	}
 	LeaveCriticalSection(&g_lock);
 	return id;
+}
+
+YCN_API int ycn_rdp_graphics_settings_probe(uint32_t use_gfx, uint32_t decode_policy,
+                                            uint32_t legacy_entry,
+                                            ycn_graphics_settings_probe* out)
+{
+	YcnGfxConfig cfg;
+	rdpSettings* settings;
+	uint32_t caller_size;
+	BOOL audioPreserved;
+
+	if (!out || out->size < sizeof(*out) ||
+	    out->version != YCN_GRAPHICS_SETTINGS_PROBE_VERSION)
+		return YCN_ERR_INVALID_ARG;
+	if (decode_policy > YCN_DECODE_POLICY_SOFTWARE)
+		return YCN_ERR_INVALID_ARG;
+
+	process_init();
+	settings = freerdp_settings_new(0);
+	if (!settings)
+		return YCN_ERR_NO_MEMORY;
+	if (!freerdp_settings_set_bool(settings, FreeRDP_AudioPlayback, FALSE))
+	{
+		freerdp_settings_free(settings);
+		return YCN_ERR_INVALID_ARG;
+	}
+
+	caller_size = out->size;
+	ycn_calc_gfx_config(use_gfx ? 1u : 0u, decode_policy, legacy_entry ? 1u : 0u, &cfg);
+	ycn_apply_gfx_config(settings, &cfg);
+	audioPreserved = freerdp_settings_get_bool(settings, FreeRDP_AudioPlayback) == FALSE;
+
+	memset(out, 0, sizeof(*out));
+	out->size = caller_size;
+	out->version = YCN_GRAPHICS_SETTINGS_PROBE_VERSION;
+	out->use_gfx = use_gfx ? 1u : 0u;
+	out->decode_policy = decode_policy;
+	out->legacy_entry = legacy_entry ? 1u : 0u;
+	/* 读回生产 setter 写进真实 rdpSettings 的值，而不是复制 cfg 预测。 */
+	out->support_graphics_pipeline =
+	    freerdp_settings_get_bool(settings, FreeRDP_SupportGraphicsPipeline) ? 1u : 0u;
+	out->support_dynamic_channels =
+	    freerdp_settings_get_bool(settings, FreeRDP_SupportDynamicChannels) ? 1u : 0u;
+	out->gfx_thin_client = freerdp_settings_get_bool(settings, FreeRDP_GfxThinClient) ? 1u : 0u;
+	out->gfx_small_cache = freerdp_settings_get_bool(settings, FreeRDP_GfxSmallCache) ? 1u : 0u;
+	out->gfx_h264 = freerdp_settings_get_bool(settings, FreeRDP_GfxH264) ? 1u : 0u;
+	out->gfx_avc444 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444) ? 1u : 0u;
+	out->gfx_avc444v2 = freerdp_settings_get_bool(settings, FreeRDP_GfxAVC444v2) ? 1u : 0u;
+	out->gfx_progressive = freerdp_settings_get_bool(settings, FreeRDP_GfxProgressive) ? 1u : 0u;
+	out->gfx_progressivev2 =
+	    freerdp_settings_get_bool(settings, FreeRDP_GfxProgressiveV2) ? 1u : 0u;
+	out->gfx_planar = freerdp_settings_get_bool(settings, FreeRDP_GfxPlanar) ? 1u : 0u;
+	out->audio_unchanged = audioPreserved ? 1u : 0u;
+	freerdp_settings_free(settings);
+	return YCN_OK;
+}
+
+YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
+                            void* user)
+{
+	return ycn_connect_impl(params, callbacks, user, YCN_DECODE_POLICY_LEGACY);
+}
+
+YCN_API int ycn_rdp_connect_ex(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
+                               void* user, uint32_t decode_policy)
+{
+	if (decode_policy > YCN_DECODE_POLICY_SOFTWARE)
+	{
+		set_global_error("invalid decode_policy: %u", (unsigned)decode_policy);
+		return YCN_ERR_INVALID_ARG;
+	}
+	return ycn_connect_impl(params, callbacks, user, decode_policy);
+}
+
+YCN_API uint32_t ycn_rdp_decode_api_version(void)
+{
+	return 1u;
+}
+
+YCN_API uint32_t ycn_rdp_decode_capabilities(void)
+{
+	const YcnFreeRdpDecodeProbe* probe = decode_probe();
+	if (!probe->ready)
+		return 0u;
+	return probe->capabilities & (YCN_DECODE_CAP_AVC | YCN_DECODE_CAP_DIAGNOSTICS |
+	                              YCN_DECODE_CAP_HW_COMPILED);
 }
 
 YCN_API void ycn_rdp_disconnect(int session)
@@ -2935,7 +3697,12 @@ YCN_API int ycn_rdp_copy_frame(int session, uint8_t* dst, uint32_t dst_size,
 		need = (size_t)s->frame_stride * s->frame_height;
 		if (need <= (size_t)dst_size)
 		{
+			const uint64_t t0 = ycn_qpc_now();
 			memcpy(dst, s->frame, need);
+			const uint64_t t1 = ycn_qpc_now();
+			s->copy_frame_count++;
+			s->copy_frame_bytes += (uint64_t)need;
+			s->copy_frame_ticks += t1 - t0;
 			rc = YCN_OK;
 		}
 		else
@@ -2985,6 +3752,8 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 	rdpSettings* settings = NULL;
 	int live = 0;
 	int i;
+	uint32_t adv_last = 0;
+	char perf[1024];
 
 	if (!buf || buflen == 0)
 		return;
@@ -3000,14 +3769,90 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		settings = s->instance->context->settings;
 	if (s)
 	{
+		if (s->gfx_adv_count > 0)
+		{
+			adv_last = s->gfx_adv_count - 1;
+			if (adv_last >= YCN_GFX_ADV_CAP_MAX)
+				adv_last = YCN_GFX_ADV_CAP_MAX - 1;
+		}
 		_snprintf_s(buf, buflen, _TRUNCATE,
-		            "live_sessions=%d total_created=%ld total_released=%ld load_addins=%d static_ch=%u dyn_ch=%u gfx_state=%d dvc=%u gfx_init=%d codecs_null=%d names=[%s]",
-		            live, (long)InterlockedCompareExchange(&g_total_created, 0, 0),
-		            (long)InterlockedCompareExchange(&g_total_released, 0, 0), s->addins_rc,
+		            "live_sessions=%d load_addins=%d static_ch=%u dyn_ch=%u gfx_state=%d dvc=%u gfx_init=%d codecs_null=%d "
+		            "gfx_cfg=[pipeline:%u thin:%u h264:%u avc444:%u progressive:%u] "
+		            "caps=[confirm:%u version:0x%08X flags:0x%08X] "
+		            "adv=[n:%u req:h264%u avc444%u v2:%u v0:0x%08X f0:0x%08X v1:0x%08X f1:0x%08X vlast:0x%08X flast:0x%08X send_rc:%u] "
+		            "decode_policy=%u decode_effective=%u decode_codec=%u decoder=[%s] "
+		            "hw_compiled=%u hw_init=%u hwactive=%u hw_frames=%llu sw_frames=%llu decode_fail=%llu "
+		            "recovery_pending=%u fallback=%u fallback_detail=[%s] decode_error=%d "
+		            "avc_surface=%llu non_avc_surface=%llu codec_counts_by_id=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]",
+		            live, s->addins_rc,
 		            settings ? (unsigned)freerdp_settings_get_uint32(settings, FreeRDP_StaticChannelCount) : 0u,
 		            settings ? (unsigned)freerdp_settings_get_uint32(settings, FreeRDP_DynamicChannelCount) : 0u,
 		            (int)s->gfx_state, (unsigned)s->dvc_connected,
-		            s->gfx_init_rc, s->gfx_codecs_null, s->dvc_names);
+		            s->gfx_init_rc, s->gfx_codecs_null,
+		            (unsigned)s->gfx_cfg_support_pipeline, (unsigned)s->gfx_cfg_thin_client,
+		            (unsigned)s->gfx_cfg_h264, (unsigned)s->gfx_cfg_avc444,
+		            (unsigned)s->gfx_cfg_progressive,
+		            (unsigned)s->gfx_caps_confirm_count, (unsigned)s->gfx_caps_version,
+		            (unsigned)s->gfx_caps_flags,
+		            (unsigned)s->gfx_adv_count, (unsigned)s->gfx_adv_req_h264,
+		            (unsigned)s->gfx_adv_req_avc444, (unsigned)s->gfx_adv_req_avc444v2,
+		            (unsigned)s->gfx_adv_version[0], (unsigned)s->gfx_adv_flags[0],
+		            (unsigned)s->gfx_adv_version[1], (unsigned)s->gfx_adv_flags[1],
+		            (unsigned)s->gfx_adv_version[adv_last], (unsigned)s->gfx_adv_flags[adv_last],
+		            (unsigned)s->gfx_adv_send_rc,
+		            (unsigned)s->decode_request_policy, (unsigned)s->decode_effective_policy,
+		            (unsigned)s->decode_last_codec, s->decode_backend_name,
+		            (unsigned)s->decode_hw_compiled, (unsigned)s->decode_hw_initialized,
+		            (unsigned)((s->decode_hw_frames > 0u && s->decode_backend >= 2u &&
+		                        s->decode_backend <= 4u && !s->decode_recovery_pending &&
+		                        (s->decode_last_codec == 11u || s->decode_last_codec == 14u ||
+		                         s->decode_last_codec == 15u))
+		                           ? 1u
+		                           : 0u),
+		            (unsigned long long)s->decode_hw_frames,
+		            (unsigned long long)s->decode_sw_frames,
+		            (unsigned long long)s->decode_failures,
+		            (unsigned)s->decode_recovery_pending, (unsigned)s->decode_fallback,
+		            s->decode_fallback_detail, (int)s->decode_last_error,
+		            (unsigned long long)s->gfx_avc_surface_count,
+		            (unsigned long long)s->gfx_non_avc_surface_count,
+		            (unsigned long long)s->gfx_codec_counts[0], (unsigned long long)s->gfx_codec_counts[1],
+		            (unsigned long long)s->gfx_codec_counts[2], (unsigned long long)s->gfx_codec_counts[3],
+		            (unsigned long long)s->gfx_codec_counts[4], (unsigned long long)s->gfx_codec_counts[5],
+		            (unsigned long long)s->gfx_codec_counts[6], (unsigned long long)s->gfx_codec_counts[7],
+		            (unsigned long long)s->gfx_codec_counts[8], (unsigned long long)s->gfx_codec_counts[9],
+		            (unsigned long long)s->gfx_codec_counts[10], (unsigned long long)s->gfx_codec_counts[11],
+		            (unsigned long long)s->gfx_codec_counts[12], (unsigned long long)s->gfx_codec_counts[13],
+		            (unsigned long long)s->gfx_codec_counts[14], (unsigned long long)s->gfx_codec_counts[15]);
+		_snprintf_s(perf, sizeof(perf), _TRUNCATE,
+		            " perf=[endpaint n=%llu B=%llu ms=%.3f copy_frame n=%llu B=%llu ms=%.3f "
+		            "surface_ms_by_codec=[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f] "
+		            "surface_B_by_codec=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+		            "names=[%.31s]]",
+		            (unsigned long long)s->endpaint_memcpy_count,
+		            (unsigned long long)s->endpaint_memcpy_bytes,
+		            ycn_ticks_to_ms(s->endpaint_memcpy_ticks),
+		            (unsigned long long)s->copy_frame_count,
+		            (unsigned long long)s->copy_frame_bytes,
+		            ycn_ticks_to_ms(s->copy_frame_ticks),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[0]), ycn_ticks_to_ms(s->gfx_codec_ticks[1]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[2]), ycn_ticks_to_ms(s->gfx_codec_ticks[3]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[4]), ycn_ticks_to_ms(s->gfx_codec_ticks[5]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[6]), ycn_ticks_to_ms(s->gfx_codec_ticks[7]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[8]), ycn_ticks_to_ms(s->gfx_codec_ticks[9]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[10]), ycn_ticks_to_ms(s->gfx_codec_ticks[11]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[12]), ycn_ticks_to_ms(s->gfx_codec_ticks[13]),
+		            ycn_ticks_to_ms(s->gfx_codec_ticks[14]), ycn_ticks_to_ms(s->gfx_codec_ticks[15]),
+		            (unsigned long long)s->gfx_codec_bytes[0], (unsigned long long)s->gfx_codec_bytes[1],
+		            (unsigned long long)s->gfx_codec_bytes[2], (unsigned long long)s->gfx_codec_bytes[3],
+		            (unsigned long long)s->gfx_codec_bytes[4], (unsigned long long)s->gfx_codec_bytes[5],
+		            (unsigned long long)s->gfx_codec_bytes[6], (unsigned long long)s->gfx_codec_bytes[7],
+		            (unsigned long long)s->gfx_codec_bytes[8], (unsigned long long)s->gfx_codec_bytes[9],
+		            (unsigned long long)s->gfx_codec_bytes[10], (unsigned long long)s->gfx_codec_bytes[11],
+		            (unsigned long long)s->gfx_codec_bytes[12], (unsigned long long)s->gfx_codec_bytes[13],
+		            (unsigned long long)s->gfx_codec_bytes[14], (unsigned long long)s->gfx_codec_bytes[15],
+		            s->dvc_names);
+		strncat_s(buf, buflen, perf, _TRUNCATE);
 	}
 	else
 	{

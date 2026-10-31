@@ -1,0 +1,25 @@
+{
+  "name": "yomori-native-deps",
+  "version-string": "1.0.0",
+  "builtin-baseline": "10541e317a660f4165ba4ac2851ab54a8d4577b1",
+  "dependencies": [
+    {
+      "name": "freerdp",
+      "default-features": false,
+      "features": [
+        "client",
+        "ffmpeg"
+      ]
+    }
+  ],
+  "overrides": [
+    {
+      "name": "freerdp",
+      "version": "3.32.0"
+    },
+    {
+      "name": "ffmpeg",
+      "version": "9.0.2"
+    }
+  ]
+}

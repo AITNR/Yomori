@@ -26,6 +26,8 @@ namespace Yomori.Services
         public bool AllowSelfsigned { get; init; } = true;
         public bool EnableAudio { get; init; } = true;
         public bool UseGfx { get; init; }
+        public string DecodeBackend { get; init; } = DecodeBackends.Auto;
+        public string RenderBackend { get; init; } = RenderBackends.Auto;
     }
 
     /// <summary>一帧就绪的通知（携带可立即 grab 的会话）。</summary>
@@ -54,6 +56,14 @@ namespace Yomori.Services
         private RdpClientState _state = RdpClientState.Idle;
         private int _session;
         private bool _disconnectRequested;
+        private string _decodeBackend = DecodeBackends.Auto;
+        private string _renderBackend = RenderBackends.Auto;
+        private uint _requestedDecodePolicy;
+        private uint _decodeApiVersion;
+        private uint _decodeCapabilities;
+        private bool _usedVersionedDecodeEntry;
+        private static readonly bool s_forceSoftwareFromCommandLine = Array.Exists(
+            Environment.GetCommandLineArgs(), a => a == "--embed-nod3d");
         // 最近一次「静音意图」。原生 ycn_rdp_set_muted 在会话不是 RUNNING 时**直接拒绝**，
         // 而调用方普遍在 Connect() 之前就下发（见 MainViewModel.TryStartEmbeddedConnect /
         // RdpSurfaceCell.SetClient）——那一刻 session 还是 0，必然被拒。
@@ -209,7 +219,42 @@ namespace Yomori.Services
 
             var cb = _nativeCallbacks.Value;
             int session;
-            try { session = RdpNativeInterop.ycn_rdp_connect(ref p, ref cb, IntPtr.Zero); }
+            try
+            {
+                var requestedPolicy = RdpDecodePolicy.Resolve(
+                    info.DecodeBackend, info.RenderBackend, s_forceSoftwareFromCommandLine);
+                var useVersionedEntry = RdpNativeInterop.TryProbeDecodeApi(
+                    out var decodeApiVersion, out var decodeCapabilities);
+                lock (_gate)
+                {
+                    _decodeBackend = DecodeBackends.Normalize(info.DecodeBackend);
+                    _renderBackend = RenderBackends.Normalize(info.RenderBackend);
+                    _requestedDecodePolicy = requestedPolicy;
+                    _decodeApiVersion = decodeApiVersion;
+                    _decodeCapabilities = decodeCapabilities;
+                    _usedVersionedDecodeEntry = useVersionedEntry;
+                }
+
+                if (useVersionedEntry)
+                {
+                    try
+                    {
+                        session = RdpNativeInterop.ycn_rdp_connect_ex(
+                            ref p, ref cb, IntPtr.Zero, requestedPolicy);
+                    }
+                    catch (EntryPointNotFoundException)
+                    {
+                        // 极端情况下探测通过但调用时导出消失/被替换：完整退回旧入口，
+                        // 不把失败当成连接失败，也不给旧结构追加任何字段。
+                        lock (_gate) { _usedVersionedDecodeEntry = false; }
+                        session = RdpNativeInterop.ycn_rdp_connect(ref p, ref cb, IntPtr.Zero);
+                    }
+                }
+                else
+                {
+                    session = RdpNativeInterop.ycn_rdp_connect(ref p, ref cb, IntPtr.Zero);
+                }
+            }
             catch
             {
                 lock (_gate)
@@ -321,10 +366,32 @@ namespace Yomori.Services
             return System.Text.Encoding.UTF8.GetString(buf, 0, len);
         }
 
+        /// <summary>
+        /// 本次连接尝试的解码配置与原生入口探测结果。它只说明“请求了什么/走了哪个入口”，
+        /// 不把设备创建或入口调用当成硬解已成功；实际 codec/decoder/成功硬解帧看 Diag()。
+        /// </summary>
+        public string DecodeStatus()
+        {
+            lock (_gate)
+            {
+                var entry = _usedVersionedDecodeEntry ? "connect_ex" : "connect";
+                var hwCompiled = (_decodeCapabilities & (uint)YcnDecodeCapabilities.HardwareCompiled) != 0;
+                var hwDiagnostics = (_decodeCapabilities & (uint)YcnDecodeCapabilities.HardwareDiagnostics) != 0;
+                return $"decode_backend={DecodeBackends.Normalize(_decodeBackend)}" +
+                       $", render_backend={RenderBackends.Normalize(_renderBackend)}" +
+                       $", requested_policy={RdpDecodePolicy.Label(_requestedDecodePolicy)}" +
+                       $", decode_api={_decodeApiVersion}" +
+                       $", decode_caps=0x{_decodeCapabilities:X}" +
+                       $", hw_compiled={(hwCompiled ? "yes" : "no")}" +
+                       $", hw_diagnostics={(hwDiagnostics ? "yes" : "no")}" +
+                       $", entry={entry}";
+            }
+        }
+
         /// <summary>原生通道加载诊断（一行文本：load_addins 返回值 / 通道计数 / GFX 状态 / 通道名）。</summary>
         public string Diag()
         {
-            var buf = new byte[512];
+            var buf = new byte[2048];
             RdpNativeInterop.ycn_rdp_diag(_session, buf, (UIntPtr)buf.Length);
             var len = Array.IndexOf(buf, (byte)0);
             if (len < 0)
@@ -419,5 +486,148 @@ namespace Yomori.Services
         {
             Disconnect();
         }
+    }
+
+    /// <summary>
+    /// 帧阶段计时窗口聚合（RdpView 每 5 秒诊断日志用）。
+    ///
+    /// 放在这里是因为纯 .NET、无 XAML/Vortice 依赖，DecodeChecks 可直接链接本文件测试。
+    /// 所有 Record/TakeSnapshot 都由 UI 线程调用（OnPresentTick 及其 await 续体），
+    /// 所以热路径只用普通 long 累加，不做逐字段原子操作；Stopwatch 只读时间戳，不逐帧分配。
+    /// ⚠️ 如果将来真的跨线程调用：TakeSnapshot 是逐字段拷贝+清零，不是跨字段原子快照，
+    /// 恰在窗口边界的帧可能被算到相邻窗口（或 count/bytes 落在不同窗口），但单帧计时本身不受影响。
+    /// </summary>
+    internal sealed class RdpFramePhaseStats
+    {
+        private RdpPhaseTotals _grab;
+        private RdpPhaseTotals _d3d;
+        private RdpPhaseTotals _softCommit;
+        private RdpPhaseTotals _softAwait;
+        private RdpPhaseTotals _tick;
+        private long _d3dFailures;
+        private long _lastResolution = -1; // (width << 32) | height；-1 = 尚未抓到帧
+        private uint _lastStride;
+        private int _resolutionChanges;
+
+        public void RecordGrab(long elapsedTicks, uint width, uint height, uint stride)
+        {
+            _grab.Add(elapsedTicks, (long)stride * height);
+            var packed = ((long)width << 32) | height;
+            if (_lastResolution >= 0 && _lastResolution != packed)
+            {
+                _resolutionChanges++;
+            }
+            _lastResolution = packed;
+            _lastStride = stride;
+        }
+
+        /// <summary>
+        /// D3D Present 无论成功失败都计时；失败时 bytes=0 并单独计失败次数，
+        /// 避免只采样成功路径把慢失败从 avg/max 里过滤掉。
+        /// </summary>
+        public void RecordD3D(long elapsedTicks, uint width, uint height, uint stride, bool uploaded)
+        {
+            _d3d.Add(elapsedTicks, uploaded ? (long)stride * height : 0);
+            if (!uploaded)
+            {
+                _d3dFailures++;
+            }
+        }
+
+        public void RecordSoftCommit(long elapsedTicks, uint width, uint height, uint stride) =>
+            _softCommit.Add(elapsedTicks, (long)stride * height);
+
+        public void RecordSoftAwait(long elapsedTicks) => _softAwait.Add(elapsedTicks, 0);
+
+        public void RecordTick(long elapsedTicks) => _tick.Add(elapsedTicks, 0);
+
+        public void Reset()
+        {
+            _grab = default;
+            _d3d = default;
+            _softCommit = default;
+            _softAwait = default;
+            _tick = default;
+            _d3dFailures = 0;
+            _lastResolution = -1;
+            _lastStride = 0;
+            _resolutionChanges = 0;
+        }
+
+        /// <summary>
+        /// 取走当前窗口并清零计数。仅每 5 秒由 UI 线程调用一次；分辨率/stride 是
+        /// 最近一次成功抓帧的真实值（本窗没抓到帧时沿用上一次），字节数按每帧 stride*height 累加。
+        /// </summary>
+        public RdpFramePhaseSnapshot TakeSnapshot(long elapsedMs)
+        {
+            var packed = _lastResolution;
+            var snapshot = new RdpFramePhaseSnapshot
+            {
+                ElapsedMs = elapsedMs,
+                Grab = _grab,
+                D3D = _d3d,
+                SoftCommit = _softCommit,
+                SoftAwait = _softAwait,
+                Tick = _tick,
+                Width = packed >= 0 ? (uint)(packed >> 32) : 0u,
+                Height = packed >= 0 ? (uint)(packed & 0xFFFFFFFFL) : 0u,
+                Stride = _lastStride,
+                ResolutionChanges = _resolutionChanges,
+                D3DFailures = _d3dFailures,
+            };
+
+            _grab = default;
+            _d3d = default;
+            _softCommit = default;
+            _softAwait = default;
+            _tick = default;
+            _d3dFailures = 0;
+            _resolutionChanges = 0;
+            return snapshot;
+        }
+    }
+
+    /// <summary>一个阶段的累加器：次数/总 ticks/最大 ticks/字节。只在 UI 线程读写。</summary>
+    internal struct RdpPhaseTotals
+    {
+        public long Count;
+        public long Ticks;
+        public long MaxTicks;
+        public long Bytes;
+
+        public readonly double AverageMs =>
+            Count > 0 ? Ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency / Count : 0;
+
+        public readonly double MaxMs => MaxTicks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
+        public void Add(long ticks, long bytes)
+        {
+            Count++;
+            Ticks += ticks;
+            if (ticks > MaxTicks)
+            {
+                MaxTicks = ticks;
+            }
+            Bytes += bytes;
+        }
+
+        public readonly double BytesPerSecond(long elapsedMs) =>
+            elapsedMs > 0 ? Bytes * 1000.0 / elapsedMs : 0;
+    }
+
+    /// <summary>RdpFramePhaseStats 的一次 5 秒窗口快照（值对象，每 5 秒才创建）。</summary>
+    internal struct RdpFramePhaseSnapshot
+    {
+        public long ElapsedMs;
+        public RdpPhaseTotals Grab;
+        public RdpPhaseTotals D3D;
+        public RdpPhaseTotals SoftCommit;
+        public RdpPhaseTotals SoftAwait;
+        public RdpPhaseTotals Tick;
+        public uint Width;
+        public uint Height;
+        public uint Stride;
+        public int ResolutionChanges;
+        public long D3DFailures;
     }
 }

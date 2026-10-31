@@ -87,8 +87,70 @@ typedef struct ycn_rdp_callbacks
 
 /* ---- 导出函数（§4.2 冻结）。YCN_API 置于类型前（避免 declarator 位置歧义） ---- */
 
-/* 建立会话：立即返回，连接在后台线程进行；成功返回 session id(>0)，失败返回负错误码 */
+/* ---- 解码策略（connect_ex 的 decode_policy） ---- */
+#define YCN_DECODE_POLICY_LEGACY       0u  /* 完全保留旧 connect 行为：non-AVC */
+#define YCN_DECODE_POLICY_AUTO_HW      1u  /* AVC，优先硬解；初始化失败软回退 */
+#define YCN_DECODE_POLICY_SOFTWARE     2u  /* AVC，明确禁用视频硬解 */
+
+/* ycn_rdp_decode_capabilities() 位 */
+#define YCN_DECODE_CAP_AVC             0x00000001u
+#define YCN_DECODE_CAP_DIAGNOSTICS     0x00000002u
+#define YCN_DECODE_CAP_HW_COMPILED     0x00000004u
+
+/* 建立会话：立即返回，连接在后台线程进行；成功返回 session id(>0)，失败返回负错误码。
+ * 旧入口保持 non-AVC 行为；新代码用 connect_ex 选择解码策略。 */
 YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks, void* user);
+
+/* decode_policy 见 YCN_DECODE_POLICY_*。缺上游真实诊断 patch 时，AUTO/SOFTWARE
+ * 也保守回退到旧 non-AVC 路径，绝不误报硬解，也不假装已禁用 HW。 */
+YCN_API int ycn_rdp_connect_ex(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
+                               void* user, uint32_t decode_policy);
+
+/* 图形/AVC 设置自检（纯函数，不建立会话、不改 FreeRDP 全局状态）。
+ * 只返回本实现将写入 rdpSettings 的值，供 native_decode_checks.py 用
+ * 类型化结构体验证，而不是搜索 diag 文本。真实 CAPSADVERTISE/CAPSCONFIRM
+ * flags 不在纯函数里预测；运行时由 CapsConfirm hook / 离线 PDU 测试取证。
+ *
+ * 规则（p.use_gfx 优先）：
+ *   - use_gfx == 0：关闭 GFX/AVC，但 SupportDynamicChannels/AudioPlayback 不变；
+ *     探针会先设 AudioPlayback=FALSE，再验证生产 setter 后仍为 FALSE；
+ *   - legacy_entry != 0：GFX 可开，但保持旧 non-AVC（不声明 thinclient/AVC420）；
+ *   - decode_policy AUTO/SOFTWARE + GFX：声明 AVC420 + AVC444/v2 + THINCLIENT。
+ *     v2 设置值会被写入，但 FreeRDP 3.32 的 rdpgfx_main 不读取它；实际是否发
+ *     codec 14/15 必须看 CAPSADVERTISE/确认与 codec 统计。
+ * THINCLIENT 是上游 CAPVERSION_81 的规范 flag；它抑制 progressive 选择，
+ * 但不强制服务器必选 AVC。 */
+#define YCN_GRAPHICS_SETTINGS_PROBE_VERSION 1u
+typedef struct ycn_graphics_settings_probe
+{
+    uint32_t size;                    /* 调用方填 sizeof(ycn_graphics_settings_probe) */
+    uint32_t version;                 /* 调用方填 YCN_GRAPHICS_SETTINGS_PROBE_VERSION；函数回填 1 */
+    uint32_t use_gfx;
+    uint32_t decode_policy;
+    uint32_t legacy_entry;
+    uint32_t support_graphics_pipeline;
+    uint32_t support_dynamic_channels;
+    uint32_t gfx_thin_client;
+    uint32_t gfx_small_cache;
+    uint32_t gfx_h264;
+    uint32_t gfx_avc444;
+    uint32_t gfx_avc444v2;
+    uint32_t gfx_progressive;
+    uint32_t gfx_progressivev2;
+    uint32_t gfx_planar;
+    uint32_t audio_unchanged;         /* 1 = probe 用生产 setter 应用后未改动 AudioPlayback */
+    uint32_t reserved[4];
+} ycn_graphics_settings_probe;
+
+YCN_API int ycn_rdp_graphics_settings_probe(uint32_t use_gfx, uint32_t decode_policy,
+                                            uint32_t legacy_entry,
+                                            ycn_graphics_settings_probe* out);
+
+/* 桥接解码 ABI 版本；当前为 1。 */
+YCN_API uint32_t ycn_rdp_decode_api_version(void);
+
+/* 位掩码见 YCN_DECODE_CAP_*；仅在上游 patch 和对应 AVC 解码能力都可用时报告。 */
+YCN_API uint32_t ycn_rdp_decode_capabilities(void);
 
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);

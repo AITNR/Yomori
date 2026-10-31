@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+
+    <Compile Include="..\..\src\Yomori.App\Helpers\ObservableObject.cs" Link="Production\Helpers\ObservableObject.cs" />
+    <Compile Include="..\..\src\Yomori.App\Helpers\KeywordHelper.cs" Link="Production\Helpers\KeywordHelper.cs" />
+    <Compile Include="..\..\src\Yomori.App\Helpers\FormatHelper.cs" Link="Production\Helpers\FormatHelper.cs" />
+
+    <Compile Include="..\..\src\Yomori.App\Models\Enums.cs" Link="Production\Models\Enums.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\ExternalLogGrammar.cs" Link="Production\Models\ExternalLogGrammar.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\ExternalLogModels.cs" Link="Production\Models\ExternalLogModels.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\TaskConfig.cs" Link="Production\Models\TaskConfig.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\TaskTypeModels.cs" Link="Production\Models\TaskTypeModels.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\RdpModels.cs" Link="Production\Models\RdpModels.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\RdpChannel.cs" Link="Production\Models\RdpChannel.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\RdpClientStateMachine.cs" Link="Production\Models\RdpClientStateMachine.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\KeyboardToggleState.cs" Link="Production\Models\KeyboardToggleState.cs" />
+
+    <Compile Include="..\..\src\Yomori.App\Services\RdpNativeInterop.cs" Link="Production\Services\RdpNativeInterop.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\RdpEmbeddedClient.cs" Link="Production\Services\RdpEmbeddedClient.cs" />
+  </ItemGroup>
+</Project>

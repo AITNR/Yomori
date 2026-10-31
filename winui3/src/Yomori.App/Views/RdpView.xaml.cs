@@ -38,7 +38,7 @@ namespace Yomori.Views
 
         /// <summary>
         /// 渲染世代号。每次 DetachClient / Disconnect 自增；
-        /// RenderFrameAsync 在 await 前后比对自己那一代的号，不匹配就立即放弃。
+        /// AwaitSoftRenderAsync 在 await 前后比对自己那一代的号，不匹配就立即放弃。
         ///
         /// 🔑 为什么必须有（2026-10-16 实测）：原来 OnPresentTick 用
         /// <c>_ = RenderFrameAsync(...)</c> 即发即弃，而旧的全局防重入标志无法区分连接世代。
@@ -175,6 +175,7 @@ namespace Yomori.Views
         private int _frameSeq;                 // 帧到达序号（原生线程递增）
         private int _presentedSeq;             // 已呈现到的序号（UI 线程写）
         private long _windowStartFrames;       // 统计窗口起点时的 FramesRendered（算呈现帧率用）
+        private readonly RdpFramePhaseStats _phaseStats = new(); // 5 秒窗口的分阶段计时/字节聚合
         private int _lastGfxState = -1;        // 上次打印过的 GFX 状态
         private uint _lastDvcCount;            // 上次打印过的通道数
         private double _remoteWidth;
@@ -326,7 +327,7 @@ namespace Yomori.Views
                 _client.Disconnected -= OnClientDisconnected;
                 _client = null;
             }
-            // 推进世代号：让已在飞的 RenderFrameAsync 在下一个检查点自行退出
+            // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
             _renderer?.Dispose();
             _renderer = null;
@@ -336,6 +337,7 @@ namespace Yomori.Views
             _statsWindowStart = 0;
             System.Threading.Interlocked.Exchange(ref _frameArrivals, 0);
             System.Threading.Interlocked.Exchange(ref _maxArrivalGapMs, 0);
+            _phaseStats.Reset();
             RetireSoftRenderState();
             _presentTimer?.Stop();
             _presentTimer = null;
@@ -366,7 +368,7 @@ namespace Yomori.Views
             UnhookClient(_client);
             _client.Dispose();
             _client = null;
-            // 推进世代号：让已在飞的 RenderFrameAsync 在下一个检查点自行退出
+            // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
             _renderer?.Dispose();
             _renderer = null;
@@ -376,6 +378,7 @@ namespace Yomori.Views
             _statsWindowStart = 0;
             System.Threading.Interlocked.Exchange(ref _frameArrivals, 0);
             System.Threading.Interlocked.Exchange(ref _maxArrivalGapMs, 0);
+            _phaseStats.Reset();
             RetireSoftRenderState();
             _presentTimer?.Stop();
             _presentTimer = null;
@@ -785,52 +788,71 @@ namespace Yomori.Views
                 return;
             }
 
-            if (!client.TryCopyFrame(out var w, out var h, out var stride, out var pixels))
+            // 只计「真正开始取帧之后」的同步工作：EmitFrameRhythmStats 每 5 秒一次，
+            // 不属于逐帧渲染成本。tick 计时用于区分 UI 线程忙与等待 SetBitmapAsync。
+            var tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
             {
-                // ⚠️ 这里**不能**推进 _presentedSeq：会话还在 CONNECTING / 尺寸切换瞬间
-                // 抓帧会失败，一旦推进就再也等不到这一帧了（正是切页回来黑屏的另一半原因）。
-                if (_pendingFirstFrame && ++_pendingFirstFrameTries > PendingFirstFrameMaxTries)
+                var grabStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                var copied = client.TryCopyFrame(out var w, out var h, out var stride, out var pixels);
+                var grabTicks = System.Diagnostics.Stopwatch.GetTimestamp() - grabStart;
+                if (!copied)
                 {
-                    _pendingFirstFrame = false; // 会话大概已断：停止空转，等下一条连接
+                    // ⚠️ 这里**不能**推进 _presentedSeq：会话还在 CONNECTING / 尺寸切换瞬间
+                    // 抓帧会失败，一旦推进就再也等不到这一帧了（正是切页回来黑屏的另一半原因）。
+                    if (_pendingFirstFrame && ++_pendingFirstFrameTries > PendingFirstFrameMaxTries)
+                    {
+                        _pendingFirstFrame = false; // 会话大概已断：停止空转，等下一条连接
+                    }
+                    return; // 尺寸切换瞬间等：下一拍再来
                 }
-                return; // 尺寸切换瞬间等：下一拍再来
-            }
 
-            _presentedSeq = seq;
-            _pendingFirstFrame = false;
+                _phaseStats.RecordGrab(grabTicks, w, h, stride);
+                _presentedSeq = seq;
+                _pendingFirstFrame = false;
 
-            // 渲染器是挂到「本实例的面板」上的，切页回来时新实例还没有渲染器；
-            // 上面既然已经抓到帧（拿得到真实尺寸），就地建好，不必再等下一帧触发。
-            if (_renderer is null && !_d3dFailed && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
-            {
-                EnsureRendererOnUi(w, h);
-            }
-
-            if (_renderer is { Initialized: true })
-            {
-                if (_renderer.Present(pixels, w, h, stride))
+                // 渲染器是挂到「本实例的面板」上的，切页回来时新实例还没有渲染器；
+                // 上面既然已经抓到帧（拿得到真实尺寸），就地建好，不必再等下一帧触发。
+                if (_renderer is null && !_d3dFailed && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
                 {
-                    FramesRendered++;
+                    EnsureRendererOnUi(w, h);
                 }
-                else
+
+                if (_renderer is { Initialized: true })
                 {
-                    DiagnosticLog?.Invoke($"[embed] Present 失败：{_renderer.LastError}");
-                    _d3dFailed = true; // 本帧起回退软渲染（renderer 失效不再重试）
-                    _renderer.Dispose();
-                    _renderer = null;
-                    CreateSoftRenderState();
-                    PartFrame.Visibility = Visibility.Visible;
-                    PartPanel.Visibility = Visibility.Collapsed;
-                    PartViewbox.Visibility = Visibility.Collapsed;
+                    var presentStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var presented = _renderer.Present(pixels, w, h, stride);
+                    var presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - presentStart;
+                    // 失败也要进 avg/max（bytes=0），否则慢失败会被成功路径采样掩盖。
+                    _phaseStats.RecordD3D(presentTicks, w, h, stride, presented);
+                    if (presented)
+                    {
+                        FramesRendered++;
+                    }
+                    else
+                    {
+                        DiagnosticLog?.Invoke($"[embed] Present 失败：{_renderer.LastError}");
+                        _d3dFailed = true; // 本帧起回退软渲染（renderer 失效不再重试）
+                        _renderer.Dispose();
+                        _renderer = null;
+                        CreateSoftRenderState();
+                        PartFrame.Visibility = Visibility.Visible;
+                        PartPanel.Visibility = Visibility.Collapsed;
+                        PartViewbox.Visibility = Visibility.Collapsed;
+                    }
+                }
+                else if (_softRenderState is { IsRetired: false } state && state.TryBeginRender())
+                {
+                    // 软渲染回退路线：同一套节拍（否则回退后撕裂原样回来）。
+                    // pixels 是本拍已经抓到的完整帧，直接同步 CopyFromBuffer；
+                    // 旧实现会在 RenderFrameAsync 里再 TryCopyFrame 一次，等于每帧白拷一份。
+                    LogRenderPathOnce("SoftwareBitmap（软渲染回退，无 D3D）");
+                    BeginSoftRender(state, _renderGeneration, pixels, w, h, stride);
                 }
             }
-            else if (_softRenderState is { IsRetired: false } state && state.TryBeginRender())
+            finally
             {
-                // 软渲染回退路线：同一套节拍（否则回退后撕裂原样回来）
-                LogRenderPathOnce("SoftwareBitmap（软渲染回退，无 D3D）");
-                // 带上当前世代号：若本次任务在 await 中时连接已被换掉，
-                // 它会自行退出，不再碰已废弃的 SoftwareBitmapSource / SoftwareBitmap。
-                _ = RenderFrameAsync(client, _renderGeneration, state);
+                _phaseStats.RecordTick(System.Diagnostics.Stopwatch.GetTimestamp() - tickStart);
             }
         }
 
@@ -875,7 +897,8 @@ namespace Yomori.Views
             var presented = (long)FramesRendered - _windowStartFrames;
             _windowStartFrames = (long)FramesRendered;
 
-            if (_client is { } gfxClient)
+            var diagClient = _client;
+            if (diagClient is { } gfxClient)
             {
                 var st = gfxClient.GfxState(out var dvc);
                 if (st != _lastGfxState || dvc != _lastDvcCount)
@@ -896,14 +919,38 @@ namespace Yomori.Views
                 }
             }
 
+            var decodeStatus = diagClient?.DecodeStatus() ?? "decode_backend=unknown";
+            var nativeDiag = diagClient?.Diag() ?? "native_diag=unavailable";
             DiagnosticLog?.Invoke(
                 $"[embed] 帧到达节奏：{arrivals} 次 / {elapsed / 1000.0:F0}s" +
                 $"（≈{arrivals * 1000.0 / elapsed:F1} 次/秒，最大间隔 {maxGap} ms）｜" +
-                $"呈现 ≈{presented * 1000.0 / elapsed:F1} 帧/秒");
+                $"呈现 ≈{presented * 1000.0 / elapsed:F1} 帧/秒｜{decodeStatus}｜{nativeDiag}");
+
+            // 分阶段聚合：只在 5 秒窗口边界取一次快照；热路径只累加 long，不逐帧打日志/分配。
+            // 抓帧=TryCopyFrame（原生抓帧+整帧拷贝）；D3D=Map/Unmap+CopyResource+Present；
+            // 软提交=CopyFromBuffer+SetBitmapAsync 发起；软等待=SetBitmapAsync 完成等待；
+            // tick=OnPresentTick 同步工作总时长。这样能区分 UI 忙、复制与等待。
+            var phase = _phaseStats.TakeSnapshot(elapsed);
+            var resolution = phase.Width == 0 || phase.Height == 0
+                ? "分辨率未知"
+                : $"分辨率 {phase.Width}×{phase.Height} stride {phase.Stride}";
+            var resolutionChanges = phase.ResolutionChanges > 0
+                ? $"，本窗变化 {phase.ResolutionChanges} 次"
+                : string.Empty;
+            DiagnosticLog?.Invoke(
+                $"[embed] 帧阶段（{elapsed / 1000.0:F1}s，{resolution}{resolutionChanges}）：" +
+                $"抓帧 {phase.Grab.Count} 次 avg {phase.Grab.AverageMs:F2} / max {phase.Grab.MaxMs:F2} ms，" +
+                $"拷贝 {phase.Grab.BytesPerSecond(elapsed) / 1048576.0:F1} MB/s｜" +
+                $"D3D {phase.D3D.Count} 次（失败 {phase.D3DFailures}）avg {phase.D3D.AverageMs:F2} / max {phase.D3D.MaxMs:F2} ms，" +
+                $"上载 {phase.D3D.BytesPerSecond(elapsed) / 1048576.0:F1} MB/s｜" +
+                $"软提交 {phase.SoftCommit.Count} 次 avg {phase.SoftCommit.AverageMs:F2} / max {phase.SoftCommit.MaxMs:F2} ms，" +
+                $"{phase.SoftCommit.BytesPerSecond(elapsed) / 1048576.0:F1} MB/s｜" +
+                $"软等待 {phase.SoftAwait.Count} 次 avg {phase.SoftAwait.AverageMs:F2} / max {phase.SoftAwait.MaxMs:F2} ms｜" +
+                $"tick {phase.Tick.Count} 次 avg {phase.Tick.AverageMs:F2} / max {phase.Tick.MaxMs:F2} ms");
         }
 
         /// <summary>
-        /// 软渲染呈现一帧。
+        /// 软渲染提交一帧。
         ///
         /// 🔑 <b>复用 SoftwareBitmap，不要每帧 new</b>（2026-10-16 修，dump 实证的假死根因）。
         ///
@@ -915,58 +962,82 @@ namespace Yomori.Views
         /// 整窗假死、无任何日志（进程内看门狗也一起被拖住，所以它也没记录）。
         ///
         /// 现在：bitmap 尺寸不变就复用同一个实例，每帧只 <c>CopyFromBuffer</c> 原地更新内容，
-        /// 内存压力从「每帧 8.3MB」降到「每连接一次 8.3MB」。尺寸变化（远端改分辨率）才重建。
+        /// 内存压力从「每帧 8.3MB」降到「每连接一次 8.3MB」。
+        ///
+        /// 2026-10-31：只消费 <see cref="OnPresentTick"/> 已经抓到的 pixels，不再二次
+        /// <c>TryCopyFrame</c>。CopyFromBuffer/CreateCopyFromBuffer 在第一次 await 之前同步完成；
+        /// 之后只 await SetBitmapAsync。pixels（客户端复用缓冲）不会跨 await 被读取，
+        /// 因此不会出现复用数组被下一拍覆盖导致的撕裂，客户端生命周期也与旧实现一致。
         /// </summary>
-        private async System.Threading.Tasks.Task RenderFrameAsync(RdpEmbeddedClient client, int generation, SoftRenderState state)
+        private void BeginSoftRender(SoftRenderState state, int generation, byte[] pixels, uint width, uint height, uint stride)
         {
             System.Threading.Interlocked.Increment(ref _renderInFlight);
             state.Enter();
+            Windows.Foundation.IAsyncAction? operation = null;
             try
             {
-                // 世代校验：本任务发出后连接已被换掉 → 直接丢弃
-                if (state.IsRetired || generation != System.Threading.Volatile.Read(ref _renderGeneration))
+                // 世代/生命周期校验：本拍发出后连接可能已被换掉。
+                // 这里绝不能 return —— Enter()/renderInFlight 已经计数，必须统一走下方 cleanup。
+                if (!state.IsRetired
+                    && generation == System.Threading.Volatile.Read(ref _renderGeneration)
+                    && state.Source is not null)
                 {
-                    return;
-                }
+                    var commitStart = System.Diagnostics.Stopwatch.GetTimestamp();
 
-                if (!IsCurrentClient(client, generation))
-                {
-                    return;
-                }
+                    // pixels 是复用缓冲，长度可能大于本帧实际字节数 —— 必须按 stride*height 切
+                    var byteCount = checked((int)(stride * height));
+                    var buffer = System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions.AsBuffer(
+                        pixels, 0, byteCount);
 
-                if (!client.TryCopyFrame(out var w, out var h, out var stride, out var pixels))
-                {
-                    return;
-                }
+                    // 尺寸变化（远端改分辨率）才重建；否则原地更新，避免每帧触发 AddMemoryPressure
+                    if (state.Bitmap is null || state.BitmapWidth != (int)width || state.BitmapHeight != (int)height)
+                    {
+                        state.Bitmap?.Dispose();
+                        state.Bitmap = SoftwareBitmap.CreateCopyFromBuffer(
+                            buffer, BitmapPixelFormat.Bgra8, (int)width, (int)height, BitmapAlphaMode.Ignore);
+                        state.BitmapWidth = (int)width;
+                        state.BitmapHeight = (int)height;
+                    }
+                    else
+                    {
+                        state.Bitmap.CopyFromBuffer(buffer);
+                    }
 
-                if (state.Source is null)
-                {
-                    return;
+                    // SetBitmapAsync 接收的是 SoftwareBitmap 本身。上面的同步拷贝已经完成；
+                    // 从这里开始不再读取 pixels，所以复用帧缓冲不会跨 await。
+                    operation = state.Source.SetBitmapAsync(state.Bitmap);
+                    _phaseStats.RecordSoftCommit(
+                        System.Diagnostics.Stopwatch.GetTimestamp() - commitStart, width, height, stride);
                 }
+            }
+            catch
+            {
+                // 尺寸切换瞬间可能抛参数异常，丢帧即可
+            }
 
-                // pixels 是复用缓冲，长度可能大于本帧实际字节数 —— 必须按 stride*height 切
-                var byteCount = checked((int)(stride * h));
+            if (operation is null)
+            {
+                // 没有异步接管：本方法自己收尾（Exit/EndRender 各一次）。
+                state.Exit();
+                state.EndRender();
+                System.Threading.Interlocked.Decrement(ref _renderInFlight);
+                return;
+            }
 
-                // 尺寸变化（远端改分辨率）才重建；否则原地更新，避免每帧触发 AddMemoryPressure
-                if (state.Bitmap is null || state.BitmapWidth != (int)w || state.BitmapHeight != (int)h)
-                {
-                    state.Bitmap?.Dispose();
-                    state.Bitmap = SoftwareBitmap.CreateCopyFromBuffer(
-                        System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions.AsBuffer(pixels, 0, byteCount),
-                        BitmapPixelFormat.Bgra8, (int)w, (int)h, BitmapAlphaMode.Ignore);
-                    state.BitmapWidth = (int)w;
-                    state.BitmapHeight = (int)h;
-                }
-                else
-                {
-                    state.Bitmap.CopyFromBuffer(
-                        System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions.AsBuffer(pixels, 0, byteCount));
-                }
+            // operation 非空后由 AwaitSoftRenderAsync 的 finally 接管收尾（Exit/EndRender 仍各一次）。
+            _ = AwaitSoftRenderAsync(state, generation, operation);
+        }
 
-                var setBitmapOperation = state.Source.SetBitmapAsync(state.Bitmap);
-                using (state.Cancellation.Token.Register(() => setBitmapOperation.Cancel()))
+        /// <summary>等待 SetBitmapAsync 完成并收尾软渲染生命周期（与旧 RenderFrameAsync 一致）。</summary>
+        private async System.Threading.Tasks.Task AwaitSoftRenderAsync(
+            SoftRenderState state, int generation, Windows.Foundation.IAsyncAction operation)
+        {
+            var awaitStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            try
+            {
+                using (state.Cancellation.Token.Register(() => operation.Cancel()))
                 {
-                    await setBitmapOperation;
+                    await operation;
                 }
 
                 // await 回来后再校验：等待期间可能已断开 / 换过实例。
@@ -980,10 +1051,11 @@ namespace Yomori.Views
             }
             catch
             {
-                // 尺寸切换瞬间可能抛参数异常，丢帧即可
+                // 断开取消 / 尺寸切换：丢帧即可
             }
             finally
             {
+                _phaseStats.RecordSoftAwait(System.Diagnostics.Stopwatch.GetTimestamp() - awaitStart);
                 state.Exit();
                 state.EndRender();
                 System.Threading.Interlocked.Decrement(ref _renderInFlight);

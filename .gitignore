@@ -83,3 +83,6 @@ native-out/
 # notifications.json = 铃铛里的通知与已读状态；updates/ = 自动下载的安装包（几十 MB）
 notifications.json
 updates/
+
+# Isolated native dependency builds
+.native-work/

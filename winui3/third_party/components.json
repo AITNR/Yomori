@@ -8,6 +8,15 @@
 
   "native": [
     {
+      "key": "ffmpeg",
+      "name": "FFmpeg",
+      "license": "GNU Lesser General Public License v2.1 or later",
+      "files": ["avcodec-*.dll", "avutil-*.dll", "swscale-*.dll", "swresample-*.dll"],
+      "purpose": "内嵌 RDP H.264 视频解码（优先 DXVA2 硬件加速）及声音格式转换",
+      "homepage": "https://ffmpeg.org",
+      "mustContain": ["GNU LESSER GENERAL PUBLIC LICENSE", "Version 2.1"]
+    },
+    {
       "key": "freerdp",
       "name": "FreeRDP",
       "license": "Apache License 2.0",
@@ -31,7 +40,7 @@
       "key": "openssl",
       "name": "OpenSSL",
       "license": "Apache License 2.0",
-      "files": ["libssl-3-x64.dll", "libcrypto-3-x64.dll"],
+      "files": ["libssl-3-x64.dll", "libcrypto-3-x64.dll", "legacy.dll"],
       "purpose": "TLS / 密码学基础库，由 FreeRDP 在建立连接时调用",
       "homepage": "https://github.com/openssl/openssl",
       "mustContain": ["Apache License", "Version 2.0"]

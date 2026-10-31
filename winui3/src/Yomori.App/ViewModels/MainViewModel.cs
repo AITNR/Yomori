@@ -1823,6 +1823,8 @@ public sealed class MainViewModel : ObservableObject
         rdp.ClientMode = source.ClientMode;
         rdp.AudioEnabled = source.AudioEnabled;
         rdp.GfxEnabled = source.GfxEnabled;
+        rdp.DecodeBackend = source.DecodeBackend;
+        rdp.RenderBackend = source.RenderBackend;
         rdp.DesktopWidth = source.DesktopWidth;
         rdp.DesktopHeight = source.DesktopHeight;
 
@@ -4734,6 +4736,9 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>连接方式下拉框数据源。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> ClientModeItems => ClientModes.Items;
 
+    /// <summary>内嵌画面解码方式选项（绑到通道管理页的下拉框）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> DecodeBackendItems => DecodeBackends.Items;
+
     /// <summary>内嵌画面渲染后端选项（绑到通道管理页的下拉框）。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> RenderBackendItems => RenderBackends.Items;
 
@@ -4869,6 +4874,8 @@ public sealed class MainViewModel : ObservableObject
             AllowSelfsigned = true,
             EnableAudio = RdpSettings.AudioEnabled,
             UseGfx = RdpSettings.GfxEnabled,
+            DecodeBackend = RdpSettings.DecodeBackend,
+            RenderBackend = RdpSettings.RenderBackend,
         });
         if (!started)
         {

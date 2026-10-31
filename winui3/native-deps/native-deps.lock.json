@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "vcpkg_commit": "10541e317a660f4165ba4ac2851ab54a8d4577b1",
+  "triplet": "x64-windows",
+  "freerdp": {
+    "version": "3.32.0",
+    "features": [
+      "client",
+      "ffmpeg"
+    ]
+  },
+  "ffmpeg": {
+    "version": "9.0.2",
+    "components": [
+      "avcodec",
+      "avutil",
+      "swscale",
+      "swresample"
+    ]
+  },
+  "freerdp_options": {
+    "WITH_FFMPEG": true,
+    "WITH_VIDEO_FFMPEG": true,
+    "WITH_FFMPEG_HWACCEL": true,
+    "WITH_DSP_FFMPEG": true,
+    "WITH_SWSCALE": true,
+    "WITH_GFX_H264": true,
+    "WITH_MEDIA_FOUNDATION": false,
+    "WITH_OPENH264": false
+  },
+  "ycn_h264_decode_api_version": 1,
+  "ycn_h264_decode_capabilities_mask": 7
+}
