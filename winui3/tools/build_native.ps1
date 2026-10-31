@@ -261,7 +261,10 @@ function Ensure-VcpkgExe {
       throw "外部 vcpkg 没有 vcpkg.exe：$exe（不会修改外部安装）"
     }
     Write-Step 'bootstrap vcpkg'
-    & (Join-Path $VcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics
+    # Native command output enters PowerShell's success stream. Route it to the
+    # host, otherwise Ensure-VcpkgExe returns bootstrap text plus the path and
+    # the caller tries to execute the first output line as a program.
+    & (Join-Path $VcpkgRoot 'bootstrap-vcpkg.bat') -disableMetrics | Out-Host
     if ($LASTEXITCODE -ne 0) { throw 'bootstrap-vcpkg 失败' }
   }
   if (-not (Test-Path -LiteralPath $exe)) { throw "bootstrap 后仍找不到 $exe" }
