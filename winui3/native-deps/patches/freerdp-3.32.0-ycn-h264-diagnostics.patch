@@ -1,12 +1,14 @@
 diff --git a/include/freerdp/codec/h264.h b/include/freerdp/codec/h264.h
-index 16fc8cc..dba20ef 100644
+index 16fc8cc..f9b348d 100644
 --- a/include/freerdp/codec/h264.h
 +++ b/include/freerdp/codec/h264.h
-@@ -63,8 +63,139 @@ extern "C"
+@@ -63,8 +63,214 @@ extern "C"
  		H264_CONTEXT_OPTION_USAGETYPE, /** @since version 3.6.0 */
  		H264_CONTEXT_OPTION_HW_ACCEL,  /** set to request hw accel, get to check if hw accel is on,
  		                                  @since version 3.11.0 */
 +		H264_CONTEXT_OPTION_YCN_DECODE_POLICY = 0x59434E01, /** Yomori per-context decode policy */
++		H264_CONTEXT_OPTION_YCN_DIRECT_PRESENT =
++		    0x59434E02, /** request a directly presentable decode backend */
  	} H264_CONTEXT_OPTION;
  
 +	/* Yomori bridge extension: versioned, append-only diagnostics.
@@ -139,11 +141,84 @@ index 16fc8cc..dba20ef 100644
 +	 * high resolution counter. */
 +	FREERDP_API UINT64 ycn_h264_qpc_frequency(void);
 +
++	/* ---- Yomori direct present ----
++	 * When a decoder is armed for direct present and the decoded frame really is
++	 * a shareable hardware surface, the frame is handed to the registered sink
++	 * *instead of* being copied to CPU pixels. The receiver keeps the AVFrame
++	 * reference (the lease) and releases it when the GPU is done with the
++	 * texture. Arming is decided per surface command by the bridge, so a frame
++	 * the receiver refuses simply takes the normal GPU->CPU path. */
++#define YCN_H264_DIRECT_API_VERSION 1U
++
++/* ycn_h264_direct_frame.flags */
++#define YCN_H264_DIRECT_FLAG_HW_FRAME   0x00000001U
++#define YCN_H264_DIRECT_FLAG_FULL_FRAME 0x00000002U
++
++/* ycn_h264_direct_frame.colorMatrix */
++#define YCN_H264_COLOR_MATRIX_UNKNOWN 0U
++#define YCN_H264_COLOR_MATRIX_BT601   1U
++#define YCN_H264_COLOR_MATRIX_BT709   2U
++#define YCN_H264_COLOR_MATRIX_BT2020  3U
++
++/* ycn_h264_direct_frame.colorRange */
++#define YCN_H264_COLOR_RANGE_UNKNOWN 0U
++#define YCN_H264_COLOR_RANGE_LIMITED 1U
++#define YCN_H264_COLOR_RANGE_FULL    2U
++
++	typedef struct ycn_h264_direct_frame
++	{
++		UINT32 size;
++		UINT32 version;
++		UINT32 flags;        /* YCN_H264_DIRECT_FLAG_* */
++		UINT32 width;
++		UINT32 height;
++		UINT32 hwType;       /* AVHWDeviceType of the decoder device */
++		UINT32 pixFormat;    /* AVFrame::format, e.g. AV_PIX_FMT_D3D11 */
++		UINT32 swFormat;     /* AVHWFramesContext::sw_format, e.g. AV_PIX_FMT_NV12 */
++		UINT32 subresource;  /* D3D11 subresource index of the decoded surface */
++		UINT32 colorMatrix;  /* YCN_H264_COLOR_MATRIX_* */
++		UINT32 colorRange;   /* YCN_H264_COLOR_RANGE_* */
++		UINT32 colorPrimaries; /* AVColorPrimaries of the frame */
++		UINT32 colorTransfer;  /* AVColorTransferCharacteristic of the frame */
++		UINT32 reserved0;
++		UINT64 frameIndex;
++		INT64 pts;
++		void* frame;   /* AVFrame*: owned by the receiver, see release below */
++		void* texture; /* ID3D11Texture2D*; valid while frame is held */
++		void* device;  /* ID3D11Device* of the decoder; borrowed, not AddRef'd */
++		UINT32 reserved[6];
++	} YCN_H264_DIRECT_FRAME;
++
++	/* Returns TRUE when the receiver took the frame and now owns the lease.
++	 * Returning FALSE makes the decoder fall back to the GPU->CPU copy for this
++	 * frame, so a receiver that cannot present must answer FALSE promptly. */
++	typedef BOOL (*ycn_h264_direct_sink)(void* user, const YCN_H264_DIRECT_FRAME* frame);
++
++	FREERDP_API UINT32 ycn_h264_direct_api_version(void);
++
++	FREERDP_API void ycn_h264_set_direct_sink(ycn_h264_direct_sink sink, void* user);
++
++	/* Releases a lease taken through the sink (no-op on NULL). */
++	FREERDP_API void ycn_h264_direct_frame_release(void* frame);
++
++	/* Arms the hand-off for the next decode call. The decoder disarms itself
++	 * after one frame, so a bridge that wants every frame must re-arm. */
++	FREERDP_API void ycn_h264_set_direct_armed(H264_CONTEXT* h264, BOOL armed);
++
++	/* Forces the D3D11VA decoder onto a caller owned ID3D11Device instead of
++	 * letting FFmpeg create one. A single device is what makes a zero-copy path
++	 * possible: texture, video processor and swap chain must share it. Must be
++	 * called before the H264 context is created; passing NULL reverts. */
++	WINPR_ATTR_NODISCARD
++	FREERDP_API BOOL ycn_h264_set_external_d3d11_device(void* device);
++
++	FREERDP_API void* ycn_h264_get_external_d3d11_device(void);
++
  	FREERDP_API void free_h264_metablock(RDPGFX_H264_METABLOCK* meta);
  
  	WINPR_ATTR_NODISCARD
 diff --git a/include/freerdp/gdi/gfx.h b/include/freerdp/gdi/gfx.h
-index 14b2b33..88ad5c6 100644
+index 14b2b33..b2a4ecc 100644
 --- a/include/freerdp/gdi/gfx.h
 +++ b/include/freerdp/gdi/gfx.h
 @@ -22,6 +22,7 @@
@@ -154,11 +229,26 @@ index 14b2b33..88ad5c6 100644
  
  #ifdef __cplusplus
  extern "C"
-@@ -76,6 +77,11 @@ extern "C"
+@@ -49,6 +50,10 @@ extern "C"
+ 		UINT32 outputTargetHeight;
+ 		BOOL windowMapped;
+ 		BOOL handleInUpdateSurfaceArea;
++		/* Yomori direct present: while TRUE the surface lives on the GPU and the
++		 * GDI copy of it is deliberately stale, so composing it into the primary
++		 * buffer would only burn CPU on pixels nobody shows. */
++		BOOL ycnDirectActive;
+ #if defined(WITH_GFX_AV1)
+ 		FREERDP_AV1_CONTEXT* av1; /** @since version 3.25.0 */
+ #else
+@@ -76,6 +81,15 @@ extern "C"
  	                                               pcRdpgfxUpdateSurfaceArea update);
  	FREERDP_API void gdi_graphics_pipeline_uninit(rdpGdi* gdi, RdpgfxClientContext* gfx);
  
 +	FREERDP_API BOOL ycn_gdi_set_thread_h264_decode_policy(UINT32 decodePolicy);
++	/* Asks the next AVC surface command on this thread to hand its decoded
++	 * surface to the direct presenter. The flag is consumed by the command, so
++	 * the bridge re-arms it for every frame it wants presented directly. */
++	FREERDP_API BOOL ycn_gdi_set_thread_direct_present(UINT32 mode);
 +	WINPR_ATTR_NODISCARD
 +	FREERDP_API BOOL ycn_gdi_get_h264_diagnostics(rdpGdi* gdi, UINT16 surfaceId,
 +	                                              YCN_H264_DIAGNOSTICS* diagnostics);
@@ -167,7 +257,7 @@ index 14b2b33..88ad5c6 100644
  }
  #endif
 diff --git a/libfreerdp/codec/h264.c b/libfreerdp/codec/h264.c
-index da7f7dc..d87091c 100644
+index da7f7dc..1adccc9 100644
 --- a/libfreerdp/codec/h264.c
 +++ b/libfreerdp/codec/h264.c
 @@ -145,6 +145,104 @@ static BOOL areRectsValid(wLog* log, UINT32 width, UINT32 height, const RECTANGL
@@ -313,13 +403,24 @@ index da7f7dc..d87091c 100644
  
  	status = log_decompress(h264, pSrcData, SrcSize, regionRects, numRegionRects);
  
-@@ -189,15 +301,22 @@ INT32 avc420_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize
+@@ -189,15 +301,33 @@ INT32 avc420_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize
  		return 1;
  
  	if (status < 0)
 +	{
++		h264->ycnDirectFrameValid = FALSE;
 +		ycn_h264_diag_frame_failure(h264, status, "decode");
  		return status;
++	}
++
++	/* Direct present handshake: the decoder kept the frame on the GPU and
++	 * published it to the presenter, so pYUVData still holds the *previous*
++	 * frame. Converting it here would burn CPU on pixels nobody shows. */
++	if (h264->ycnDirectFrameValid)
++	{
++		h264->ycnDirectFrameValid = FALSE;
++		h264->ycnDirectFrames++;
++		return 2;
 +	}
  
  	pYUVData[0] = h264->pYUVData[0];
@@ -336,7 +437,7 @@ index da7f7dc..d87091c 100644
  	return 1;
  }
  
-@@ -649,9 +768,15 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
+@@ -649,9 +779,15 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
  		return -1001;
  
  	if (!areRectsValid(h264->log, nDstWidth, nDstHeight, regionRects, numRegionRects))
@@ -352,7 +453,7 @@ index da7f7dc..d87091c 100644
  
  	switch (op)
  	{
-@@ -718,6 +843,11 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
+@@ -718,6 +854,11 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
  	           " [avg=%lf]",
  	           op1, op1sum, op2, op2sum, op3, op3sum);
  #endif
@@ -364,7 +465,7 @@ index da7f7dc..d87091c 100644
  	return status;
  }
  
-@@ -781,6 +911,21 @@ static BOOL h264_context_init(H264_CONTEXT* h264)
+@@ -781,6 +922,21 @@ static BOOL h264_context_init(H264_CONTEXT* h264)
  			h264->subsystem = subsystem;
  			return TRUE;
  		}
@@ -386,7 +487,7 @@ index da7f7dc..d87091c 100644
  	}
  
  	return FALSE;
-@@ -796,24 +941,37 @@ BOOL h264_context_reset(H264_CONTEXT* h264, UINT32 width, UINT32 height)
+@@ -796,24 +952,39 @@ BOOL h264_context_reset(H264_CONTEXT* h264, UINT32 width, UINT32 height)
  
  	if (h264->subsystem && h264->subsystem->Uninit)
  		h264->subsystem->Uninit(h264);
@@ -394,6 +495,8 @@ index da7f7dc..d87091c 100644
 +	 * size change is described again instead of reporting the stale surface. */
 +	h264->ycnSurfaceValid = FALSE;
 +	h264->ycnSurfaceProbes = 0;
++	h264->ycnDirectArmed = FALSE;
++	h264->ycnDirectFrameValid = FALSE;
  	if (!h264_context_init(h264))
  		return FALSE;
  
@@ -426,7 +529,7 @@ index da7f7dc..d87091c 100644
  	if (Compressor)
  	{
  		/* Default compressor settings, may be changed by caller */
-@@ -823,6 +981,9 @@ H264_CONTEXT* h264_context_new(BOOL Compressor)
+@@ -823,6 +994,9 @@ H264_CONTEXT* h264_context_new(BOOL Compressor)
  
  	if (!h264_context_init(h264))
  		goto fail;
@@ -436,7 +539,7 @@ index da7f7dc..d87091c 100644
  
  	h264->yuv = yuv_context_new(Compressor, 0);
  	if (!h264->yuv)
-@@ -838,6 +999,18 @@ fail:
+@@ -838,6 +1012,18 @@ fail:
  	return nullptr;
  }
  
@@ -455,12 +558,18 @@ index da7f7dc..d87091c 100644
  void h264_context_free(H264_CONTEXT* h264)
  {
  	if (h264)
-@@ -911,7 +1084,16 @@ BOOL h264_context_set_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option, UIN
+@@ -911,7 +1097,22 @@ BOOL h264_context_set_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option, UIN
  			h264->UsageType = value;
  			return TRUE;
  		case H264_CONTEXT_OPTION_HW_ACCEL:
 -			h264->hwAccel = (value);
 +			h264->hwAccel = (h264->ycnDecodePolicy == YCN_H264_DECODE_POLICY_SOFTWARE) ? 0 : value;
++			return TRUE;
++		case H264_CONTEXT_OPTION_YCN_DIRECT_PRESENT:
++			h264->ycnDirectPresent = value ? TRUE : FALSE;
++			if (h264->ycnDirectPresent &&
++			    (h264->ycnDecodePolicy != YCN_H264_DECODE_POLICY_SOFTWARE))
++				h264->hwAccel = 1;
 +			return TRUE;
 +		case H264_CONTEXT_OPTION_YCN_DECODE_POLICY:
 +			if (value > YCN_H264_DECODE_POLICY_SOFTWARE)
@@ -473,12 +582,14 @@ index da7f7dc..d87091c 100644
  			return TRUE;
  		default:
  			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
-@@ -937,9 +1119,180 @@ UINT32 h264_context_get_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option)
+@@ -937,9 +1138,247 @@ UINT32 h264_context_get_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option)
  			return h264->UsageType;
  		case H264_CONTEXT_OPTION_HW_ACCEL:
  			return h264->hwAccel;
 +		case H264_CONTEXT_OPTION_YCN_DECODE_POLICY:
 +			return h264->ycnDecodePolicy;
++		case H264_CONTEXT_OPTION_YCN_DIRECT_PRESENT:
++			return h264->ycnDirectPresent;
  		default:
  			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
  			           option);
@@ -549,6 +660,12 @@ index da7f7dc..d87091c 100644
 +
 +static ycn_h264_surface_sink g_YcnSurfaceSink = NULL;
 +static void* g_YcnSurfaceSinkUser = NULL;
++
++/* Direct present: the bridge registers one process wide sink and (optionally)
++ * one process wide ID3D11Device that the decoder must decode onto. */
++static ycn_h264_direct_sink g_YcnDirectSink = NULL;
++static void* g_YcnDirectSinkUser = NULL;
++static void* g_YcnExternalDevice = NULL;
 +
 +UINT64 ycn_h264_qpc_frequency(void)
 +{
@@ -623,6 +740,65 @@ index da7f7dc..d87091c 100644
 +	return TRUE;
 +}
 +
++void ycn_h264_set_direct_armed(H264_CONTEXT* h264, BOOL armed)
++{
++	if (!h264)
++		return;
++	h264->ycnDirectArmed = armed ? TRUE : FALSE;
++}
++
++BOOL ycn_h264_take_direct(H264_CONTEXT* h264, YCN_H264_DIRECT_FRAME* frame)
++{
++	if (!h264 || !frame || !frame->frame)
++		return FALSE;
++	if (!g_YcnDirectSink)
++		return FALSE;
++
++	frame->size = sizeof(*frame);
++	frame->version = YCN_H264_DIRECT_API_VERSION;
++	if (!g_YcnDirectSink(g_YcnDirectSinkUser, frame))
++		return FALSE;
++
++	h264->ycnDirectFrameValid = TRUE;
++	return TRUE;
++}
++
++UINT32 ycn_h264_direct_api_version(void)
++{
++	return YCN_H264_DIRECT_API_VERSION;
++}
++
++void ycn_h264_set_direct_sink(ycn_h264_direct_sink sink, void* user)
++{
++	g_YcnDirectSink = sink;
++	g_YcnDirectSinkUser = user;
++}
++
++void ycn_h264_direct_frame_release(void* frame)
++{
++#ifdef WITH_VIDEO_FFMPEG
++	ycn_h264_release_frame_impl(frame);
++#else
++	WINPR_UNUSED(frame);
++#endif
++}
++
++BOOL ycn_h264_set_external_d3d11_device(void* device)
++{
++#ifdef WITH_FFMPEG_HWACCEL
++	g_YcnExternalDevice = device;
++	return TRUE;
++#else
++	WINPR_UNUSED(device);
++	return FALSE;
++#endif
++}
++
++void* ycn_h264_get_external_d3d11_device(void)
++{
++	return g_YcnExternalDevice;
++}
++
 +BOOL ycn_h264_context_recover_software(H264_CONTEXT* h264)
 +{
 +	if (!h264 || h264->Compressor)
@@ -655,10 +831,10 @@ index da7f7dc..d87091c 100644
 +	return TRUE;
 +}
 diff --git a/libfreerdp/codec/h264.h b/libfreerdp/codec/h264.h
-index af1c4fd..361bb68 100644
+index af1c4fd..e720fbb 100644
 --- a/libfreerdp/codec/h264.h
 +++ b/libfreerdp/codec/h264.h
-@@ -65,6 +65,29 @@ extern "C"
+@@ -65,6 +65,37 @@ extern "C"
  		UINT32 hwAccel;
  		UINT32 NumberOfThreads;
  
@@ -685,10 +861,18 @@ index af1c4fd..361bb68 100644
 +		UINT32 ycnSurfaceValid;
 +		UINT32 ycnSurfaceProbes;
 +
++		/* Yomori direct present: armed by the bridge right before a surface
++		 * command, consumed by the decoder. ycnDirectFrameValid is the handshake
++		 * back to avc420_decompress, which then skips the CPU conversion. */
++		UINT32 ycnDirectPresent;
++		UINT32 ycnDirectArmed;
++		UINT32 ycnDirectFrameValid;
++		UINT64 ycnDirectFrames;
++
  		UINT32 iStride[3];
  		BYTE* pOldYUVData[3];
  		BYTE* pYUVData[3];
-@@ -94,6 +117,28 @@ extern "C"
+@@ -94,6 +125,39 @@ extern "C"
  	FREERDP_LOCAL BOOL avc420_ensure_buffer(H264_CONTEXT* h264, UINT32 stride, UINT32 width,
  	                                        UINT32 height);
  
@@ -714,23 +898,37 @@ index af1c4fd..361bb68 100644
 +	FREERDP_LOCAL BOOL ycn_h264_surface_probe_wanted(H264_CONTEXT* h264);
 +	FREERDP_LOCAL void ycn_h264_surface_probe_done(H264_CONTEXT* h264);
 +
++	/* Direct present: offers an already referenced hardware frame (frame->frame
++	 * is an AVFrame* the caller created with av_frame_ref) to the registered
++	 * sink. Returns TRUE when the sink took the lease; on FALSE the caller keeps
++	 * ownership and must free it. Sets ycnDirectFrameValid so
++	 * avc420_decompress skips the CPU conversion for this frame. */
++	FREERDP_LOCAL BOOL ycn_h264_take_direct(H264_CONTEXT* h264, YCN_H264_DIRECT_FRAME* frame);
++
++	/* Frees a direct present lease (an AVFrame reference). Implemented by the
++	 * libavcodec backend, which is the only place that knows AVPacket/AVFrame. */
++	FREERDP_LOCAL void ycn_h264_release_frame_impl(void* frame);
++
  #ifdef WITH_MEDIACODEC
  	extern const H264_CONTEXT_SUBSYSTEM g_Subsystem_mediacodec;
  #endif
 diff --git a/libfreerdp/codec/h264_ffmpeg.c b/libfreerdp/codec/h264_ffmpeg.c
-index 563305f..a9d80cf 100644
+index b64d0b4..d29fd71 100644
 --- a/libfreerdp/codec/h264_ffmpeg.c
 +++ b/libfreerdp/codec/h264_ffmpeg.c
-@@ -35,6 +35,8 @@
+@@ -35,6 +35,11 @@
  #ifdef WITH_FFMPEG_HWACCEL
  #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(55, 9, 0)
  #include <libavutil/hwcontext.h>
 +#include <libavutil/imgutils.h>
 +#include <libavutil/pixdesc.h>
++#if defined(_WIN32)
++#include <libavutil/hwcontext_d3d11va.h>
++#endif
  #else
  #pragma warning You have asked for VA - API decoding, \
      but your version of libavutil is too old !Disabling.
-@@ -403,7 +405,14 @@ static enum AVPixelFormat get_hwctx_image_format(H264_CONTEXT_LIBAVCODEC* sys, w
+@@ -403,7 +408,14 @@ static enum AVPixelFormat get_hwctx_image_format(H264_CONTEXT_LIBAVCODEC* sys, w
  			return AV_PIX_FMT_D3D12;
  #endif
  		case AV_HWDEVICE_TYPE_D3D11VA:
@@ -745,7 +943,7 @@ index 563305f..a9d80cf 100644
  		case AV_HWDEVICE_TYPE_DRM:
  			return AV_PIX_FMT_DRM_PRIME;
  		case AV_HWDEVICE_TYPE_OPENCL:
-@@ -617,6 +626,141 @@ static int hw_supports_target_format(AVBufferRef* hwframectx, enum AVPixelFormat
+@@ -617,6 +629,293 @@ static int hw_supports_target_format(AVBufferRef* hwframectx, enum AVPixelFormat
  }
  #endif
  
@@ -786,6 +984,151 @@ index 563305f..a9d80cf 100644
 +		default:
 +			return YCN_H264_SURFACE_OTHER_HW;
 +	}
++}
++
++/* Colour metadata is never guessed from the resolution: it either comes from
++ * the bitstream VUI through FFmpeg or the frame is not presented directly. */
++static UINT32 ycn_h264_color_matrix(enum AVColorSpace space)
++{
++	switch (space)
++	{
++		case AVCOL_SPC_BT709:
++			return YCN_H264_COLOR_MATRIX_BT709;
++		case AVCOL_SPC_BT470BG:
++		case AVCOL_SPC_SMPTE170M:
++		case AVCOL_SPC_SMPTE240M:
++		case AVCOL_SPC_FCC:
++			return YCN_H264_COLOR_MATRIX_BT601;
++		case AVCOL_SPC_BT2020_NCL:
++		case AVCOL_SPC_BT2020_CL:
++			return YCN_H264_COLOR_MATRIX_BT2020;
++		default:
++			return YCN_H264_COLOR_MATRIX_UNKNOWN;
++	}
++}
++
++static UINT32 ycn_h264_color_range(enum AVColorRange range)
++{
++	switch (range)
++	{
++		case AVCOL_RANGE_MPEG:
++			return YCN_H264_COLOR_RANGE_LIMITED;
++		case AVCOL_RANGE_JPEG:
++			return YCN_H264_COLOR_RANGE_FULL;
++		default:
++			return YCN_H264_COLOR_RANGE_UNKNOWN;
++	}
++}
++
++/* Offers a decoded hardware frame to the direct presenter. On success the
++ * presenter owns the AVFrame lease and the caller must not transfer it to CPU
++ * memory; on failure nothing has changed and the normal path continues. */
++static BOOL ycn_h264_try_direct(H264_CONTEXT* h264, H264_CONTEXT_LIBAVCODEC* sys)
++{
++	YCN_H264_DIRECT_FRAME info;
++	AVFrame* hold = nullptr;
++	const AVFrame* hw = nullptr;
++	const AVHWFramesContext* frames = nullptr;
++
++	if (!h264->ycnDirectArmed)
++		return FALSE;
++	if ((sys->type != AV_HWDEVICE_TYPE_D3D11VA) || !sys->hwVideoFrame)
++		return FALSE;
++
++	hw = sys->hwVideoFrame;
++	if (hw->format != sys->hw_pix_fmt)
++		return FALSE;
++
++	hold = av_frame_alloc();
++	if (!hold)
++		return FALSE;
++	if (av_frame_ref(hold, hw) < 0)
++	{
++		av_frame_free(&hold);
++		return FALSE;
++	}
++
++	memset(&info, 0, sizeof(info));
++	info.size = sizeof(info);
++	info.version = YCN_H264_DIRECT_API_VERSION;
++	info.flags = YCN_H264_DIRECT_FLAG_HW_FRAME;
++	info.width = (UINT32)MAX(0, hw->width);
++	info.height = (UINT32)MAX(0, hw->height);
++	info.hwType = (UINT32)sys->type;
++	info.pixFormat = (UINT32)hw->format;
++	info.swFormat = (UINT32)AV_PIX_FMT_NONE;
++	if (hw->hw_frames_ctx)
++	{
++		frames = (const AVHWFramesContext*)hw->hw_frames_ctx->data;
++		if (frames)
++			info.swFormat = (UINT32)frames->sw_format;
++	}
++	/* AV_PIX_FMT_D3D11 stores the subresource index in data[1]. */
++	info.subresource = (UINT32)(uintptr_t)hw->data[1];
++	info.colorMatrix = ycn_h264_color_matrix(hw->colorspace);
++	info.colorRange = ycn_h264_color_range(hw->color_range);
++	info.colorPrimaries = (UINT32)hw->color_primaries;
++	info.colorTransfer = (UINT32)hw->color_trc;
++	info.frameIndex = h264->ycnSuccessfulFrames;
++	info.pts = hw->pts;
++	info.frame = hold;
++	info.texture = hw->data[0];
++	info.device = nullptr;
++
++	if (!ycn_h264_take_direct(h264, &info))
++	{
++		av_frame_free(&hold);
++		return FALSE;
++	}
++	return TRUE;
++}
++
++/* When the bridge handed us a device, decode onto it instead of letting FFmpeg
++ * create one. A single device is what makes zero copy possible: the decoded
++ * texture, the video processor and the swap chain must all share it. */
++static int ycn_h264_create_hw_device(AVBufferRef** ctx, enum AVHWDeviceType type,
++                                     const char* name)
++{
++	void* external = ycn_h264_get_external_d3d11_device();
++
++	*ctx = nullptr;
++#if defined(_WIN32)
++	if ((type == AV_HWDEVICE_TYPE_D3D11VA) && external)
++	{
++		AVBufferRef* ref = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
++		if (!ref)
++			return AVERROR(ENOMEM);
++
++		AVHWDeviceContext* devctx = (AVHWDeviceContext*)ref->data;
++		AVD3D11VADeviceContext* d3dctx = (AVD3D11VADeviceContext*)devctx->hwctx;
++		d3dctx->device = (ID3D11Device*)external;
++		/* 直接走 vtable：C 里的 ID3D11Device_AddRef 宏在部分 SDK 下会被展开成
++		 * 外部符号，链接时找不到。 */
++		d3dctx->device->lpVtbl->AddRef(d3dctx->device);
++
++		const int rc = av_hwdevice_ctx_init(ref);
++		if (rc < 0)
++		{
++			av_buffer_unref(&ref);
++			return rc;
++		}
++
++		/* Refuse silently substituted devices: a mismatched device would make
++		 * every later texture hand-off invalid. */
++		if (!d3dctx->device || ((void*)d3dctx->device != external))
++		{
++			av_buffer_unref(&ref);
++			return AVERROR(EINVAL);
++		}
++
++		*ctx = ref;
++		return 0;
++	}
++#else
++	WINPR_UNUSED(external);
++#endif
++
++	return av_hwdevice_ctx_create(ctx, type, name, nullptr, 0);
 +}
 +
 +/* Publishes what this frame's surface actually is. Runs on the decoder thread
@@ -884,10 +1227,17 @@ index 563305f..a9d80cf 100644
 +}
 +#endif
 +
++void ycn_h264_release_frame_impl(void* frame)
++{
++	AVFrame* av = (AVFrame*)frame;
++	if (av)
++		av_frame_free(&av);
++}
++
  static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
                                   const BYTE* WINPR_RESTRICT pSrcData, UINT32 SrcSize)
  {
-@@ -629,6 +773,10 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -629,6 +928,10 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  	int status = 0;
  	int gotFrame = 0;
  	AVPacket* packet = nullptr;
@@ -898,7 +1248,7 @@ index 563305f..a9d80cf 100644
  
  	WINPR_ASSERT(h264);
  	WINPR_ASSERT(pSrcData || (SrcSize == 0));
-@@ -638,6 +786,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -638,6 +941,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  	UINT32* iStride = h264->iStride;
  
  	WINPR_ASSERT(sys);
@@ -906,7 +1256,7 @@ index 563305f..a9d80cf 100644
  
  #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 133, 100)
  	packet = &sys->bufferpacket;
-@@ -664,6 +813,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -664,6 +968,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  	if (status < 0)
  	{
  		WLog_Print(h264->log, WLOG_ERROR, "Failed to decode video frame (status=%d)", status);
@@ -914,7 +1264,7 @@ index 563305f..a9d80cf 100644
  		goto fail;
  	}
  
-@@ -684,6 +834,8 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -684,6 +989,8 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  
  	if (status == 0)
  		gotFrame = 1;
@@ -923,7 +1273,7 @@ index 563305f..a9d80cf 100644
  #else
  #if defined(WITH_FFMPEG_HWACCEL)
  	status =
-@@ -696,6 +848,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -696,6 +1003,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  	if (status < 0)
  	{
  		WLog_Print(h264->log, WLOG_ERROR, "Failed to decode video frame (status=%d)", status);
@@ -931,10 +1281,25 @@ index 563305f..a9d80cf 100644
  		goto fail;
  	}
  
-@@ -729,9 +882,18 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -729,9 +1037,33 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  		{
  			if (sys->hwVideoFrame->format == sys->hw_pix_fmt)
  			{
++				/* Direct present: the presenter took the GPU surface, so the
++				 * whole GPU->CPU copy (and the YUV->RGB conversion behind it) is
++				 * skipped for this frame. pYUVData deliberately keeps pointing at
++				 * the previous frame; avc420_decompress knows not to touch it. */
++				if (ycn_h264_try_direct(h264, sys))
++				{
++					h264->YUVWidth =
++					    WINPR_ASSERTING_INT_CAST(UINT32, sys->hwVideoFrame->width);
++					h264->YUVHeight =
++					    WINPR_ASSERTING_INT_CAST(UINT32, sys->hwVideoFrame->height);
++					ycn_h264_diag_mark_frame(h264, TRUE, av_hwdevice_get_type_name(sys->type));
++					rc = 1;
++					goto fail;
++				}
++
 +				const UINT64 transferStart = ycn_h264_qpc_now();
  				target->width = sys->hwVideoFrame->width;
  				target->height = sys->hwVideoFrame->height;
@@ -950,7 +1315,7 @@ index 563305f..a9d80cf 100644
  			}
  			else
  				status = av_frame_copy(target, sys->hwVideoFrame);
-@@ -743,6 +905,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -743,6 +1075,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  		{
  			WLog_Print(h264->log, WLOG_ERROR, "Failed to transfer video frame (status=%d) (%s)",
  			           status, av_err2str(status));
@@ -958,7 +1323,7 @@ index 563305f..a9d80cf 100644
  			goto fail;
  		}
  
-@@ -767,6 +930,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -767,6 +1100,7 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  			{
  				WLog_Print(h264->log, WLOG_ERROR, "Failed to convert video frame (status=%d) (%s)",
  				           status, av_err2str(status));
@@ -966,7 +1331,7 @@ index 563305f..a9d80cf 100644
  				goto fail;
  			}
  		}
-@@ -778,6 +942,19 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -778,6 +1112,19 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  	{
  		WINPR_ASSERT(sys->videoFrame);
  
@@ -986,7 +1351,7 @@ index 563305f..a9d80cf 100644
  		pYUVData[0] = sys->videoFrame->data[0];
  		pYUVData[1] = sys->videoFrame->data[1];
  		pYUVData[2] = sys->videoFrame->data[2];
-@@ -788,6 +965,11 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
+@@ -788,6 +1135,11 @@ static int libavcodec_decompress(H264_CONTEXT* WINPR_RESTRICT h264,
  		h264->YUVWidth = WINPR_ASSERTING_INT_CAST(UINT32, sys->videoFrame->width);
  		h264->YUVHeight = WINPR_ASSERTING_INT_CAST(UINT32, sys->videoFrame->height);
  		rc = 1;
@@ -998,7 +1363,7 @@ index 563305f..a9d80cf 100644
  	}
  	else
  		rc = -2;
-@@ -1220,6 +1402,16 @@ WINPR_ATTR_NODISCARD
+@@ -1220,6 +1572,16 @@ WINPR_ATTR_NODISCARD
  static BOOL load_config(H264_CONTEXT_LIBAVCODEC* sys, BOOL enabled, wLog* log)
  {
  	WINPR_ASSERT(sys);
@@ -1015,7 +1380,7 @@ index 563305f..a9d80cf 100644
  
  #if defined(WITH_FFMPEG_HWACCEL)
  	sys->useHwDecoder = TRUE;
-@@ -1311,9 +1503,20 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+@@ -1311,9 +1673,29 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
  	if (!sys)
  		goto EXCEPTION;
  
@@ -1024,6 +1389,15 @@ index 563305f..a9d80cf 100644
  	if (!load_config(sys, h264->hwAccel > 0, h264->log))
  		goto EXCEPTION;
  
++#if defined(WITH_FFMPEG_HWACCEL) && defined(_WIN32)
++	/* Direct present needs a backend whose decoded surface is a sampleable
++	 * D3D11 texture. The Windows default is DXVA2, whose surfaces can only be
++	 * read back, so the backend is chosen here instead of being discovered at
++	 * the first frame. */
++	if (h264->ycnDirectPresent && sys->useHwDecoder)
++		sys->type = AV_HWDEVICE_TYPE_D3D11VA;
++#endif
++
 +#if defined(WITH_FFMPEG_HWACCEL)
 +	if (h264->hwAccel && (!sys->useHwDecoder || (sys->type == AV_HWDEVICE_TYPE_NONE)))
 +		ycn_h264_diag_set_fallback(h264, YCN_H264_FALLBACK_HW_UNAVAILABLE, "ffmpeg-software");
@@ -1036,7 +1410,18 @@ index 563305f..a9d80cf 100644
  	h264->pSystemData = (void*)sys;
  
  #if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 10, 100)
-@@ -1370,12 +1573,15 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+@@ -1361,8 +1743,8 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+ 			enum AVHWDeviceType type = sys->type;
+ 			if (!sys->hwctx)
+ 			{
+-				int ret =
+-				    av_hwdevice_ctx_create(&sys->hwctx, type, get_hwctx_device(sys), nullptr, 0);
++				int ret = ycn_h264_create_hw_device(&sys->hwctx, type,
++				                                    get_hwctx_device(sys));
+ 
+ 				if (ret < 0)
+ 				{
+@@ -1370,12 +1752,15 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
  					           "Could not initialize hardware decoder for %s, falling back to "
  					           "software: %s",
  					           get_hwctx_device(sys), av_err2str(ret));
@@ -1052,7 +1437,7 @@ index 563305f..a9d80cf 100644
  
  			sys->codecDecoderContext->get_format = libavcodec_get_format;
  			sys->hw_pix_fmt = get_hwctx_image_format(sys, h264->log);
-@@ -1392,6 +1598,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+@@ -1392,6 +1777,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
  		if (avcodec_open2(sys->codecDecoderContext, sys->codecDecoder, nullptr) < 0)
  		{
  			WLog_Print(h264->log, WLOG_ERROR, "Failed to open libav codec");
@@ -1060,7 +1445,7 @@ index 563305f..a9d80cf 100644
  			goto EXCEPTION;
  		}
  
-@@ -1400,6 +1607,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+@@ -1400,6 +1786,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
  		if (!sys->codecParser)
  		{
  			WLog_Print(h264->log, WLOG_ERROR, "Failed to initialize libav parser");
@@ -1068,8 +1453,18 @@ index 563305f..a9d80cf 100644
  			goto EXCEPTION;
  		}
  	}
+@@ -1424,8 +1811,7 @@ static BOOL libavcodec_init(H264_CONTEXT* h264)
+ 			{
+ 				WLog_Print(h264->log, WLOG_ERROR, "H264 hardware encoder not found");
+ 			}
+-			else if (av_hwdevice_ctx_create(&sys->hwctx, type, get_hwctx_device(sys), nullptr, 0) <
+-			         0)
++			else if (ycn_h264_create_hw_device(&sys->hwctx, type, get_hwctx_device(sys)) < 0)
+ 			{
+ 				WLog_Print(h264->log, WLOG_ERROR, "av_hwdevice_ctx_create(%s) failed",
+ 				           get_hwctx_device(sys));
 diff --git a/libfreerdp/gdi/gfx.c b/libfreerdp/gdi/gfx.c
-index 8d9d708..94a9a75 100644
+index 8d9d708..e6d2b4c 100644
 --- a/libfreerdp/gdi/gfx.c
 +++ b/libfreerdp/gdi/gfx.c
 @@ -25,6 +25,7 @@
@@ -1080,7 +1475,7 @@ index 8d9d708..94a9a75 100644
  
  #include <freerdp/api.h>
  #include <freerdp/log.h>
-@@ -35,6 +36,24 @@
+@@ -35,6 +36,39 @@
  
  #define TAG FREERDP_TAG("gdi")
  
@@ -1102,10 +1497,25 @@ index 8d9d708..94a9a75 100644
 +	return g_YcnThreadH264DecodePolicy;
 +}
 +
++/* Direct present admission, also thread local for the same reason: the bridge
++ * sets it per surface command on the thread that runs the GFX callback. */
++static WINPR_TLS UINT32 g_YcnThreadDirectPresent = 0;
++
++BOOL ycn_gdi_set_thread_direct_present(UINT32 mode)
++{
++	g_YcnThreadDirectPresent = mode ? 1u : 0u;
++	return TRUE;
++}
++
++static BOOL ycn_gdi_thread_direct_present(void)
++{
++	return g_YcnThreadDirectPresent ? TRUE : FALSE;
++}
++
  static BOOL is_rect_valid(const RECTANGLE_16* rect, size_t width, size_t height)
  {
  	if (!rect)
-@@ -671,6 +690,38 @@ fail:
+@@ -671,6 +705,53 @@ fail:
  	return status;
  }
  
@@ -1120,6 +1530,21 @@ index 8d9d708..94a9a75 100644
 +		                        .right = (UINT16)MIN(UINT16_MAX, surface->width),
 +		                        .bottom = (UINT16)MIN(UINT16_MAX, surface->height) };
 +	gdi->context->update->RefreshRect(gdi->context, 1, &rect);
++}
++
++/* Hands a directly presented surface back to GDI. The CPU copy of such a
++ * surface is stale by design, so only a full refresh can restore it. */
++static void ycn_gdi_drop_direct(rdpGdi* gdi, RdpgfxClientContext* context,
++                                const RDPGFX_SURFACE_COMMAND* cmd)
++{
++	if (!context || !cmd || !context->GetSurfaceData)
++		return;
++	gdiGfxSurface* surface = (gdiGfxSurface*)context->GetSurfaceData(
++	    context, (UINT16)MIN(UINT16_MAX, cmd->surfaceId));
++	if (!surface || !surface->ycnDirectActive)
++		return;
++	surface->ycnDirectActive = FALSE;
++	ycn_gdi_request_full_refresh(gdi, surface);
 +}
 +
 +/* A failed packet is never replayed: it may be a P frame whose reference was
@@ -1144,7 +1569,7 @@ index 8d9d708..94a9a75 100644
  /**
   * Function description
   *
-@@ -701,7 +752,8 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+@@ -701,7 +782,8 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
  
  	if (!surface->h264)
  	{
@@ -1154,7 +1579,7 @@ index 8d9d708..94a9a75 100644
  
  		if (!surface->h264)
  		{
-@@ -709,9 +761,13 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+@@ -709,9 +791,18 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
  			return ERROR_NOT_ENOUGH_MEMORY;
  		}
  
@@ -1168,10 +1593,35 @@ index 8d9d708..94a9a75 100644
 +		                                    : freerdp_settings_get_bool(gdi->context->settings,
 +		                                                                FreeRDP_SoftwareGdi));
 +		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_HW_ACCEL, requestHw))
++			return ERROR_INTERNAL_ERROR;
++
++		/* Must be known before the decoder is created: it decides the backend. */
++		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_YCN_DIRECT_PRESENT,
++		                             ycn_gdi_thread_direct_present() ? 1u : 0u))
  			return ERROR_INTERNAL_ERROR;
  
  		if (!h264_context_reset(surface->h264, surface->width, surface->height))
-@@ -736,8 +792,10 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+@@ -730,14 +821,41 @@ static UINT gdi_SurfaceCommand_AVC420(rdpGdi* gdi, RdpgfxClientContext* context,
+ 		return ERROR_INTERNAL_ERROR;
+ 
+ 	meta = &(bs->meta);
++	/* Direct present admission: the bridge decides per session, this thread
++	 * local flag carries that decision into the decode. */
++	const BOOL directWasActive = surface->ycnDirectActive;
++	const BOOL wantDirect = (surface->h264 && ycn_gdi_thread_direct_present()) ? TRUE : FALSE;
++	if (wantDirect)
++		ycn_h264_set_direct_armed(surface->h264, TRUE);
+ 	rc = avc420_decompress(surface->h264, bs->data, bs->length, surface->data, surface->format,
+ 	                       surface->scanline, surface->width, surface->height, meta->regionRects,
+ 	                       meta->numRegionRects);
++	if (wantDirect)
++		ycn_h264_set_direct_armed(surface->h264, FALSE);
++	surface->ycnDirectActive = (rc == 2) ? TRUE : FALSE;
++
++	/* Leaving the direct path: the GDI copy of this surface is stale, so only a
++	 * full refresh can restore the reference picture the CPU path assumes. */
++	if (directWasActive && !surface->ycnDirectActive)
++		ycn_gdi_request_full_refresh(gdi, surface);
  
  	if (rc < 0)
  	{
@@ -1181,10 +1631,21 @@ index 8d9d708..94a9a75 100644
 +		if (ycn_gdi_handle_h264_failure(gdi, surface))
 +			return CHANNEL_RC_OK; /* packet dropped; diagnostics retain the failure */
 +		return ERROR_INTERNAL_ERROR;
++	}
++
++	/* 2 == the decoded picture already went to the direct presenter and
++	 * surface->data was deliberately left stale. Composing it into the primary
++	 * buffer would copy the previous frame and cost a full frame of CPU time for
++	 * pixels nobody displays. The next GDI frame repaints it from scratch. */
++	if (rc == 2)
++	{
++		region16_clear(&(surface->invalidRegion));
++		return IFCALLRESULT(CHANNEL_RC_OK, context->UpdateSurfaceArea, context,
++		                    surface->surfaceId, meta->numRegionRects, meta->regionRects);
  	}
  
  	for (UINT32 i = 0; i < meta->numRegionRects; i++)
-@@ -795,7 +853,8 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+@@ -795,7 +913,8 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
  
  	if (!surface->h264)
  	{
@@ -1194,7 +1655,7 @@ index 8d9d708..94a9a75 100644
  
  		if (!surface->h264)
  		{
-@@ -803,10 +862,15 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+@@ -803,10 +922,20 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
  			return ERROR_NOT_ENOUGH_MEMORY;
  		}
  
@@ -1210,10 +1671,15 @@ index 8d9d708..94a9a75 100644
 +		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_HW_ACCEL, requestHw))
  			return ERROR_INTERNAL_ERROR;
 +
++		/* Must be known before the decoder is created: it decides the backend. */
++		if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_YCN_DIRECT_PRESENT,
++		                             ycn_gdi_thread_direct_present() ? 1u : 0u))
++			return ERROR_INTERNAL_ERROR;
++
  		if (!h264_context_reset(surface->h264, surface->width, surface->height))
  			return ERROR_INTERNAL_ERROR;
  	}
-@@ -833,8 +897,10 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+@@ -833,8 +962,10 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
  
  	if (rc < 0)
  	{
@@ -1226,7 +1692,25 @@ index 8d9d708..94a9a75 100644
  	}
  
  	for (UINT32 i = 0; i < meta1->numRegionRects; i++)
-@@ -2092,3 +2158,18 @@ void gdi_graphics_pipeline_uninit(rdpGdi* gdi, RdpgfxClientContext* gfx)
+@@ -1185,12 +1316,16 @@ static UINT gdi_SurfaceCommand(RdpgfxClientContext* context, const RDPGFX_SURFAC
+ 	dump_cmd(cmd, gdi->frameId);
+ #endif
+ 
++	/* Anything that is not AVC420 paints the surface on the CPU, so a surface
++	 * that was presented directly has to be handed back to GDI as a whole. */
++	if (codecId != RDPGFX_CODECID_AVC420)
++		ycn_gdi_drop_direct(gdi, context, cmd);
++
+ 	switch (codecId)
+ 	{
+ 		case RDPGFX_CODECID_UNCOMPRESSED:
+ 			status = gdi_SurfaceCommand_Uncompressed(gdi, context, cmd);
+ 			break;
+-
+ #if defined(WITH_GFX_AV1)
+ 		case RDPGFX_CODECID_AV1:
+ 			status = gdi_SurfaceCommand_AV1(gdi, context, cmd);
+@@ -2092,3 +2227,18 @@ void gdi_graphics_pipeline_uninit(rdpGdi* gdi, RdpgfxClientContext* gfx)
  	PROFILER_PRINT_FOOTER
  	PROFILER_FREE(gfx->SurfaceProfiler)
  }

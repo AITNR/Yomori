@@ -232,6 +232,28 @@ YCN_API int ycn_rdp_direct_probe_last(ycn_direct_surface_info* out);
 /* QPC 频率，用来把 *_ticks 换算成微秒；0 表示本机没有高精度计数器。 */
 YCN_API uint64_t ycn_rdp_qpc_frequency(void);
 
+/* ---- AVC 直显（S1）：零拷贝呈现 ----
+ *
+ * 必须**在建连前** enable：D3D11VA 后端与 device 在第一个 AVC 包到来时就定死。
+ * enable 失败（旧 DLL / 无视频驱动）返回 YCN_ERR_UNSUPPORTED，调用方继续用
+ * 原来的 GDI 上传路径即可，没有任何副作用。 */
+#include "ycn_direct_present.h"
+
+YCN_API int ycn_rdp_direct_enable(int session, uint32_t enable);
+
+/* UI 线程：把 SwapChainPanel 的 IUnknown* 交给直显呈现器（首次 present 时才建
+ * 交换链）。传 NULL 之后 present 返回 YCN_DP_STATUS_NEED_PANEL。 */
+YCN_API int ycn_rdp_direct_attach_panel(int session, void* panel);
+
+/* UI 线程：转换并呈现已锁存的一帧。out->size 由调用方填。
+ * 返回 YCN_OK（看 out->status）或 YCN_ERR_INTERNAL（该路径应关闭）。 */
+YCN_API int ycn_rdp_direct_present(int session, ycn_direct_present_result* out);
+
+/* 自检：用与实时路径完全相同的 VideoProcessor 把已知 YUV 图案转成 RGB 再读回，
+ * 用来验 BT.601/709 × limited/full。不依赖 RDP 会话。 */
+YCN_API int ycn_rdp_direct_color_test(uint32_t matrix, uint32_t range, uint32_t width,
+                                      uint32_t height, ycn_direct_color_result* out);
+
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);
 
@@ -318,6 +340,8 @@ YCN_API int ycn_rdp_copy_frame_strided(int session, uint8_t* dst, uint32_t dst_s
 /* dirty ABI 专用错误码（与 YCN_ERR_* 不重叠）。 */
 #define YCN_ERR_DIRTY_NOT_ATTACHED (-20)
 #define YCN_ERR_DIRTY_STALE_TOKEN  (-21)
+#define YCN_ERR_UNSUPPORTED        (-22) /* 本机/本版本没有该能力（降级即可） */
+#define YCN_ERR_INTERNAL           (-23) /* 内部状态错，调用方应关闭该路径 */
 #define YCN_ERR_DIRTY_STALE_SEQ    (-22)
 
 /* tile 对齐的像素矩形（半开区间），与 ycn_dirty_pending.h 的

@@ -55,6 +55,7 @@
 #include <inttypes.h>
 
 #include "ycn_direct_probe.h"
+#include "ycn_direct_present.h"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -265,6 +266,9 @@ typedef struct
 	ycn_direct_surface_info direct;
 	uint32_t direct_valid;
 	uint32_t direct_logged;
+
+	/* 直显呈现（S1）：准入标记 + 该会话是否已启用 */
+	uint32_t direct_present_enabled;
 } YcnSession;
 
 static YcnSession g_sessions[YCN_MAX_SESSIONS];
@@ -552,6 +556,14 @@ typedef struct
 typedef void(__cdecl* YcnSurfaceSinkFn)(void*, const YcnFreeRdpSurfaceInfo*);
 typedef void(__cdecl* YcnFn_SetSurfaceSink)(YcnSurfaceSinkFn, void*);
 
+/* 直显帧：布局与 freerdp 侧 YCN_H264_DIRECT_FRAME、以及本文件
+ * ycn_direct_present.h 的 ycn_dp_frame 完全一致。 */
+typedef BOOL(__cdecl* YcnDirectSinkFn)(void*, const ycn_dp_frame*);
+typedef void(__cdecl* YcnFn_SetDirectSink)(YcnDirectSinkFn, void*);
+typedef void(__cdecl* YcnFn_ReleaseFrame)(void*);
+typedef BOOL(__cdecl* YcnFn_SetExternalDevice)(void*);
+typedef BOOL(__cdecl* YcnFn_SetThreadDirect)(uint32_t);
+
 typedef struct
 {
 	YcnFn_U32Void getApiVersion;
@@ -559,6 +571,10 @@ typedef struct
 	YcnFn_SetThreadPolicy setThreadPolicy;
 	YcnFn_GetGdiDiag getGdiDiag;
 	YcnFn_SetSurfaceSink setSurfaceSink;
+	YcnFn_SetDirectSink setDirectSink;
+	YcnFn_ReleaseFrame releaseFrame;
+	YcnFn_SetExternalDevice setExternalDevice;
+	YcnFn_SetThreadDirect setThreadDirect;
 	uint32_t capabilities;
 	BOOL ready;
 } YcnFreeRdpDecodeProbe;
@@ -567,6 +583,7 @@ static INIT_ONCE g_decode_probe_once = INIT_ONCE_STATIC_INIT;
 static YcnFreeRdpDecodeProbe g_decode_probe;
 
 static void ycn_direct_sink(void* user, const YcnFreeRdpSurfaceInfo* info);
+static BOOL ycn_direct_frame_sink(void* user, const ycn_dp_frame* frame);
 
 static BOOL CALLBACK init_decode_probe(PINIT_ONCE once, PVOID param, PVOID* context)
 {
@@ -599,6 +616,16 @@ static BOOL CALLBACK init_decode_probe(PINIT_ONCE once, PVOID param, PVOID* cont
 	/* 直显探针只在存在时注册；旧 DLL 没有导出时完全无副作用。 */
 	if (g_decode_probe.setSurfaceSink)
 		g_decode_probe.setSurfaceSink(ycn_direct_sink, NULL);
+
+	/* 直显通道（S1）：全部按名字可选解析，旧 DLL 缺导出时本机走原路径。 */
+	g_decode_probe.setDirectSink =
+	    (YcnFn_SetDirectSink)GetProcAddress(module, "ycn_h264_set_direct_sink");
+	g_decode_probe.releaseFrame =
+	    (YcnFn_ReleaseFrame)GetProcAddress(module, "ycn_h264_direct_frame_release");
+	g_decode_probe.setExternalDevice =
+	    (YcnFn_SetExternalDevice)GetProcAddress(module, "ycn_h264_set_external_d3d11_device");
+	g_decode_probe.setThreadDirect =
+	    (YcnFn_SetThreadDirect)GetProcAddress(module, "ycn_gdi_set_thread_direct_present");
 	return TRUE;
 }
 
@@ -657,6 +684,18 @@ static void ycn_direct_copy_name(char* dst, size_t size, const char* src)
 		len = size - 1;
 	memcpy(dst, src, len);
 	dst[len] = '\0';
+}
+
+/* 直显帧到达：解码线程调用，只交指针（z 含 AVFrame 租约）。返回 TRUE 表示
+ * 接收方接管租约；FALSE 让解码器照原样回读 CPU 像素，本帧由 GDI 显示。 */
+static BOOL ycn_direct_frame_sink(void* user, const ycn_dp_frame* frame)
+{
+	const int sid = g_direct_session_id;
+	(void)user;
+	if (!frame || (frame->size != sizeof(ycn_dp_frame)) ||
+	    (frame->version != YCN_DP_API_VERSION) || (sid <= 0))
+		return FALSE;
+	return ycn_dp_publish(sid, (void*)frame) ? TRUE : FALSE;
 }
 
 static void ycn_direct_sink(void* user, const YcnFreeRdpSurfaceInfo* in)
@@ -1474,6 +1513,12 @@ static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFA
 	/* 解码回调在 orig 内部发生；用 TLS 告诉 sink 这一帧属于哪个会话。 */
 	{
 		const int previousDirectSession = g_direct_session_id;
+		BOOL directEnabled = FALSE;
+		EnterCriticalSection(&g_lock);
+		directEnabled = s->direct_present_enabled ? TRUE : FALSE;
+		LeaveCriticalSection(&g_lock);
+		if (probe->setThreadDirect)
+			probe->setThreadDirect(directEnabled ? 1u : 0u);
 		g_direct_session_id = s->id;
 		rc = orig(ctx, cmd);
 		g_direct_session_id = previousDirectSession;
@@ -1500,6 +1545,116 @@ static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFA
 	if (!recoveryWasPending && recoveryNowPending)
 		ycn_request_full_refresh(s);
 	return rc;
+}
+
+/* ============================================================
+ * 直显呈现（S1）：准入、挂面板、呈现
+ *
+ * 准入必须在建连前完成：解码后端（FFmpeg 的 hwaccel 类型）和 device 都在
+ * 第一个 AVC 包到来时定死，之后改不了。enable 会：
+ *   ① 建进程级 D3D11 device（BGRA|VIDEO_SUPPORT）；
+ *   ② 把它注入 FreeRDP，让 D3D11VA 解码到这块 device 上；
+ *   ③ 注册直显帧 sink；
+ *   ④ 打开该会话的直显闸门。
+ * 任何一步没成，FreeRDP 侧就继续走原 GDI 路径，行为与未启用完全一致。
+ * ============================================================ */
+
+int ycn_rdp_direct_enable(int session, uint32_t enable)
+{
+	const YcnFreeRdpDecodeProbe* probe = decode_probe();
+	YcnSession* s;
+	void* device = NULL;
+	int rc = YCN_OK;
+
+	s = find_session(session);
+	if (!s && enable)
+		return YCN_ERR_INVALID_ARG;
+
+	if (!enable)
+	{
+		/* 关总是允许的：会话可能已经结束，但 presenter 槽位还挂在 session id 上。
+		 * 只有 UI 线程会走这里（SetSwapChain 限制）。 */
+		if (s)
+		{
+			EnterCriticalSection(&g_lock);
+			s->direct_present_enabled = 0;
+			LeaveCriticalSection(&g_lock);
+		}
+		ycn_dp_detach(session);
+		if (probe->setThreadDirect)
+			probe->setThreadDirect(0u);
+		if (probe->setExternalDevice)
+			probe->setExternalDevice(NULL);
+		return YCN_OK;
+	}
+	if (!probe->setDirectSink || !probe->releaseFrame || !probe->setExternalDevice ||
+	    !probe->setThreadDirect)
+		return YCN_ERR_UNSUPPORTED;
+
+	device = ycn_dp_device();
+	if (!device)
+		return YCN_ERR_UNSUPPORTED;
+
+	ycn_dp_set_release(probe->releaseFrame);
+	if (!probe->setExternalDevice(device))
+		return YCN_ERR_UNSUPPORTED;
+	probe->setDirectSink(ycn_direct_frame_sink, NULL);
+
+	rc = ycn_dp_enable(session);
+	if (rc != YCN_DP_STATUS_OK)
+		return YCN_ERR_UNSUPPORTED;
+
+	EnterCriticalSection(&g_lock);
+	s->direct_present_enabled = 1;
+	LeaveCriticalSection(&g_lock);
+	WLog_INFO(TAG, "direct-present: enabled for session %d", session);
+	return YCN_OK;
+}
+
+int ycn_rdp_direct_attach_panel(int session, void* panel)
+{
+	if (!find_session(session) || !panel)
+		return YCN_ERR_INVALID_ARG;
+	return (ycn_dp_attach_panel(session, panel) == YCN_DP_STATUS_OK) ? YCN_OK
+	                                                                 : YCN_ERR_UNSUPPORTED;
+}
+
+int ycn_rdp_direct_present(int session, ycn_direct_present_result* out)
+{
+	YcnSession* s = find_session(session);
+	int status;
+
+	if (!s || !out || (out->size < sizeof(ycn_direct_present_result)))
+		return YCN_ERR_INVALID_ARG;
+
+	EnterCriticalSection(&g_lock);
+	out->size = sizeof(ycn_direct_present_result);
+	out->version = YCN_DIRECT_API_VERSION;
+	/* 只有启用且会话在跑才呈现：断链后残留的租约直接释放掉。 */
+	if (!s->direct_present_enabled)
+	{
+		LeaveCriticalSection(&g_lock);
+		out->status = YCN_DP_STATUS_DISABLED;
+		return YCN_OK;
+	}
+	LeaveCriticalSection(&g_lock);
+
+	status = ycn_dp_present(session, out);
+	out->version = YCN_DIRECT_API_VERSION;
+	return (status == YCN_DP_STATUS_FAILED) ? YCN_ERR_INTERNAL : YCN_OK;
+}
+
+int ycn_rdp_direct_color_test(uint32_t matrix, uint32_t range, uint32_t width, uint32_t height,
+                              ycn_direct_color_result* out)
+{
+	int status;
+
+	if (!out || (out->size < sizeof(ycn_direct_color_result)))
+		return YCN_ERR_INVALID_ARG;
+	out->version = YCN_DIRECT_API_VERSION;
+	status = ycn_dp_color_test(matrix, range, width, height, out);
+	out->version = YCN_DIRECT_API_VERSION;
+	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
 }
 
 /* ---- 诊断面包屑：**内存环形缓冲**，稳态零 I/O ----
@@ -1595,6 +1750,8 @@ static UINT ycn_gfx_reset_graphics(RdpgfxClientContext* ctx, const RDPGFX_RESET_
 		s->direct_valid = 0;
 		s->direct_logged = 0;
 		LeaveCriticalSection(&g_lock);
+		/* 旧世代的待呈现帧必须丢掉：尺寸已经变了，再画出去就是错帧。 */
+		ycn_dp_end_frame(s->id);
 	}
 	if (orig)
 	{
@@ -1666,6 +1823,10 @@ static UINT ycn_gfx_end_frame(RdpgfxClientContext* ctx, const RDPGFX_END_FRAME_P
 			rc = CHANNEL_RC_OK;
 		}
 	}
+	/* 整帧边界：所有 SurfaceCommand 都已完成，这时交出去的帧才是完整帧。
+	 * 半帧宁可丢，也不能画（错帧比掉帧更显眼）。 */
+	if (s && s->direct_present_enabled)
+		ycn_dp_end_frame(s->id);
 	return rc;
 }
 
@@ -3571,6 +3732,10 @@ teardown:
 		CloseHandle(stop_event);
 	if (thread_handle)
 		CloseHandle(thread_handle);
+
+	/* 直显 presenter 槽位按 session id 存，id 不复用 —— 必须还回去。
+	 * 这里只释放 COM 引用、不碰面板（SetSwapChain 只能 UI 线程）。 */
+	ycn_dp_release_session(callback_id);
 
 	/* Terminal callback: after this point no FreeRDP/channel/native callback for
 	 * this session can occur, so managed code may release its GCHandle roots. */

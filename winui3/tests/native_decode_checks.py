@@ -128,6 +128,81 @@ class DirectSurfaceInfo(ctypes.Structure):
     ]
 
 
+YCN_DP_STATUS_NAMES = {
+    0: "ok",
+    1: "no-frame",
+    2: "not-ready",
+    3: "need-panel",
+    4: "disabled",
+    5: "failed",
+}
+
+YCN_DP_MATRIX = {"bt601": 1, "bt709": 2}
+YCN_DP_RANGE = {"limited": 1, "full": 2}
+
+# Failing step reported by ycn_direct_color_test when status != ok.
+YCN_DP_COLOR_STAGE_NAMES = {
+    1: "nv12-texture",
+    2: "update-subresource",
+    3: "target-texture",
+    4: "processor-enumerator",
+    5: "video-processor",
+    6: "input-view",
+    7: "output-view",
+    8: "video-processor-blt",
+    9: "staging-texture",
+    10: "copy-resource",
+    11: "map",
+}
+
+
+class DirectPresentResult(ctypes.Structure):
+    """Mirrors ycn_direct_present_result (ycn_direct_present.h)."""
+
+    _fields_ = [
+        ("size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("color_matrix", ctypes.c_uint32),
+        ("color_range", ctypes.c_uint32),
+        ("converter", ctypes.c_uint32),
+        ("dxgi_format", ctypes.c_uint32),
+        ("color_inferred", ctypes.c_uint32),
+        ("frame_seq", ctypes.c_uint64),
+        ("frames_presented", ctypes.c_uint64),
+        ("frames_dropped", ctypes.c_uint64),
+        ("leases_outstanding", ctypes.c_uint64),
+        ("lease_idle_ticks", ctypes.c_uint64),
+        ("convert_ticks", ctypes.c_uint64),
+        ("present_ticks", ctypes.c_uint64),
+        ("last_hresult", ctypes.c_int32),
+        ("reserved1", ctypes.c_uint32),
+        ("detail", ctypes.c_char * 96),
+        ("reserved", ctypes.c_uint32 * 4),
+    ]
+
+
+class DirectColorResult(ctypes.Structure):
+    """Mirrors ycn_direct_color_result (ycn_direct_present.h)."""
+
+    _fields_ = [
+        ("size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("matrix", ctypes.c_uint32),
+        ("range", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("last_hresult", ctypes.c_int32),
+        ("samples", (ctypes.c_uint8 * 4) * 4),
+        ("error", ctypes.c_uint32 * 4),
+        ("stage", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 3),
+    ]
+
+
 class Rect16(ctypes.Structure):
     _fields_ = [
         ("left", ctypes.c_uint16),
@@ -419,6 +494,64 @@ def decode_offline(lib: ctypes.CDLL, freerdp: ctypes.CDLL, h264_path: Path,
         free_context(context)
 
 
+def check_direct_color(lib: ctypes.CDLL) -> dict[str, object]:
+    """S1: the conversion that the live path uses, verified on known pixels.
+
+    Four quadrants of a NV12 texture are filled from an exact inverse of the
+    matrix under test (black / white / red / mid grey), pushed through the same
+    ID3D11VideoProcessor configuration, read back and compared. A wrong matrix
+    or a wrong nominal range moves the values far outside the tolerance, so this
+    cannot pass by accident.
+    """
+    fn = getattr(lib, "ycn_rdp_direct_color_test", None)
+    if fn is None:
+        raise AssertionError("bridge has no direct colour self-test")
+    _configure(
+        fn,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(DirectColorResult),
+    )
+
+    tolerance = 8
+    combos = [("bt601", "limited"), ("bt601", "full"), ("bt709", "limited"), ("bt709", "full")]
+    results: dict[str, object] = {}
+    for matrix_name, range_name in combos:
+        info = DirectColorResult()
+        info.size = ctypes.sizeof(DirectColorResult)
+        rc = int(fn(YCN_DP_MATRIX[matrix_name], YCN_DP_RANGE[range_name], 256, 128, ctypes.byref(info)))
+        if rc != 0:
+            raise AssertionError(
+                f"colour self-test failed to run for {matrix_name}/{range_name}: "
+                f"status={info.status} hr=0x{info.last_hresult & 0xFFFFFFFF:08X} "
+                f"stage={YCN_DP_COLOR_STAGE_NAMES.get(info.stage, info.stage)}"
+            )
+        if info.status != 0:
+            raise AssertionError(
+                f"colour self-test did not complete for {matrix_name}/{range_name}: "
+                f"{YCN_DP_STATUS_NAMES.get(info.status, info.status)} "
+                f"hr=0x{info.last_hresult & 0xFFFFFFFF:08X} "
+                f"stage={YCN_DP_COLOR_STAGE_NAMES.get(info.stage, info.stage)}"
+            )
+        errors = [int(info.error[i]) for i in range(4)]
+        if max(errors) > tolerance:
+            samples = [[int(info.samples[i][c]) for c in range(4)] for i in range(4)]
+            raise AssertionError(
+                f"{matrix_name}/{range_name} converted outside tolerance: "
+                f"error={errors} samples={samples}"
+            )
+        results[f"{matrix_name}/{range_name}"] = {
+            "status": YCN_DP_STATUS_NAMES.get(info.status, str(info.status)),
+            "max_error": max(errors),
+            "errors": errors,
+            "samples_bgra": [[int(info.samples[i][c]) for c in range(4)] for i in range(4)],
+        }
+    return {"tolerance": tolerance, "combos": results}
+
+
 def check_direct_surface(lib: ctypes.CDLL) -> dict[str, object]:
     """S0: read the surface probe the decoder published for the last frame.
 
@@ -489,6 +622,59 @@ def check_direct_surface(lib: ctypes.CDLL) -> dict[str, object]:
     }
 
 
+def check_direct_contract(lib: ctypes.CDLL) -> dict[str, object]:
+    """S1: the direct-present entry points must refuse bad input, not crash.
+
+    These run without a live session on purpose: they pin the ABI contract that
+    the managed side relies on (size-versioned structs, invalid session id), and
+    they prove the exports exist in the shipped DLL. A silent S_OK here would
+    mean the managed fallback never triggers.
+    """
+    present = getattr(lib, "ycn_rdp_direct_present", None)
+    enable = getattr(lib, "ycn_rdp_direct_enable", None)
+    attach = getattr(lib, "ycn_rdp_direct_attach_panel", None)
+    for name, fn in (
+        ("ycn_rdp_direct_present", present),
+        ("ycn_rdp_direct_enable", enable),
+        ("ycn_rdp_direct_attach_panel", attach),
+    ):
+        if fn is None:
+            raise AssertionError(f"bridge is missing {name}")
+
+    _configure(present, ctypes.c_int, ctypes.c_int, ctypes.POINTER(DirectPresentResult))
+    _configure(enable, ctypes.c_int, ctypes.c_int, ctypes.c_uint32)
+    _configure(attach, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+
+    # Unknown session id: every entry point must reject it.
+    info = DirectPresentResult()
+    info.size = ctypes.sizeof(DirectPresentResult)
+    rc_unknown_session = int(present(0x7FFFFFF0, ctypes.byref(info)))
+    if rc_unknown_session == 0:
+        raise AssertionError("ycn_rdp_direct_present accepted an unknown session")
+    rc_enable_unknown = int(enable(0x7FFFFFF0, 1))
+    if rc_enable_unknown == 0:
+        raise AssertionError("ycn_rdp_direct_enable accepted an unknown session")
+    rc_attach_unknown = int(attach(0x7FFFFFF0, ctypes.c_void_p(1)))
+    if rc_attach_unknown == 0:
+        raise AssertionError("ycn_rdp_direct_attach_panel accepted an unknown session")
+
+    # Size-versioned struct: a caller that passes a stale/short struct must be
+    # rejected instead of having the tail of its buffer written.
+    short = DirectPresentResult()
+    short.size = 4
+    rc_short = int(present(0x7FFFFFF0, ctypes.byref(short)))
+    if rc_short == 0:
+        raise AssertionError("ycn_rdp_direct_present accepted an undersized result struct")
+
+    return {
+        "unknown_session_present": rc_unknown_session,
+        "unknown_session_enable": rc_enable_unknown,
+        "unknown_session_attach": rc_attach_unknown,
+        "undersized_result": rc_short,
+        "result_struct_size": ctypes.sizeof(DirectPresentResult),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dll", type=Path, help="path to ycn_rdp.dll")
@@ -534,6 +720,8 @@ def main() -> int:
         )
         if hasattr(lib, "ycn_rdp_direct_probe_last"):
             result["direct_surface"] = check_direct_surface(lib)
+            result["direct_color"] = check_direct_color(lib)
+            result["direct_contract"] = check_direct_contract(lib)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

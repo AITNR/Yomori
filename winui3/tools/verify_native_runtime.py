@@ -434,9 +434,17 @@ exports = [
     "ycn_h264_surface_api_version",
     "ycn_h264_set_surface_sink",
     "ycn_h264_get_surface_info",
+    "ycn_h264_qpc_frequency",
+    "ycn_h264_direct_api_version",
+    "ycn_h264_set_direct_sink",
+    "ycn_h264_direct_frame_release",
+    "ycn_h264_set_direct_armed",
+    "ycn_h264_set_external_d3d11_device",
+    "ycn_h264_get_external_d3d11_device",
+    "ycn_gdi_set_thread_direct_present",
 ]
 info = {"exports": [], "decode_api_version": None, "decode_capabilities": None,
-        "surface_api_version": None}
+        "surface_api_version": None, "direct_api_version": None}
 try:
     fd = ctypes.WinDLL(os.path.join(app, "freerdp3.dll"))
 except OSError as exc:
@@ -452,6 +460,9 @@ if "ycn_h264_decode_capabilities" in info["exports"]:
 if "ycn_h264_surface_api_version" in info["exports"]:
     fd.ycn_h264_surface_api_version.restype = ctypes.c_uint32
     info["surface_api_version"] = int(fd.ycn_h264_surface_api_version())
+if "ycn_h264_direct_api_version" in info["exports"]:
+    fd.ycn_h264_direct_api_version.restype = ctypes.c_uint32
+    info["direct_api_version"] = int(fd.ycn_h264_direct_api_version())
 # OpenSSL providers are loaded dynamically and absent from PE imports.
 crypto = ctypes.CDLL(os.path.join(app, "libcrypto-3-x64.dll"))
 crypto.OSSL_PROVIDER_load.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -486,7 +497,7 @@ print("YCN_H264_API=" + json.dumps(info, sort_keys=True))
         problems.append("干净加载失败（exit %d）：%s" % (proc.returncode, detail.strip()))
         return None
     info = {"version": None, "exports": [], "decode_api_version": None,
-            "decode_capabilities": None, "surface_api_version": None}
+            "decode_capabilities": None, "surface_api_version": None, "direct_api_version": None}
     for line in proc.stdout.splitlines():
         if line.startswith("YCN_RDP_VERSION="):
             info["version"] = line.split("=", 1)[1]
@@ -623,6 +634,14 @@ def verify(
                     "ycn_h264_surface_api_version",
                     "ycn_h264_set_surface_sink",
                     "ycn_h264_get_surface_info",
+                    "ycn_h264_qpc_frequency",
+                    "ycn_h264_direct_api_version",
+                    "ycn_h264_set_direct_sink",
+                    "ycn_h264_direct_frame_release",
+                    "ycn_h264_set_direct_armed",
+                    "ycn_h264_set_external_d3d11_device",
+                    "ycn_h264_get_external_d3d11_device",
+                    "ycn_gdi_set_thread_direct_present",
                 }
                 actual_exports = set(load_info.get("exports") or [])
                 missing_exports = sorted(expected_exports - actual_exports)
@@ -636,6 +655,11 @@ def verify(
                     problems.append(
                         "ycn_h264_surface_api_version=%r，期望 1"
                         % load_info.get("surface_api_version")
+                    )
+                if load_info.get("direct_api_version") != 1:
+                    problems.append(
+                        "ycn_h264_direct_api_version=%r，期望 1"
+                        % load_info.get("direct_api_version")
                     )
                 # AVC | diagnostics | hardware compiled
                 required_caps = 0x1 | 0x2 | 0x4

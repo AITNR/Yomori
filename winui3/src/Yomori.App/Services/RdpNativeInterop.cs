@@ -249,6 +249,123 @@ namespace Yomori.Services
             }
         }
 
+        // ------------------------------------------------------------------
+        // S1 直显（ycn_direct_present.h）：解码器解到本机 D3D11 纹理，由原生层
+        // 用 ID3D11VideoProcessor 直接画进 SwapChainPanel 自己的交换链，托管侧不再
+        // 拷像素。交换链归原生层所有 —— 一旦启用，本面板就不能再挂托管渲染器的
+        // 交换链，二者只能选一（见 RdpView 的渲染路线选择）。
+        // ------------------------------------------------------------------
+
+        internal const uint DirectApiVersion = 1;
+
+        /// <summary>ycn_direct_present_result 的托管镜像。</summary>
+        /// <remarks>
+        /// 用 <c>fixed</c> 缓冲区而不是 <c>ByValArray</c>：后者不是 blittable，
+        /// 每次 <c>ref</c> 调用都要封送一份并分配两个托管数组；直显是每帧一调的
+        /// 热路径（60Hz），这里必须零分配。
+        /// </remarks>
+        [StructLayout(LayoutKind.Sequential, Pack = 8)]
+        internal unsafe struct YcnDirectPresentResult
+        {
+            public uint Size;
+            public uint Version;
+            public uint Status;          // YcnDirectStatus
+            public uint Width;
+            public uint Height;
+            public uint ColorMatrix;     // YcnDirectMatrix
+            public uint ColorRange;      // YcnDirectRange
+            public uint Converter;       // 1 = VideoProcessor, 2 = 像素着色器
+            public uint DxgiFormat;
+            /// <summary>1 = 码流无 VUI 色彩标注，矩阵/范围按分辨率推断。</summary>
+            public uint ColorInferred;
+            public ulong FrameSeq;
+            public ulong FramesPresented;
+            public ulong FramesDropped;
+            public ulong LeasesOutstanding;
+            public ulong LeaseIdleTicks;
+            public ulong ConvertTicks;
+            public ulong PresentTicks;
+            public int LastHresult;
+            public uint Reserved1;
+            public fixed byte Detail[96];
+            public fixed uint Reserved[4];
+        }
+
+        internal static class YcnDirectStatus
+        {
+            public const uint Ok = 0;
+            public const uint NoFrame = 1;
+            public const uint NotReady = 2;
+            public const uint NeedPanel = 3;
+            public const uint Disabled = 4;
+            public const uint Failed = 5;
+        }
+
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_direct_enable")]
+        internal static extern int ycn_rdp_direct_enable(int session, uint enable);
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_direct_attach_panel")]
+        internal static extern int ycn_rdp_direct_attach_panel(int session, IntPtr panel);
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_direct_present")]
+        internal static extern int ycn_rdp_direct_present(int session, ref YcnDirectPresentResult result);
+
+        private static readonly object s_directProbeGate = new();
+        private static bool s_directProbeDone;
+        private static bool s_directSupported;
+
+        /// <summary>DLL 是否带 S1 直显导出。结果进程级缓存；缺导出时零副作用。</summary>
+        internal static bool SupportsDirectPresent
+        {
+            get
+            {
+                lock (s_directProbeGate)
+                {
+                    if (!s_directProbeDone)
+                    {
+                        var handle = IntPtr.Zero;
+                        try
+                        {
+                            var loaded = NativeLibrary.TryLoad(Lib, out handle)
+                                         || NativeLibrary.TryLoad(
+                                             Lib,
+                                             typeof(RdpNativeInterop).Assembly,
+                                             DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.SafeDirectories,
+                                             out handle);
+                            s_directSupported = loaded
+                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_direct_present", out _)
+                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_direct_attach_panel", out _)
+                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_direct_enable", out _)
+                                && NativeLibrary.TryGetExport(handle, "ycn_h264_set_external_d3d11_device", out _);
+                        }
+                        catch (Exception ex) when (ex is DllNotFoundException
+                                                   || ex is BadImageFormatException
+                                                   || ex is ArgumentException)
+                        {
+                            s_directSupported = false;
+                        }
+                        finally
+                        {
+                            if (handle != IntPtr.Zero)
+                            {
+                                NativeLibrary.Free(handle);
+                            }
+                        }
+                        s_directProbeDone = true;
+                    }
+                    return s_directSupported;
+                }
+            }
+        }
+
+        /// <summary>实调用失败后永久降级（本次进程内不再尝试直显）。</summary>
+        internal static void MarkDirectPresentUnsupported()
+        {
+            lock (s_directProbeGate)
+            {
+                s_directProbeDone = true;
+                s_directSupported = false;
+            }
+        }
+
         /// <summary>
         /// 版本化连接入口是否可用。只有 API == 1 且构建同时声明 AVC 解码与真实硬件
         /// 诊断补丁时才走 connect_ex；否则退回旧的非 AVC ycn_rdp_connect，包括旧 DLL

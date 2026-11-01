@@ -72,6 +72,23 @@ namespace Yomori.Services
         private uint _decodeApiVersion;
         private uint _decodeCapabilities;
         private bool _usedVersionedDecodeEntry;
+        private bool _directPresentArmed;
+
+        /// <summary>
+        /// 直显是否已武装（原生层已建 device、注入解码器、打开直显闸门）。
+        /// 这里只记状态，**不持有** RdpDirectPresenter：那个类碰 SwapChainPanel，
+        /// 而冒烟工程（纯控制台，不引用 WinUI）也链接本文件。
+        /// </summary>
+        internal bool DirectPresentArmed { get { lock (_gate) { return _directPresentArmed; } } }
+
+        /// <summary>UI 侧开关直显后同步状态；<c>false</c> 时下一个视图会重新武装。</summary>
+        internal void NoteDirectPresentArmed(bool armed)
+        {
+            lock (_gate) { _directPresentArmed = armed; }
+        }
+
+        /// <summary>武装直显失败的原因（null = 成功或未尝试）。仅诊断用。</summary>
+        internal string? DirectPresentError { get; private set; }
         private static readonly bool s_forceSoftwareFromCommandLine = Array.Exists(
             Environment.GetCommandLineArgs(), a => a == "--embed-nod3d");
         // 最近一次「静音意图」。原生 ycn_rdp_set_muted 在会话不是 RUNNING 时**直接拒绝**，
@@ -229,10 +246,10 @@ namespace Yomori.Services
 
             var cb = _nativeCallbacks.Value;
             int session;
+            var requestedPolicy = RdpDecodePolicy.Resolve(
+                info.DecodeBackend, info.RenderBackend, s_forceSoftwareFromCommandLine);
             try
             {
-                var requestedPolicy = RdpDecodePolicy.Resolve(
-                    info.DecodeBackend, info.RenderBackend, s_forceSoftwareFromCommandLine);
                 var useVersionedEntry = RdpNativeInterop.TryProbeDecodeApi(
                     out var decodeApiVersion, out var decodeCapabilities);
                 lock (_gate)
@@ -296,7 +313,50 @@ namespace Yomori.Services
                 disconnect = _disconnectRequested && !_completion.Task.IsCompleted;
             }
             if (disconnect) { RdpNativeInterop.ycn_rdp_disconnect(session); }
+
+            // S1 直显：**必须在这里武装**，不能等 UI 线程的第一次 tick ——
+            // H264 上下文的解码后端（D3D11VA / DXVA2）在上下文创建那一刻就定死，
+            // 而上下文是在第一帧 AVC420 到达时创建的。晚一步，这个会话就永远
+            // 没有直显帧（表现为直显一直 NoFrame，靠 RdpView 的看门狗回退）。
+            // 只在「自动（优先硬件）」策略下武装：策略=软件时用户明确要避开 GPU。
+            if (!disconnect && requestedPolicy == RdpDecodePolicy.Auto)
+            {
+                DirectPresentError = ArmDirectPresent(session);
+            }
+
             return true;
+        }
+
+        /// <summary>建 device / 注入解码器 / 开直显闸门。返回 null 表示成功。</summary>
+        private string? ArmDirectPresent(int session)
+        {
+            if (!RdpNativeInterop.SupportsDirectPresent)
+            {
+                return "native exports missing";
+            }
+
+            try
+            {
+                var rc = RdpNativeInterop.ycn_rdp_direct_enable(session, 1u);
+                if (rc != 0)
+                {
+                    return $"direct enable rc={rc}";
+                }
+                lock (_gate) { _directPresentArmed = true; }
+                return null;
+            }
+            catch (Exception ex) when (ex is EntryPointNotFoundException
+                                       || ex is DllNotFoundException
+                                       || ex is BadImageFormatException)
+            {
+                // 探测通过、实调用缺导出（DLL 被换掉）：降级缓存，免得每帧再试。
+                RdpNativeInterop.MarkDirectPresentUnsupported();
+                return ex.GetType().Name;
+            }
+            catch (Exception ex)
+            {
+                return ex.Message;
+            }
         }
 
         /// <summary>断开会话（语义 = mstsc「断开连接」）。幂等。</summary>
