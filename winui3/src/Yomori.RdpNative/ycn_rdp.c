@@ -14,6 +14,7 @@
  *      （标准 RDP 安全 + AutoDetect = RC4 解密流错位）
  * ============================================================ */
 #include "ycn_rdp.h"
+#include "ycn_dirty_diag.h"
 
 /* WIN32_LEAN_AND_MEAN 必须定义：否则 windows.h 引入 shellapi.h，其 NIIF_* 宏
  * 会与 freerdp rail.h 的 NIIF 枚举冲突（C2059）。spike 已踩过 */
@@ -222,6 +223,7 @@ typedef struct
 	uint64_t copy_frame_count;
 	uint64_t copy_frame_bytes;
 	uint64_t copy_frame_ticks;
+	YcnDirtyDiagAggregate dirty_diag; /* g_lock protected; read-only invalid-rect diagnostics */
 
 	/* 解码策略与真实诊断（g_lock 保护；稳定路径零 I/O）。 */
 	uint32_t decode_request_policy;
@@ -580,10 +582,98 @@ static void ycn_abandon_connect(YcnSession* s, freerdp* instance, HANDLE stop_ev
 
 /* ---------------- 帧回调链（gdi EndPaint 铩） ---------------- */
 
+/* 只读采集当前 EndPaint 批次的 invalid 矩形。
+ *
+ * 调用上下文：FreeRDP 事件线程的 ycn_end_paint 回调内。update_end_paint()
+ * 此时仍持有 update 锁，begin_paint() 已在同一线程清空批列表；因此这些公开
+ * GDI 字段在本调用期间稳定。这里不持有 g_lock 遍历矩形，采集完成后由调用方
+ * 在 g_lock 内合并，避免把列表遍历的耗时扩散到 UI/diag 线程。
+ *
+ * 任何无法证明安全的状态只计数并标记 full fallback，绝不遍历未知容量。 */
+static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
+{
+	const GDI_WND* hwnd;
+	const GDI_RGN* invalid;
+	const GDI_RGN* rects;
+	uint32_t ninvalid;
+	uint32_t capacity;
+	uint32_t i;
+	uint32_t bad_capacity = 0;
+
+	if (!batch)
+		return;
+
+	ycn_dirty_diag_batch_init(batch, gdi ? gdi->width : 0,
+	                          gdi ? gdi->height : 0, 0u);
+
+	if (!gdi || !gdi->primary || !gdi->primary->hdc)
+	{
+		batch->list_missing = 1u;
+		return;
+	}
+
+	hwnd = gdi->primary->hdc->hwnd;
+	if (!hwnd)
+	{
+		batch->list_missing = 1u;
+		return;
+	}
+
+	invalid = hwnd->invalid;
+	if (!invalid)
+	{
+		batch->list_missing = 1u;
+		return;
+	}
+
+	batch->invalid_null = invalid->null ? 1u : 0u;
+
+	if (hwnd->ninvalid < 0)
+	{
+		batch->bad_capacity = 1u;
+		return;
+	}
+
+	ninvalid = (uint32_t)hwnd->ninvalid;
+	capacity = hwnd->count;
+
+	if (capacity == 0u || capacity > YCN_DIRTY_DIAG_MAX_RECTS ||
+	    ninvalid > capacity)
+		bad_capacity = 1u;
+	if (capacity > 0u && !hwnd->cinvalid)
+		bad_capacity = 1u;
+	if (ninvalid > 0u && !hwnd->cinvalid)
+		bad_capacity = 1u;
+	if (invalid->null && ninvalid > 0u)
+		bad_capacity = 1u;
+
+	if (bad_capacity)
+	{
+		batch->bad_capacity = 1u;
+		return;
+	}
+
+	rects = hwnd->cinvalid;
+	if (!rects)
+		return;
+
+	for (i = 0; i < ninvalid; i++)
+	{
+		YcnDirtyRect rect;
+		rect.x = rects[i].x;
+		rect.y = rects[i].y;
+		rect.w = rects[i].w;
+		rect.h = rects[i].h;
+		ycn_dirty_diag_batch_add_rect(batch, &rect);
+	}
+}
+
 static BOOL ycn_end_paint(rdpContext* context)
 {
 	YcnSession* s = NULL;
 	rdpGdi* gdi;
+	YcnDirtyDiagBatch dirty;
+	BOOL orig_ok = TRUE;
 	int i;
 
 	/* 线性查 session（最多 4 个）；先调 gdi 原生 EndPaint 再拷帧 */
@@ -599,18 +689,28 @@ static BOOL ycn_end_paint(rdpContext* context)
 	}
 	LeaveCriticalSection(&g_lock);
 
-	if (s && s->orig_end_paint && !s->orig_end_paint(context))
-		return FALSE;
+	if (s && s->orig_end_paint)
+		orig_ok = s->orig_end_paint(context);
 
 	if (!s || !s->instance || !s->instance->context || !s->instance->context->gdi)
-		return TRUE;
+		return orig_ok;
 
 	gdi = s->instance->context->gdi;
-	if (!gdi->primary_buffer || gdi->width <= 0 || gdi->height <= 0)
-		return TRUE;
+
+	/* 仅诊断：在任何复制/返回分支之前采集本批次 invalid 矩形。 */
+	ycn_capture_dirty_diag(gdi, &dirty);
+
+	if (!orig_ok || !gdi->primary_buffer || gdi->width <= 0 || gdi->height <= 0)
+	{
+		EnterCriticalSection(&g_lock);
+		ycn_dirty_diag_commit(&s->dirty_diag, &dirty);
+		LeaveCriticalSection(&g_lock);
+		return orig_ok;
+	}
 
 	/* 拷贝到会话帧缓冲（BGRA32）。容量不足才 realloc；失败时保留上一帧。 */
 	EnterCriticalSection(&g_lock);
+	ycn_dirty_diag_commit(&s->dirty_diag, &dirty);
 	{
 		const uint32_t width = (uint32_t)gdi->width;
 		const uint32_t height = (uint32_t)gdi->height;
@@ -3871,7 +3971,7 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 	int live = 0;
 	int i;
 	uint32_t adv_last = 0;
-	char perf[1024];
+	char perf[1536];
 
 	if (!buf || buflen == 0)
 		return;
@@ -3946,6 +4046,9 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            " perf=[endpaint n=%llu B=%llu ms=%.3f copy_frame n=%llu B=%llu ms=%.3f "
 		            "surface_ms_by_codec=[%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f] "
 		            "surface_B_by_codec=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+		            "dirty=[paints:%llu invalid_rects:%llu max_rects:%llu empty:%llu full_fallback:%llu "
+		            "sum_area:%llu sum_pct:%.2f bbox_area:%llu bbox_pct:%.2f "
+		            "clipped_rects:%llu overflow_events:%llu bad_capacity:%llu missing:%llu] "
 		            "names=[%.31s]]",
 		            (unsigned long long)s->endpaint_memcpy_count,
 		            (unsigned long long)s->endpaint_memcpy_bytes,
@@ -3969,6 +4072,19 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            (unsigned long long)s->gfx_codec_bytes[10], (unsigned long long)s->gfx_codec_bytes[11],
 		            (unsigned long long)s->gfx_codec_bytes[12], (unsigned long long)s->gfx_codec_bytes[13],
 		            (unsigned long long)s->gfx_codec_bytes[14], (unsigned long long)s->gfx_codec_bytes[15],
+		            (unsigned long long)s->dirty_diag.paints,
+		            (unsigned long long)s->dirty_diag.rect_count,
+		            (unsigned long long)s->dirty_diag.max_rects_in_paint,
+		            (unsigned long long)s->dirty_diag.empty_batches,
+		            (unsigned long long)s->dirty_diag.full_fallback_batches,
+		            (unsigned long long)s->dirty_diag.sum_area,
+		            ycn_dirty_diag_percent(s->dirty_diag.sum_area, s->dirty_diag.desktop_area_sum),
+		            (unsigned long long)s->dirty_diag.bbox_area_sum,
+		            ycn_dirty_diag_percent(s->dirty_diag.bbox_area_sum, s->dirty_diag.desktop_area_sum),
+		            (unsigned long long)s->dirty_diag.clipped_rects,
+		            (unsigned long long)s->dirty_diag.overflow_events,
+		            (unsigned long long)s->dirty_diag.bad_capacity_batches,
+		            (unsigned long long)s->dirty_diag.missing_batches,
 		            s->dvc_names);
 		strncat_s(buf, buflen, perf, _TRUNCATE);
 	}

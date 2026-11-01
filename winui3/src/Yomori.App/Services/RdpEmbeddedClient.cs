@@ -466,7 +466,8 @@ namespace Yomori.Services
         /// <summary>原生通道加载诊断（一行文本：load_addins 返回值 / 通道计数 / GFX 状态 / 通道名）。</summary>
         public string Diag()
         {
-            var buf = new byte[2048];
+            // Native diag now appends read-only dirty-rect aggregates; keep enough room for the full line.
+            var buf = new byte[4096];
             RdpNativeInterop.ycn_rdp_diag(_session, buf, (UIntPtr)buf.Length);
             var len = Array.IndexOf(buf, (byte)0);
             if (len < 0)

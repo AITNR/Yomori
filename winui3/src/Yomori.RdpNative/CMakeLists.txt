@@ -104,7 +104,7 @@ foreach(_dll IN LISTS YCN_COPY_RUNTIME_DLLS)
   endif()
 endforeach()
 
-add_library(ycn_rdp SHARED ycn_rdp.c)
+add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c)
 # 注意：不要定义 UNICODE/_UNICODE —— 会引发 freerdp rail.h 的 NIIF_* 与 shellapi.h 宏冲突
 target_compile_definitions(ycn_rdp PRIVATE YCN_RDP_EXPORTS)
 target_compile_options(ycn_rdp PRIVATE /utf-8)
@@ -119,6 +119,20 @@ target_link_libraries(ycn_rdp PRIVATE
   "${VCPKG_INST}/lib/freerdp3.lib"
   "${VCPKG_INST}/lib/winpr3.lib"
   ws2_32.lib)
+
+# Pure tests for the read-only dirty-rectangle aggregator.  They do not link
+# FreeRDP and do not exercise the render or frame-copy behaviour.
+option(YCN_BUILD_DIRTY_DIAG_TESTS "Build pure dirty-rectangle diagnostic tests" ON)
+if(YCN_BUILD_DIRTY_DIAG_TESTS)
+  enable_testing()
+  add_executable(ycn_dirty_diag_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ycn_dirty_diag_tests.c"
+    ycn_dirty_diag.c)
+  target_include_directories(ycn_dirty_diag_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_options(ycn_dirty_diag_tests PRIVATE /utf-8)
+  add_test(NAME ycn_dirty_diag_tests COMMAND ycn_dirty_diag_tests)
+endif()
 
 # ---- 能力信息（构建时快照，发布包和 CI 都会校验） -------------------------
 set(_ffmpeg_dll_json "")
