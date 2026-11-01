@@ -62,6 +62,7 @@ namespace Yomori.Services
         private YcnCallbacks.OnError? _onError;
 
         private readonly object _gate = new();
+        private readonly RdpDirtyPathStats _dirtyStats = new();
         private RdpClientState _state = RdpClientState.Idle;
         private int _session;
         private bool _disconnectRequested;
@@ -358,9 +359,19 @@ namespace Yomori.Services
 
         internal bool AttachDirtyRenderer(ulong token)
         {
-            if (!SupportsDirtyFrameCopy || token == 0) return false;
-            try { return RdpNativeInterop.ycn_rdp_dirty_attach(_session, token) == 0; }
-            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException) { return false; }
+            if (!SupportsDirtyFrameCopy) { _dirtyStats.RecordUnsupported(); return false; }
+            if (token == 0) { _dirtyStats.RecordAttach(false); return false; }
+            try
+            {
+                var ok = RdpNativeInterop.ycn_rdp_dirty_attach(_session, token) == 0;
+                _dirtyStats.RecordAttach(ok);
+                return ok;
+            }
+            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException)
+            {
+                _dirtyStats.RecordAttach(false);
+                return false;
+            }
         }
 
         internal void DetachDirtyRenderer(ulong token)
@@ -370,34 +381,71 @@ namespace Yomori.Services
             catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException) { }
         }
 
+        /// <summary>dirty 路径累计计数（5 秒日志用；watchdog 走完整帧 API，不会计入）。</summary>
+        internal RdpDirtyPathSnapshot DirtyPathSnapshot() => _dirtyStats.Snapshot();
+
         internal unsafe int CopyPendingDirty(
             ulong token, IntPtr destination, uint destinationSize, uint destinationStride,
             out RdpNativeInterop.YcnDirtyFrameInfo info,
             Span<RdpNativeInterop.YcnDirtyRect> rects)
         {
             info = default;
-            if (!SupportsDirtyFrameCopy || token == 0 || destination == IntPtr.Zero)
+            if (!SupportsDirtyFrameCopy) { _dirtyStats.RecordUnsupported(); return -1; }
+            if (token == 0 || destination == IntPtr.Zero)
+            {
+                _dirtyStats.RecordCopy(-1, 0, 0, 0);
                 return -1;
+            }
+
+            int rc;
             fixed (RdpNativeInterop.YcnDirtyRect* rectPtr = rects)
             {
                 try
                 {
-                    return RdpNativeInterop.ycn_rdp_dirty_copy_pending(
+                    rc = RdpNativeInterop.ycn_rdp_dirty_copy_pending(
                         _session, token, (byte*)destination, destinationSize,
                         destinationStride, out info, rectPtr, (uint)rects.Length);
                 }
                 catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException)
                 {
+                    _dirtyStats.RecordUnsupported();
                     return -1;
                 }
             }
+
+            long bytes = 0;
+            if (rc == 0)
+            {
+                if (info.Kind == RdpNativeInterop.DirtyKindFull)
+                {
+                    bytes = (long)info.Stride * (info.Height - 1) + (long)info.Width * 4;
+                }
+                else if (info.Kind == RdpNativeInterop.DirtyKindBoxes)
+                {
+                    var count = Math.Min(info.RectCount, (uint)rects.Length);
+                    for (uint i = 0; i < count; i++)
+                        bytes += (long)rects[(int)i].W * 4 * rects[(int)i].H;
+                }
+            }
+            _dirtyStats.RecordCopy(rc, info.Kind, info.RectCount, bytes);
+            return rc;
         }
 
         internal bool AckDirtyFrame(ulong token, ulong sequence)
         {
-            if (token == 0 || !SupportsDirtyFrameCopy) return false;
-            try { return RdpNativeInterop.ycn_rdp_dirty_ack(_session, token, sequence) == 0; }
-            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException) { return false; }
+            if (token == 0) { _dirtyStats.RecordAck(false); return false; }
+            if (!SupportsDirtyFrameCopy) { _dirtyStats.RecordUnsupported(); return false; }
+            try
+            {
+                var ok = RdpNativeInterop.ycn_rdp_dirty_ack(_session, token, sequence) == 0;
+                _dirtyStats.RecordAck(ok);
+                return ok;
+            }
+            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException)
+            {
+                _dirtyStats.RecordAck(false);
+                return false;
+            }
         }
         internal bool SupportsMappedFrameCopy => RdpNativeInterop.SupportsMappedFrameCopy;
 
@@ -512,7 +560,7 @@ namespace Yomori.Services
         public string Diag()
         {
             // Native diag now appends read-only dirty-rect aggregates; keep enough room for the full line.
-            var buf = new byte[4096];
+            var buf = new byte[8192];
             RdpNativeInterop.ycn_rdp_diag(_session, buf, (UIntPtr)buf.Length);
             var len = Array.IndexOf(buf, (byte)0);
             if (len < 0)

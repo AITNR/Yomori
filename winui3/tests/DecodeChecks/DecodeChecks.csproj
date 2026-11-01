@@ -27,5 +27,6 @@
 
     <Compile Include="..\..\src\Yomori.App\Services\RdpNativeInterop.cs" Link="Production\Services\RdpNativeInterop.cs" />
     <Compile Include="..\..\src\Yomori.App\Services\RdpEmbeddedClient.cs" Link="Production\Services\RdpEmbeddedClient.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\RdpDirtyPathStats.cs" Link="Production\Services\RdpDirtyPathStats.cs" />
   </ItemGroup>
 </Project>

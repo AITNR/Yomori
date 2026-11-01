@@ -99,6 +99,7 @@ namespace Yomori.Services
         private ulong _dirtyToken;
         private static long s_dirtyTokenSource;
         private readonly RdpNativeInterop.YcnDirtyRect[] _dirtyRects = new RdpNativeInterop.YcnDirtyRect[2048];
+        private long _dirtyBoxCalls, _dirtyBoxBytes, _dirtyFullUploads, _dirtyTextureResets;
         private ID3D11Texture2D? _backBuffer;
         private Microsoft.UI.Xaml.Controls.SwapChainPanel? _panel;
         private IntPtr _panelPtr;                 // SwapChainPanel 原生指针（SetCompositionScale 用）
@@ -245,6 +246,7 @@ namespace Yomori.Services
                 MiscFlags = ResourceOptionFlags.None,
             });
             _frameTextureValid = false;
+            _dirtyTextureResets++;
         }
 
         internal bool AttachDirtyClient(RdpEmbeddedClient client)
@@ -304,6 +306,8 @@ namespace Yomori.Services
                 {
                     _context.CopyResource(_frameTexture, _staging);
                     _frameTextureValid = true;
+                    _dirtyFullUploads++;
+
                 }
                 else if (!_frameTextureValid)
                 {
@@ -317,6 +321,9 @@ namespace Yomori.Services
                         var b=_dirtyRects[i];
                         var box=new Vortice.Mathematics.Box(b.X,b.Y,0,b.X+(int)b.W,b.Y+(int)b.H,1);
                         _context.CopySubresourceRegion(_frameTexture,0,(uint)b.X,(uint)b.Y,0,_staging,0,box);
+                        _dirtyBoxCalls++;
+                        _dirtyBoxBytes += (long)b.W * b.H * 4;
+
                     }
                 }
                 else { LastError="unknown dirty frame kind"; _frameTextureValid=false; return false; }
@@ -598,6 +605,7 @@ namespace Yomori.Services
                 _staging = null;
                 _frameTexture = null;
                 _frameTextureValid = false;
+            _dirtyTextureResets++;
                 _backBuffer = null;
                 _swapChain = null;
                 _context = null;

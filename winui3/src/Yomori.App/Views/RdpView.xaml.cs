@@ -1052,6 +1052,7 @@ namespace Yomori.Views
             // 软提交=CopyFromBuffer+SetBitmapAsync 发起；软等待=SetBitmapAsync 完成等待；
             // tick=OnPresentTick 同步工作总时长。这样能区分 UI 忙、复制与等待。
             var phase = _phaseStats.TakeSnapshot(elapsed);
+            var dirtyPathSummary = diagClient?.DirtyPathSnapshot().ToLogString() ?? "unavailable";
             var resolution = phase.Width == 0 || phase.Height == 0
                 ? "分辨率未知"
                 : $"分辨率 {phase.Width}×{phase.Height} stride {phase.Stride}";
@@ -1067,7 +1068,8 @@ namespace Yomori.Views
                 $"软提交 {phase.SoftCommit.Count} 次 avg {phase.SoftCommit.AverageMs:F2} / max {phase.SoftCommit.MaxMs:F2} ms，" +
                 $"{phase.SoftCommit.BytesPerSecond(elapsed) / 1048576.0:F1} MB/s｜" +
                 $"软等待 {phase.SoftAwait.Count} 次 avg {phase.SoftAwait.AverageMs:F2} / max {phase.SoftAwait.MaxMs:F2} ms｜" +
-                $"tick {phase.Tick.Count} 次 avg {phase.Tick.AverageMs:F2} / max {phase.Tick.MaxMs:F2} ms");
+                $"tick {phase.Tick.Count} 次 avg {phase.Tick.AverageMs:F2} / max {phase.Tick.MaxMs:F2} ms｜" +
+                $"dirty路径 {dirtyPathSummary}");
         }
 
         /// <summary>

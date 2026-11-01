@@ -17,6 +17,7 @@
 #include "ycn_dirty_diag.h"
 #include "ycn_dirty_snapshot.h"
 #include "ycn_dirty_pending.h"
+#include "ycn_dirty_stats.h"
 
 /* WIN32_LEAN_AND_MEAN 必须定义：否则 windows.h 引入 shellapi.h，其 NIIF_* 宏
  * 会与 freerdp rail.h 的 NIIF 枚举冲突（C2059）。spike 已踩过 */
@@ -230,6 +231,7 @@ typedef struct
 	YcnDirtyDiagAggregate dirty_diag; /* g_lock protected; read-only invalid-rect diagnostics */
 	YcnDirtySnapshot dirty_snapshot;  /* bounded EndPaint batch; no per-frame allocation */
 	YcnDirtyPending dirty_pending;    /* 阶段 2B：tile/sealed 增量帧状态（g_lock 保护） */
+	YcnDirtyStats dirty_stats;        /* 阶段 3：dirty ABI 结果计数（g_lock 保护） */
 	uint64_t endpaint_dirty_count;
 	uint64_t endpaint_full_count;
 	uint64_t endpaint_dirty_fallback_count;
@@ -3322,6 +3324,7 @@ static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callback
 	s = &g_sessions[slot];
 	memset(s, 0, sizeof(*s));
 	ycn_dirty_pending_init(&s->dirty_pending);
+	ycn_dirty_stats_init(&s->dirty_stats);
 	s->used = 1;
 	s->id = (int)g_next_session_id++;
 	id = s->id;
@@ -4087,6 +4090,8 @@ YCN_API int ycn_rdp_dirty_attach(int session, uint64_t token)
 			rc = YCN_OK;
 		}
 	}
+	if (s)
+		ycn_dirty_stats_record_attach(&s->dirty_stats, rc);
 	LeaveCriticalSection(&g_lock);
 	return rc;
 }
@@ -4109,6 +4114,8 @@ YCN_API int ycn_rdp_dirty_detach(int session, uint64_t token)
 			         ? YCN_OK
 			         : YCN_ERR_DIRTY_STALE_TOKEN;
 	}
+	if (s)
+		ycn_dirty_stats_record_detach(&s->dirty_stats, rc);
 	LeaveCriticalSection(&g_lock);
 	return rc;
 }
@@ -4125,6 +4132,9 @@ YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
 	uint32_t flags = 0u;
 	uint32_t box_count = 0u;
 	uint64_t seq = 0u;
+	uint32_t stats_kind = YCN_DIRTY_STATS_KIND_EMPTY;
+	uint32_t copied_boxes = 0u;
+	uint64_t copied_bytes = 0u;
 
 	if (!dst || dst_size == 0u || dst_stride == 0u || !out_info)
 		return YCN_ERR_INVALID_ARG;
@@ -4177,6 +4187,7 @@ YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
 
 	if (flags == YCN_DIRTY_PENDING_EMPTY)
 	{
+		stats_kind = YCN_DIRTY_STATS_KIND_EMPTY;
 		rc = YCN_OK; /* 无新数据：不写 dst */
 		goto dirty_copy_unlock;
 	}
@@ -4228,6 +4239,8 @@ YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
 					       s->frame + (size_t)row * src_stride, row_bytes);
 				}
 			}
+			stats_kind = YCN_DIRTY_STATS_KIND_FULL;
+			copied_bytes = (uint64_t)row_bytes * height;
 			rc = YCN_OK;
 		}
 		else
@@ -4238,6 +4251,7 @@ YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
 				rc = YCN_ERR_NO_MEMORY; /* out_info.rect_count 已给出所需容量 */
 				goto dirty_copy_unlock;
 			}
+			stats_kind = YCN_DIRTY_STATS_KIND_BOXES;
 			for (i = 0; i < box_count; i++)
 			{
 				const YcnDirtyPendingRect* b = &g_dirty_copy_boxes[i];
@@ -4264,12 +4278,17 @@ YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
 				out_rects[i].y = b->y;
 				out_rects[i].w = (uint32_t)b->w;
 				out_rects[i].h = (uint32_t)b->h;
+				copied_boxes++;
+				copied_bytes += (uint64_t)copy_bytes * (uint32_t)b->h;
 			}
 			rc = YCN_OK;
 		}
 	}
 
 dirty_copy_unlock:
+	if (s)
+		ycn_dirty_stats_record_copy(&s->dirty_stats, rc, stats_kind,
+		                            copied_boxes, copied_bytes);
 	LeaveCriticalSection(&g_lock);
 	return rc;
 }
@@ -4292,6 +4311,8 @@ YCN_API int ycn_rdp_dirty_ack(int session, uint64_t token, uint64_t seq)
 		else
 			rc = YCN_OK;
 	}
+	if (s)
+		ycn_dirty_stats_record_ack(&s->dirty_stats, rc);
 	LeaveCriticalSection(&g_lock);
 	return rc;
 }
@@ -4335,7 +4356,7 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 	int live = 0;
 	int i;
 	uint32_t adv_last = 0;
-	char perf[1536];
+	char perf[2048];
 
 	if (!buf || buflen == 0)
 		return;
@@ -4414,6 +4435,7 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            "sum_area:%llu sum_pct:%.2f bbox_area:%llu bbox_pct:%.2f "
 		            "clipped_rects:%llu overflow_events:%llu bad_capacity:%llu missing:%llu] "
 		            "snapshot=[dirty:%llu full:%llu fallback:%llu merged:%llu] "
+			"dirty_api=[copy_ok:%llu copy_fail:%llu empty:%llu boxes:%llu full:%llu box_n:%llu box_max:%llu B:%llu ack_ok:%llu ack_fail:%llu attach_fail:%llu detach_fail:%llu fail_natt:%llu fail_stale:%llu fail_seq:%llu fail_nconn:%llu fail_inval:%llu fail_nomem:%llu fail_nsess:%llu fail_other:%llu] "
 		            "names=[%.31s]]",
 		            (unsigned long long)s->endpaint_memcpy_count,
 		            (unsigned long long)s->endpaint_memcpy_bytes,
@@ -4454,6 +4476,26 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            (unsigned long long)s->endpaint_full_count,
 		            (unsigned long long)s->endpaint_dirty_fallback_count,
 		            (unsigned long long)s->endpaint_dirty_merged_count,
+			(unsigned long long)s->dirty_stats.copy_ok,
+			(unsigned long long)s->dirty_stats.copy_fail,
+			(unsigned long long)s->dirty_stats.kind_empty,
+			(unsigned long long)s->dirty_stats.kind_boxes,
+			(unsigned long long)s->dirty_stats.kind_full,
+			(unsigned long long)s->dirty_stats.boxes_total,
+			(unsigned long long)s->dirty_stats.boxes_max,
+			(unsigned long long)s->dirty_stats.bytes_total,
+			(unsigned long long)s->dirty_stats.ack_ok,
+			(unsigned long long)s->dirty_stats.ack_fail,
+			(unsigned long long)s->dirty_stats.attach_fail,
+			(unsigned long long)s->dirty_stats.detach_fail,
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_NOT_ATTACHED],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_STALE_TOKEN],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_STALE_SEQ],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_NOT_CONNECTED],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_INVALID_ARG],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_NO_MEMORY],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_SESSION_NOT_FOUND],
+			(unsigned long long)s->dirty_stats.reason[YCN_DIRTY_REASON_OTHER],
 		            s->dvc_names);
 		strncat_s(buf, buflen, perf, _TRUNCATE);
 	}
