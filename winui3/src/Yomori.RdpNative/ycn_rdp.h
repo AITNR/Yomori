@@ -152,6 +152,86 @@ YCN_API uint32_t ycn_rdp_decode_api_version(void);
 /* 位掩码见 YCN_DECODE_CAP_*；仅在上游 patch 和对应 AVC 解码能力都可用时报告。 */
 YCN_API uint32_t ycn_rdp_decode_capabilities(void);
 
+/* ============================================================
+ * 直显 surface 探测（S0 只读取证，不参与绘制）
+ *
+ * 解码器每帧发布一次 surface 描述；本接口返回**最近一次**解码出来的
+ * surface 能否被 GPU 零拷贝访问，以及 GPU→CPU 回读的实际代价。
+ *
+ *   stage   = surface 类型（软件 / D3D11 / DXVA2 / 其它硬件）
+ *   verdict = S0 的结论位（见 YCN_DIRECT_VERDICT_*）
+ *
+ * 稳态成本：一次会话只做一次 COM 探测（按 generation），其余帧只累计字节与
+ * 计时；不写盘、不分配、不加锁到 g_lock 之外。
+ * ============================================================ */
+#define YCN_DIRECT_API_VERSION 1u
+
+#define YCN_DIRECT_STAGE_NONE     0u /* 还没收到 AVC 帧 */
+#define YCN_DIRECT_STAGE_SOFTWARE 1u
+#define YCN_DIRECT_STAGE_D3D11    2u
+#define YCN_DIRECT_STAGE_DXVA2    3u
+#define YCN_DIRECT_STAGE_OTHER_HW 4u
+
+#define YCN_DIRECT_VERDICT_UNKNOWN     0u /* 尚未探测 */
+#define YCN_DIRECT_VERDICT_D3D11_DIRECT 1u /* GPU 可直接消费（VideoProcessor 输入视图可用） */
+#define YCN_DIRECT_VERDICT_DXVA2_INTEROP 2u /* D3D9 面可共享，需互操作 */
+#define YCN_DIRECT_VERDICT_CPU_READBACK 3u /* 只能回读，零拷贝不成立 */
+#define YCN_DIRECT_VERDICT_UNSUPPORTED 4u /* 探测失败/无法识别 */
+
+#define YCN_DIRECT_FLAG_HW_FRAME   0x00000001u
+#define YCN_DIRECT_FLAG_MAP_READ   0x00000002u
+#define YCN_DIRECT_FLAG_MAP_DIRECT 0x00000004u
+#define YCN_DIRECT_FLAG_SHAREABLE  0x00000008u
+#define YCN_DIRECT_FLAG_OPENED     0x00000010u
+#define YCN_DIRECT_FLAG_SAMPLEABLE 0x00000020u
+#define YCN_DIRECT_FLAG_PROBED     0x00000040u
+
+typedef struct ycn_direct_surface_info
+{
+	uint32_t size;   /* 调用方填 sizeof(ycn_direct_surface_info) */
+	uint32_t version;
+	uint32_t stage;   /* YCN_DIRECT_STAGE_* */
+	uint32_t verdict; /* YCN_DIRECT_VERDICT_* */
+	uint32_t flags;   /* YCN_DIRECT_FLAG_* */
+	uint32_t width;
+	uint32_t height;
+	uint32_t frame_format; /* AVPixelFormat 数值（硬件面格式） */
+	uint32_t sw_format;    /* AVHWFramesContext::sw_format */
+	uint32_t cpu_format;   /* 交给 GDI 的 CPU 帧格式 */
+	uint32_t plane_count;
+	uint32_t dxgi_format;
+	uint32_t adapter_vendor;
+	uint32_t adapter_device;
+	uint32_t texture_array_size;
+	uint32_t texture_mip_levels;
+	uint32_t format_support; /* D3D11_FORMAT_SUPPORT_* */
+	int32_t share_status;    /* CreateSharedHandle / GetSharedHandle 的 HRESULT */
+	int32_t open_status;     /* OpenSharedResource1 的 HRESULT */
+	int32_t sample_status;   /* VideoProcessor 输入视图的 HRESULT */
+	uint32_t probe_count;    /* 本会话已做过的 COM 探测次数 */
+	uint64_t frames;         /* 已观测的解码帧数 */
+	uint64_t transfer_bytes; /* 累计 GPU→CPU 回读字节 */
+	uint64_t transfer_ticks; /* 累计 GPU→CPU 回读 QPC ticks */
+	uint64_t probe_ticks;    /* 最近一次 COM 探测耗时（QPC ticks） */
+	char device_name[32];
+	char format_name[32];
+	char sw_format_name[32];
+	char detail[96];
+	uint32_t reserved[6];
+} ycn_direct_surface_info;
+
+YCN_API uint32_t ycn_rdp_direct_api_version(void);
+
+/* 取指定会话最近的 surface 探测结果；out->size 由调用方填。
+ * 返回 YCN_OK（结构已填）、YCN_ERR_SESSION_NOT_FOUND 或 YCN_ERR_INVALID_ARG。 */
+YCN_API int ycn_rdp_direct_probe(int session, ycn_direct_surface_info* out);
+
+/* 进程级快照：最近一次任意会话/离线解码探测的结果（自检用，不需要会话）。 */
+YCN_API int ycn_rdp_direct_probe_last(ycn_direct_surface_info* out);
+
+/* QPC 频率，用来把 *_ticks 换算成微秒；0 表示本机没有高精度计数器。 */
+YCN_API uint64_t ycn_rdp_qpc_frequency(void);
+
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);
 

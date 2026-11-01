@@ -52,6 +52,9 @@
 #include <wchar.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <inttypes.h>
+
+#include "ycn_direct_probe.h"
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
@@ -257,6 +260,11 @@ typedef struct
 	char decode_backend_name[32];
 	char decode_error_phase[32];
 	char decode_fallback_detail[48];
+
+	/* 直显 surface 探测（g_lock 保护；COM 探测只在锁外做，且每代一次） */
+	ycn_direct_surface_info direct;
+	uint32_t direct_valid;
+	uint32_t direct_logged;
 } YcnSession;
 
 static YcnSession g_sessions[YCN_MAX_SESSIONS];
@@ -267,6 +275,13 @@ static volatile LONG g_total_created = 0;
 static volatile LONG g_total_released = 0;
 static char g_global_error[YCN_ERRBUF_LEN]; /* session 未找到时的兜底 */
 static uint64_t g_qpc_freq = 0;
+
+/* 直显探测：进程级快照 + 当前解码线程对应的会话 id。
+ * 解码回调发生在 GFX SurfaceCommand 的同一个事件循环线程上，所以用 TLS
+ * 就能把帧归到正确的会话，不需要在 freerdp 里加会话表。 */
+static ycn_direct_surface_info g_direct_last;
+static volatile LONG g_direct_last_valid = 0;
+static __declspec(thread) int g_direct_session_id = 0;
 
 /* copy_pending 的 prepare 输出缓冲；整个复制过程持 g_lock，故进程级一份即可。 */
 static YcnDirtyPendingRect g_dirty_copy_boxes[YCN_DIRTY_PENDING_MAX_BOXES];
@@ -504,18 +519,54 @@ typedef uint32_t(__cdecl* YcnFn_U32Void)(void);
 typedef BOOL(__cdecl* YcnFn_SetThreadPolicy)(uint32_t);
 typedef BOOL(__cdecl* YcnFn_GetGdiDiag)(rdpGdi*, uint16_t, YcnFreeRdpH264Diag*);
 
+/* 解码器发布的 surface 描述（与 freerdp 侧 YCN_H264_SURFACE_INFO 同布局）。
+ * 故意本地镜像，不依赖安装头文件：旧 DLL 没有这套导出时只是不注册 sink。 */
+typedef struct
+{
+	uint32_t size;
+	uint32_t version;
+	uint32_t kind;
+	uint32_t flags;
+	uint32_t frameFormat;
+	uint32_t swFormat;
+	uint32_t cpuFormat;
+	uint32_t width;
+	uint32_t height;
+	uint32_t linesize[4];
+	uint32_t planeCount;
+	int32_t mapStatus;
+	uint32_t hwDeviceType;
+	uint32_t frameIndex;
+	uint64_t transferBytes;
+	uint64_t transferTicks;
+	void* plane[4];
+	void* hwFramesCtx;
+	void* deviceCtx;
+	void* frame;
+	char deviceName[32];
+	char formatName[32];
+	char swFormatName[32];
+	uint32_t reserved[6];
+} YcnFreeRdpSurfaceInfo;
+
+typedef void(__cdecl* YcnSurfaceSinkFn)(void*, const YcnFreeRdpSurfaceInfo*);
+typedef void(__cdecl* YcnFn_SetSurfaceSink)(YcnSurfaceSinkFn, void*);
+
 typedef struct
 {
 	YcnFn_U32Void getApiVersion;
 	YcnFn_U32Void getCapabilities;
 	YcnFn_SetThreadPolicy setThreadPolicy;
 	YcnFn_GetGdiDiag getGdiDiag;
+	YcnFn_SetSurfaceSink setSurfaceSink;
 	uint32_t capabilities;
 	BOOL ready;
 } YcnFreeRdpDecodeProbe;
 
 static INIT_ONCE g_decode_probe_once = INIT_ONCE_STATIC_INIT;
 static YcnFreeRdpDecodeProbe g_decode_probe;
+
+static void ycn_direct_sink(void* user, const YcnFreeRdpSurfaceInfo* info);
 
 static BOOL CALLBACK init_decode_probe(PINIT_ONCE once, PVOID param, PVOID* context)
 {
@@ -535,6 +586,8 @@ static BOOL CALLBACK init_decode_probe(PINIT_ONCE once, PVOID param, PVOID* cont
 	    module, "ycn_gdi_set_thread_h264_decode_policy");
 	g_decode_probe.getGdiDiag =
 	    (YcnFn_GetGdiDiag)GetProcAddress(module, "ycn_gdi_get_h264_diagnostics");
+	g_decode_probe.setSurfaceSink =
+	    (YcnFn_SetSurfaceSink)GetProcAddress(module, "ycn_h264_set_surface_sink");
 	if (g_decode_probe.getApiVersion && g_decode_probe.getCapabilities &&
 	    g_decode_probe.setThreadPolicy && g_decode_probe.getGdiDiag &&
 	    g_decode_probe.getApiVersion() == 1)
@@ -543,6 +596,9 @@ static BOOL CALLBACK init_decode_probe(PINIT_ONCE once, PVOID param, PVOID* cont
 		g_decode_probe.ready =
 		    ((g_decode_probe.capabilities & 3u) == 3u) ? TRUE : FALSE;
 	}
+	/* 直显探针只在存在时注册；旧 DLL 没有导出时完全无副作用。 */
+	if (g_decode_probe.setSurfaceSink)
+		g_decode_probe.setSurfaceSink(ycn_direct_sink, NULL);
 	return TRUE;
 }
 
@@ -563,6 +619,254 @@ static YcnSession* find_session(int id)
 			return &g_sessions[i];
 	}
 	return NULL;
+}
+
+/* ============================================================
+ * 直显 surface 探测：解码器回调 → 会话快照
+ *
+ * 每帧只做一次结构体拷贝与计数累加；真正的 COM 探测（可能花几毫秒）只在
+ * 会话第一次见到某类 surface 时做一次，且一定在 g_lock 之外进行。
+ * ============================================================ */
+
+static uint32_t ycn_direct_stage_of(uint32_t kind)
+{
+	switch (kind)
+	{
+		case 1u: /* YCN_H264_SURFACE_SOFTWARE */
+			return YCN_DIRECT_STAGE_SOFTWARE;
+		case 2u: /* YCN_H264_SURFACE_D3D11 */
+			return YCN_DIRECT_STAGE_D3D11;
+		case 3u: /* YCN_H264_SURFACE_DXVA2 */
+			return YCN_DIRECT_STAGE_DXVA2;
+		case 4u: /* YCN_H264_SURFACE_OTHER_HW */
+			return YCN_DIRECT_STAGE_OTHER_HW;
+		default:
+			return YCN_DIRECT_STAGE_NONE;
+	}
+}
+
+static void ycn_direct_copy_name(char* dst, size_t size, const char* src)
+{
+	size_t len;
+	if (!dst || (size == 0))
+		return;
+	if (!src)
+		src = "";
+	len = strlen(src);
+	if (len >= size)
+		len = size - 1;
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
+
+static void ycn_direct_sink(void* user, const YcnFreeRdpSurfaceInfo* in)
+{
+	ycn_direct_surface_info info;
+	ycn_direct_surface_info snapshot;
+	const void* planes[4];
+	YcnSession* s = NULL;
+	int sid;
+	int i;
+	BOOL needProbe = FALSE;
+	BOOL logNow = FALSE;
+
+	(void)user;
+	if (!in || (in->size != sizeof(YcnFreeRdpSurfaceInfo)) || (in->version != 1u))
+		return;
+
+	memset(&info, 0, sizeof(info));
+	info.size = sizeof(info);
+	info.version = YCN_DIRECT_API_VERSION;
+	info.stage = ycn_direct_stage_of(in->kind);
+	info.width = in->width;
+	info.height = in->height;
+	info.frame_format = in->frameFormat;
+	info.sw_format = in->swFormat;
+	info.cpu_format = in->cpuFormat;
+	info.plane_count = in->planeCount;
+	info.frames = 1;
+	info.transfer_bytes = in->transferBytes;
+	info.transfer_ticks = in->transferTicks;
+	if (in->flags & 1u)
+		info.flags |= YCN_DIRECT_FLAG_HW_FRAME;
+	if (in->flags & 2u)
+		info.flags |= YCN_DIRECT_FLAG_MAP_READ;
+	if (in->flags & 4u)
+		info.flags |= YCN_DIRECT_FLAG_MAP_DIRECT;
+	ycn_direct_copy_name(info.device_name, sizeof(info.device_name), in->deviceName);
+	ycn_direct_copy_name(info.format_name, sizeof(info.format_name), in->formatName);
+	ycn_direct_copy_name(info.sw_format_name, sizeof(info.sw_format_name), in->swFormatName);
+	for (i = 0; i < 4; i++)
+		planes[i] = in->plane[i];
+
+	sid = g_direct_session_id;
+	if (sid > 0)
+	{
+		EnterCriticalSection(&g_lock);
+		for (i = 0; i < YCN_MAX_SESSIONS; i++)
+		{
+			if (g_sessions[i].used && g_sessions[i].id == sid)
+			{
+				s = &g_sessions[i];
+				break;
+			}
+		}
+		if (s)
+		{
+			const uint64_t frames = s->direct.frames + 1;
+			const uint64_t bytes = s->direct.transfer_bytes + in->transferBytes;
+			const uint64_t ticks = s->direct.transfer_ticks + in->transferTicks;
+			if (!s->direct_valid || (s->direct.stage != info.stage))
+			{
+				s->direct = info;
+				s->direct_valid = 1;
+				needProbe = TRUE;
+			}
+			s->direct.frames = frames;
+			s->direct.transfer_bytes = bytes;
+			s->direct.transfer_ticks = ticks;
+		}
+		LeaveCriticalSection(&g_lock);
+	}
+	else
+	{
+		/* 没有会话归属（离线自检 / 解码器被直接驱动）：按进程级快照决定是否探测。 */
+		EnterCriticalSection(&g_lock);
+		if (!InterlockedCompareExchange(&g_direct_last_valid, 1, 1) ||
+		    (g_direct_last.stage != info.stage))
+			needProbe = TRUE;
+		LeaveCriticalSection(&g_lock);
+	}
+	snapshot = info;
+	if (needProbe)
+	{
+		const uint64_t t0 = ycn_qpc_now();
+		snapshot = info;
+		ycn_direct_probe_surface(&snapshot, info.stage, planes);
+		snapshot.probe_ticks = ycn_qpc_now() - t0;
+		EnterCriticalSection(&g_lock);
+		if (s && s->used && (s->id == sid))
+		{
+			const uint64_t frames = s->direct.frames;
+			const uint64_t bytes = s->direct.transfer_bytes;
+			const uint64_t ticks = s->direct.transfer_ticks;
+			const uint32_t logged = s->direct_logged;
+			s->direct = snapshot;
+			s->direct.frames = frames;
+			s->direct.transfer_bytes = bytes;
+			s->direct.transfer_ticks = ticks;
+			s->direct.probe_count = 1;
+			s->direct_logged = logged;
+			if (!logged)
+			{
+				s->direct_logged = 1;
+				logNow = TRUE;
+			}
+		}
+		LeaveCriticalSection(&g_lock);
+		if (logNow)
+		{
+			/* 一次会话一条：这是 S0 的原始证据行，稳态不再输出。 */
+			WLog_INFO(TAG,
+			          "direct-probe: stage=%" PRIu32 " verdict=%" PRIu32 " flags=0x%08" PRIx32
+			          " adapter=%04" PRIx32 ":%04" PRIx32 " %" PRIu32 "x%" PRIu32
+			          " dev=%s fmt=%s/%s share=%08" PRIx32 " open=%08" PRIx32
+			          " sample=%08" PRIx32 " fssupport=0x%08" PRIx32 " probe=%.3fms %s",
+			          snapshot.stage, snapshot.verdict, snapshot.flags, snapshot.adapter_vendor,
+			          snapshot.adapter_device, snapshot.width, snapshot.height,
+			          snapshot.device_name[0] ? snapshot.device_name : "-",
+			          snapshot.format_name[0] ? snapshot.format_name : "-",
+			          snapshot.sw_format_name[0] ? snapshot.sw_format_name : "-",
+			          (uint32_t)snapshot.share_status, (uint32_t)snapshot.open_status,
+			          (uint32_t)snapshot.sample_status, snapshot.format_support,
+			          g_qpc_freq ? (double)snapshot.probe_ticks * 1000.0 / (double)g_qpc_freq : 0.0,
+			          snapshot.detail);
+		}
+	}
+
+	EnterCriticalSection(&g_lock);
+	if (snapshot.stage != YCN_DIRECT_STAGE_NONE)
+	{
+		g_direct_last = snapshot;
+		g_direct_last.frames = (s && s->used) ? s->direct.frames : snapshot.frames;
+		g_direct_last.transfer_bytes = (s && s->used) ? s->direct.transfer_bytes
+		                                             : snapshot.transfer_bytes;
+		g_direct_last.transfer_ticks = (s && s->used) ? s->direct.transfer_ticks
+		                                             : snapshot.transfer_ticks;
+		InterlockedExchange(&g_direct_last_valid, 1);
+	}
+	LeaveCriticalSection(&g_lock);
+}
+
+uint32_t ycn_rdp_direct_api_version(void)
+{
+	return YCN_DIRECT_API_VERSION;
+}
+
+uint64_t ycn_rdp_qpc_frequency(void)
+{
+	return g_qpc_freq;
+}
+
+int ycn_rdp_direct_probe(int session, ycn_direct_surface_info* out)
+{
+	YcnSession* s;
+	uint32_t size;
+
+	if (!out || (out->size < sizeof(ycn_direct_surface_info)))
+		return YCN_ERR_INVALID_ARG;
+	size = out->size;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	memset(out, 0, sizeof(*out));
+	out->size = size;
+	out->version = YCN_DIRECT_API_VERSION;
+	if (!s)
+	{
+		LeaveCriticalSection(&g_lock);
+		return YCN_ERR_SESSION_NOT_FOUND;
+	}
+	if (s->direct_valid)
+	{
+		*out = s->direct;
+		out->size = size;
+		out->version = YCN_DIRECT_API_VERSION;
+	}
+	else
+	{
+		out->stage = YCN_DIRECT_STAGE_NONE;
+		out->verdict = YCN_DIRECT_VERDICT_UNKNOWN;
+	}
+	LeaveCriticalSection(&g_lock);
+	return YCN_OK;
+}
+
+int ycn_rdp_direct_probe_last(ycn_direct_surface_info* out)
+{
+	uint32_t size;
+
+	if (!out || (out->size < sizeof(ycn_direct_surface_info)))
+		return YCN_ERR_INVALID_ARG;
+	size = out->size;
+
+	EnterCriticalSection(&g_lock);
+	if (InterlockedCompareExchange(&g_direct_last_valid, 1, 1))
+	{
+		*out = g_direct_last;
+		out->size = size;
+		out->version = YCN_DIRECT_API_VERSION;
+	}
+	else
+	{
+		memset(out, 0, sizeof(*out));
+		out->size = size;
+		out->version = YCN_DIRECT_API_VERSION;
+		out->stage = YCN_DIRECT_STAGE_NONE;
+		out->verdict = YCN_DIRECT_VERDICT_UNKNOWN;
+	}
+	LeaveCriticalSection(&g_lock);
+	return YCN_OK;
 }
 
 /* 阶段 2B：强制下一批为 FULL（reset / GFX failure / 快照失败）。
@@ -1167,7 +1471,13 @@ static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFA
 	}
 
 	t0 = ycn_qpc_now();
-	rc = orig(ctx, cmd);
+	/* 解码回调在 orig 内部发生；用 TLS 告诉 sink 这一帧属于哪个会话。 */
+	{
+		const int previousDirectSession = g_direct_session_id;
+		g_direct_session_id = s->id;
+		rc = orig(ctx, cmd);
+		g_direct_session_id = previousDirectSession;
+	}
 	if (rc != CHANNEL_RC_OK)
 	{
 		EnterCriticalSection(&g_lock);
@@ -1281,6 +1591,9 @@ static UINT ycn_gfx_reset_graphics(RdpgfxClientContext* ctx, const RDPGFX_RESET_
 		EnterCriticalSection(&g_lock);
 		orig = s->orig_gfx_reset;
 		ycn_dirty_force_full_locked(s);
+		/* 尺寸/codec 世代变了：下一帧重新做一次 surface 探测。 */
+		s->direct_valid = 0;
+		s->direct_logged = 0;
 		LeaveCriticalSection(&g_lock);
 	}
 	if (orig)

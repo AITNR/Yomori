@@ -104,7 +104,7 @@ foreach(_dll IN LISTS YCN_COPY_RUNTIME_DLLS)
   endif()
 endforeach()
 
-add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c ycn_dirty_snapshot.c ycn_dirty_pending.c ycn_dirty_stats.c)
+add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c ycn_dirty_snapshot.c ycn_dirty_pending.c ycn_dirty_stats.c ycn_direct_probe.c)
 # 注意：不要定义 UNICODE/_UNICODE —— 会引发 freerdp rail.h 的 NIIF_* 与 shellapi.h 宏冲突
 target_compile_definitions(ycn_rdp PRIVATE YCN_RDP_EXPORTS)
 target_compile_options(ycn_rdp PRIVATE /utf-8)
@@ -118,6 +118,8 @@ target_link_libraries(ycn_rdp PRIVATE
   "${VCPKG_INST}/lib/freerdp-client3.lib"
   "${VCPKG_INST}/lib/freerdp3.lib"
   "${VCPKG_INST}/lib/winpr3.lib"
+  # 直显 surface 探测：只读地检查解码 surface 能否被 GPU 直接消费。
+  d3d11.lib d3d9.lib dxgi.lib dxguid.lib
   ws2_32.lib)
 
 # Pure tests for the read-only dirty-rectangle aggregator.  They do not link

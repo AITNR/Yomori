@@ -72,6 +72,62 @@ class H264Diagnostics(ctypes.Structure):
     ]
 
 
+YCN_DIRECT_API_VERSION = 1
+YCN_DIRECT_STAGE_NONE = 0
+YCN_DIRECT_STAGE_SOFTWARE = 1
+YCN_DIRECT_STAGE_NAMES = {
+    0: "none",
+    1: "software",
+    2: "d3d11",
+    3: "dxva2",
+    4: "other-hw",
+}
+YCN_DIRECT_VERDICT_NAMES = {
+    0: "unknown",
+    1: "d3d11-direct",
+    2: "dxva2-interop",
+    3: "cpu-readback",
+    4: "unsupported",
+}
+
+
+class DirectSurfaceInfo(ctypes.Structure):
+    """Mirrors ycn_direct_surface_info (ycn_rdp.h)."""
+
+    _fields_ = [
+        ("size", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("stage", ctypes.c_uint32),
+        ("verdict", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("width", ctypes.c_uint32),
+        ("height", ctypes.c_uint32),
+        ("frame_format", ctypes.c_uint32),
+        ("sw_format", ctypes.c_uint32),
+        ("cpu_format", ctypes.c_uint32),
+        ("plane_count", ctypes.c_uint32),
+        ("dxgi_format", ctypes.c_uint32),
+        ("adapter_vendor", ctypes.c_uint32),
+        ("adapter_device", ctypes.c_uint32),
+        ("texture_array_size", ctypes.c_uint32),
+        ("texture_mip_levels", ctypes.c_uint32),
+        ("format_support", ctypes.c_uint32),
+        ("share_status", ctypes.c_int32),
+        ("open_status", ctypes.c_int32),
+        ("sample_status", ctypes.c_int32),
+        ("probe_count", ctypes.c_uint32),
+        ("frames", ctypes.c_uint64),
+        ("transfer_bytes", ctypes.c_uint64),
+        ("transfer_ticks", ctypes.c_uint64),
+        ("probe_ticks", ctypes.c_uint64),
+        ("device_name", ctypes.c_char * 32),
+        ("format_name", ctypes.c_char * 32),
+        ("sw_format_name", ctypes.c_char * 32),
+        ("detail", ctypes.c_char * 96),
+        ("reserved", ctypes.c_uint32 * 6),
+    ]
+
+
 class Rect16(ctypes.Structure):
     _fields_ = [
         ("left", ctypes.c_uint16),
@@ -363,6 +419,76 @@ def decode_offline(lib: ctypes.CDLL, freerdp: ctypes.CDLL, h264_path: Path,
         free_context(context)
 
 
+def check_direct_surface(lib: ctypes.CDLL) -> dict[str, object]:
+    """S0: read the surface probe the decoder published for the last frame.
+
+    This is read-only evidence. It asserts the descriptor is well formed and
+    that a hardware frame really did cross the PCIe bus into CPU memory, so the
+    numbers cannot be explained away as "no copy happened".
+    """
+    version = getattr(lib, "ycn_rdp_direct_api_version", None)
+    if version is None:
+        raise AssertionError("bridge has no direct-surface API")
+    _configure(version, ctypes.c_uint32)
+    if version() != YCN_DIRECT_API_VERSION:
+        raise AssertionError(f"unexpected direct API version {version()}")
+
+    probe_last = lib.ycn_rdp_direct_probe_last
+    _configure(probe_last, ctypes.c_int, ctypes.POINTER(DirectSurfaceInfo))
+    qpc = getattr(lib, "ycn_rdp_qpc_frequency", None)
+    freq = 0
+    if qpc is not None:
+        _configure(qpc, ctypes.c_uint64)
+        freq = int(qpc())
+
+    info = DirectSurfaceInfo()
+    info.size = ctypes.sizeof(DirectSurfaceInfo)
+    rc = int(probe_last(ctypes.byref(info)))
+    if rc != 0:
+        raise AssertionError(f"ycn_rdp_direct_probe_last failed: {rc}")
+    if info.size != ctypes.sizeof(DirectSurfaceInfo):
+        raise AssertionError(f"direct info size mismatch: {info.size}")
+    if info.stage == YCN_DIRECT_STAGE_NONE:
+        raise AssertionError("no surface was published after a successful decode")
+    if info.stage not in YCN_DIRECT_STAGE_NAMES:
+        raise AssertionError(f"unknown surface stage {info.stage}")
+    if info.verdict == 0:
+        raise AssertionError("surface verdict was never computed")
+    if info.width == 0 or info.height == 0:
+        raise AssertionError("surface descriptor has no dimensions")
+    if not info.detail.split(b"\0", 1)[0]:
+        raise AssertionError("surface descriptor has no detail string")
+    # A hardware surface must show the copy it actually cost; a software surface
+    # has no GPU->CPU transfer at all.
+    if info.stage != YCN_DIRECT_STAGE_SOFTWARE and int(info.transfer_bytes) == 0:
+        raise AssertionError("hardware surface reported zero GPU->CPU bytes")
+
+    return {
+        "stage": YCN_DIRECT_STAGE_NAMES.get(info.stage, str(info.stage)),
+        "verdict": YCN_DIRECT_VERDICT_NAMES.get(info.verdict, str(info.verdict)),
+        "flags": f"0x{info.flags:08X}",
+        "device": _diag_text(info.device_name),
+        "format": _diag_text(info.format_name),
+        "sw_format": _diag_text(info.sw_format_name),
+        "detail": _diag_text(info.detail),
+        "width": info.width,
+        "height": info.height,
+        "plane_count": info.plane_count,
+        "dxgi_format": info.dxgi_format,
+        "adapter": f"{info.adapter_vendor:04X}:{info.adapter_device:04X}",
+        "format_support": f"0x{info.format_support:08X}",
+        "share_hresult": f"0x{info.share_status & 0xFFFFFFFF:08X}",
+        "open_hresult": f"0x{info.open_status & 0xFFFFFFFF:08X}",
+        "sample_hresult": f"0x{info.sample_status & 0xFFFFFFFF:08X}",
+        "frames": int(info.frames),
+        "transfer_bytes": int(info.transfer_bytes),
+        "transfer_us": (
+            round(int(info.transfer_ticks) * 1_000_000.0 / freq, 3) if freq else None
+        ),
+        "probe_us": round(int(info.probe_ticks) * 1_000_000.0 / freq, 3) if freq else None,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dll", type=Path, help="path to ycn_rdp.dll")
@@ -406,6 +532,8 @@ def main() -> int:
         result["offline_decode"] = decode_offline(
             lib, freerdp, args.h264.resolve(), args.width, args.height, args.policy
         )
+        if hasattr(lib, "ycn_rdp_direct_probe_last"):
+            result["direct_surface"] = check_direct_surface(lib)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

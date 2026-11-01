@@ -294,6 +294,18 @@ function Write-ManifestSnapshot {
   if (-not (Test-Path -LiteralPath (Join-Path $ManifestRoot 'ports\freerdp\portfile.cmake'))) {
     throw "manifest 快照缺少 overlay port：$ManifestRoot\ports\freerdp"
   }
+
+  # vcpkg 的包 ABI 只覆盖 portfile 与 port 目录内的文件；../../patches 里的补丁
+  # 改动不会改变 ABI，于是 vcpkg 会把旧包当成最新，静默发布过期 DLL（实测过一次）。
+  # 因此把补丁复制进 port 目录，使补丁内容进入 ABI，改补丁必然触发重编。
+  $snapshotPortDir = Join-Path $ManifestRoot 'ports\freerdp'
+  $snapshotPatchDir = Join-Path $snapshotPortDir 'patches'
+  if (Test-Path -LiteralPath $PatchDir) {
+    New-Item -ItemType Directory -Force $snapshotPatchDir | Out-Null
+    Copy-Item -Path (Join-Path $PatchDir '*.patch') -Destination $snapshotPatchDir -Force
+    # 顶层 patches 留着会让 portfile 里两条路径都命中；快照里只保留 port 目录内那份。
+    Remove-TreeSafely (Join-Path $ManifestRoot 'patches') $ManifestRoot
+  }
 }
 
 function Install-Deps {

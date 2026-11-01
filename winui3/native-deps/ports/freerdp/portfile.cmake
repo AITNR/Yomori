@@ -5,10 +5,18 @@
 #   * keeps Media Foundation and OpenH264 disabled;
 #   * appends repo-local patches from winui3/native-deps/patches/*.patch.
 #
-# The patch list is sorted and passed to vcpkg_from_github, so vcpkg includes
-# every patch hash in the package ABI. Changing a patch therefore changes both
-# the vcpkg package identity and the workflow cache key.
-file(GLOB YCN_EXTRA_PATCHES "${CMAKE_CURRENT_LIST_DIR}/../../patches/*.patch")
+# Patch visibility matters for the package ABI: vcpkg hashes the portfile and the
+# files *inside the port directory*, but not files reached through ../../. A
+# patch edit would therefore leave the recorded ABI unchanged and vcpkg would
+# report the old package as up to date, silently shipping a stale DLL.
+# tools/build_native.ps1 copies the patches into <manifest>/ports/freerdp/patches
+# so they are part of the hashed port directory; direct CMake runs against
+# native-deps keep using ../../patches.
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/patches")
+    file(GLOB YCN_EXTRA_PATCHES "${CMAKE_CURRENT_LIST_DIR}/patches/*.patch")
+else()
+    file(GLOB YCN_EXTRA_PATCHES "${CMAKE_CURRENT_LIST_DIR}/../../patches/*.patch")
+endif()
 list(SORT YCN_EXTRA_PATCHES)
 message(STATUS "Yomori FreeRDP overlay: ${CMAKE_CURRENT_LIST_DIR}")
 foreach(_ycn_patch IN LISTS YCN_EXTRA_PATCHES)
