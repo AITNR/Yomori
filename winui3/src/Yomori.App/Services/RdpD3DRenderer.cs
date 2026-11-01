@@ -307,7 +307,7 @@ namespace Yomori.Services
                 }
                 else if (!_frameTextureValid)
                 {
-                    LastError = "dirty texture invalid without FULL snapshot";
+                    LastError = "dirty D3D texture invalid without FULL snapshot";
                     return false;
                 }
                 else if (info.Kind == RdpNativeInterop.DirtyKindBoxes)

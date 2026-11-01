@@ -324,6 +324,7 @@ namespace Yomori.Views
         {
             if (_client is not null)
             {
+                _renderer?.DetachDirtyClient(_client);
                 _client.Connected -= OnClientConnected;
                 _client.FrameArrived -= OnFrameArrived;
                 _client.DesktopResized -= OnDesktopResized;
