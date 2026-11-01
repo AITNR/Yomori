@@ -328,7 +328,8 @@ namespace Yomori.Services
                 }
                 else { LastError="unknown dirty frame kind"; _frameTextureValid=false; return false; }
                 _context.CopyResource(_backBuffer,_frameTexture);
-                _swapChain!.Present(0,0);
+                var presentResult = _swapChain!.Present(0, 0);
+                if (presentResult.Failure) { LastError = $"dirty Present failed: {presentResult.Code}"; _frameTextureValid = false; return false; }
                 if (client.AckDirtyFrame(_dirtyToken,info.Seq)) { presentTicks=System.Diagnostics.Stopwatch.GetTimestamp()-start; return true; }
                 LastError="dirty frame ack rejected"; _frameTextureValid=false; return false;
             }
@@ -470,7 +471,8 @@ namespace Yomori.Services
                         _context.Unmap(_staging, 0);
                         mapped = false;
                         _context.CopyResource(_backBuffer, _staging);
-                        _swapChain!.Present(0, 0);
+                        var presentResult = _swapChain!.Present(0, 0);
+                        if (presentResult.Failure) { LastError = $"Present failed: {presentResult.Code}"; return RdpD3DPresentResult.FatalFailure; }
                         presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - totalStart;
                         return RdpD3DPresentResult.Presented;
                     }
@@ -572,7 +574,8 @@ namespace Yomori.Services
                 }
                 _context.CopyResource(_backBuffer, _staging);
                 // SyncInterval=0：立即返回不等待 vsync（vsync 阻塞会卡住 FreeRDP 事件循环线程）
-                _swapChain.Present(0, 0);
+                var presentResult = _swapChain.Present(0, 0);
+                if (presentResult.Failure) { LastError = $"Present failed: {presentResult.Code}"; return false; }
                 return true;
             }
             catch (Exception ex)

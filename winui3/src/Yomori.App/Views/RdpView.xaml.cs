@@ -322,13 +322,14 @@ namespace Yomori.Views
         /// <summary>只解除事件绑定与画面，不断开会话（交还另一处 RdpView 时用）。</summary>
         public void DetachClient()
         {
-            if (_client is not null)
+            var oldClient = _client;
+            if (oldClient is not null)
             {
-                _renderer?.DetachDirtyClient(_client);
-                _client.Connected -= OnClientConnected;
-                _client.FrameArrived -= OnFrameArrived;
-                _client.DesktopResized -= OnDesktopResized;
-                _client.Disconnected -= OnClientDisconnected;
+                _renderer?.DetachDirtyClient(oldClient);
+                oldClient.Connected -= OnClientConnected;
+                oldClient.FrameArrived -= OnFrameArrived;
+                oldClient.DesktopResized -= OnDesktopResized;
+                oldClient.Disconnected -= OnClientDisconnected;
                 _client = null;
             }
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
