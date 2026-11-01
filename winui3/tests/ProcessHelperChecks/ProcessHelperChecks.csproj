@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\ProcessHelper.cs" Link="Production\Services\ProcessHelper.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\NativeMethods.cs" Link="Production\Services\NativeMethods.cs" />
+  </ItemGroup>
+</Project>

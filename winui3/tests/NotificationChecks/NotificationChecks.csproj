@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\src\Yomori.App\Helpers\ObservableObject.cs" Link="Production\Helpers\ObservableObject.cs" />
+    <Compile Include="..\..\src\Yomori.App\Models\AppNotification.cs" Link="Production\Models\AppNotification.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\AppPaths.cs" Link="Production\Services\AppPaths.cs" />
+    <Compile Include="..\..\src\Yomori.App\Services\NotificationCenter.cs" Link="Production\Services\NotificationCenter.cs" />
+  </ItemGroup>
+</Project>

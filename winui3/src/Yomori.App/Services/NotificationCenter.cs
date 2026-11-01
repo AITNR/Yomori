@@ -7,6 +7,8 @@ using System.Linq;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Yomori.Models;
 
 namespace Yomori.Services;
@@ -18,14 +20,21 @@ namespace Yomori.Services;
 /// 已读状态一起存）。为什么落盘：用户可能关掉程序才想起来"刚才好像提示有更新"，
 /// 而启动时检查更新的结果如果只在内存里，关一次就没了 —— 那就等于每次都得盯着看。</para>
 ///
-/// <para>⚠️ 线程纪律：本类**不做线程调度**，Add / MarkRead / Load 必须在 UI 线程调用
-/// （<see cref="Items"/> 是直接绑到界面的 ObservableCollection）。后台线程（更新检查、
-/// 下载）要加通知，先在 VM 里 Post 回 UI 线程。</para>
+/// <para>⚠️ 线程纪律：本类**不做线程调度**，Add / MarkRead / Load 等访问
+/// <see cref="Items"/> 的操作必须在 UI 线程调用（<see cref="Items"/> 是直接绑到界面的
+/// ObservableCollection）。后台线程（更新检查、下载）要加通知，先在 VM 里 Post 回 UI 线程。</para>
+///
+/// <para>高频 Add / MarkRead / Remove / Clear 不再逐次同步写盘：它们在 UI 线程完成内存变更后，
+/// 只生成一份很快的深拷贝快照，并由**至多一个、短生命周期**的后台任务在合并窗口结束后写最新快照。
+/// 正常退出和 <see cref="Flush"/> 仍会同步写出最后状态；后台任务只碰快照，不碰 ObservableCollection。</para>
 /// </summary>
 public sealed class NotificationCenter
 {
     /// <summary>最多保留多少条。再多的价值低于"翻不到最新那条"的代价。</summary>
     public const int MaxItems = 50;
+
+    /// <summary>第一次产生变更后最多等这么久再开始后台写，用来合并连续操作。</summary>
+    private static readonly TimeSpan CoalesceDelay = TimeSpan.FromMilliseconds(250);
 
     private static readonly JsonSerializerOptions WriteOptions = new()
     {
@@ -33,13 +42,40 @@ public sealed class NotificationCenter
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
+    private static readonly object ProcessExitGate = new();
+    private static readonly List<WeakReference<NotificationCenter>> ProcessExitCenters = new();
+    private static bool _processExitHooked;
+
     private readonly string _path;
+    private readonly TimeSpan _writeDelay;
+
+    /// <summary>保护最新快照与修订号；锁内不做文件 I/O。</summary>
+    private readonly object _saveStateGate = new();
+
+    /// <summary>串行化实际文件写入和启动删除，避免旧快照覆盖新快照。</summary>
+    private readonly object _diskGate = new();
+
+    private List<AppNotification>? _latestSnapshot;
+    private long _generation;
+    private long _mutationRevision;
+    private long _attemptedRevision;
+    private long _persistedRevision;
+    private bool _writeTaskActive;
+    private int _persistenceWriteCount;
 
     public NotificationCenter(string? path = null)
+        : this(path, CoalesceDelay)
+    {
+    }
+
+    /// <summary>测试可缩短/延长合并窗口；生产只走上面的默认构造。</summary>
+    internal NotificationCenter(string? path, TimeSpan writeDelay)
     {
         _path = string.IsNullOrWhiteSpace(path)
             ? Path.Combine(AppPaths.BaseDir, "notifications.json")
             : path;
+        _writeDelay = writeDelay < TimeSpan.Zero ? TimeSpan.Zero : writeDelay;
+        RegisterForProcessExit(this);
     }
 
     /// <summary>通知列表，新的在前面（直接绑 ListView，别整体替换集合）。</summary>
@@ -57,10 +93,14 @@ public sealed class NotificationCenter
 
     public string FilePath => _path;
 
+    /// <summary>仅供同程序集冒烟测试确认多次高频变更合并成了一次实际写入。</summary>
+    internal int PersistenceWriteCount => Volatile.Read(ref _persistenceWriteCount);
+
     /// <summary>从磁盘读回来。文件不存在 / 内容坏了都当成"没有通知"，不抛。</summary>
     public void Load()
     {
         Items.Clear();
+        InvalidatePendingPersistence();
 
         try
         {
@@ -69,7 +109,17 @@ public sealed class NotificationCenter
                 return;
             }
 
-            var json = File.ReadAllText(_path, Encoding.UTF8);
+            string json;
+            lock (_diskGate)
+            {
+                if (!File.Exists(_path))
+                {
+                    return;
+                }
+
+                json = File.ReadAllText(_path, Encoding.UTF8);
+            }
+
             var loaded = JsonSerializer.Deserialize<List<AppNotification>>(json, new JsonSerializerOptions
             {
                 PropertyNameCaseInsensitive = true,
@@ -110,12 +160,16 @@ public sealed class NotificationCenter
     public void ResetOnStartup()
     {
         Items.Clear();
+        InvalidatePendingPersistence();
 
         try
         {
-            if (File.Exists(_path))
+            lock (_diskGate)
             {
-                File.Delete(_path);
+                if (File.Exists(_path))
+                {
+                    File.Delete(_path);
+                }
             }
         }
         catch
@@ -126,7 +180,7 @@ public sealed class NotificationCenter
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
-    /// <summary>加一条并落盘，返回新条目。</summary>
+    /// <summary>加一条并排队写盘，返回新条目。</summary>
     public AppNotification Add(
         string title,
         string body,
@@ -145,7 +199,7 @@ public sealed class NotificationCenter
 
         Items.Insert(0, item);
         Trim();
-        Save();
+        QueueSave();
         Added?.Invoke(this, item);
         Changed?.Invoke(this, EventArgs.Empty);
         return item;
@@ -196,7 +250,7 @@ public sealed class NotificationCenter
         }
 
         item.IsRead = true;
-        Save();
+        QueueSave();
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -215,7 +269,7 @@ public sealed class NotificationCenter
             return;
         }
 
-        Save();
+        QueueSave();
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -227,7 +281,7 @@ public sealed class NotificationCenter
             return;
         }
 
-        Save();
+        QueueSave();
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -240,8 +294,34 @@ public sealed class NotificationCenter
         }
 
         Items.Clear();
-        Save();
+        QueueSave();
         Changed?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// 立即把当前最新快照同步写到磁盘。
+    ///
+    /// <para>正常退出由 <see cref="AppDomain.ProcessExit"/> 自动调用；测试或其他显式收尾点也可直接调用。
+    /// 它只读后台写者持有的快照，不访问 <see cref="Items"/>，因此退出回调线程也可以安全调用。</para>
+    /// </summary>
+    public void Flush()
+    {
+        List<AppNotification>? snapshot;
+        long generation;
+        long revision;
+        lock (_saveStateGate)
+        {
+            snapshot = _latestSnapshot;
+            generation = _generation;
+            revision = _mutationRevision;
+        }
+
+        if (snapshot is null)
+        {
+            return;
+        }
+
+        TryPersistSnapshot(generation, revision, snapshot);
     }
 
     private void Trim()
@@ -252,8 +332,151 @@ public sealed class NotificationCenter
         }
     }
 
-    /// <summary>写盘。失败只吞掉 —— 通知丢了不影响主功能，但界面上的那份还在。</summary>
-    private void Save()
+    /// <summary>
+    /// 在 UI 线程取一份不可变（就本类而言）的值快照，随后至多启动一个后台写者。
+    /// 后面的变更只替换"最新快照"，不会形成无界队列。
+    /// </summary>
+    private void QueueSave()
+    {
+        var snapshot = SnapshotItems();
+        lock (_saveStateGate)
+        {
+            _mutationRevision++;
+            _latestSnapshot = snapshot;
+
+            if (!_writeTaskActive)
+            {
+                StartWriteTaskLocked();
+            }
+        }
+    }
+
+    private void StartWriteTaskLocked()
+    {
+        _writeTaskActive = true;
+        var generation = _generation;
+
+        try
+        {
+            _ = Task.Run(() => WriteAfterDelayAsync(generation));
+        }
+        catch
+        {
+            _writeTaskActive = false;
+        }
+    }
+
+    private async Task WriteAfterDelayAsync(long generation)
+    {
+        try
+        {
+            if (_writeDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(_writeDelay).ConfigureAwait(false);
+            }
+
+            List<AppNotification>? snapshot;
+            long revision;
+            lock (_saveStateGate)
+            {
+                if (generation != _generation ||
+                    _latestSnapshot is null ||
+                    _mutationRevision <= _attemptedRevision)
+                {
+                    _writeTaskActive = false;
+                    StartWriteTaskIfNeededLocked();
+                    return;
+                }
+
+                snapshot = _latestSnapshot;
+                revision = _mutationRevision;
+            }
+
+            TryPersistSnapshot(generation, revision, snapshot);
+
+            lock (_saveStateGate)
+            {
+                _writeTaskActive = false;
+
+                if (generation != _generation || _mutationRevision > _attemptedRevision)
+                {
+                    StartWriteTaskIfNeededLocked();
+                }
+            }
+        }
+        catch
+        {
+            lock (_saveStateGate)
+            {
+                _writeTaskActive = false;
+                StartWriteTaskIfNeededLocked();
+            }
+        }
+    }
+
+    /// <summary>调用方必须持有 <see cref="_saveStateGate"/>。</summary>
+    private void StartWriteTaskIfNeededLocked()
+    {
+        if (_writeTaskActive ||
+            _latestSnapshot is null ||
+            _mutationRevision <= _attemptedRevision)
+        {
+            return;
+        }
+
+        StartWriteTaskLocked();
+    }
+
+    /// <summary>
+    /// 写一份快照；修订号与代次检查保证 Reset/Load/Flush 之后旧任务不会把旧内容写回来。
+    /// 失败只吞掉 —— 通知丢了不影响主功能，下次变更或显式 Flush 还会重试最新快照。
+    /// </summary>
+    private bool TryPersistSnapshot(long generation, long revision, List<AppNotification> snapshot)
+    {
+        lock (_diskGate)
+        {
+            lock (_saveStateGate)
+            {
+                if (generation != _generation)
+                {
+                    return false;
+                }
+
+                if (revision <= _persistedRevision)
+                {
+                    if (revision > _attemptedRevision)
+                    {
+                        _attemptedRevision = revision;
+                    }
+
+                    return true;
+                }
+            }
+
+            Interlocked.Increment(ref _persistenceWriteCount);
+            var success = TryWriteSnapshotToDisk(snapshot);
+
+            lock (_saveStateGate)
+            {
+                if (generation == _generation)
+                {
+                    if (revision > _attemptedRevision)
+                    {
+                        _attemptedRevision = revision;
+                    }
+
+                    if (success && revision > _persistedRevision)
+                    {
+                        _persistedRevision = revision;
+                    }
+                }
+            }
+
+            return success;
+        }
+    }
+
+    private bool TryWriteSnapshotToDisk(List<AppNotification> snapshot)
     {
         try
         {
@@ -263,11 +486,96 @@ public sealed class NotificationCenter
                 Directory.CreateDirectory(dir);
             }
 
-            File.WriteAllText(_path, JsonSerializer.Serialize(Items.ToList(), WriteOptions), new UTF8Encoding(false));
+            File.WriteAllText(_path, JsonSerializer.Serialize(snapshot, WriteOptions), new UTF8Encoding(false));
+            return true;
         }
         catch
         {
-            // 盘满 / 只读目录 / 文件被占用：都静默
+            // 盘满 / 只读目录 / 文件被占用：都静默；界面上的那份还在
+            return false;
+        }
+    }
+
+    private List<AppNotification> SnapshotItems() => Items.Select(CloneForPersistence).ToList();
+
+    /// <summary>
+    /// 只复制真正落盘的字段。进度是瞬时 UI 状态（<see cref="AppNotification.Progress"/> 本身也不序列化），
+    /// 后台线程因此不会读到仍在 UI 线程上变化的通知对象。
+    /// </summary>
+    private static AppNotification CloneForPersistence(AppNotification item) => new()
+    {
+        Id = item.Id,
+        Title = item.Title,
+        Body = item.Body,
+        Kind = item.Kind,
+        CreatedAt = item.CreatedAt,
+        IsRead = item.IsRead,
+        ActionKind = item.ActionKind,
+        ActionTarget = item.ActionTarget,
+    };
+
+    /// <summary>Load / Reset 使在途快照失效；下一次 QueueSave 会使用新的代次。</summary>
+    private void InvalidatePendingPersistence()
+    {
+        lock (_saveStateGate)
+        {
+            _generation++;
+            _latestSnapshot = null;
+            _mutationRevision++;
+            _attemptedRevision = _mutationRevision;
+        }
+    }
+
+    private static void RegisterForProcessExit(NotificationCenter center)
+    {
+        lock (ProcessExitGate)
+        {
+            for (var i = ProcessExitCenters.Count - 1; i >= 0; i--)
+            {
+                if (!ProcessExitCenters[i].TryGetTarget(out _))
+                {
+                    ProcessExitCenters.RemoveAt(i);
+                }
+            }
+
+            ProcessExitCenters.Add(new WeakReference<NotificationCenter>(center));
+            if (_processExitHooked)
+            {
+                return;
+            }
+
+            _processExitHooked = true;
+            AppDomain.CurrentDomain.ProcessExit += FlushAllOnProcessExit;
+        }
+    }
+
+    private static void FlushAllOnProcessExit(object? sender, EventArgs e)
+    {
+        NotificationCenter[] centers;
+        lock (ProcessExitGate)
+        {
+            var live = new List<NotificationCenter>(ProcessExitCenters.Count);
+            foreach (var reference in ProcessExitCenters)
+            {
+                if (reference.TryGetTarget(out var center))
+                {
+                    live.Add(center);
+                }
+            }
+
+            centers = live.ToArray();
+        }
+
+        foreach (var center in centers)
+        {
+            try
+            {
+                center.Flush();
+            }
+            catch
+            {
+                // 退出路径不能让通知落盘失败拖垮进程收尾
+            }
         }
     }
 }

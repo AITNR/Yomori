@@ -78,6 +78,17 @@ public sealed class ProcessSnapshotEntry
 /// </summary>
 public static class ProcessHelper
 {
+    private const int CommandlineQueryTimeoutMs = 8000;
+    private const long CommandlineCacheTtlMs = 750;
+    private const int CommandlineCacheCapacity = 32;
+
+    /// <summary>
+    /// cmdline_keyword 的轮询节拍是 250ms，而一次 CIM 查询本身通常更贵。
+    /// 以进程级缓存合并同一关键词的短时间查询；false 也缓存，才能覆盖“尚未出现”的高频轮询。
+    /// </summary>
+    private static readonly CommandlineKeywordQueryCache s_commandlineKeywordQueries =
+        new(QueryCommandlineKeyword, TimeSpan.FromMilliseconds(CommandlineCacheTtlMs), CommandlineCacheCapacity);
+
     /// <summary>去掉 <c>.exe</c> 的镜像名（<c>Process.ProcessName</c> 不带扩展名，比较前必须统一）。</summary>
     public static string BareImageName(string? imageName)
     {
@@ -427,6 +438,15 @@ public static class ProcessHelper
             return false;
         }
 
+        return s_commandlineKeywordQueries.Lookup(text);
+    }
+
+    /// <summary>
+    /// 执行一次真实的 CIM 查询。输出读取与进程等待并行，确保 8 秒预算覆盖整个调用，
+    /// 而不是只覆盖读取结束后的 <see cref="Process.WaitForExit(int)"/>。
+    /// </summary>
+    private static bool QueryCommandlineKeyword(string text)
+    {
         var safe = text.Replace("'", "''");
         var ps = "Get-CimInstance Win32_Process | "
                  + $"Where-Object {{$_.CommandLine -like '*{safe}*'}} | "
@@ -449,18 +469,65 @@ public static class ProcessHelper
                 return false;
             }
 
-            var output = process.StandardOutput.ReadToEnd();
-            if (!process.WaitForExit(8000))
+            var timer = Stopwatch.StartNew();
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+
+            if (!process.WaitForExit(CommandlineQueryTimeoutMs))
             {
-                process.Kill(true);
+                try
+                {
+                    process.Kill(true);
+                }
+                catch
+                {
+                    // 查询失败只代表本次无法确认，调用方保持原有的 false 降级。
+                }
+
+                ObserveReadFailures(outputTask, errorTask);
+                return false;
             }
 
-            return !string.IsNullOrWhiteSpace(output);
+            var remainingMs = Math.Max(0, CommandlineQueryTimeoutMs - (int)Math.Min(timer.ElapsedMilliseconds, int.MaxValue));
+            if (!WaitForReads(outputTask, errorTask, remainingMs))
+            {
+                ObserveReadFailures(outputTask, errorTask);
+                return false;
+            }
+
+            return !string.IsNullOrWhiteSpace(outputTask.Result);
         }
         catch
         {
             return false;
         }
+    }
+
+    private static bool WaitForReads(Task<string> outputTask, Task<string> errorTask, int timeoutMs)
+    {
+        var tasks = new Task[] { outputTask, errorTask };
+        if (timeoutMs <= 0)
+        {
+            return outputTask.IsCompleted && errorTask.IsCompleted;
+        }
+
+        try
+        {
+            return Task.WaitAll(tasks, timeoutMs);
+        }
+        catch (AggregateException)
+        {
+            return false;
+        }
+    }
+
+    private static void ObserveReadFailures(params Task[] tasks)
+    {
+        _ = Task.WhenAll(tasks).ContinueWith(
+            static task => _ = task.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>是否存在包含指定关键词的可见窗口。</summary>
@@ -951,5 +1018,180 @@ public static class ProcessHelper
         }
 
         target.Add(text);
+    }
+}
+
+/// <summary>
+/// 命令行关键词查询的有界短 TTL 缓存，并对同一关键词的并发查询做单飞合并。
+///
+/// <para>键按 <see cref="StringComparer.OrdinalIgnoreCase"/> 合并，因为 PowerShell 的
+/// <c>-like</c> 默认不区分大小写；值仅在完成查询后开始计时，避免慢查询刚结束就被判为过期。</para>
+/// <para>等待同一在途查询时使用 <see cref="Monitor.Wait(object)"/>，不引入第二套取消/超时语义；
+/// 真实查询本身继续受原 8 秒上限约束。</para>
+/// </summary>
+internal sealed class CommandlineKeywordQueryCache
+{
+    private readonly object _sync = new();
+    private readonly Dictionary<string, CacheEntry> _entries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Func<string, bool> _query;
+    private readonly Func<long> _clock;
+    private readonly long _ttlMilliseconds;
+    private readonly int _capacity;
+
+    internal CommandlineKeywordQueryCache(
+        Func<string, bool> query,
+        TimeSpan ttl,
+        int capacity,
+        Func<long>? clock = null)
+    {
+        _query = query ?? throw new ArgumentNullException(nameof(query));
+        if (ttl <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(ttl));
+        }
+
+        if (capacity <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(capacity));
+        }
+
+        _clock = clock ?? (() => Environment.TickCount64);
+        _ttlMilliseconds = Math.Max(1L, (long)Math.Ceiling(ttl.TotalMilliseconds));
+        _capacity = capacity;
+    }
+
+    internal bool Lookup(string keyword)
+    {
+        var text = (keyword ?? string.Empty).Trim();
+        if (text.Length == 0)
+        {
+            return false;
+        }
+
+        CacheEntry? ownedEntry = null;
+        lock (_sync)
+        {
+            var now = _clock();
+            RemoveExpiredLocked(now);
+
+            if (_entries.TryGetValue(text, out var existing))
+            {
+                if (existing.InFlight)
+                {
+                    while (existing.InFlight)
+                    {
+                        Monitor.Wait(_sync);
+                    }
+
+                    return existing.Value;
+                }
+
+                if (now < existing.ExpiresAtMilliseconds)
+                {
+                    return existing.Value;
+                }
+
+                _entries.Remove(text);
+            }
+
+            if (MakeRoomLocked())
+            {
+                ownedEntry = new CacheEntry { InFlight = true };
+                _entries[text] = ownedEntry;
+            }
+        }
+
+        // 32 个关键词全部在途时仍允许查询，只是不进入缓存，保证表本身始终有界。
+        return ownedEntry is null ? ExecuteSafely(text) : ExecuteAndPublish(text, ownedEntry);
+    }
+
+    private bool ExecuteAndPublish(string keyword, CacheEntry entry)
+    {
+        var result = ExecuteSafely(keyword);
+        lock (_sync)
+        {
+            entry.Value = result;
+            entry.ExpiresAtMilliseconds = AddTtl(_clock());
+            entry.InFlight = false;
+            Monitor.PulseAll(_sync);
+        }
+
+        return result;
+    }
+
+    private bool ExecuteSafely(string keyword)
+    {
+        try
+        {
+            return _query(keyword);
+        }
+        catch
+        {
+            // 与旧实现一致：查询异常按“本次未确认”处理，并让同一拍等待者得到同一结果。
+            return false;
+        }
+    }
+
+    private void RemoveExpiredLocked(long now)
+    {
+        List<string>? expired = null;
+        foreach (var pair in _entries)
+        {
+            if (!pair.Value.InFlight && now >= pair.Value.ExpiresAtMilliseconds)
+            {
+                (expired ??= new List<string>()).Add(pair.Key);
+            }
+        }
+
+        if (expired is null)
+        {
+            return;
+        }
+
+        foreach (var key in expired)
+        {
+            _entries.Remove(key);
+        }
+    }
+
+    private bool MakeRoomLocked()
+    {
+        if (_entries.Count < _capacity)
+        {
+            return true;
+        }
+
+        string? oldestKey = null;
+        var oldestExpiry = long.MaxValue;
+        foreach (var pair in _entries)
+        {
+            if (!pair.Value.InFlight && pair.Value.ExpiresAtMilliseconds < oldestExpiry)
+            {
+                oldestKey = pair.Key;
+                oldestExpiry = pair.Value.ExpiresAtMilliseconds;
+            }
+        }
+
+        if (oldestKey is null)
+        {
+            return false;
+        }
+
+        _entries.Remove(oldestKey);
+        return true;
+    }
+
+    private long AddTtl(long now)
+    {
+        return now > long.MaxValue - _ttlMilliseconds
+            ? long.MaxValue
+            : now + _ttlMilliseconds;
+    }
+
+    private sealed class CacheEntry
+    {
+        public bool InFlight { get; set; }
+        public bool Value { get; set; }
+        public long ExpiresAtMilliseconds { get; set; }
     }
 }

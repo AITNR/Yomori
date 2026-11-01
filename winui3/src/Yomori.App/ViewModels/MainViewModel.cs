@@ -749,7 +749,7 @@ public sealed class MainViewModel : ObservableObject
     /// 诊断（内存探针最长十几秒、内嵌画面最长 5 秒，还得正好挂着画面）才看出变化，
     /// 会以为开关坏了。
     /// </summary>
-    private readonly List<string> _logBacklog = new();
+    private readonly Queue<string> _logBacklog = new();
 
     public ObservableCollection<StatRow> StatRows { get; }
 
@@ -2563,10 +2563,10 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
-        _logBacklog.Add(line);
+        _logBacklog.Enqueue(line);
         while (_logBacklog.Count > MaxLogLines)
         {
-            _logBacklog.RemoveAt(0);
+            _logBacklog.Dequeue();
         }
 
         if (!ShouldShowLogLine(line))
