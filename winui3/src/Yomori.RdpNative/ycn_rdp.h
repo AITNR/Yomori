@@ -209,6 +209,82 @@ YCN_API int ycn_rdp_copy_frame_strided(int session, uint8_t* dst, uint32_t dst_s
                                        uint32_t dst_stride, uint32_t* out_width,
                                        uint32_t* out_height, uint32_t* out_stride);
 
+/* ============================================================
+ * 阶段 2B：dirty pending 增量帧 C ABI（独立于上面的 full-frame ABI）
+ *
+ * 这是新增的、与 grab_frame / copy_frame / copy_frame_strided 平行的增量
+ * 取帧接口；上面的旧接口签名与语义完全不变。
+ *
+ *   ycn_rdp_dirty_api_version()              探测导出是否存在。
+ *   ycn_rdp_dirty_attach(session, token)     建立消费者令牌；attach 后第一批
+ *                                            必为 FULL（attach 强制整帧）。
+ *   ycn_rdp_dirty_copy_pending(...)          在 g_lock 内从稳定帧快照复制当前
+ *                                            sealed 批次：BOXES 只写 sealed
+ *                                            矩形，FULL 写整帧；同时返回这一批
+ *                                            冻结的 info/rects。
+ *   ycn_rdp_dirty_ack(session, token, seq)   确认该批；seq 来自 copy_pending。
+ *   ycn_rdp_dirty_detach(session, token)     解除令牌。
+ *
+ * 未 ack 前再次 copy_pending 会返回同一批（相同 seq/rects），不会丢帧；
+ * 只有 copy_pending 返回 YCN_OK 且 info.kind != EMPTY 时才需要 ack。
+ * ============================================================ */
+#define YCN_DIRTY_API_VERSION 1u
+
+/* ycn_rdp_dirty_info.kind */
+#define YCN_DIRTY_KIND_EMPTY 0u
+#define YCN_DIRTY_KIND_BOXES 1u
+#define YCN_DIRTY_KIND_FULL  2u
+
+/* dirty ABI 专用错误码（与 YCN_ERR_* 不重叠）。 */
+#define YCN_ERR_DIRTY_NOT_ATTACHED (-20)
+#define YCN_ERR_DIRTY_STALE_TOKEN  (-21)
+#define YCN_ERR_DIRTY_STALE_SEQ    (-22)
+
+/* tile 对齐的像素矩形（半开区间），与 ycn_dirty_pending.h 的
+ * YcnDirtyPendingRect 同布局。 */
+typedef struct ycn_rdp_dirty_rect
+{
+    int32_t x;
+    int32_t y;
+    uint32_t w;
+    uint32_t h;
+} ycn_rdp_dirty_rect;
+
+/* copy_pending 返回的冻结批次信息。 */
+typedef struct ycn_rdp_dirty_info
+{
+    uint32_t api_version;   /* YCN_DIRTY_API_VERSION */
+    uint32_t width;         /* 稳定帧宽（像素） */
+    uint32_t height;        /* 稳定帧高（像素） */
+    uint32_t stride;        /* 稳定帧 stride（字节） */
+    uint32_t kind;          /* YCN_DIRTY_KIND_* */
+    uint32_t rect_count;    /* BOXES 时为矩形数，其余为 0 */
+    uint64_t seq;           /* 批次号；ack 时原样传回 */
+    uint64_t token;         /* attach 时使用的令牌 */
+} ycn_rdp_dirty_info;
+
+YCN_API uint32_t ycn_rdp_dirty_api_version(void);
+YCN_API int ycn_rdp_dirty_attach(int session, uint64_t token);
+YCN_API int ycn_rdp_dirty_detach(int session, uint64_t token);
+
+/* dst/dst_size/dst_stride 描述一个与稳定帧同尺寸的整帧映射缓冲：
+ *   - FULL：写入整帧；
+ *   - BOXES：只写 out_rects 对应的矩形，缓冲其余字节不动；
+ *   - EMPTY：不写 dst（返回 YCN_OK，info.kind == EMPTY）。
+ * out_info 必需；out_rects 仅在 BOXES 且 rect_count > 0 时需要，容量不足
+ * 返回 YCN_ERR_NO_MEMORY，此时 out_info 已填好（可按 rect_count 扩容重试）。
+ * 所有复制都在 g_lock 内完成，与 end_paint 写稳定帧互斥。 */
+YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
+                                       uint8_t* dst, uint32_t dst_size,
+                                       uint32_t dst_stride,
+                                       ycn_rdp_dirty_info* out_info,
+                                       ycn_rdp_dirty_rect* out_rects,
+                                       uint32_t rect_capacity);
+
+/* 确认 copy_pending 返回的批次。token 必须是当前令牌，seq 必须是未被 ack 的
+ * 当前 sealed 批次；否则返回 YCN_ERR_DIRTY_STALE_TOKEN / _STALE_SEQ。 */
+YCN_API int ycn_rdp_dirty_ack(int session, uint64_t token, uint64_t seq);
+
 /* 取最近一次错误的可读描述（UTF-8）。session 未知时返回全局最后错误 */
 YCN_API void ycn_rdp_last_error(int session, char* buf, size_t buflen);
 

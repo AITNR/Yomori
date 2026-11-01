@@ -104,7 +104,7 @@ foreach(_dll IN LISTS YCN_COPY_RUNTIME_DLLS)
   endif()
 endforeach()
 
-add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c ycn_dirty_snapshot.c)
+add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c ycn_dirty_snapshot.c ycn_dirty_pending.c)
 # 注意：不要定义 UNICODE/_UNICODE —— 会引发 freerdp rail.h 的 NIIF_* 与 shellapi.h 宏冲突
 target_compile_definitions(ycn_rdp PRIVATE YCN_RDP_EXPORTS)
 target_compile_options(ycn_rdp PRIVATE /utf-8)
@@ -147,6 +147,14 @@ if(YCN_BUILD_DIRTY_DIAG_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(ycn_dirty_pending_tests PRIVATE /utf-8)
   add_test(NAME ycn_dirty_pending_tests COMMAND ycn_dirty_pending_tests)
+
+  add_executable(ycn_dirty_pending_session_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ycn_dirty_pending_session_tests.c"
+    ycn_dirty_pending.c)
+  target_include_directories(ycn_dirty_pending_session_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_options(ycn_dirty_pending_session_tests PRIVATE /utf-8)
+  add_test(NAME ycn_dirty_pending_session_tests COMMAND ycn_dirty_pending_session_tests)
 endif()
 
 # ---- 能力信息（构建时快照，发布包和 CI 都会校验） -------------------------

@@ -58,6 +58,10 @@ function Get-NativeCacheKey {
     (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_dirty_snapshot.c'),
     (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_dirty_snapshot.h'),
     (Join-Path $RepoRoot 'winui3\tests\ycn_dirty_snapshot_tests.c'),
+    (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_dirty_pending.c'),
+    (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_dirty_pending.h'),
+    (Join-Path $RepoRoot 'winui3\tests\ycn_dirty_pending_tests.c'),
+    (Join-Path $RepoRoot 'winui3\tests\ycn_dirty_pending_session_tests.c'),
     (Join-Path $RepoRoot 'winui3\tools\build_native.ps1'),
     (Join-Path $RepoRoot 'winui3\tools\verify_native_runtime.py'),
     (Join-Path $RepoRoot 'winui3\tools\package_release.py')

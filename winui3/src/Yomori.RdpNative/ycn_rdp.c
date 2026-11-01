@@ -16,6 +16,7 @@
 #include "ycn_rdp.h"
 #include "ycn_dirty_diag.h"
 #include "ycn_dirty_snapshot.h"
+#include "ycn_dirty_pending.h"
 
 /* WIN32_LEAN_AND_MEAN 必须定义：否则 windows.h 引入 shellapi.h，其 NIIF_* 宏
  * 会与 freerdp rail.h 的 NIIF 枚举冲突（C2059）。spike 已踩过 */
@@ -228,6 +229,7 @@ typedef struct
 	uint64_t copy_frame_ticks;
 	YcnDirtyDiagAggregate dirty_diag; /* g_lock protected; read-only invalid-rect diagnostics */
 	YcnDirtySnapshot dirty_snapshot;  /* bounded EndPaint batch; no per-frame allocation */
+	YcnDirtyPending dirty_pending;    /* 阶段 2B：tile/sealed 增量帧状态（g_lock 保护） */
 	uint64_t endpaint_dirty_count;
 	uint64_t endpaint_full_count;
 	uint64_t endpaint_dirty_fallback_count;
@@ -263,6 +265,9 @@ static volatile LONG g_total_created = 0;
 static volatile LONG g_total_released = 0;
 static char g_global_error[YCN_ERRBUF_LEN]; /* session 未找到时的兜底 */
 static uint64_t g_qpc_freq = 0;
+
+/* copy_pending 的 prepare 输出缓冲；整个复制过程持 g_lock，故进程级一份即可。 */
+static YcnDirtyPendingRect g_dirty_copy_boxes[YCN_DIRTY_PENDING_MAX_BOXES];
 
 /* ---------------- 工具 ---------------- */
 
@@ -558,6 +563,16 @@ static YcnSession* find_session(int id)
 	return NULL;
 }
 
+/* 阶段 2B：强制下一批为 FULL（reset / GFX failure / 快照失败）。
+ * 调用方必须持有 g_lock；会丢弃未 ack 的 sealed 批次。 */
+static void ycn_dirty_force_full_locked(YcnSession* s)
+{
+	if (!s)
+		return;
+	InterlockedExchange(&s->dirty_force_full, 1);
+	ycn_dirty_pending_reset_stream(&s->dirty_pending);
+}
+
 /* Connect setup failures happen before the event thread owns the FreeRDP objects. */
 static void ycn_abandon_connect(YcnSession* s, freerdp* instance, HANDLE stop_event,
                                 HANDLE thread)
@@ -730,7 +745,7 @@ static BOOL ycn_end_paint(rdpContext* context)
 	{
 		EnterCriticalSection(&g_lock);
 		ycn_dirty_diag_commit(&s->dirty_diag, &dirty);
-		InterlockedExchange(&s->dirty_force_full, 1);
+		ycn_dirty_force_full_locked(s);
 		LeaveCriticalSection(&g_lock);
 		return orig_ok;
 	}
@@ -816,6 +831,21 @@ static BOOL ycn_end_paint(rdpContext* context)
 				s->frame_stride = stride;
 				s->frame_valid = TRUE;
 				s->frame_snapshot_complete = TRUE;
+				/* 阶段 2B：成功的完整快照才进入 pending。
+				 * FULL 强制整帧；普通 dirty 批次只登记本批矩形；
+				 * 空批次不产生 pending（下次 prepare 得到 EMPTY）。 */
+				if (use_full)
+				{
+					ycn_dirty_pending_add_frame(&s->dirty_pending, (int32_t)width,
+					                            (int32_t)height, 1u, NULL, 0u);
+				}
+				else if (s->dirty_snapshot.count > 0u)
+				{
+					ycn_dirty_pending_add_frame(&s->dirty_pending, (int32_t)width,
+					                            (int32_t)height, 0u,
+					                            s->dirty_snapshot.rects,
+					                            s->dirty_snapshot.count);
+				}
 				InterlockedExchange(&s->dirty_force_full, 0);
 				s->endpaint_memcpy_count++;
 				s->endpaint_memcpy_bytes += copied_bytes;
@@ -827,7 +857,7 @@ static BOOL ycn_end_paint(rdpContext* context)
 end_paint_break_snapshot:
 		s->frame_valid = FALSE;
 		s->frame_snapshot_complete = FALSE;
-		InterlockedExchange(&s->dirty_force_full, 1);
+		ycn_dirty_force_full_locked(s);
 end_paint_unlock:
 		LeaveCriticalSection(&g_lock);
 		if (!copied)
@@ -979,7 +1009,7 @@ static void ycn_request_full_refresh(YcnSession* s)
 	{
 		instance = s->instance;
 		settings = instance->context->settings;
-		InterlockedExchange(&s->dirty_force_full, 1);
+		ycn_dirty_force_full_locked(s);
 	}
 	LeaveCriticalSection(&g_lock);
 	if (!instance || !settings || !instance->context->update)
@@ -1128,14 +1158,20 @@ static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFA
 		probe->setThreadPolicy(policy);
 	if (!orig)
 	{
-		InterlockedExchange(&s->dirty_force_full, 1);
+		EnterCriticalSection(&g_lock);
+		ycn_dirty_force_full_locked(s);
+		LeaveCriticalSection(&g_lock);
 		return ERROR_INTERNAL_ERROR;
 	}
 
 	t0 = ycn_qpc_now();
 	rc = orig(ctx, cmd);
 	if (rc != CHANNEL_RC_OK)
-		InterlockedExchange(&s->dirty_force_full, 1);
+	{
+		EnterCriticalSection(&g_lock);
+		ycn_dirty_force_full_locked(s);
+		LeaveCriticalSection(&g_lock);
+	}
 	{
 		const uint64_t t1 = ycn_qpc_now();
 		EnterCriticalSection(&g_lock);
@@ -1242,7 +1278,7 @@ static UINT ycn_gfx_reset_graphics(RdpgfxClientContext* ctx, const RDPGFX_RESET_
 	{
 		EnterCriticalSection(&g_lock);
 		orig = s->orig_gfx_reset;
-		InterlockedExchange(&s->dirty_force_full, 1);
+		ycn_dirty_force_full_locked(s);
 		LeaveCriticalSection(&g_lock);
 	}
 	if (orig)
@@ -2570,6 +2606,12 @@ static void ycn_on_channel_connected(void* ctx, const ChannelConnectedEventArgs*
 			InterlockedExchange(&s->gfx_state, ok ? 2 : 4);
 			ycn_debug_dump_gfx(s, ok ? "attach-ok" : "attach-fail"); /* 崩溃前落盘 */
 
+			if (!ok)
+			{
+				EnterCriticalSection(&g_lock);
+				ycn_dirty_force_full_locked(s);
+				LeaveCriticalSection(&g_lock);
+			}
 			if (ok)
 			{
 				/* 原回调按会话保存，避免多会话互相覆盖函数指针。 */
@@ -3147,7 +3189,7 @@ teardown:
 	s->frame_capacity = 0;
 	s->frame_valid = FALSE;
 	s->frame_snapshot_complete = FALSE;
-	InterlockedExchange(&s->dirty_force_full, 1);
+	ycn_dirty_force_full_locked(s);
 	LeaveCriticalSection(&g_lock);
 
 	/* References registered before STOPPING protect freerdp_connect/abort from
@@ -3279,6 +3321,7 @@ static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callback
 	}
 	s = &g_sessions[slot];
 	memset(s, 0, sizeof(*s));
+	ycn_dirty_pending_init(&s->dirty_pending);
 	s->used = 1;
 	s->id = (int)g_next_session_id++;
 	id = s->id;
@@ -4007,6 +4050,248 @@ YCN_API int ycn_rdp_copy_frame_strided(int session, uint8_t* dst, uint32_t dst_s
 		}
 	}
 copy_strided_unlock:
+	LeaveCriticalSection(&g_lock);
+	return rc;
+}
+
+/* ============================================================
+ * 阶段 2B：dirty pending 增量帧 C ABI 实现
+ * 全部状态访问都在 g_lock 内；旧 full-frame ABI 不受影响。
+ * ============================================================ */
+
+YCN_API uint32_t ycn_rdp_dirty_api_version(void)
+{
+	return YCN_DIRTY_API_VERSION;
+}
+
+YCN_API int ycn_rdp_dirty_attach(int session, uint64_t token)
+{
+	YcnSession* s;
+	int rc = YCN_ERR_SESSION_NOT_FOUND;
+
+	if (token == 0u)
+		return YCN_ERR_INVALID_ARG;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (s)
+	{
+		if (InterlockedCompareExchange(&s->state, 0, 0) != YCN_STATE_RUNNING)
+		{
+			rc = YCN_ERR_NOT_CONNECTED;
+		}
+		else
+		{
+			/* attach 强制 FULL：第一批必为整帧。 */
+			ycn_dirty_pending_attach(&s->dirty_pending, token);
+			rc = YCN_OK;
+		}
+	}
+	LeaveCriticalSection(&g_lock);
+	return rc;
+}
+
+YCN_API int ycn_rdp_dirty_detach(int session, uint64_t token)
+{
+	YcnSession* s;
+	int rc = YCN_ERR_SESSION_NOT_FOUND;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (s)
+	{
+		if (!s->dirty_pending.attached)
+			rc = YCN_ERR_DIRTY_NOT_ATTACHED;
+		else if (s->dirty_pending.token != token)
+			rc = YCN_ERR_DIRTY_STALE_TOKEN;
+		else
+			rc = ycn_dirty_pending_detach(&s->dirty_pending, token) == 0
+			         ? YCN_OK
+			         : YCN_ERR_DIRTY_STALE_TOKEN;
+	}
+	LeaveCriticalSection(&g_lock);
+	return rc;
+}
+
+YCN_API int ycn_rdp_dirty_copy_pending(int session, uint64_t token,
+                                       uint8_t* dst, uint32_t dst_size,
+                                       uint32_t dst_stride,
+                                       ycn_rdp_dirty_info* out_info,
+                                       ycn_rdp_dirty_rect* out_rects,
+                                       uint32_t rect_capacity)
+{
+	YcnSession* s;
+	int rc = YCN_ERR_SESSION_NOT_FOUND;
+	uint32_t flags = 0u;
+	uint32_t box_count = 0u;
+	uint64_t seq = 0u;
+
+	if (!dst || dst_size == 0u || dst_stride == 0u || !out_info)
+		return YCN_ERR_INVALID_ARG;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (!s)
+		goto dirty_copy_unlock;
+	if (InterlockedCompareExchange(&s->state, 0, 0) != YCN_STATE_RUNNING)
+	{
+		rc = YCN_ERR_NOT_CONNECTED;
+		goto dirty_copy_unlock;
+	}
+	if (!s->dirty_pending.attached)
+	{
+		rc = YCN_ERR_DIRTY_NOT_ATTACHED;
+		goto dirty_copy_unlock;
+	}
+	if (s->dirty_pending.token != token)
+	{
+		rc = YCN_ERR_DIRTY_STALE_TOKEN;
+		goto dirty_copy_unlock;
+	}
+	if (!s->frame_valid || !s->frame_snapshot_complete || !s->frame ||
+	    s->frame_width == 0u || s->frame_height == 0u)
+	{
+		rc = YCN_ERR_NOT_CONNECTED;
+		goto dirty_copy_unlock;
+	}
+
+	rc = ycn_dirty_pending_prepare(&s->dirty_pending,
+	                              g_dirty_copy_boxes,
+	                              YCN_DIRTY_PENDING_MAX_BOXES, &flags, &box_count, &seq);
+	if (rc != 0)
+	{
+		rc = YCN_ERR_INVALID_ARG;
+		goto dirty_copy_unlock;
+	}
+
+	out_info->api_version = YCN_DIRTY_API_VERSION;
+	out_info->width = s->frame_width;
+	out_info->height = s->frame_height;
+	out_info->stride = s->frame_stride;
+	out_info->kind = flags == YCN_DIRTY_PENDING_FULL ? YCN_DIRTY_KIND_FULL
+	                 : flags == YCN_DIRTY_PENDING_DIRTY ? YCN_DIRTY_KIND_BOXES
+	                 : YCN_DIRTY_KIND_EMPTY;
+	out_info->rect_count = box_count;
+	out_info->seq = seq;
+	out_info->token = token;
+
+	if (flags == YCN_DIRTY_PENDING_EMPTY)
+	{
+		rc = YCN_OK; /* 无新数据：不写 dst */
+		goto dirty_copy_unlock;
+	}
+
+	{
+		const uint32_t width = s->frame_width;
+		const uint32_t height = s->frame_height;
+		const uint32_t src_stride = s->frame_stride;
+		uint32_t row_bytes;
+		uint64_t src_extent;
+		uint64_t dst_extent;
+
+		if (width > UINT32_MAX / 4u)
+		{
+			rc = YCN_ERR_INVALID_ARG;
+			goto dirty_copy_unlock;
+		}
+		row_bytes = width * 4u;
+		if (src_stride < row_bytes || dst_stride < row_bytes)
+		{
+			rc = YCN_ERR_INVALID_ARG;
+			goto dirty_copy_unlock;
+		}
+		src_extent = (uint64_t)src_stride * (height - 1u) + row_bytes;
+		dst_extent = (uint64_t)dst_stride * (height - 1u) + row_bytes;
+		if (src_extent > (uint64_t)s->frame_capacity)
+		{
+			rc = YCN_ERR_INVALID_ARG;
+			goto dirty_copy_unlock;
+		}
+		if (dst_extent > (uint64_t)dst_size)
+		{
+			rc = YCN_ERR_NO_MEMORY; /* out_info 已填好，可按尺寸重建 */
+			goto dirty_copy_unlock;
+		}
+
+		if (flags == YCN_DIRTY_PENDING_FULL)
+		{
+			uint32_t row;
+			if (dst_stride == row_bytes && src_stride == row_bytes)
+			{
+				memcpy(dst, s->frame, (size_t)row_bytes * height);
+			}
+			else
+			{
+				for (row = 0; row < height; row++)
+				{
+					memcpy(dst + (size_t)row * dst_stride,
+					       s->frame + (size_t)row * src_stride, row_bytes);
+				}
+			}
+			rc = YCN_OK;
+		}
+		else
+		{
+			uint32_t i;
+			if (box_count > 0u && (!out_rects || rect_capacity < box_count))
+			{
+				rc = YCN_ERR_NO_MEMORY; /* out_info.rect_count 已给出所需容量 */
+				goto dirty_copy_unlock;
+			}
+			for (i = 0; i < box_count; i++)
+			{
+				const YcnDirtyPendingRect* b = &g_dirty_copy_boxes[i];
+				uint32_t row;
+				uint32_t copy_bytes;
+				if (b->x < 0 || b->y < 0 || b->w <= 0 || b->h <= 0)
+					continue;
+				if ((uint64_t)b->x + (uint64_t)b->w > width ||
+				    (uint64_t)b->y + (uint64_t)b->h > height)
+				{
+					rc = YCN_ERR_INVALID_ARG;
+					goto dirty_copy_unlock;
+				}
+				copy_bytes = (uint32_t)b->w * 4u;
+				for (row = 0; row < (uint32_t)b->h; row++)
+				{
+					memcpy(dst + (size_t)(b->y + (int32_t)row) * dst_stride +
+					           (size_t)b->x * 4u,
+					       s->frame + (size_t)(b->y + (int32_t)row) * src_stride +
+					           (size_t)b->x * 4u,
+					       copy_bytes);
+				}
+				out_rects[i].x = b->x;
+				out_rects[i].y = b->y;
+				out_rects[i].w = (uint32_t)b->w;
+				out_rects[i].h = (uint32_t)b->h;
+			}
+			rc = YCN_OK;
+		}
+	}
+
+dirty_copy_unlock:
+	LeaveCriticalSection(&g_lock);
+	return rc;
+}
+
+YCN_API int ycn_rdp_dirty_ack(int session, uint64_t token, uint64_t seq)
+{
+	YcnSession* s;
+	int rc = YCN_ERR_SESSION_NOT_FOUND;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (s)
+	{
+		if (!s->dirty_pending.attached)
+			rc = YCN_ERR_DIRTY_NOT_ATTACHED;
+		else if (s->dirty_pending.token != token)
+			rc = YCN_ERR_DIRTY_STALE_TOKEN;
+		else if (ycn_dirty_pending_ack(&s->dirty_pending, token, seq) != 0)
+			rc = YCN_ERR_DIRTY_STALE_SEQ;
+		else
+			rc = YCN_OK;
+	}
 	LeaveCriticalSection(&g_lock);
 	return rc;
 }
