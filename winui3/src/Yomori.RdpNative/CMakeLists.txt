@@ -140,6 +140,13 @@ if(YCN_BUILD_DIRTY_DIAG_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(ycn_dirty_snapshot_tests PRIVATE /utf-8)
   add_test(NAME ycn_dirty_snapshot_tests COMMAND ycn_dirty_snapshot_tests)
+  add_executable(ycn_dirty_pending_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ycn_dirty_pending_tests.c"
+    ycn_dirty_pending.c)
+  target_include_directories(ycn_dirty_pending_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_options(ycn_dirty_pending_tests PRIVATE /utf-8)
+  add_test(NAME ycn_dirty_pending_tests COMMAND ycn_dirty_pending_tests)
 endif()
 
 # ---- 能力信息（构建时快照，发布包和 CI 都会校验） -------------------------
@@ -247,3 +254,6 @@ add_custom_command(TARGET ycn_rdp POST_BUILD
           "-DYCN_PYTHON=${YCN_PYTHON_EXECUTABLE}"
           "-DYCN_EXPECT_HWACCEL=ON"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/verify_runtime_dlls.cmake")
+
+
+

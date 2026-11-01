@@ -1,0 +1,4 @@
+#include "ycn_dirty_pending.h"
+#include <stdio.h>
+#define C(x) do{if(!(x)){fprintf(stderr,"FAIL %d: %s\n",__LINE__,#x);return 1;}}while(0)
+int main(void){YcnDirtyPending p;YcnDirtySnapshotRect r={0,0,64,64};YcnDirtyPendingRect b[32];uint32_t f,n;uint64_t s;ycn_dirty_pending_init(&p);ycn_dirty_pending_attach(&p,7);ycn_dirty_pending_add_frame(&p,128,128,1,0,0);C(ycn_dirty_pending_prepare(&p,b,32,&f,&n,&s)==0&&f==YCN_DIRTY_PENDING_FULL);C(ycn_dirty_pending_ack(&p,7,s)==0);C(ycn_dirty_pending_prepare(&p,b,32,&f,&n,&s)==0&&f==YCN_DIRTY_PENDING_EMPTY);ycn_dirty_pending_add_frame(&p,128,128,0,&r,1);C(ycn_dirty_pending_prepare(&p,b,32,&f,&n,&s)==0&&f==YCN_DIRTY_PENDING_DIRTY&&n==1);ycn_dirty_pending_add_frame(&p,128,128,0,&r,1);C(ycn_dirty_pending_ack(&p,7,s)==0);C(ycn_dirty_pending_prepare(&p,b,32,&f,&n,&s)==0&&f==YCN_DIRTY_PENDING_DIRTY&&n==1);C(ycn_dirty_pending_ack(&p,7,s)==0);C(ycn_dirty_pending_ack(&p,99,s)!=0);puts("pending ok");return 0;}
