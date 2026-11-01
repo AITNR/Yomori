@@ -120,6 +120,7 @@ typedef struct
 	uint32_t frame_width;
 	uint32_t frame_height;
 	uint32_t frame_stride;
+	uint32_t frame_capacity;
 	BOOL frame_valid;
 
 	char last_error[YCN_ERRBUF_LEN];
@@ -608,36 +609,65 @@ static BOOL ycn_end_paint(rdpContext* context)
 	if (!gdi->primary_buffer || gdi->width <= 0 || gdi->height <= 0)
 		return TRUE;
 
-	/* 拷贝到会话帧缓冲（BGRA32） */
+	/* 拷贝到会话帧缓冲（BGRA32）。容量不足才 realloc；失败时保留上一帧。 */
 	EnterCriticalSection(&g_lock);
 	{
-		uint32_t stride = (uint32_t)gdi->stride > 0 ? (uint32_t)gdi->stride
-		                                            : (uint32_t)gdi->width * 4;
-		if (s->frame_width != (uint32_t)gdi->width || s->frame_height != (uint32_t)gdi->height ||
-		    !s->frame)
+		const uint32_t width = (uint32_t)gdi->width;
+		const uint32_t height = (uint32_t)gdi->height;
+		uint32_t row_bytes;
+		uint32_t stride;
+		BOOL copied = FALSE;
+
+		if (width == 0 || width > UINT32_MAX / 4u)
+			goto end_paint_unlock;
+		row_bytes = width * 4u;
+		stride = (uint32_t)gdi->stride > 0 ? (uint32_t)gdi->stride : row_bytes;
+		if (stride < row_bytes || height > UINT32_MAX / stride)
+			goto end_paint_unlock;
+
 		{
-			uint8_t* nb = (uint8_t*)realloc(s->frame, (size_t)stride * gdi->height);
-			if (nb)
+			const uint32_t need = stride * height;
+			if (!s->frame || s->frame_capacity < need)
 			{
+				uint8_t* nb = (uint8_t*)realloc(s->frame, (size_t)need);
+				if (!nb)
+					goto end_paint_unlock;
 				s->frame = nb;
-				s->frame_width = (uint32_t)gdi->width;
-				s->frame_height = (uint32_t)gdi->height;
-				s->frame_stride = stride;
+				s->frame_capacity = need;
 			}
-		}
-		if (s->frame)
-		{
-			const size_t bytes = (size_t)s->frame_stride * s->frame_height;
-			const uint64_t t0 = ycn_qpc_now();
-			memcpy(s->frame, gdi->primary_buffer, bytes);
-			const uint64_t t1 = ycn_qpc_now();
+
+			if (stride == row_bytes)
+			{
+				const uint64_t t0 = ycn_qpc_now();
+				memcpy(s->frame, gdi->primary_buffer, (size_t)need);
+				const uint64_t t1 = ycn_qpc_now();
+				s->endpaint_memcpy_ticks += t1 - t0;
+			}
+			else
+			{
+				uint32_t row;
+				const uint64_t t0 = ycn_qpc_now();
+				for (row = 0; row < height; row++)
+				{
+					memcpy(s->frame + (size_t)row * stride,
+					       gdi->primary_buffer + (size_t)row * stride, row_bytes);
+				}
+				const uint64_t t1 = ycn_qpc_now();
+				s->endpaint_memcpy_ticks += t1 - t0;
+			}
+			s->frame_width = width;
+			s->frame_height = height;
+			s->frame_stride = stride;
 			s->frame_valid = TRUE;
 			s->endpaint_memcpy_count++;
-			s->endpaint_memcpy_bytes += (uint64_t)bytes;
-			s->endpaint_memcpy_ticks += t1 - t0;
+			s->endpaint_memcpy_bytes += need;
+			copied = TRUE;
 		}
+end_paint_unlock:
+		LeaveCriticalSection(&g_lock);
+		if (!copied)
+			return TRUE;
 	}
-	LeaveCriticalSection(&g_lock);
 
 	if (s->cb.on_frame_ready)
 		s->cb.on_frame_ready(s->user, s->id, s->frame_width, s->frame_height, s->frame_stride);
@@ -2941,6 +2971,7 @@ teardown:
 	callback_id = s->id;
 	frame = s->frame;
 	s->frame = NULL;
+	s->frame_capacity = 0;
 	s->frame_valid = FALSE;
 	LeaveCriticalSection(&g_lock);
 
@@ -2974,6 +3005,7 @@ teardown:
 	s->frame_width = 0;
 	s->frame_height = 0;
 	s->frame_stride = 0;
+	s->frame_capacity = 0;
 	s->thread = NULL;
 	s->stop_event = NULL;
 	{
@@ -3133,6 +3165,7 @@ static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callback
 	s->frame_width = 0;
 	s->frame_height = 0;
 	s->frame_stride = 0;
+	s->frame_capacity = 0;
 	s->mouse_head = 0;
 	s->mouse_tail = 0;
 	s->key_head = 0;
@@ -3710,6 +3743,91 @@ YCN_API int ycn_rdp_copy_frame(int session, uint8_t* dst, uint32_t dst_size,
 			rc = YCN_ERR_NO_MEMORY; /* 缓冲过小：调用方按 out_* 尺寸重分配后重试 */
 		}
 	}
+	LeaveCriticalSection(&g_lock);
+	return rc;
+}
+
+YCN_API int ycn_rdp_copy_frame_strided(int session, uint8_t* dst, uint32_t dst_size,
+                                       uint32_t dst_stride, uint32_t* out_width,
+                                       uint32_t* out_height, uint32_t* out_stride)
+{
+	YcnSession* s;
+	int rc = YCN_ERR_NOT_CONNECTED;
+
+	if (!dst || dst_size == 0 || dst_stride == 0)
+		return YCN_ERR_INVALID_ARG;
+
+	/* 与 end_paint 的整帧写入互斥；尺寸、stride 与容量都在同一次锁内校验。 */
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (s && InterlockedCompareExchange(&s->state, 0, 0) == YCN_STATE_RUNNING &&
+	    s->frame_valid && s->frame && s->frame_width > 0 && s->frame_height > 0)
+	{
+		const uint32_t width = s->frame_width;
+		const uint32_t height = s->frame_height;
+		const uint32_t src_stride = s->frame_stride;
+		uint32_t row_bytes;
+
+		if (out_width)
+			*out_width = width;
+		if (out_height)
+			*out_height = height;
+		if (out_stride)
+			*out_stride = src_stride;
+
+		if (width > UINT32_MAX / 4u)
+		{
+			rc = YCN_ERR_INVALID_ARG;
+			goto copy_strided_unlock;
+		}
+		row_bytes = width * 4u;
+		if (src_stride < row_bytes)
+		{
+			/* 会话帧自身的 stride 与宽度不一致：内部状态损坏，不能逐行读。 */
+			rc = YCN_ERR_INVALID_ARG;
+			goto copy_strided_unlock;
+		}
+		if (dst_stride < row_bytes)
+		{
+			/* 目标 staging 还按旧宽度建造：按“容量不足”返回，调用方重建后重试。 */
+			rc = YCN_ERR_NO_MEMORY;
+			goto copy_strided_unlock;
+		}
+
+		{
+			/* extent 用 64 位：stride * (height - 1) + row_bytes 可能越过 32 位上限。 */
+			const uint64_t src_extent = (uint64_t)src_stride * (height - 1u) + row_bytes;
+			const uint64_t dst_extent = (uint64_t)dst_stride * (height - 1u) + row_bytes;
+			if (src_extent > s->frame_capacity)
+			{
+				rc = YCN_ERR_INVALID_ARG;
+				goto copy_strided_unlock;
+			}
+			if (dst_extent > dst_size)
+			{
+				rc = YCN_ERR_NO_MEMORY;
+				goto copy_strided_unlock;
+			}
+
+			{
+				const uint64_t t0 = ycn_qpc_now();
+				uint32_t row;
+				for (row = 0; row < height; row++)
+				{
+					memcpy(dst + (size_t)row * dst_stride,
+					       s->frame + (size_t)row * src_stride, row_bytes);
+				}
+				{
+					const uint64_t t1 = ycn_qpc_now();
+					s->copy_frame_count++;
+					s->copy_frame_bytes += (uint64_t)row_bytes * height;
+					s->copy_frame_ticks += t1 - t0;
+				}
+			}
+			rc = YCN_OK;
+		}
+	}
+copy_strided_unlock:
 	LeaveCriticalSection(&g_lock);
 	return rc;
 }

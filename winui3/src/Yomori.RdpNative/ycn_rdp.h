@@ -201,6 +201,14 @@ YCN_API int ycn_rdp_grab_frame(int session, uint32_t* out_width, uint32_t* out_h
 YCN_API int ycn_rdp_copy_frame(int session, uint8_t* dst, uint32_t dst_size,
                                uint32_t* out_width, uint32_t* out_height, uint32_t* out_stride);
 
+/* 取当前帧并在 g_lock 内按目标 stride 逐行拷到调用方缓冲（D3D staging 直填）。
+ * dst_size 是目标缓冲实际占用范围；dst_stride 必须 >= width*4。目标容量不足时返回
+ * YCN_ERR_NO_MEMORY，并仍写出真实 width/height/源 stride，调用方可重建缓冲后重试。
+ * 只读取会话自己的稳定帧快照，不暴露 gdi->primary_buffer。 */
+YCN_API int ycn_rdp_copy_frame_strided(int session, uint8_t* dst, uint32_t dst_size,
+                                       uint32_t dst_stride, uint32_t* out_width,
+                                       uint32_t* out_height, uint32_t* out_stride);
+
 /* 取最近一次错误的可读描述（UTF-8）。session 未知时返回全局最后错误 */
 YCN_API void ycn_rdp_last_error(int session, char* buf, size_t buflen);
 

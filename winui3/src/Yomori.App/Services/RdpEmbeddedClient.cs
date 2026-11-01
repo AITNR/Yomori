@@ -39,6 +39,15 @@ namespace Yomori.Services
         public uint Stride { get; init; }
     }
 
+    internal enum RdpMappedFrameCopyResult
+    {
+        Success,
+        NoFrame,
+        ResizeRequired,
+        Unsupported,
+        Error,
+    }
+
     /// <summary>
     /// 内嵌 RDP 客户端。一次实例对应一条会话；Disconnected/Failed 后可重用实例再次 Connect。
     /// </summary>
@@ -344,6 +353,72 @@ namespace Yomori.Services
             pixels = buffer;
             return true;
         }
+
+        internal bool SupportsMappedFrameCopy => RdpNativeInterop.SupportsMappedFrameCopy;
+
+        /// <summary>只读取当前帧元数据，不复制像素。供 D3D 首次初始化与旧路径降级使用。</summary>
+        internal bool TryGetFrameInfo(out uint width, out uint height, out uint stride)
+        {
+            var rc = RdpNativeInterop.ycn_rdp_grab_frame(_session, out width, out height, out stride, out _);
+            return rc == 0 && width > 0 && height > 0
+                && width <= uint.MaxValue / 4u
+                && stride >= width * 4u;
+        }
+
+        /// <summary>
+        /// 在原生锁内把当前帧逐行写入已映射的 D3D staging 纹理。
+        /// 失败时仍返回真实尺寸；ResizeRequired 表示按返回尺寸重建 staging 后重试一次。
+        /// </summary>
+        internal RdpMappedFrameCopyResult TryCopyFrameToMappedBuffer(
+            IntPtr destination,
+            uint destinationSize,
+            uint destinationStride,
+            out uint width,
+            out uint height,
+            out uint stride)
+        {
+            width = height = stride = 0;
+            if (!SupportsMappedFrameCopy)
+            {
+                return RdpMappedFrameCopyResult.Unsupported;
+            }
+            if (destination == IntPtr.Zero || destinationSize == 0 || destinationStride == 0 || _session <= 0)
+            {
+                return RdpMappedFrameCopyResult.NoFrame;
+            }
+
+            int rc;
+            unsafe
+            {
+                try
+                {
+                    rc = RdpNativeInterop.ycn_rdp_copy_frame_strided(
+                        _session,
+                        (byte*)destination,
+                        destinationSize,
+                        destinationStride,
+                        out width,
+                        out height,
+                        out stride);
+                }
+                catch (Exception ex) when (ex is EntryPointNotFoundException
+                                           || ex is DllNotFoundException
+                                           || ex is BadImageFormatException)
+                {
+                    RdpNativeInterop.MarkMappedFrameCopyUnsupported();
+                    return RdpMappedFrameCopyResult.Unsupported;
+                }
+            }
+            return ClassifyMappedFrameCopyResult(rc);
+        }
+
+        internal static RdpMappedFrameCopyResult ClassifyMappedFrameCopyResult(int rc) => rc switch
+        {
+            0 => RdpMappedFrameCopyResult.Success,
+            -2 => RdpMappedFrameCopyResult.ResizeRequired,
+            -4 or -8 => RdpMappedFrameCopyResult.NoFrame,
+            _ => RdpMappedFrameCopyResult.Error,
+        };
 
         /// <summary>
         /// GFX 图形管线状态（诊断）：

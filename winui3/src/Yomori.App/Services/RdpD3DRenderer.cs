@@ -34,6 +34,17 @@ namespace Yomori.Services
         void SetSwapChain(IntPtr swapChain);
     }
 
+    internal enum RdpD3DPresentResult
+    {
+        Presented,
+        /// <summary>这一拍没有可用的完整帧（会话未就绪 / 尺寸竞态）：只丢本拍。</summary>
+        NoFrame,
+        /// <summary>DLL 实际没有直填导出：本拍改走托管拷贝，D3D 本身仍然可用。</summary>
+        Unsupported,
+        /// <summary>D3D 资源或呈现真失败：调用方关闭 D3D 并回退软渲染。</summary>
+        FatalFailure,
+    }
+
     internal sealed class RdpD3DRenderer : IDisposable
     {
         /// <summary>
@@ -250,6 +261,143 @@ namespace Yomori.Services
             }
         }
 
+        /// <summary>
+        /// D3D 直填：原生锁内把帧逐行写入已映射 staging，再 CopyResource/Present。
+        /// 不创建托管 byte[]；尺寸竞态或目标不足时按原生返回尺寸重建并重试一次。
+        /// 始终 Unmap；只有 D3D 资源重建/呈现真失败才返回 FatalFailure。
+        /// </summary>
+        internal RdpD3DPresentResult TryPresentFromClient(
+            RdpEmbeddedClient client,
+            out uint width,
+            out uint height,
+            out uint stride,
+            out long copyTicks,
+            out long presentTicks)
+        {
+            lock (_gate)
+            {
+                return TryPresentFromClientLocked(client, out width, out height, out stride,
+                    out copyTicks, out presentTicks);
+            }
+        }
+
+        private RdpD3DPresentResult TryPresentFromClientLocked(
+            RdpEmbeddedClient client,
+            out uint width,
+            out uint height,
+            out uint stride,
+            out long copyTicks,
+            out long presentTicks)
+        {
+            width = height = stride = 0;
+            copyTicks = 0;
+            var totalStart = System.Diagnostics.Stopwatch.GetTimestamp();
+            presentTicks = 0;
+
+            if (!Initialized || _staging is null || _backBuffer is null || _context is null)
+            {
+                LastError = "renderer not initialized";
+                return RdpD3DPresentResult.FatalFailure;
+            }
+
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                var mapped = false;
+                var needsResize = false;
+                var mappedDimensions = false;
+                try
+                {
+                    var map = _context.Map(_staging, 0, MapMode.Write, Vortice.Direct3D11.MapFlags.None);
+                    mapped = true; // Map 已成功；任何后续失败和 return 都必须在 finally 中 Unmap
+
+                    var capacity = (ulong)(uint)map.RowPitch * _remoteHeight;
+                    if (capacity == 0 || capacity > uint.MaxValue)
+                    {
+                        LastError = "staging capacity overflow";
+                        return RdpD3DPresentResult.FatalFailure;
+                    }
+
+                    var copyStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                    var copyResult = client.TryCopyFrameToMappedBuffer(
+                        map.DataPointer,
+                        (uint)capacity,
+                        (uint)map.RowPitch,
+                        out width,
+                        out height,
+                        out stride);
+                    copyTicks += System.Diagnostics.Stopwatch.GetTimestamp() - copyStart;
+
+                    if (copyResult == RdpMappedFrameCopyResult.ResizeRequired)
+                    {
+                        needsResize = width > 0 && height > 0;
+                    }
+                    else if (copyResult == RdpMappedFrameCopyResult.Unsupported)
+                    {
+                        LastError = "native strided frame copy unavailable";
+                        return RdpD3DPresentResult.Unsupported;
+                    }
+                    else if (copyResult == RdpMappedFrameCopyResult.NoFrame)
+                    {
+                        // 原生 -4/-8 是会话/尺寸竞态，只丢本拍，不能关闭 D3D。
+                        LastError = "native frame unavailable";
+                        return RdpD3DPresentResult.NoFrame;
+                    }
+                    else if (copyResult != RdpMappedFrameCopyResult.Success)
+                    {
+                        // 其余原生错误表示帧状态或参数真实损坏：回退软渲染，避免永久静默丢帧。
+                        LastError = "native strided frame copy failed";
+                        return RdpD3DPresentResult.FatalFailure;
+                    }
+                    else
+                    {
+                        mappedDimensions = width == _remoteWidth && height == _remoteHeight;
+                        needsResize = !mappedDimensions;
+                    }
+
+                    if (mappedDimensions)
+                    {
+                        _context.Unmap(_staging, 0);
+                        mapped = false;
+                        _context.CopyResource(_backBuffer, _staging);
+                        _swapChain!.Present(0, 0);
+                        presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - totalStart;
+                        return RdpD3DPresentResult.Presented;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LastError = ex.Message;
+                    presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - totalStart;
+                    return RdpD3DPresentResult.FatalFailure;
+                }
+                finally
+                {
+                    if (mapped)
+                    {
+                        try { _context.Unmap(_staging, 0); }
+                        catch (Exception ex) { LastError = "Unmap: " + ex.Message; }
+                    }
+                }
+
+                if (!needsResize)
+                {
+                    LastError = "native frame has no dimensions";
+                    presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - totalStart;
+                    return RdpD3DPresentResult.NoFrame;
+                }
+                if (!ResizeRemoteLocked(width, height))
+                {
+                    presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - totalStart;
+                    return RdpD3DPresentResult.FatalFailure;
+                }
+            }
+
+            // 分辨率在两次尝试之间仍在变化：本拍不呈现，下一拍重来；不升级为 D3D 永久故障。
+            LastError = "remote resolution changed during direct present";
+            presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - totalStart;
+            return RdpD3DPresentResult.NoFrame;
+        }
+
         /// <summary>上传一帧（同尺寸 CopyResource）并呈现。失败返回 false。
         /// ⚠️ 必须在 UI 线程调（本方法整体在一个 GPU 阻塞段里，绝不能拖到后台线程 ——
         /// 那会让 UI 线程与 GPU 互相等，成假死）。</summary>
@@ -281,30 +429,36 @@ namespace Yomori.Services
                 // 上传远端帧：Map/Unmap 手动拷贝。不用 UpdateSubresource 的 span 重载——
                 // 每帧 new 的数组若在原生执行期间被 GC 回收会 AV（M4 崩溃 bug），fixed 显式固定
                 var mapped = _context.Map(_staging, 0, MapMode.Write, Vortice.Direct3D11.MapFlags.None);
-                unsafe
+                try
                 {
-                    fixed (byte* src = pixels)
+                    unsafe
                     {
-                        var dst = (byte*)mapped.DataPointer;
-                        var rowBytes = (int)(width * 4);
-                        if ((uint)mapped.RowPitch == stride)
+                        fixed (byte* src = pixels)
                         {
-                            Buffer.MemoryCopy(src, dst, (long)mapped.RowPitch * height, (long)stride * height);
-                        }
-                        else
-                        {
-                            for (var row = 0; row < height; row++)
+                            var dst = (byte*)mapped.DataPointer;
+                            var rowBytes = (int)(width * 4);
+                            if ((uint)mapped.RowPitch == stride)
                             {
-                                Buffer.MemoryCopy(
-                                    src + (ulong)(stride * row),
-                                    dst + (ulong)(mapped.RowPitch * row),
-                                    rowBytes,
-                                    rowBytes);
+                                Buffer.MemoryCopy(src, dst, (long)mapped.RowPitch * height, (long)stride * height);
+                            }
+                            else
+                            {
+                                for (var row = 0; row < height; row++)
+                                {
+                                    Buffer.MemoryCopy(
+                                        src + (ulong)(stride * row),
+                                        dst + (ulong)(mapped.RowPitch * row),
+                                        rowBytes,
+                                        rowBytes);
+                                }
                             }
                         }
                     }
                 }
-                _context.Unmap(_staging, 0);
+                finally
+                {
+                    _context.Unmap(_staging, 0);
+                }
                 _context.CopyResource(_backBuffer, _staging);
                 // SyncInterval=0：立即返回不等待 vsync（vsync 阻塞会卡住 FreeRDP 事件循环线程）
                 _swapChain.Present(0, 0);

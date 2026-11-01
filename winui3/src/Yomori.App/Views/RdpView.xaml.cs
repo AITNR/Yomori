@@ -29,6 +29,7 @@ namespace Yomori.Views
         private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
         private RdpD3DRenderer? _renderer;
         private bool _d3dFailed;               // D3D 初始化失败后本实例不再重试（回退软渲染）
+        private bool _mappedCopyUnsupportedLogged; // 直填导出实调用缺失只提示一次（诊断用）
         private bool _initQueued;              // 惰性初始化已排队（防高频帧重复排队泄漏渲染器）
         private bool _renderSuspended;         // 全屏时页面内渲染器挂起，避免双路渲染
         private long _lastFrameArrivedTick;    // 最近一次 end_paint（原生线程写，帧节奏统计用）
@@ -103,6 +104,8 @@ namespace Yomori.Views
             public int BitmapHeight { get; set; }
             public System.Threading.CancellationTokenSource Cancellation { get; } = new();
             public bool IsRetired => System.Threading.Volatile.Read(ref _retired) != 0;
+
+            public bool IsRendering => System.Threading.Volatile.Read(ref _rendering) != 0;
 
             public bool TryBeginRender() =>
                 !IsRetired && System.Threading.Interlocked.CompareExchange(ref _rendering, 1, 0) == 0;
@@ -755,7 +758,9 @@ namespace Yomori.Views
         ///
         /// 早先那套「等 end_paint 静默 ≥8ms 才算一轮画完」的启发式已删除：服务器持续推帧时
         /// 它永远不成立，只会退化成「每 60ms 兜底抓一次」—— 那正是最后那点撕裂的来源之一。
-        /// 「抓到的必然是完整帧」现在由原生侧保证：ycn_rdp_copy_frame 在 g_lock 内整帧拷贝。
+        /// 「抓到的必然是完整帧」现在由原生侧保证：托管回退走 ycn_rdp_copy_frame，
+        /// D3D 直填走 ycn_rdp_copy_frame_strided，二者都在 g_lock 内拷贝稳定快照；
+        /// 直填路线还省掉了每帧一个托管 byte[] 中间缓冲。
         /// </summary>
         private void OnPresentTick(object? sender, object e)
         {
@@ -793,52 +798,120 @@ namespace Yomori.Views
             var tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
+                // 新 DLL + D3D：原生在锁内逐行直填已映射 staging，不经过托管 byte[]。
+                var directCopy = !_d3dFailed
+                    && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware
+                    && client.SupportsMappedFrameCopy;
+                if (directCopy)
+                {
+                    if (_renderer is not { Initialized: true })
+                    {
+                        // 首次接管静止桌面：只取元数据建交换链，不复制像素。
+                        if (!client.TryGetFrameInfo(out var initW, out var initH, out _))
+                        {
+                            MarkFrameUnavailable();
+                            return;
+                        }
+                        EnsureRendererOnUi(initW, initH);
+                    }
+
+                    if (_renderer is { Initialized: true } directRenderer)
+                    {
+                        var directStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                        var result = directRenderer.TryPresentFromClient(
+                            client, out var w, out var h, out var stride, out var copyTicks, out var presentTicks);
+                        if (result == RdpD3DPresentResult.Presented)
+                        {
+                            _phaseStats.RecordGrab(copyTicks, w, h, stride);
+                            _phaseStats.RecordD3D(presentTicks, w, h, stride, uploaded: true);
+                            _presentedSeq = seq;
+                            _pendingFirstFrame = false;
+                            FramesRendered++;
+                            return;
+                        }
+                        if (result == RdpD3DPresentResult.NoFrame)
+                        {
+                            // -4/-8 或分辨率竞态只丢本拍，绝不推进序号或关闭 D3D。
+                            MarkFrameUnavailable();
+                            return;
+                        }
+                        if (result == RdpD3DPresentResult.Unsupported)
+                        {
+                            // 探测说支持、实调用却缺导出：本拍直接转托管拷贝；探测缓存已降级。
+                            if (!_mappedCopyUnsupportedLogged)
+                            {
+                                _mappedCopyUnsupportedLogged = true;
+                                DiagnosticLog?.Invoke("[embed] 直填导出不可用，转托管帧拷贝");
+                            }
+                        }
+                        else
+                        {
+                            _phaseStats.RecordD3D(
+                                System.Diagnostics.Stopwatch.GetTimestamp() - directStart,
+                                w, h, stride, uploaded: false);
+                            DiagnosticLog?.Invoke($"[embed] D3D 直填失败：{directRenderer.LastError}");
+                            _d3dFailed = true;
+                            directRenderer.Dispose();
+                            _renderer = null;
+                            CreateSoftRenderState();
+                            PartFrame.Visibility = Visibility.Visible;
+                            PartPanel.Visibility = Visibility.Collapsed;
+                            PartViewbox.Visibility = Visibility.Collapsed;
+                        }
+                    }
+                }
+
+                // 软渲染同一时刻只允许一个 SetBitmapAsync 在飞。上一拍还没回来时不要白拷整帧；
+                // 它完成后会推进 _presentedSeq，届时若还有新序号，下一拍自然会再抓。
+                if ((_d3dFailed || RdpD3DRenderer.ShouldUseSoftware)
+                    && _softRenderState is { IsRendering: true })
+                {
+                    return;
+                }
+
+                // 旧 DLL、软件后端，以及直填初始化失败后的回退：保留原有托管帧路径。
                 var grabStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                var copied = client.TryCopyFrame(out var w, out var h, out var stride, out var pixels);
+                var copied = client.TryCopyFrame(out var mw, out var mh, out var mstride, out var pixels);
                 var grabTicks = System.Diagnostics.Stopwatch.GetTimestamp() - grabStart;
                 if (!copied)
                 {
-                    // ⚠️ 这里**不能**推进 _presentedSeq：会话还在 CONNECTING / 尺寸切换瞬间
-                    // 抓帧会失败，一旦推进就再也等不到这一帧了（正是切页回来黑屏的另一半原因）。
-                    if (_pendingFirstFrame && ++_pendingFirstFrameTries > PendingFirstFrameMaxTries)
-                    {
-                        _pendingFirstFrame = false; // 会话大概已断：停止空转，等下一条连接
-                    }
-                    return; // 尺寸切换瞬间等：下一拍再来
+                    MarkFrameUnavailable();
+                    return;
                 }
 
-                _phaseStats.RecordGrab(grabTicks, w, h, stride);
-                _presentedSeq = seq;
-                _pendingFirstFrame = false;
+                _phaseStats.RecordGrab(grabTicks, mw, mh, mstride);
 
                 // 渲染器是挂到「本实例的面板」上的，切页回来时新实例还没有渲染器；
                 // 上面既然已经抓到帧（拿得到真实尺寸），就地建好，不必再等下一帧触发。
                 if (_renderer is null && !_d3dFailed && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
                 {
-                    EnsureRendererOnUi(w, h);
+                    EnsureRendererOnUi(mw, mh);
                 }
 
-                if (_renderer is { Initialized: true })
+                if (_renderer is { Initialized: true } renderer)
                 {
                     var presentStart = System.Diagnostics.Stopwatch.GetTimestamp();
-                    var presented = _renderer.Present(pixels, w, h, stride);
+                    var presented = renderer.Present(pixels, mw, mh, mstride);
                     var presentTicks = System.Diagnostics.Stopwatch.GetTimestamp() - presentStart;
                     // 失败也要进 avg/max（bytes=0），否则慢失败会被成功路径采样掩盖。
-                    _phaseStats.RecordD3D(presentTicks, w, h, stride, presented);
+                    _phaseStats.RecordD3D(presentTicks, mw, mh, mstride, presented);
                     if (presented)
                     {
+                        _presentedSeq = seq;
+                        _pendingFirstFrame = false;
                         FramesRendered++;
                     }
                     else
                     {
-                        DiagnosticLog?.Invoke($"[embed] Present 失败：{_renderer.LastError}");
+                        DiagnosticLog?.Invoke($"[embed] Present 失败：{renderer.LastError}");
                         _d3dFailed = true; // 本帧起回退软渲染（renderer 失效不再重试）
-                        _renderer.Dispose();
+                        renderer.Dispose();
                         _renderer = null;
                         CreateSoftRenderState();
                         PartFrame.Visibility = Visibility.Visible;
                         PartPanel.Visibility = Visibility.Collapsed;
                         PartViewbox.Visibility = Visibility.Collapsed;
+                        MarkFrameUnavailable();
                     }
                 }
                 else if (_softRenderState is { IsRetired: false } state && state.TryBeginRender())
@@ -847,12 +920,33 @@ namespace Yomori.Views
                     // pixels 是本拍已经抓到的完整帧，直接同步 CopyFromBuffer；
                     // 旧实现会在 RenderFrameAsync 里再 TryCopyFrame 一次，等于每帧白拷一份。
                     LogRenderPathOnce("SoftwareBitmap（软渲染回退，无 D3D）");
-                    BeginSoftRender(state, _renderGeneration, pixels, w, h, stride);
+                    if (BeginSoftRender(state, _renderGeneration, seq, pixels, mw, mh, mstride))
+                    {
+                        // 同步提交已受理；只有 SetBitmapAsync 真正成功后才在
+                        // AwaitSoftRenderAsync 里推进 _presentedSeq / 清除首帧标记。
+                    }
+                    else
+                    {
+                        MarkFrameUnavailable();
+                    }
                 }
             }
             finally
             {
                 _phaseStats.RecordTick(System.Diagnostics.Stopwatch.GetTimestamp() - tickStart);
+            }
+        }
+
+        /// <summary>
+        /// 本拍没有可呈现的帧。绝不能推进 <see cref="_presentedSeq"/>：会话还在 CONNECTING /
+        /// 尺寸切换瞬间抓帧会失败，一旦推进就再也等不到这一帧了（切页回来黑屏的一半原因）。
+        /// 仅首帧等待有尝试上限，避免会话已断时无限空转。
+        /// </summary>
+        private void MarkFrameUnavailable()
+        {
+            if (_pendingFirstFrame && ++_pendingFirstFrameTries > PendingFirstFrameMaxTries)
+            {
+                _pendingFirstFrame = false;
             }
         }
 
@@ -969,7 +1063,7 @@ namespace Yomori.Views
         /// 之后只 await SetBitmapAsync。pixels（客户端复用缓冲）不会跨 await 被读取，
         /// 因此不会出现复用数组被下一拍覆盖导致的撕裂，客户端生命周期也与旧实现一致。
         /// </summary>
-        private void BeginSoftRender(SoftRenderState state, int generation, byte[] pixels, uint width, uint height, uint stride)
+        private bool BeginSoftRender(SoftRenderState state, int generation, int sequence, byte[] pixels, uint width, uint height, uint stride)
         {
             System.Threading.Interlocked.Increment(ref _renderInFlight);
             state.Enter();
@@ -1021,16 +1115,17 @@ namespace Yomori.Views
                 state.Exit();
                 state.EndRender();
                 System.Threading.Interlocked.Decrement(ref _renderInFlight);
-                return;
+                return false;
             }
 
             // operation 非空后由 AwaitSoftRenderAsync 的 finally 接管收尾（Exit/EndRender 仍各一次）。
-            _ = AwaitSoftRenderAsync(state, generation, operation);
+            _ = AwaitSoftRenderAsync(state, generation, sequence, operation);
+            return true;
         }
 
         /// <summary>等待 SetBitmapAsync 完成并收尾软渲染生命周期（与旧 RenderFrameAsync 一致）。</summary>
         private async System.Threading.Tasks.Task AwaitSoftRenderAsync(
-            SoftRenderState state, int generation, Windows.Foundation.IAsyncAction operation)
+            SoftRenderState state, int generation, int sequence, Windows.Foundation.IAsyncAction operation)
         {
             var awaitStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
@@ -1047,11 +1142,20 @@ namespace Yomori.Views
                     return;
                 }
 
+                // 只有 SetBitmapAsync 真正完成才算这一序号呈现成功；失败绝不推进，
+                // 否则会把没上屏的帧永久跳过（旧实现就在抓帧后无条件推进）。
+                _presentedSeq = sequence;
+                _pendingFirstFrame = false;
                 FramesRendered++;
             }
             catch
             {
-                // 断开取消 / 尺寸切换：丢帧即可
+                // 断开取消 / 尺寸切换：丢帧即可；同一序号下一拍仍可重试。
+                if (!state.IsRetired
+                    && generation == System.Threading.Volatile.Read(ref _renderGeneration))
+                {
+                    MarkFrameUnavailable();
+                }
             }
             finally
             {

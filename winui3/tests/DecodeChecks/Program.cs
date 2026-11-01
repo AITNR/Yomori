@@ -14,6 +14,7 @@ var tests = new (string Name, Action Run)[]
     ("connect info passes auto decode defaults", TestConnectInfoDefaults),
     ("decode status reports requested entry, not hardware success", TestDecodeStatus),
     ("frame phase stats aggregate windows and stay allocation-free", TestFramePhaseStats),
+    ("mapped frame copy status preserves safe fallback semantics", TestMappedFrameCopyStatus),
 };
 
 var failures = new List<string>();
@@ -128,6 +129,16 @@ static void TestDecodeStatus()
     Assert(status.Contains("hw_compiled=no", StringComparison.Ordinal), "does not mark hardware as compiled");
     Assert(!status.Contains("hardware active", StringComparison.OrdinalIgnoreCase),
         "does not claim successful hardware decode");
+}
+
+static void TestMappedFrameCopyStatus()
+{
+    Equal(RdpMappedFrameCopyResult.Success, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(0), "successful mapped copy");
+    Equal(RdpMappedFrameCopyResult.ResizeRequired, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(-2), "mapped copy resize");
+    Equal(RdpMappedFrameCopyResult.NoFrame, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(-4), "missing session is no-frame");
+    Equal(RdpMappedFrameCopyResult.NoFrame, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(-8), "not-connected is no-frame");
+    Equal(RdpMappedFrameCopyResult.Error, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(-1), "invalid native state is fatal-class error");
+    Equal(RdpMappedFrameCopyResult.Error, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(-99), "unknown native error is not silently ignored");
 }
 
 static void TestFramePhaseStats()

@@ -115,6 +115,8 @@ namespace Yomori.Services
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_get_muted(int session);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_grab_frame(int session, out uint out_width, out uint out_height, out uint out_stride, out IntPtr out_data);
         [DllImport(Lib, CallingConvention = CC)] internal static extern unsafe int ycn_rdp_copy_frame(int session, byte* dst, uint dst_size, out uint out_width, out uint out_height, out uint out_stride);
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_copy_frame_strided")]
+        internal static extern unsafe int ycn_rdp_copy_frame_strided(int session, byte* dst, uint dst_size, uint dst_stride, out uint out_width, out uint out_height, out uint out_stride);
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_last_error(int session, [Out] byte[] buf, UIntPtr buflen);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_gfx_state(int session, out uint out_dvc_count);
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_dvc_names(int session, [Out] byte[] buf, UIntPtr buflen);
@@ -128,6 +130,65 @@ namespace Yomori.Services
         private static bool s_decodeProbeDone;
         private static uint s_decodeApiVersion;
         private static uint s_decodeCapabilities;
+        private static readonly object s_mappedCopyProbeGate = new();
+        private static bool s_mappedCopyProbeDone;
+        private static bool s_mappedCopySupported;
+
+        /// <summary>新 DLL 是否提供直接写入 D3D staging 的受控导出。结果进程级缓存。</summary>
+        internal static bool SupportsMappedFrameCopy
+        {
+            get
+            {
+                lock (s_mappedCopyProbeGate)
+                {
+                    if (!s_mappedCopyProbeDone)
+                    {
+                        var handle = IntPtr.Zero;
+                        try
+                        {
+                            // 先按 P/Invoke 同款默认搜索，再退回程序集目录；打包版与开发版都能命中。
+                            var loaded = NativeLibrary.TryLoad(Lib, out handle)
+                                         || NativeLibrary.TryLoad(
+                                             Lib,
+                                             typeof(RdpNativeInterop).Assembly,
+                                             DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.SafeDirectories,
+                                             out handle);
+                            s_mappedCopySupported = loaded
+                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_copy_frame_strided", out _);
+                        }
+                        catch (Exception ex) when (ex is DllNotFoundException
+                                                   || ex is BadImageFormatException
+                                                   || ex is ArgumentException)
+                        {
+                            s_mappedCopySupported = false;
+                        }
+                        finally
+                        {
+                            // TryLoad 成功会多持一次引用；探测完立刻平衡，避免进程寿命内挂一个句柄。
+                            if (handle != IntPtr.Zero)
+                            {
+                                NativeLibrary.Free(handle);
+                            }
+                        }
+                        s_mappedCopyProbeDone = true;
+                    }
+                    return s_mappedCopySupported;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 实调用才发现缺导出（探测与实际加载到的 DLL 不一致）时降级缓存：
+        /// 下一拍回到托管 byte[] 拷贝，而不是一直把帧丢掉。
+        /// </summary>
+        internal static void MarkMappedFrameCopyUnsupported()
+        {
+            lock (s_mappedCopyProbeGate)
+            {
+                s_mappedCopyProbeDone = true;
+                s_mappedCopySupported = false;
+            }
+        }
 
         /// <summary>
         /// 版本化连接入口是否可用。只有 API == 1 且构建同时声明 AVC 解码与真实硬件
