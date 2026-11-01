@@ -165,6 +165,15 @@ if(YCN_BUILD_DIRTY_DIAG_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(ycn_dirty_stats_tests PRIVATE /utf-8)
   add_test(NAME ycn_dirty_stats_tests COMMAND ycn_dirty_stats_tests)
+
+  # AVC444 整帧提交闸门：纯状态机，不需要服务器也不需要 D3D。
+  add_executable(ycn_avc444_gate_tests
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ycn_avc444_gate_tests.c"
+    ycn_avc444_gate.c)
+  target_include_directories(ycn_avc444_gate_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}")
+  target_compile_options(ycn_avc444_gate_tests PRIVATE /utf-8)
+  add_test(NAME ycn_avc444_gate_tests COMMAND ycn_avc444_gate_tests)
 endif()
 
 # ---- 能力信息（构建时快照，发布包和 CI 都会校验） -------------------------

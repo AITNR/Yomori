@@ -390,6 +390,17 @@ function Import-VsDevEnv {
     if ($line -match '^([^=]+)=(.*)$') {
       $name = $Matches[1]
       $value = $Matches[2]
+      if ($name -match '(?i)^path$') {
+        # 归一化：vcvars 写的是 Path，而进程里可能已有 PATH，.NET 的
+        # SetEnvironmentVariable 在 Windows 上按大小写敏感地新增条目，于是
+        # 进程环境里会同时出现 PATH/Path。MSBuild 的 CL.exe 任务把它们灌进
+        # StringDictionary 时抛 ArgumentException，cmake 只看得到
+        # "The C compiler identification is unknown"。
+        foreach ($variant in @('Path', 'PATH', 'path')) {
+          [System.Environment]::SetEnvironmentVariable($variant, $null)
+        }
+        $name = 'Path'
+      }
       Set-Item -Path ('Env:' + $name) -Value $value
     }
   }

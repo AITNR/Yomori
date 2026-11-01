@@ -1657,6 +1657,19 @@ int ycn_rdp_direct_color_test(uint32_t matrix, uint32_t range, uint32_t width, u
 	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
 }
 
+int ycn_rdp_direct_bench(uint32_t width, uint32_t height, uint32_t iterations,
+                         ycn_direct_present_result* out)
+{
+	int status;
+
+	if (!out || (out->size < sizeof(ycn_direct_present_result)))
+		return YCN_ERR_INVALID_ARG;
+	out->version = YCN_DIRECT_API_VERSION;
+	status = ycn_dp_bench(width, height, iterations, out);
+	out->version = YCN_DIRECT_API_VERSION;
+	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
+}
+
 /* ---- 诊断面包屑：**内存环形缓冲**，稳态零 I/O ----
  *
  * 🔴 纪律（2026-10-16 实测换来的，改前必读）：

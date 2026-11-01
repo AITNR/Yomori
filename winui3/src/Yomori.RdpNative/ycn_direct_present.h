@@ -144,6 +144,16 @@ int ycn_dp_present(int session, ycn_direct_present_result* out);
 int ycn_dp_color_test(uint32_t matrix, uint32_t range, uint32_t width, uint32_t height,
                       ycn_direct_color_result* out);
 
+/* Offline cost measurement: runs `iterations` real VideoProcessorBlt calls at the
+ * given size on a synthetic NV12 texture and reports the distribution in
+ * `reserved[0..2]` (nanoseconds: min / mean / p99 of the CPU submission) plus
+ * `reserved[3]` (nanoseconds of GPU time per frame, from timestamp queries) and
+ * `convert_ticks` (same GPU number in microseconds); `frames_presented` carries
+ * the iteration count. No panel, no decoder, no readback — this is exactly the
+ * GPU conversion segment of a live frame and nothing else. */
+int ycn_dp_bench(uint32_t width, uint32_t height, uint32_t iterations,
+                 ycn_direct_present_result* out);
+
 /* UI thread: drops the swap chain and unbinds it from the panel, so the managed
  * renderer can take the panel over cleanly. */
 void ycn_dp_detach(int session);

@@ -147,6 +147,13 @@ static uint64_t ycn_dp_ticks_to_us(uint64_t ticks)
 	return (ticks * 1000000ull) / (uint64_t)g_qpc_freq.QuadPart;
 }
 
+static uint64_t ycn_dp_ticks_to_ns(uint64_t ticks)
+{
+	if (g_qpc_freq.QuadPart <= 0)
+		return 0;
+	return (ticks * 1000000000ull) / (uint64_t)g_qpc_freq.QuadPart;
+}
+
 static void ycn_dp_ensure_lock(void)
 {
 	InitializeCriticalSection(&g_dp_lock);
@@ -1240,6 +1247,265 @@ done:
 		out->height = height;
 		out->last_hresult = (int32_t)hr;
 		out->stage = (status == YCN_DP_STATUS_OK) ? 0u : stage;
+	}
+	return status;
+}
+
+/* ------------------------------------------------------------ benchmark --- */
+
+static int ycn_dp_cmp_u64(const void* a, const void* b)
+{
+	const uint64_t x = *(const uint64_t*)a;
+	const uint64_t y = *(const uint64_t*)b;
+	return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+/* 量一帧真实转色（VideoProcessorBlt）在给定尺寸下要多久。
+ *
+ * 为什么单独做一个导出而不是复用 ycn_dp_present：present 需要面板、需要真实
+ * 解码纹理，而这是**离线**可测的成本项 —— 计划书要的「每帧 CPU 微秒」里，
+ * GPU 转色那一段在没有联机会话时也必须能拿到数。
+ *
+ * 只计 Blt：不含解码、不含 Present、不含拷贝回读（实时路径本身也不回读）。
+ * 结果放到 reserved[0..2]（微秒）：最小 / p50 / p99，iterations 放在
+ * frames_presented。字段复用见 ycn_direct_present.h 的说明。 */
+int ycn_dp_bench(uint32_t width, uint32_t height, uint32_t iterations,
+                 ycn_direct_present_result* out)
+{
+	ID3D11Texture2D* nv12 = NULL;
+	ID3D11Texture2D* target = NULL;
+	D3D11_TEXTURE2D_DESC desc;
+	D3D11_VIDEO_PROCESSOR_CONTENT_DESC content;
+	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC in_desc;
+	D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC out_desc;
+	D3D11_VIDEO_PROCESSOR_COLOR_SPACE in_space;
+	D3D11_VIDEO_PROCESSOR_COLOR_SPACE out_space;
+	D3D11_VIDEO_PROCESSOR_STREAM stream;
+	ID3D11VideoProcessorEnumerator* vp_enum = NULL;
+	ID3D11VideoProcessor* vp = NULL;
+	ID3D11VideoProcessorInputView* in_view = NULL;
+	ID3D11VideoProcessorOutputView* out_view = NULL;
+	D3D11_QUERY_DESC qdesc;
+	ID3D11Query* q_event = NULL;
+	uint64_t gpu_start = 0;
+	uint64_t gpu_per_frame_ns = 0;
+	char gpu_note[48];
+	uint64_t* samples = NULL;
+	uint8_t* planes = NULL;
+	size_t y_pitch, uv_offset, total;
+	int status = YCN_DP_STATUS_FAILED;
+	HRESULT hr = S_OK;
+	uint32_t i;
+
+	const uint32_t out_size = (out && (out->size >= sizeof(*out))) ? out->size : 0;
+
+	memset(gpu_note, 0, sizeof(gpu_note));
+	if (out_size)
+		memset(out, 0, sizeof(*out));
+	if (!g_device || !g_video_device || !g_video_context || !g_device)
+		return YCN_DP_STATUS_FAILED;
+	if ((width < 64) || (height < 64) || (iterations == 0) || (iterations > 10000))
+		return YCN_DP_STATUS_FAILED;
+
+	/* 尺寸对齐到偶数，NV12 的色度平面按 2 采样。 */
+	{
+		y_pitch = (size_t)width;
+		uv_offset = y_pitch * height;
+		total = uv_offset + y_pitch * (height / 2);
+	}
+	planes = (uint8_t*)calloc(1, total);
+	samples = (uint64_t*)calloc(iterations, sizeof(uint64_t));
+	if (!planes || !samples)
+		goto done;
+	/* 中灰：色度平面保持 128，亮度 126（limited 中灰附近），内容不影响耗时。 */
+	memset(planes, 126, uv_offset);
+	memset(planes + uv_offset, 128, total - uv_offset);
+
+	memset(&desc, 0, sizeof(desc));
+	desc.Width = width;
+	desc.Height = height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = (DXGI_FORMAT)YCN_DP_FORMAT_NV12;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	hr = g_device->lpVtbl->CreateTexture2D(g_device, &desc, NULL, &nv12);
+	if (FAILED(hr) || !nv12)
+	{
+		nv12 = NULL;
+		desc.BindFlags = D3D11_BIND_DECODER;
+		hr = g_device->lpVtbl->CreateTexture2D(g_device, &desc, NULL, &nv12);
+	}
+	if (FAILED(hr) || !nv12)
+		goto done;
+	g_context->lpVtbl->UpdateSubresource(g_context, (ID3D11Resource*)nv12, 0, NULL, planes,
+	                                    (UINT)y_pitch, (UINT)total);
+
+	memset(&desc, 0, sizeof(desc));
+	desc.Width = width;
+	desc.Height = height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	hr = g_device->lpVtbl->CreateTexture2D(g_device, &desc, NULL, &target);
+	if (FAILED(hr) || !target)
+		goto done;
+
+	memset(&content, 0, sizeof(content));
+	content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+	content.InputWidth = width;
+	content.InputHeight = height;
+	content.OutputWidth = width;
+	content.OutputHeight = height;
+	content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+	content.InputFrameRate.Numerator = 60;
+	content.InputFrameRate.Denominator = 1;
+	content.OutputFrameRate.Numerator = 60;
+	content.OutputFrameRate.Denominator = 1;
+	hr = g_video_device->lpVtbl->CreateVideoProcessorEnumerator(g_video_device, &content,
+	                                                           &vp_enum);
+	if (FAILED(hr) || !vp_enum)
+		goto done;
+	hr = g_video_device->lpVtbl->CreateVideoProcessor(g_video_device, vp_enum, 0, &vp);
+	if (FAILED(hr) || !vp)
+		goto done;
+
+	memset(&in_desc, 0, sizeof(in_desc));
+	in_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+	hr = g_video_device->lpVtbl->CreateVideoProcessorInputView(g_video_device,
+	                                                          (ID3D11Resource*)nv12, vp_enum,
+	                                                          &in_desc, &in_view);
+	if (FAILED(hr) || !in_view)
+		goto done;
+
+	memset(&out_desc, 0, sizeof(out_desc));
+	out_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+	hr = g_video_device->lpVtbl->CreateVideoProcessorOutputView(
+	    g_video_device, (ID3D11Resource*)target, vp_enum, &out_desc, &out_view);
+	if (FAILED(hr) || !out_view)
+		goto done;
+
+	memset(&in_space, 0, sizeof(in_space));
+	in_space.YCbCr_Matrix = 1; /* BT.709 */
+	in_space.Nominal_Range = 1; /* limited */
+	g_video_context->lpVtbl->VideoProcessorSetStreamColorSpace(g_video_context, vp, 0, &in_space);
+	memset(&out_space, 0, sizeof(out_space));
+	g_video_context->lpVtbl->VideoProcessorSetOutputColorSpace(g_video_context, vp, &out_space);
+	g_video_context->lpVtbl->VideoProcessorSetStreamFrameFormat(
+	    g_video_context, vp, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+	g_video_context->lpVtbl->VideoProcessorSetStreamAutoProcessingMode(g_video_context, vp, 0,
+	                                                                  FALSE);
+
+	memset(&stream, 0, sizeof(stream));
+	stream.Enable = TRUE;
+	stream.pInputSurface = in_view;
+
+	/* 预热两次：第一次 Blt 会包含驱动的管线延迟/着色器编译，不计入统计。 */
+	for (i = 0; i < 2; i++)
+	{
+		(void)g_video_context->lpVtbl->VideoProcessorBlt(g_video_context, vp, out_view, 0, 1,
+		                                                &stream);
+	}
+
+	/* 两段时间必须分开量：
+	 *   · CPU 侧 = 提交一次 Blt 的同步耗时（UI 线程每帧真正付的代价）；
+	 *   · GPU 侧 = 这批 Blt 从第一次提交到 GPU 真正跑完的墙钟时间。
+	 *
+	 * GPU 侧不用 D3D11_QUERY_TIMESTAMP：本机驱动上两个时间戳都恒为 0，
+	 * 差值看起来像「0 帧时间」，这正是上一版得出 gpu_per_frame_us=0 的原因。
+	 * EVENT 查询是驱动一等公民：End 一次，等它被 GPU 执行到，就是批次完成点。 */
+	memset(&qdesc, 0, sizeof(qdesc));
+	qdesc.Query = D3D11_QUERY_EVENT;
+	if (FAILED(g_device->lpVtbl->CreateQuery(g_device, &qdesc, &q_event)))
+		goto measure_cpu;
+
+	gpu_start = ycn_dp_now();
+measure_cpu:
+	for (i = 0; i < iterations; i++)
+	{
+		const uint64_t start = ycn_dp_now();
+		hr = g_video_context->lpVtbl->VideoProcessorBlt(g_video_context, vp, out_view, 0, 1,
+		                                               &stream);
+		samples[i] = ycn_dp_now() - start;
+		if (FAILED(hr))
+			goto done;
+	}
+
+	if (q_event)
+	{
+		UINT32 spins;
+		BOOL done_event = FALSE;
+		/* GPU 侧：End 排在所有 Blt 之后，Flush 逼驱动提交，再等它跑到。 */
+		g_context->lpVtbl->End(g_context, (ID3D11Asynchronous*)q_event);
+		g_context->lpVtbl->Flush(g_context);
+		for (spins = 0; spins < 5000; spins++)
+		{
+			/* GetData 未就绪返回 S_FALSE，不是失败码；必须判 S_OK。 */
+			if (g_context->lpVtbl->GetData(g_context, (ID3D11Asynchronous*)q_event, NULL, 0,
+			                               0) == S_OK)
+			{
+				done_event = TRUE;
+				break;
+			}
+			Sleep(1);
+		}
+		if (!done_event)
+			ycn_dp_set_text(gpu_note, sizeof(gpu_note), "gpu-timing-timeout");
+		else
+		{
+			/* 保留纳秒：1080p NV12→BGRA 每帧只有几十微秒，先除到微秒会丢精度。
+			 * reserved[3] = GPU 每帧纳秒。 */
+			const uint64_t wall = ycn_dp_now() - gpu_start;
+			const uint64_t per_frame_ns = ycn_dp_ticks_to_ns(wall) / (uint64_t)iterations;
+			gpu_per_frame_ns = per_frame_ns;
+			if (out_size)
+				out->convert_ticks = per_frame_ns / 1000ull;
+			ycn_dp_set_text(gpu_note, sizeof(gpu_note), "gpu-timing-event-ok");
+		}
+	}
+
+	qsort(samples, iterations, sizeof(uint64_t), ycn_dp_cmp_u64);
+	if (out_size)
+	{
+		uint64_t sum = 0;
+		for (i = 0; i < iterations; i++)
+			sum += samples[i];
+		/* CPU 提交耗时用纳秒：一次 Blt 提交常在 1 µs 以内，用 µs 会全是 0。 */
+		out->reserved[0] = (uint32_t)ycn_dp_ticks_to_ns(samples[0]);
+		out->reserved[1] = (uint32_t)ycn_dp_ticks_to_ns(sum / iterations);
+		out->reserved[2] = (uint32_t)ycn_dp_ticks_to_ns(samples[(iterations * 99u) / 100u]);
+		out->frames_presented = iterations;
+	}
+	status = YCN_DP_STATUS_OK;
+
+done:
+	YCN_DP_RELEASE(q_event);
+	YCN_DP_RELEASE(out_view);
+	YCN_DP_RELEASE(in_view);
+	YCN_DP_RELEASE(vp);
+	YCN_DP_RELEASE(vp_enum);
+	YCN_DP_RELEASE(target);
+	YCN_DP_RELEASE(nv12);
+	free(samples);
+	free(planes);
+
+	if (out_size)
+	{
+		out->size = out_size;
+		out->version = YCN_DP_API_VERSION;
+		out->status = (uint32_t)status;
+		out->width = width;
+		out->height = height;
+		out->converter = vp ? 1u : 0u;
+		out->dxgi_format = YCN_DP_FORMAT_NV12;
+		out->last_hresult = (int32_t)hr;
+		out->reserved[3] = (uint32_t)gpu_per_frame_ns;
+		ycn_dp_set_text(out->detail, sizeof(out->detail),
+		                (gpu_note[0] != '\0') ? gpu_note : "bench-vp-blt");
 	}
 	return status;
 }

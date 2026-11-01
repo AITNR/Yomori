@@ -675,6 +675,72 @@ def check_direct_contract(lib: ctypes.CDLL) -> dict[str, object]:
     }
 
 
+def check_direct_bench(lib: ctypes.CDLL, width: int = 1920, height: int = 1080,
+                       iterations: int = 60) -> dict[str, object]:
+    """S2/S3: per-frame GPU conversion cost, measured offline.
+
+    Runs the real VideoProcessorBlt at the requested size and reports the
+    microsecond distribution. This is the only segment of a live frame that can
+    be measured without a server and a window, so it is measured here rather
+    than being left to "we'll see when we have a session".
+    """
+    fn = getattr(lib, "ycn_rdp_direct_bench", None)
+    if fn is None:
+        raise AssertionError("bridge has no direct bench export")
+    _configure(
+        fn,
+        ctypes.c_int,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(DirectPresentResult),
+    )
+
+    info = DirectPresentResult()
+    info.size = ctypes.sizeof(DirectPresentResult)
+    rc = int(fn(width, height, iterations, ctypes.byref(info)))
+    if rc != 0 or info.status != 0:
+        raise AssertionError(
+            f"direct bench failed at {width}x{height}: rc={rc} status={info.status} "
+            f"hr=0x{info.last_hresult & 0xFFFFFFFF:08X}"
+        )
+    if info.frames_presented != iterations:
+        raise AssertionError(
+            f"direct bench reported {info.frames_presented} iterations, expected {iterations}"
+        )
+
+    minimum, mean, p99 = (int(info.reserved[i]) for i in range(3))
+    # min 允许为 0：QPC 在本机是 10 MHz（100 ns 一格），一次 Blt 提交可能落在
+    # 同一格里。判据只能落在统计量上 —— mean/p99 必须为正且有序。
+    if mean <= 0:
+        raise AssertionError(f"direct bench produced zero mean submit time: {minimum}/{mean}/{p99}")
+    if p99 < mean:
+        raise AssertionError(f"direct bench distribution is inverted: min={minimum} mean={mean} p99={p99}")
+
+    gpu_ns = int(info.reserved[3])
+    # GPU 侧必须是真实测量值：0 means the timestamp queries never landed
+    # (missing Flush / disjoint / timeout), and a report built on 0 is worthless.
+    if gpu_ns <= 0:
+        raise AssertionError(
+            f"direct bench produced no GPU timing: detail={info.detail!r} "
+            f"convert_ticks={int(info.convert_ticks)}"
+        )
+
+    return {
+        "width": width,
+        "height": height,
+        "iterations": iterations,
+        # CPU 侧：提交一次 VideoProcessorBlt 的同步耗时（纳秒）。
+        "submit_min_ns": minimum,
+        "submit_mean_ns": mean,
+        "submit_p99_ns": p99,
+        # GPU 侧：这批 Blt 在 GPU 上跑完的每帧时间。
+        "gpu_per_frame_us": int(info.convert_ticks),
+        "gpu_per_frame_ns": gpu_ns,
+        "gpu_note": info.detail.decode("utf-8", "replace") if isinstance(info.detail, (bytes, bytearray)) else str(info.detail),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dll", type=Path, help="path to ycn_rdp.dll")
@@ -722,6 +788,8 @@ def main() -> int:
             result["direct_surface"] = check_direct_surface(lib)
             result["direct_color"] = check_direct_color(lib)
             result["direct_contract"] = check_direct_contract(lib)
+            if hasattr(lib, "ycn_rdp_direct_bench"):
+                result["direct_bench"] = check_direct_bench(lib)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

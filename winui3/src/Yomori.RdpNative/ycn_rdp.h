@@ -254,6 +254,12 @@ YCN_API int ycn_rdp_direct_present(int session, ycn_direct_present_result* out);
 YCN_API int ycn_rdp_direct_color_test(uint32_t matrix, uint32_t range, uint32_t width,
                                       uint32_t height, ycn_direct_color_result* out);
 
+/* 成本测量：在给定尺寸上跑 iterations 次真实 VideoProcessorBlt，把 µs 分布放在
+ * out->reserved[0..2]（最小 / 均值 / p99），iterations 放在 frames_presented。
+ * 不需要会话与面板 —— 计划书要的「每帧 GPU 转色耗时」可以离线取数。 */
+YCN_API int ycn_rdp_direct_bench(uint32_t width, uint32_t height, uint32_t iterations,
+                                 ycn_direct_present_result* out);
+
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);
 
