@@ -354,6 +354,51 @@ namespace Yomori.Services
             return true;
         }
 
+        internal bool SupportsDirtyFrameCopy => RdpNativeInterop.SupportsDirtyApi;
+
+        internal bool AttachDirtyRenderer(ulong token)
+        {
+            if (!SupportsDirtyFrameCopy || token == 0) return false;
+            try { return RdpNativeInterop.ycn_rdp_dirty_attach(_session, token) == 0; }
+            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException) { return false; }
+        }
+
+        internal void DetachDirtyRenderer(ulong token)
+        {
+            if (token == 0 || !SupportsDirtyFrameCopy) return;
+            try { RdpNativeInterop.ycn_rdp_dirty_detach(_session, token); }
+            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException) { }
+        }
+
+        internal unsafe int CopyPendingDirty(
+            ulong token, IntPtr destination, uint destinationSize, uint destinationStride,
+            out RdpNativeInterop.YcnDirtyFrameInfo info,
+            Span<RdpNativeInterop.YcnDirtyRect> rects)
+        {
+            info = default;
+            if (!SupportsDirtyFrameCopy || token == 0 || destination == IntPtr.Zero)
+                return -1;
+            fixed (RdpNativeInterop.YcnDirtyRect* rectPtr = rects)
+            {
+                try
+                {
+                    return RdpNativeInterop.ycn_rdp_dirty_copy_pending(
+                        _session, token, (byte*)destination, destinationSize,
+                        destinationStride, out info, rectPtr, (uint)rects.Length);
+                }
+                catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException)
+                {
+                    return -1;
+                }
+            }
+        }
+
+        internal bool AckDirtyFrame(ulong token, ulong sequence)
+        {
+            if (token == 0 || !SupportsDirtyFrameCopy) return false;
+            try { return RdpNativeInterop.ycn_rdp_dirty_ack(_session, token, sequence) == 0; }
+            catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException) { return false; }
+        }
         internal bool SupportsMappedFrameCopy => RdpNativeInterop.SupportsMappedFrameCopy;
 
         /// <summary>只读取当前帧元数据，不复制像素。供 D3D 首次初始化与旧路径降级使用。</summary>

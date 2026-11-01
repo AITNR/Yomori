@@ -332,6 +332,7 @@ namespace Yomori.Views
             }
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
+            if (_client is not null) _renderer?.DetachDirtyClient(_client);
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -373,6 +374,7 @@ namespace Yomori.Views
             _client = null;
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
+            if (_client is not null) _renderer?.DetachDirtyClient(_client);
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -798,7 +800,31 @@ namespace Yomori.Views
             var tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                // 新 DLL + D3D：原生在锁内逐行直填已映射 staging，不经过托管 byte[]。
+                if (!_d3dFailed && !RdpD3DRenderer.ShouldUseSoftware && client.SupportsDirtyFrameCopy)
+                {
+                    if (_renderer is not { Initialized: true })
+                    {
+                        if (!client.TryGetFrameInfo(out var initW, out var initH, out _)) { MarkFrameUnavailable(); return; }
+                        EnsureRendererOnUi(initW, initH);
+                    }
+                    if (_renderer is { Initialized: true } dirtyRenderer && dirtyRenderer.AttachDirtyClient(client))
+                    {
+                        var dirtyStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                        var dirtyOk = dirtyRenderer.TryPresentDirty(client, out var dw, out var dh, out var ds, out var dirtyCopyTicks, out var dirtyPresentTicks);
+                        if (dirtyOk)
+                        {
+                            _phaseStats.RecordGrab(dirtyCopyTicks, dw, dh, ds);
+                            _phaseStats.RecordD3D(dirtyPresentTicks, dw, dh, ds, uploaded: true);
+                            _presentedSeq = seq;
+                            _pendingFirstFrame = false;
+                            FramesRendered++;
+                            return;
+                        }
+
+                        DiagnosticLog?.Invoke($"[embed] dirty D3D path unavailable, falling back to full frame: {dirtyRenderer.LastError}");
+                        dirtyRenderer.DetachDirtyClient(client);
+                    }
+                }
                 var directCopy = !_d3dFailed
                     && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware
                     && client.SupportsMappedFrameCopy;

@@ -92,6 +92,13 @@ namespace Yomori.Services
         private ID3D11DeviceContext? _context;
         private IDXGISwapChain1? _swapChain;
         private ID3D11Texture2D? _staging;
+        private ID3D11Texture2D? _frameTexture;
+        private bool _frameTextureValid;
+        private bool _dirtyAttachAttempted;
+        private bool _dirtyAttached;
+        private ulong _dirtyToken;
+        private static long s_dirtyTokenSource;
+        private readonly RdpNativeInterop.YcnDirtyRect[] _dirtyRects = new RdpNativeInterop.YcnDirtyRect[2048];
         private ID3D11Texture2D? _backBuffer;
         private Microsoft.UI.Xaml.Controls.SwapChainPanel? _panel;
         private IntPtr _panelPtr;                 // SwapChainPanel 原生指针（SetCompositionScale 用）
@@ -176,6 +183,7 @@ namespace Yomori.Services
                 SetPanelSwapChain(_swapChain.NativePointer);
 
                 CreateStaging();
+                CreateFrameTexture();
                 _backBuffer = _swapChain.GetBuffer<ID3D11Texture2D>(0);
                 if (!Initialized) { System.Threading.Interlocked.Increment(ref _liveRenderers); }
                 Initialized = true;
@@ -226,7 +234,102 @@ namespace Yomori.Services
             });
         }
 
-        /// <summary>远端分辨率变化：重建交换链与 staging（同尺寸原则）。
+        private void CreateFrameTexture()
+        {
+            _frameTexture?.Dispose();
+            _frameTexture = _device!.CreateTexture2D(new Texture2DDescription
+            {
+                Width = _remoteWidth, Height = _remoteHeight, MipLevels = 1, ArraySize = 1,
+                Format = Format.B8G8R8A8_UNorm, SampleDescription = new SampleDescription(1, 0),
+                Usage = ResourceUsage.Default, BindFlags = BindFlags.None, CPUAccessFlags = CpuAccessFlags.None,
+                MiscFlags = ResourceOptionFlags.None,
+            });
+            _frameTextureValid = false;
+        }
+
+        internal bool AttachDirtyClient(RdpEmbeddedClient client)
+        {
+            lock (_gate)
+            {
+                if (_dirtyAttached) return true;
+                if (_dirtyAttachAttempted) return false;
+                if (!client.SupportsDirtyFrameCopy) return false;
+                var token = unchecked((ulong)System.Threading.Interlocked.Increment(ref s_dirtyTokenSource));
+                if (token == 0) token = unchecked((ulong)System.Threading.Interlocked.Increment(ref s_dirtyTokenSource));
+                if (!client.AttachDirtyRenderer(token)) return false;
+                _dirtyAttachAttempted = true;
+                _dirtyToken = token;
+                _dirtyAttached = true;
+                return true;
+            }
+        }
+
+        internal void DetachDirtyClient(RdpEmbeddedClient client)
+        {
+            lock (_gate)
+            {
+                if (_dirtyAttached) client.DetachDirtyRenderer(_dirtyToken);
+                _dirtyAttached = false;
+                _dirtyAttachAttempted = false;
+                _dirtyToken = 0;
+            }
+        }
+
+        internal bool TryPresentDirty(RdpEmbeddedClient client, out uint width, out uint height, out uint stride, out long copyTicks, out long presentTicks)
+        {
+            lock (_gate) return TryPresentDirtyLocked(client, out width, out height, out stride, out copyTicks, out presentTicks);
+        }
+
+        private bool TryPresentDirtyLocked(RdpEmbeddedClient client, out uint width, out uint height, out uint stride, out long copyTicks, out long presentTicks)
+        {
+            width = height = stride = 0; copyTicks = presentTicks = 0;
+            if (!_dirtyAttached || !Initialized || _frameTexture is null || _staging is null || _backBuffer is null || _context is null) return false;
+            var start = System.Diagnostics.Stopwatch.GetTimestamp();
+            var mapped = false;
+            try
+            {
+                var map = _context.Map(_staging, 0, MapMode.Write, Vortice.Direct3D11.MapFlags.None);
+                mapped = true;
+                var capacity64 = (ulong)(uint)map.RowPitch * _remoteHeight;
+                if (capacity64 == 0 || capacity64 > uint.MaxValue) throw new InvalidOperationException("staging capacity overflow");
+                var rc = client.CopyPendingDirty(_dirtyToken, map.DataPointer, (uint)capacity64, (uint)map.RowPitch, out var info, _dirtyRects);
+                copyTicks = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+                if (rc != 0) { LastError = $"dirty copy failed: {rc}"; _frameTextureValid = false; return false; }
+                width = info.Width; height = info.Height; stride = info.Stride;
+                if (info.ApiVersion != 1 || info.Token != _dirtyToken || info.RectCount > _dirtyRects.Length || width == 0 || height == 0) { LastError = "invalid dirty frame info"; _frameTextureValid = false; return false; }
+                if (width != _remoteWidth || height != _remoteHeight) { _context.Unmap(_staging, 0); mapped = false; if (!ResizeRemoteLocked(width,height)) throw new InvalidOperationException("dirty resize failed"); _frameTextureValid=false; return false; }
+                if (info.Kind == RdpNativeInterop.DirtyKindEmpty) { _context.Unmap(_staging,0); mapped=false; return true; }
+                _context.Unmap(_staging,0); mapped=false;
+                if (info.Kind == RdpNativeInterop.DirtyKindFull)
+                {
+                    _context.CopyResource(_frameTexture, _staging);
+                    _frameTextureValid = true;
+                }
+                else if (!_frameTextureValid)
+                {
+                    LastError = "dirty texture invalid without FULL snapshot";
+                    return false;
+                }
+                else if (info.Kind == RdpNativeInterop.DirtyKindBoxes)
+                {
+                    for (uint i=0;i<info.RectCount;i++)
+                    {
+                        var b=_dirtyRects[i];
+                        var box=new Vortice.Mathematics.Box(b.X,b.Y,0,b.X+(int)b.W,b.Y+(int)b.H,1);
+                        _context.CopySubresourceRegion(_frameTexture,0,(uint)b.X,(uint)b.Y,0,_staging,0,box);
+                    }
+                }
+                else { LastError="unknown dirty frame kind"; _frameTextureValid=false; return false; }
+                _context.CopyResource(_backBuffer,_frameTexture);
+                _swapChain!.Present(0,0);
+                if (client.AckDirtyFrame(_dirtyToken,info.Seq)) { presentTicks=System.Diagnostics.Stopwatch.GetTimestamp()-start; return true; }
+                LastError="dirty frame ack rejected"; _frameTextureValid=false; return false;
+            }
+            catch(Exception ex) { LastError="dirty D3D failure: "+ex.Message; _frameTextureValid=false; return false; }
+            finally { if(mapped) { try{_context.Unmap(_staging,0);}catch(Exception ex){LastError="Unmap: "+ex.Message;} } }
+        }
+
+        /// <summary>远端分辨率变化：重建交换链、staging 与持久帧纹理（同尺寸原则）。
         /// ⚠️ 必须在 UI 线程调（会重建 D3D 资源）。锁是 Monitor（可重入），
         /// 因为 Present 在尺寸不一致时会调用本方法。</summary>
         public bool ResizeRemote(uint width, uint height)
@@ -251,6 +354,7 @@ namespace Yomori.Services
                 _remoteWidth = width;
                 _remoteHeight = height;
                 CreateStaging();
+                CreateFrameTexture();
                 _backBuffer = _swapChain.GetBuffer<ID3D11Texture2D>(0);
                 return true;
             }
@@ -475,6 +579,7 @@ namespace Yomori.Services
         {
             lock (_gate)
             {
+                if (_dirtyAttached) { _frameTextureValid = false; }
                 if (Initialized) { System.Threading.Interlocked.Decrement(ref _liveRenderers); }
                 Initialized = false;
                 try { SetPanelSwapChain(IntPtr.Zero); }
@@ -485,11 +590,14 @@ namespace Yomori.Services
                     _panel = null;
                 }
                 _staging?.Dispose();
+                _frameTexture?.Dispose();
                 _backBuffer?.Dispose();
                 _swapChain?.Dispose();
                 _context?.Dispose();
                 _device?.Dispose();
                 _staging = null;
+                _frameTexture = null;
+                _frameTextureValid = false;
                 _backBuffer = null;
                 _swapChain = null;
                 _context = null;

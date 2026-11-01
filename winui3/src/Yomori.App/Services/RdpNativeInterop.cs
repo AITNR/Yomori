@@ -117,6 +117,11 @@ namespace Yomori.Services
         [DllImport(Lib, CallingConvention = CC)] internal static extern unsafe int ycn_rdp_copy_frame(int session, byte* dst, uint dst_size, out uint out_width, out uint out_height, out uint out_stride);
         [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_copy_frame_strided")]
         internal static extern unsafe int ycn_rdp_copy_frame_strided(int session, byte* dst, uint dst_size, uint dst_stride, out uint out_width, out uint out_height, out uint out_stride);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern uint ycn_rdp_dirty_api_version();
+        [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_dirty_attach(int session, ulong token);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_dirty_detach(int session, ulong token);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern unsafe int ycn_rdp_dirty_copy_pending(int session, ulong token, byte* dst, uint dst_size, uint dst_stride, out YcnDirtyFrameInfo info, YcnDirtyRect* rects, uint rect_capacity);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_dirty_ack(int session, ulong token, ulong seq);
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_last_error(int session, [Out] byte[] buf, UIntPtr buflen);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_gfx_state(int session, out uint out_dvc_count);
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_dvc_names(int session, [Out] byte[] buf, UIntPtr buflen);
@@ -130,6 +135,60 @@ namespace Yomori.Services
         private static bool s_decodeProbeDone;
         private static uint s_decodeApiVersion;
         private static uint s_decodeCapabilities;
+        [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    public struct YcnDirtyRect
+        {
+            public int X;
+            public int Y;
+            public uint W;
+            public uint H;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    public struct YcnDirtyFrameInfo
+        {
+            public uint ApiVersion;
+            public uint Width;
+            public uint Height;
+            public uint Stride;
+            public uint Kind;
+            public uint RectCount;
+            public ulong Seq;
+            public ulong Token;
+        }
+
+        internal const uint DirtyKindEmpty = 0;
+        internal const uint DirtyKindBoxes = 1;
+        internal const uint DirtyKindFull = 2;
+        private const uint DirtyApiVersion = 1;
+        private static readonly object s_dirtyProbeGate = new();
+        private static bool s_dirtyProbeDone;
+        private static bool s_dirtySupported;
+        internal static bool SupportsDirtyApi
+        {
+            get
+            {
+                lock (s_dirtyProbeGate)
+                {
+                    if (!s_dirtyProbeDone)
+                    {
+                        try { s_dirtySupported = ycn_rdp_dirty_api_version() == DirtyApiVersion; }
+                        catch (Exception ex) when (ex is EntryPointNotFoundException || ex is DllNotFoundException || ex is BadImageFormatException)
+                        { s_dirtySupported = false; }
+                        s_dirtyProbeDone = true;
+                    }
+                    return s_dirtySupported;
+                }
+            }
+        }
+        internal static void DisableDirtyApi()
+        {
+            lock (s_dirtyProbeGate)
+            {
+                s_dirtyProbeDone = true;
+                s_dirtySupported = false;
+            }
+        }
         private static readonly object s_mappedCopyProbeGate = new();
         private static bool s_mappedCopyProbeDone;
         private static bool s_mappedCopySupported;

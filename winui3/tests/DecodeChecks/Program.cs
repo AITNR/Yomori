@@ -15,6 +15,7 @@ var tests = new (string Name, Action Run)[]
     ("decode status reports requested entry, not hardware success", TestDecodeStatus),
     ("frame phase stats aggregate windows and stay allocation-free", TestFramePhaseStats),
     ("mapped frame copy status preserves safe fallback semantics", TestMappedFrameCopyStatus),
+    ("dirty frame ABI layout and constants", TestDirtyFrameAbi),
 };
 
 var failures = new List<string>();
@@ -131,6 +132,14 @@ static void TestDecodeStatus()
         "does not claim successful hardware decode");
 }
 
+static void TestDirtyFrameAbi()
+{
+    Equal(16, System.Runtime.InteropServices.Marshal.SizeOf<RdpNativeInterop.YcnDirtyRect>(), "dirty rect ABI size");
+    Equal(40, System.Runtime.InteropServices.Marshal.SizeOf<RdpNativeInterop.YcnDirtyFrameInfo>(), "dirty info ABI size");
+    Equal(0u, RdpNativeInterop.DirtyKindEmpty, "dirty empty kind");
+    Equal(1u, RdpNativeInterop.DirtyKindBoxes, "dirty boxes kind");
+    Equal(2u, RdpNativeInterop.DirtyKindFull, "dirty full kind");
+}
 static void TestMappedFrameCopyStatus()
 {
     Equal(RdpMappedFrameCopyResult.Success, RdpEmbeddedClient.ClassifyMappedFrameCopyResult(0), "successful mapped copy");
