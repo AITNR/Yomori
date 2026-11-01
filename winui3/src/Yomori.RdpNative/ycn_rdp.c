@@ -15,6 +15,7 @@
  * ============================================================ */
 #include "ycn_rdp.h"
 #include "ycn_dirty_diag.h"
+#include "ycn_dirty_snapshot.h"
 
 /* WIN32_LEAN_AND_MEAN 必须定义：否则 windows.h 引入 shellapi.h，其 NIIF_* 宏
  * 会与 freerdp rail.h 的 NIIF 枚举冲突（C2059）。spike 已踩过 */
@@ -123,6 +124,8 @@ typedef struct
 	uint32_t frame_stride;
 	uint32_t frame_capacity;
 	BOOL frame_valid;
+	BOOL frame_snapshot_complete;       /* last EndPaint fully applied to frame */
+	volatile LONG dirty_force_full;     /* next EndPaint must take the full-copy path */
 
 	char last_error[YCN_ERRBUF_LEN];
 	pEndPaint orig_end_paint;   /* gdi 原生 EndPaint（per-session，多会话不冲突） */
@@ -224,6 +227,11 @@ typedef struct
 	uint64_t copy_frame_bytes;
 	uint64_t copy_frame_ticks;
 	YcnDirtyDiagAggregate dirty_diag; /* g_lock protected; read-only invalid-rect diagnostics */
+	YcnDirtySnapshot dirty_snapshot;  /* bounded EndPaint batch; no per-frame allocation */
+	uint64_t endpaint_dirty_count;
+	uint64_t endpaint_full_count;
+	uint64_t endpaint_dirty_fallback_count;
+	uint64_t endpaint_dirty_merged_count;
 
 	/* 解码策略与真实诊断（g_lock 保护；稳定路径零 I/O）。 */
 	uint32_t decode_request_policy;
@@ -582,15 +590,17 @@ static void ycn_abandon_connect(YcnSession* s, freerdp* instance, HANDLE stop_ev
 
 /* ---------------- 帧回调链（gdi EndPaint 铩） ---------------- */
 
-/* 只读采集当前 EndPaint 批次的 invalid 矩形。
+/* 采集当前 EndPaint 批次，同时生成只读诊断和 bounded dirty snapshot。
  *
  * 调用上下文：FreeRDP 事件线程的 ycn_end_paint 回调内。update_end_paint()
  * 此时仍持有 update 锁，begin_paint() 已在同一线程清空批列表；因此这些公开
- * GDI 字段在本调用期间稳定。这里不持有 g_lock 遍历矩形，采集完成后由调用方
- * 在 g_lock 内合并，避免把列表遍历的耗时扩散到 UI/diag 线程。
+ * GDI 字段在本调用期间稳定。这里不持有 g_lock 遍历矩形。
  *
- * 任何无法证明安全的状态只计数并标记 full fallback，绝不遍历未知容量。 */
-static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
+ * dirty snapshot 只使用本批次公开的 GDI invalid 列表，不缓存或推断 GFX
+ * surface 生命周期。任何无法证明安全的状态都标记 full fallback，绝不遍历
+ * 未知容量。 */
+static void ycn_capture_dirty_batch(const rdpGdi* gdi, YcnDirtyDiagBatch* batch,
+                                    YcnDirtySnapshot* snapshot, uint32_t force_full)
 {
 	const GDI_WND* hwnd;
 	const GDI_RGN* invalid;
@@ -600,15 +610,18 @@ static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
 	uint32_t i;
 	uint32_t bad_capacity = 0;
 
-	if (!batch)
+	if (!batch || !snapshot)
 		return;
 
 	ycn_dirty_diag_batch_init(batch, gdi ? gdi->width : 0,
 	                          gdi ? gdi->height : 0, 0u);
+	ycn_dirty_snapshot_init(snapshot, gdi ? gdi->width : 0,
+	                        gdi ? gdi->height : 0, force_full);
 
 	if (!gdi || !gdi->primary || !gdi->primary->hdc)
 	{
 		batch->list_missing = 1u;
+		snapshot->full_required = 1u;
 		return;
 	}
 
@@ -616,6 +629,7 @@ static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
 	if (!hwnd)
 	{
 		batch->list_missing = 1u;
+		snapshot->full_required = 1u;
 		return;
 	}
 
@@ -623,6 +637,7 @@ static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
 	if (!invalid)
 	{
 		batch->list_missing = 1u;
+		snapshot->full_required = 1u;
 		return;
 	}
 
@@ -631,13 +646,14 @@ static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
 	if (hwnd->ninvalid < 0)
 	{
 		batch->bad_capacity = 1u;
+		snapshot->full_required = 1u;
 		return;
 	}
 
 	ninvalid = (uint32_t)hwnd->ninvalid;
 	capacity = hwnd->count;
 
-	if (capacity == 0u || capacity > YCN_DIRTY_DIAG_MAX_RECTS ||
+	if (capacity == 0u || capacity > YCN_DIRTY_SNAPSHOT_MAX_GDI_CAPACITY ||
 	    ninvalid > capacity)
 		bad_capacity = 1u;
 	if (capacity > 0u && !hwnd->cinvalid)
@@ -650,12 +666,16 @@ static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
 	if (bad_capacity)
 	{
 		batch->bad_capacity = 1u;
+		snapshot->full_required = 1u;
 		return;
 	}
 
 	rects = hwnd->cinvalid;
 	if (!rects)
+	{
+		ycn_dirty_snapshot_finish(snapshot);
 		return;
+	}
 
 	for (i = 0; i < ninvalid; i++)
 	{
@@ -665,7 +685,10 @@ static void ycn_capture_dirty_diag(const rdpGdi* gdi, YcnDirtyDiagBatch* batch)
 		rect.w = rects[i].w;
 		rect.h = rects[i].h;
 		ycn_dirty_diag_batch_add_rect(batch, &rect);
+		ycn_dirty_snapshot_add_rect(snapshot, rect.x, rect.y, rect.w, rect.h);
 	}
+
+	ycn_dirty_snapshot_finish(snapshot);
 }
 
 static BOOL ycn_end_paint(rdpContext* context)
@@ -674,9 +697,10 @@ static BOOL ycn_end_paint(rdpContext* context)
 	rdpGdi* gdi;
 	YcnDirtyDiagBatch dirty;
 	BOOL orig_ok = TRUE;
+	uint32_t force_full = 0;
 	int i;
 
-	/* 线性查 session（最多 4 个）；先调 gdi 原生 EndPaint 再拷帧 */
+	/* 线性查 session（最多 8 个）；先调 gdi 原生 EndPaint 再拷帧。 */
 	EnterCriticalSection(&g_lock);
 	for (i = 0; i < YCN_MAX_SESSIONS; i++)
 	{
@@ -689,6 +713,8 @@ static BOOL ycn_end_paint(rdpContext* context)
 	}
 	LeaveCriticalSection(&g_lock);
 
+	if (s)
+		force_full = InterlockedCompareExchange(&s->dirty_force_full, 0, 0) ? 1u : 0u;
 	if (s && s->orig_end_paint)
 		orig_ok = s->orig_end_paint(context);
 
@@ -697,33 +723,38 @@ static BOOL ycn_end_paint(rdpContext* context)
 
 	gdi = s->instance->context->gdi;
 
-	/* 仅诊断：在任何复制/返回分支之前采集本批次 invalid 矩形。 */
-	ycn_capture_dirty_diag(gdi, &dirty);
+	/* 同一批次只遍历一次公开 invalid 列表，同时供诊断和 dirty 复制使用。 */
+	ycn_capture_dirty_batch(gdi, &dirty, &s->dirty_snapshot, force_full);
 
 	if (!orig_ok || !gdi->primary_buffer || gdi->width <= 0 || gdi->height <= 0)
 	{
 		EnterCriticalSection(&g_lock);
 		ycn_dirty_diag_commit(&s->dirty_diag, &dirty);
+		InterlockedExchange(&s->dirty_force_full, 1);
 		LeaveCriticalSection(&g_lock);
 		return orig_ok;
 	}
 
-	/* 拷贝到会话帧缓冲（BGRA32）。容量不足才 realloc；失败时保留上一帧。 */
+	/* 拷贝到会话帧缓冲（BGRA32）。dirty 路径只更新本批次矩形；任何不确定
+	 * 条件都在同一 EndPaint 内退回原来的整帧复制。 */
 	EnterCriticalSection(&g_lock);
 	ycn_dirty_diag_commit(&s->dirty_diag, &dirty);
+	if (InterlockedCompareExchange(&s->dirty_force_full, 0, 0))
+		s->dirty_snapshot.full_required = 1u;
 	{
 		const uint32_t width = (uint32_t)gdi->width;
 		const uint32_t height = (uint32_t)gdi->height;
 		uint32_t row_bytes;
 		uint32_t stride;
 		BOOL copied = FALSE;
+		BOOL use_full = FALSE;
 
 		if (width == 0 || width > UINT32_MAX / 4u)
-			goto end_paint_unlock;
+			goto end_paint_break_snapshot;
 		row_bytes = width * 4u;
 		stride = (uint32_t)gdi->stride > 0 ? (uint32_t)gdi->stride : row_bytes;
 		if (stride < row_bytes || height > UINT32_MAX / stride)
-			goto end_paint_unlock;
+			goto end_paint_break_snapshot;
 
 		{
 			const uint32_t need = stride * height;
@@ -731,38 +762,72 @@ static BOOL ycn_end_paint(rdpContext* context)
 			{
 				uint8_t* nb = (uint8_t*)realloc(s->frame, (size_t)need);
 				if (!nb)
-					goto end_paint_unlock;
+					goto end_paint_break_snapshot;
 				s->frame = nb;
 				s->frame_capacity = need;
 			}
 
-			if (stride == row_bytes)
+			use_full = s->dirty_snapshot.full_required ||
+			           !s->frame_snapshot_complete || s->frame_width != width ||
+			           s->frame_height != height || s->frame_stride != stride;
 			{
 				const uint64_t t0 = ycn_qpc_now();
-				memcpy(s->frame, gdi->primary_buffer, (size_t)need);
-				const uint64_t t1 = ycn_qpc_now();
-				s->endpaint_memcpy_ticks += t1 - t0;
-			}
-			else
-			{
-				uint32_t row;
-				const uint64_t t0 = ycn_qpc_now();
-				for (row = 0; row < height; row++)
+				uint64_t copied_bytes = 0;
+
+				if (!use_full &&
+				    ycn_dirty_snapshot_copy_rects(&s->dirty_snapshot,
+				                                  gdi->primary_buffer, need, stride,
+				                                  s->frame, s->frame_capacity, stride) != 0)
 				{
-					memcpy(s->frame + (size_t)row * stride,
-					       gdi->primary_buffer + (size_t)row * stride, row_bytes);
+					use_full = TRUE;
+					s->endpaint_dirty_fallback_count++;
 				}
-				const uint64_t t1 = ycn_qpc_now();
-				s->endpaint_memcpy_ticks += t1 - t0;
+
+				if (use_full)
+				{
+					if (stride == row_bytes)
+					{
+						memcpy(s->frame, gdi->primary_buffer, (size_t)need);
+					}
+					else
+					{
+						uint32_t row;
+						for (row = 0; row < height; row++)
+						{
+							memcpy(s->frame + (size_t)row * stride,
+							       gdi->primary_buffer + (size_t)row * stride,
+							       row_bytes);
+						}
+					}
+					copied_bytes = (uint64_t)row_bytes * height;
+					s->endpaint_full_count++;
+				}
+				else
+				{
+					copied_bytes = s->dirty_snapshot.copy_area * 4u;
+					s->endpaint_dirty_count++;
+					if (s->dirty_snapshot.merged)
+						s->endpaint_dirty_merged_count++;
+				}
+
+				s->endpaint_memcpy_ticks += ycn_qpc_now() - t0;
+				s->frame_width = width;
+				s->frame_height = height;
+				s->frame_stride = stride;
+				s->frame_valid = TRUE;
+				s->frame_snapshot_complete = TRUE;
+				InterlockedExchange(&s->dirty_force_full, 0);
+				s->endpaint_memcpy_count++;
+				s->endpaint_memcpy_bytes += copied_bytes;
+				copied = TRUE;
 			}
-			s->frame_width = width;
-			s->frame_height = height;
-			s->frame_stride = stride;
-			s->frame_valid = TRUE;
-			s->endpaint_memcpy_count++;
-			s->endpaint_memcpy_bytes += need;
-			copied = TRUE;
 		}
+		goto end_paint_unlock;
+
+end_paint_break_snapshot:
+		s->frame_valid = FALSE;
+		s->frame_snapshot_complete = FALSE;
+		InterlockedExchange(&s->dirty_force_full, 1);
 end_paint_unlock:
 		LeaveCriticalSection(&g_lock);
 		if (!copied)
@@ -914,6 +979,7 @@ static void ycn_request_full_refresh(YcnSession* s)
 	{
 		instance = s->instance;
 		settings = instance->context->settings;
+		InterlockedExchange(&s->dirty_force_full, 1);
 	}
 	LeaveCriticalSection(&g_lock);
 	if (!instance || !settings || !instance->context->update)
@@ -1061,10 +1127,15 @@ static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFA
 	if (probe->setThreadPolicy)
 		probe->setThreadPolicy(policy);
 	if (!orig)
+	{
+		InterlockedExchange(&s->dirty_force_full, 1);
 		return ERROR_INTERNAL_ERROR;
+	}
 
 	t0 = ycn_qpc_now();
 	rc = orig(ctx, cmd);
+	if (rc != CHANNEL_RC_OK)
+		InterlockedExchange(&s->dirty_force_full, 1);
 	{
 		const uint64_t t1 = ycn_qpc_now();
 		EnterCriticalSection(&g_lock);
@@ -1171,6 +1242,7 @@ static UINT ycn_gfx_reset_graphics(RdpgfxClientContext* ctx, const RDPGFX_RESET_
 	{
 		EnterCriticalSection(&g_lock);
 		orig = s->orig_gfx_reset;
+		InterlockedExchange(&s->dirty_force_full, 1);
 		LeaveCriticalSection(&g_lock);
 	}
 	if (orig)
@@ -3043,6 +3115,7 @@ static DWORD WINAPI event_loop(LPVOID arg)
 			    GetTickCount64() - s->connected_at >= 1500)
 			{
 				s->refresh_requested = 1;
+				InterlockedExchange(&s->dirty_force_full, 1);
 				rdpSettings* settings = instance->context->settings;
 				UINT16 desktop_w = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
 				UINT16 desktop_h = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
@@ -3073,6 +3146,8 @@ teardown:
 	s->frame = NULL;
 	s->frame_capacity = 0;
 	s->frame_valid = FALSE;
+	s->frame_snapshot_complete = FALSE;
+	InterlockedExchange(&s->dirty_force_full, 1);
 	LeaveCriticalSection(&g_lock);
 
 	/* References registered before STOPPING protect freerdp_connect/abort from
@@ -3262,6 +3337,8 @@ static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callback
 	s->gfx_codecs_null = -1;
 	s->gfx_progressive_null = -1;
 	s->frame_valid = FALSE;
+	s->frame_snapshot_complete = FALSE;
+	InterlockedExchange(&s->dirty_force_full, 1);
 	s->frame_width = 0;
 	s->frame_height = 0;
 	s->frame_stride = 0;
@@ -3787,7 +3864,7 @@ YCN_API int ycn_rdp_grab_frame(int session, uint32_t* out_width, uint32_t* out_h
 		return YCN_ERR_SESSION_NOT_FOUND;
 	}
 	if (InterlockedCompareExchange(&s->state, 0, 0) == YCN_STATE_RUNNING &&
-	    s->frame_valid && s->frame)
+	    s->frame_valid && s->frame_snapshot_complete && s->frame)
 	{
 		*out_width = s->frame_width;
 		*out_height = s->frame_height;
@@ -3818,7 +3895,8 @@ YCN_API int ycn_rdp_copy_frame(int session, uint8_t* dst, uint32_t dst_size,
 	EnterCriticalSection(&g_lock);
 	s = find_session(session);
 	if (s && InterlockedCompareExchange(&s->state, 0, 0) == YCN_STATE_RUNNING &&
-	    s->frame_valid && s->frame && s->frame_height > 0)
+	    s->frame_valid && s->frame_snapshot_complete &&
+	    s->frame && s->frame_height > 0)
 	{
 		if (out_width)
 			*out_width = s->frame_width;
@@ -3861,7 +3939,8 @@ YCN_API int ycn_rdp_copy_frame_strided(int session, uint8_t* dst, uint32_t dst_s
 	EnterCriticalSection(&g_lock);
 	s = find_session(session);
 	if (s && InterlockedCompareExchange(&s->state, 0, 0) == YCN_STATE_RUNNING &&
-	    s->frame_valid && s->frame && s->frame_width > 0 && s->frame_height > 0)
+	    s->frame_valid && s->frame_snapshot_complete &&
+	    s->frame && s->frame_width > 0 && s->frame_height > 0)
 	{
 		const uint32_t width = s->frame_width;
 		const uint32_t height = s->frame_height;
@@ -4049,6 +4128,7 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            "dirty=[paints:%llu invalid_rects:%llu max_rects:%llu empty:%llu full_fallback:%llu "
 		            "sum_area:%llu sum_pct:%.2f bbox_area:%llu bbox_pct:%.2f "
 		            "clipped_rects:%llu overflow_events:%llu bad_capacity:%llu missing:%llu] "
+		            "snapshot=[dirty:%llu full:%llu fallback:%llu merged:%llu] "
 		            "names=[%.31s]]",
 		            (unsigned long long)s->endpaint_memcpy_count,
 		            (unsigned long long)s->endpaint_memcpy_bytes,
@@ -4085,6 +4165,10 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            (unsigned long long)s->dirty_diag.overflow_events,
 		            (unsigned long long)s->dirty_diag.bad_capacity_batches,
 		            (unsigned long long)s->dirty_diag.missing_batches,
+		            (unsigned long long)s->endpaint_dirty_count,
+		            (unsigned long long)s->endpaint_full_count,
+		            (unsigned long long)s->endpaint_dirty_fallback_count,
+		            (unsigned long long)s->endpaint_dirty_merged_count,
 		            s->dvc_names);
 		strncat_s(buf, buflen, perf, _TRUNCATE);
 	}
