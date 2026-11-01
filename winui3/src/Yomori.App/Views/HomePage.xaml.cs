@@ -259,10 +259,9 @@ public sealed partial class HomePage : Page
                 return;
             }
 
-            if (DispatcherQueue.HasThreadAccess)
-            {
-                CacheBanner(path, read.Stamp, bitmap);
-            }
+            var pixelCount = await RunOnUiThreadAsync(
+                () => (long)bitmap.PixelWidth * bitmap.PixelHeight);
+            CacheBanner(path, read.Stamp, bitmap, pixelCount);
 
             ApplyBanner(bitmap, generation);
         }
@@ -336,15 +335,15 @@ public sealed partial class HomePage : Page
         throw new IOException("图片正在被其他程序修改，请稍后重试。");
     }
 
-    private static async Task<BitmapImage> DecodeBannerAsync(
+    private async Task<BitmapImage> DecodeBannerAsync(
         byte[] bytes,
         CancellationToken token)
     {
-        var bitmap = new BitmapImage
+        var bitmap = await RunOnUiThreadAsync(() => new BitmapImage
         {
             DecodePixelType = DecodePixelType.Physical,
             DecodePixelWidth = BannerDecodeWidth,
-        };
+        });
 
         using var stream = new InMemoryRandomAccessStream();
 
@@ -360,9 +359,43 @@ public sealed partial class HomePage : Page
         }
 
         stream.Seek(0);
-        await bitmap.SetSourceAsync(stream);
+        var decode = await RunOnUiThreadAsync(() => bitmap.SetSourceAsync(stream));
+        await decode;
         token.ThrowIfCancellationRequested();
         return bitmap;
+    }
+
+    private Task<T> RunOnUiThreadAsync<T>(Func<T> action)
+    {
+        if (DispatcherQueue.HasThreadAccess)
+        {
+            try
+            {
+                return Task.FromResult(action());
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<T>(ex);
+            }
+        }
+
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!DispatcherQueue.TryEnqueue(() =>
+            {
+                try
+                {
+                    completion.TrySetResult(action());
+                }
+                catch (Exception ex)
+                {
+                    completion.TrySetException(ex);
+                }
+            }))
+        {
+            completion.TrySetException(new InvalidOperationException("UI dispatcher is shutting down."));
+        }
+
+        return completion.Task;
     }
 
     private static bool TryGetCachedBanner(
@@ -403,9 +436,9 @@ public sealed partial class HomePage : Page
     private static void CacheBanner(
         string path,
         BannerFileStamp stamp,
-        BitmapImage bitmap)
+        BitmapImage bitmap,
+        long pixelCount)
     {
-        var pixelCount = (long)bitmap.PixelWidth * bitmap.PixelHeight;
         if (pixelCount <= 0 || pixelCount > BannerCachePixelBudget)
         {
             // 单张图已超出预算时宁可不留，也不把首页解码内存长期钉在进程里。
