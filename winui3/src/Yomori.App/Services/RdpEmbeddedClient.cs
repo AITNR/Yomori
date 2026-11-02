@@ -113,6 +113,15 @@ namespace Yomori.Services
         internal string? DirectPresentError { get; private set; }
         private static readonly bool s_forceSoftwareFromCommandLine = Array.Exists(
             Environment.GetCommandLineArgs(), a => a == "--embed-nod3d");
+        /// <summary>
+        /// 命令行 <c>--no-direct-present</c>：无视配置强制关掉零拷贝直显。
+        ///
+        /// 逃生口。开着直显时如果一连就崩（注入外部 D3D11 设备可能崩在显卡驱动里，
+        /// 见 2026-11-02 的 igd10um64xe 事故），用这条命令启动就能先进得来，
+        /// 再去设置里把开关关掉 —— 不必手改 config.json。
+        /// </summary>
+        private static readonly bool s_disableDirectPresentFromCommandLine = Array.Exists(
+            Environment.GetCommandLineArgs(), a => a == "--no-direct-present");
         // 最近一次「静音意图」。原生 ycn_rdp_set_muted 在会话不是 RUNNING 时**直接拒绝**，
         // 而调用方普遍在 Connect() 之前就下发（见 MainViewModel.TryStartEmbeddedConnect /
         // RdpSurfaceCell.SetClient）——那一刻 session 还是 0，必然被拒。
@@ -279,7 +288,7 @@ namespace Yomori.Services
                     _decodeBackend = DecodeBackends.Normalize(info.DecodeBackend);
                     _renderBackend = RenderBackends.Normalize(info.RenderBackend);
                     _requestedDecodePolicy = requestedPolicy;
-                    _directPresentRequested = info.DirectPresent;
+                    _directPresentRequested = info.DirectPresent && !s_disableDirectPresentFromCommandLine;
                     _decodeApiVersion = decodeApiVersion;
                     _decodeCapabilities = decodeCapabilities;
                     _usedVersionedDecodeEntry = useVersionedEntry;
