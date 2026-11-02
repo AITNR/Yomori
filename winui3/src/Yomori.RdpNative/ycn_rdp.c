@@ -379,8 +379,9 @@ static BOOL process_init(void)
  *   - THINCLIENT 在 8.1 是规范 flag，客户端的 cmdline `/gfx-progressive:off`
  *     正是用 GfxThinClient=!enable 来表达“不要 progressive”。
  *
- * 这里不设置 GfxCapsFilter，因此不会强制服务器只选 AVC；服务器仍可按 caps
- * 选择 CLEAR/PLANAR 等 non-AVC codec。
+ * GfxCapsFilter 现在**会**设置（见 ycn_apply_gfx_config 末尾）：把广告版本压到
+ * 10.0，从而让服务器发 AVC420 而不是 AVC444/v2。它只限制**版本**，不强制服务器
+ * 只选 AVC —— 服务器仍可按 caps 选 CLEAR/PLANAR 等 non-AVC codec。
  *
  * 现代 AVC 路径必须置 GfxAVC444=TRUE：FreeRDP 3.32 的 rdpgfx_main.c 只有在
  * (!GfxH264 || GfxAVC444) 时才广告 10.x；GfxH264=TRUE 且 GfxAVC444=FALSE
@@ -388,7 +389,11 @@ static BOOL process_init(void)
  * 0x03（THINCLIENT|SMALL_CACHE，无 AVC），于是实际只能走 non-AVC。
  * 注意：rdpgfx_main.c 完全不读取 GfxAVC444v2，10.7 等现代版本本身就可能让
  * 服务器选择 AVC444v2(codec 15)。因此 GfxAVC444v2=FALSE 只是设置值，
- * 不能声称“服务器不会发 15”；实际必须以 CAPSADVERTISE/CAPS确认与 codec 统计为准。 */
+ * 不能声称“服务器不会发 15”；实际必须以 CAPSADVERTISE/CAPS确认与 codec 统计为准。
+ *
+ * 2026-11-02 现场结论（决定了下面的 caps 过滤）：本机连真实主机时服务器确认 10.7，
+ * 13079 个 surface 全是 codec 15，直显因此一次都没跑起来。所以默认把广告版本压到
+ * 10.0（AVC420），靠 GfxCapsFilter 实现，不改 FreeRDP 补丁。 */
 typedef struct
 {
 	BOOL gfx_enabled;
@@ -429,14 +434,26 @@ static void ycn_calc_gfx_config(uint32_t use_gfx, uint32_t decode_policy, uint32
 
 }
 
-/* 进程级回滚诊断：命令行含 --embed-avc420-only 时只关 AVC444 广告，
- * 保留 AVC420(GfxH264)。不改 config、不改导出 ABI；便于失败时 A/B 对照。
- * 只解析本进程命令行一次。 */
-static BOOL ycn_avc420_only_requested(void)
+/* GfxCapsFilter 是**按 rdpgfx_main.c 的 capList 顺序**的位掩码，置位 = 不广告。
+ * 未编入 WITH_GFX_AV1 / WITH_GFX_AZURE 时该表共 11 项：
+ *   bit0=8  bit1=81  bit2=10  bit3=101 bit4=102 bit5=103
+ *   bit6=104 bit7=105 bit8=106 bit9=106_ERR bit10=107
+ * 本机构建就是这一版（日志 adv n=11 可验）。过滤 101..107 后只剩 8 / 81 / 10。 */
+#define YCN_GFX_CAPS_FILTER_AVC420_ONLY 0x000007F8u
+
+/* 进程级 A/B 诊断：命令行含 --embed-avc444 时**放开** caps 过滤，重新广告到 10.7，
+ * 让服务器按老样子发 AVC444/v2。默认（不带该开关）只广告到 10.0 = AVC420。
+ *
+ * 历史说明：这个函数原来叫 ycn_avc420_only_requested()，解析 --embed-avc420-only，
+ * 做法是把 GfxAVC444 置 FALSE。但 rdpgfx_main.c 的规则是「GfxH264=true 且
+ * GfxAVC444=false 时不广告任何 10.x」，于是那个开关实际得到的是 8.1（无 AVC），
+ * 不是 AVC420 —— 名字与行为不符。2026-11-02 改为现在的语义：默认过滤到 10.0，
+ * 开关用于回退到旧行为。只解析本进程命令行一次。 */
+static BOOL ycn_allow_avc444_requested(void)
 {
 	static volatile LONG cached = -1;
 	LONG v = InterlockedCompareExchange(&cached, 0, 0);
-	const wchar_t token[] = L"--embed-avc420-only";
+	const wchar_t token[] = L"--embed-avc444";
 	const wchar_t* cmd;
 
 	if (v >= 0)
@@ -481,7 +498,9 @@ static void ycn_apply_gfx_config(rdpSettings* settings, const YcnGfxConfig* cfg)
 	BOOL avc444;
 	if (!settings || !cfg)
 		return;
-	avc444 = (cfg->avc444 && !ycn_avc420_only_requested()) ? TRUE : FALSE;
+	/* GfxAVC444 必须保持 TRUE：FreeRDP 只在「!GfxH264 || GfxAVC444」时才广告 10.x。
+	 * 限制版本靠 GfxCapsFilter（见 ycn_apply_gfx_config 末尾），不靠这个开关。 */
+	avc444 = cfg->avc444 ? TRUE : FALSE;
 	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
 	                          cfg->support_graphics_pipeline ? TRUE : FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_SupportDynamicChannels, TRUE);
@@ -494,6 +513,21 @@ static void ycn_apply_gfx_config(rdpSettings* settings, const YcnGfxConfig* cfg)
 	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressive, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_GfxProgressiveV2, FALSE);
 	freerdp_settings_set_bool(settings, FreeRDP_GfxPlanar, TRUE);
+	/* 只广告到 10.0（AVC420）。
+	 *
+	 * 为什么不留在 10.7：服务器一旦确认 10.1+ 就会发 AVC444 / AVC444v2
+	 * （codec 14/15），而 AVC444 的色度还原是逐像素散写、只能 CPU 做
+	 * （见 docs/rdp-avc-direct-present-s2-2026-11-02.md §2），实测每 surface
+	 * 约 5 ms，并且这条路永远进不了零拷贝直显 —— 2026-11-02 现场日志里
+	 * 13079 个 surface 全是 codec 15，直显因此一次都没跑起来。
+	 * 压到 10.0 后服务器改发 AVC420（codec 11），直显闭环才真正成立。
+	 *
+	 * 代价是色度 4:2:0（AVC444 是 4:4:4），彩色文字边缘会有轻微色渗。
+	 * 这是按「更高性能、更低占用优先」做的取舍；要退回画质优先，把这里改成
+	 * 0（不过滤）即可，其余代码不用动。 */
+	freerdp_settings_set_uint32(
+	    settings, FreeRDP_GfxCapsFilter,
+	    ycn_allow_avc444_requested() ? 0u : YCN_GFX_CAPS_FILTER_AVC420_ONLY);
 }
 
 typedef struct

@@ -121,7 +121,10 @@ static const Scenario g_scenarios[] = {
 	    { RDPGFX_CAPVERSION_106, 4, 0x42 },
 	    { RDPGFX_CAPVERSION_106_ERR, 4, 0x42 },
 	    { RDPGFX_CAPVERSION_107, 4, 0x42 } }, FALSE, TRUE },
-	{ "production", "production AVC420 preference: H264+ThinClient+SmallCache", TRUE, FALSE, TRUE, 0, 2,
+	/* 注意：这条**不是**当前生产配置（生产走 s9）。它验证的是「GfxAVC444=FALSE 时
+	 * FreeRDP 只广告 8/8.1」这一条上游行为，用来守住 ycn_apply_gfx_config 里
+	 * 「GfxAVC444 必须为 TRUE 才可能有 10.x」这个前提。 */
+	{ "avc444-off", "GfxAVC444=FALSE: only 8/8.1 advertised", TRUE, FALSE, TRUE, 0, 2,
 	  { { RDPGFX_CAPVERSION_8, 4, RDPGFX_CAPS_FLAG_THINCLIENT },
 	    { RDPGFX_CAPVERSION_81, 4, RDPGFX_CAPS_FLAG_THINCLIENT | RDPGFX_CAPS_FLAG_SMALL_CACHE | RDPGFX_CAPS_FLAG_AVC420_ENABLED } },
 	  FALSE, TRUE },
@@ -191,6 +194,19 @@ static const Scenario g_scenarios[] = {
 	  FALSE },
 	{ "s8", "filter=0x000007FF (suppress every advertised capset)", FALSE, FALSE, FALSE,
 	  0x000007FFu, 0, { 0 }, FALSE },
+	/* 生产配置（2026-11-02 起）：H264 + AVC444 设置位都开（否则 FreeRDP 不广告 10.x），
+	 * 但用 GfxCapsFilter=0x7F8 把 101..107 全部过滤掉，只留 8 / 8.1 / 10.0。
+	 * 目的：服务器确认 10.0 → 只发 AVC420(codec 11) → 零拷贝直显才成立。
+	 * 若这条断言红了，说明 capList 的位序变了（例如编入 WITH_GFX_AV1 会整体右移一位），
+	 * 那时 YCN_GFX_CAPS_FILTER_AVC420_ONLY 必须跟着改，否则会滤错版本。 */
+	{ "s9", "production AVC420-only: filter=0x7F8 keeps 8/8.1/10.0", TRUE, TRUE, TRUE,
+	  0x000007F8u, 3,
+	  { { RDPGFX_CAPVERSION_8, 4, RDPGFX_CAPS_FLAG_THINCLIENT },
+	    { RDPGFX_CAPVERSION_81, 4,
+	      RDPGFX_CAPS_FLAG_THINCLIENT | RDPGFX_CAPS_FLAG_SMALL_CACHE |
+	          RDPGFX_CAPS_FLAG_AVC420_ENABLED },
+	    { RDPGFX_CAPVERSION_10, 4, RDPGFX_CAPS_FLAG_SMALL_CACHE } },
+	  FALSE, TRUE },
 };
 
 static UINT16 read_u16le(const BYTE* p)

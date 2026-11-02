@@ -223,7 +223,47 @@ RDPGFX SurfaceCommand
    开启条件是实测收益跨过阈值（当前 9%），或 §2.3 的全幅复制被替换成着色器合成
    （全屏 quad 采样累积面，预期把 437 µs 降到几十 µs，届时增量收益会显著放大）。
 
-## 10. 复现
+## 10. 现场发现：直显为什么一次都没跑起来（2026-11-02 追加）
+
+用户在最新版上连真实主机后「看不出变化」。查安装目录的日志得到两条独立原因：
+
+### 10.1 能力探测查错了模块（已修）
+
+`RdpNativeInterop.SupportsDirectPresent` 把 `ycn_h264_set_external_d3d11_device`
+当成 `ycn_rdp.dll` 的导出。实际它由**打过补丁的 `freerdp3.dll`** 导出，桥接层自己
+也是运行时 `GetProcAddress` 去取，所以桥接层导出表里根本没有它 —— 探测恒为 false，
+`ArmDirectPresent()` 直接返回 `"native exports missing"`，直显**从未武装过**。
+日志里那行字看起来像「DLL 太旧」，实际是查错了模块。
+
+现在探测拆成两个模块分别查，并把「缺哪个符号、在哪个模块」写进
+`DirectPresentProbeDetail`，日志不再是「exports missing」一句话。
+
+### 10.2 服务器发的是 AVC444v2，直显对它无效（已改广告策略）
+
+同一份日志：`decode_codec=15`、`codec_counts_by_id` 第 16 项 13079（全部 surface
+都是 codec 15）、`surface_ms_by_codec[15]` 累计 60 秒 / 11445 surface ≈ **5.25 ms
+每 surface** 的 CPU 色度重建。
+
+也就是说这条会话走的是 S2 判定的「AVC444 只能 CPU 合成」那条路，永远进不了直显。
+按「更高性能、更低占用优先」的取舍，改成**只广告到 10.0**：
+
+```c
+freerdp_settings_set_uint32(settings, FreeRDP_GfxCapsFilter, 0x7F8u);
+```
+
+`GfxCapsFilter` 是按 `rdpgfx_main.c` 里 `capList` 顺序的位掩码（本机构建 11 项：
+`8, 81, 10, 101..107`），`0x7F8` 滤掉 101..107，只剩 8 / 8.1 / 10.0 → 服务器只能发
+AVC420（codec 11）→ 直显闭环才真正成立。代价是色度 4:2:0。
+
+- 不需要改 FreeRDP 补丁，纯设置项。
+- `GfxAVC444` 必须保持 `TRUE`：上游只在「`!GfxH264 || GfxAVC444`」时才广告 10.x。
+- 旧的 `--embed-avc420-only` 开关语义是错的（它把 `GfxAVC444` 置 FALSE，按上游规则
+  得到的是 8.1 而不是 AVC420），已换成 `--embed-avc444`：带上它就不过滤、回到 10.7，
+  用于 A/B 对照。
+- 探针 `gfx_caps_probe.c` 新增 `s9` 场景，断言过滤后只剩
+  `8(THINCLIENT) / 8.1(0x13) / 10.0(SMALL_CACHE)` 三个 capset。
+
+## 11. 复现
 
 ```bash
 # 原生层构建（Release；Debug 缺 ucrtbased 会让 verify_runtime_dlls 失败）
