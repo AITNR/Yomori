@@ -89,6 +89,12 @@ typedef struct ycn_direct_present_result
 	int32_t last_hresult;
 	uint32_t reserved1;
 	char detail[96];
+	/* ycn_dp_bench_rect 实际转过的子矩形（0 = 整幅）。
+	 * 单独占字段而不是塞 reserved[]：reserved[0..3] 已被 CPU/GPU 计时占满，
+	 * 早期版本把矩形写进 reserved[1..2] 后被统计量原地覆盖，测出来的
+	 * 「矩形」永远是 1920x1080 —— 判据因此假红。 */
+	uint32_t bench_rect_w;
+	uint32_t bench_rect_h;
 	uint32_t reserved[4];
 } ycn_direct_present_result;
 
@@ -130,6 +136,21 @@ int ycn_dp_is_enabled(int session);
  * swap chain itself is created lazily on the first present. */
 int ycn_dp_attach_panel(int session, void* panel);
 
+/* 版面：fit 模式（0=拉伸 1=Viewbox 2=裁切）、epsilon（目标像素）。
+ * 参数变化会让下一帧整面重画。 */
+int ycn_dp_set_layout(int session, uint32_t fit_mode, double epsilon);
+
+/* UI 线程：CompositionScale -> 交换链矩阵（1/scale）。0 或负数按 1.0 处理。 */
+int ycn_dp_set_scale(int session, double composition_scale);
+
+/* 增量直显开关（默认关）。开启后只有 dirty 面积 ≤ 60% 且累积面有效时才逐矩形转换，
+ * 其余情况一律整幅 —— 失败模式是「多转」，不是「少画」。 */
+int ycn_dp_set_incremental(int session, uint32_t enable);
+
+/* 本帧的 dirty 矩形（目标坐标系，xywh 交替，最多 16 个）。
+ * count=0 表示「本帧整面」。present 之后列表自动清空。 */
+int ycn_dp_set_frame_rects(int session, const int32_t* xywh, uint32_t count);
+
 /* FreeRDP thread: offers a decoded frame. Takes ownership on success. */
 int ycn_dp_publish(int session, void* freerdp_frame);
 
@@ -151,6 +172,17 @@ int ycn_dp_color_test(uint32_t matrix, uint32_t range, uint32_t width, uint32_t 
  * `convert_ticks` (same GPU number in microseconds); `frames_presented` carries
  * the iteration count. No panel, no decoder, no readback — this is exactly the
  * GPU conversion segment of a live frame and nothing else. */
+/* 只转 rect_w x rect_h 的子矩形：量化 dirty 增量的收益。
+ * 实际转过的矩形回填在 bench_rect_w / bench_rect_h。 */
+int ycn_dp_bench_rect(uint32_t width, uint32_t height, uint32_t rect_w, uint32_t rect_h,
+                      uint32_t iterations, ycn_direct_present_result* out);
+
+/* 在线每帧的**完整** GPU 工作（转换 + 落到累积面 + 落到后备缓冲），
+ * rect_w/rect_h 为 0 时按整幅帧量。这是判断「增量到底省不省」的唯一口径：
+ * 只量转换会高估收益，只量复制会低估收益。 */
+int ycn_dp_bench_frame(uint32_t width, uint32_t height, uint32_t rect_w, uint32_t rect_h,
+                       uint32_t iterations, ycn_direct_present_result* out);
+
 int ycn_dp_bench(uint32_t width, uint32_t height, uint32_t iterations,
                  ycn_direct_present_result* out);
 

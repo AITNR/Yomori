@@ -1509,6 +1509,17 @@ static UINT ycn_gfx_surface_command(RdpgfxClientContext* ctx, const RDPGFX_SURFA
 		return ERROR_INTERNAL_ERROR;
 	}
 
+	/* 把本帧的更新范围交给直显（orig 内部解码并发布纹理，present 时按它做增量）。
+	 * cmd 的 left/top/right/bottom 是这一条 surface 命令的包围盒：它可能比真实
+	 * dirty 区域大，但绝不会漏 —— 增量路径的前提就是「不能漏块」。 */
+	if (s->direct_present_enabled)
+	{
+		const int32_t xywh[4] = { cmd->left, cmd->top, (int32_t)(cmd->right - cmd->left),
+			                      (int32_t)(cmd->bottom - cmd->top) };
+		if ((xywh[2] > 0) && (xywh[3] > 0))
+			(void)ycn_dp_set_frame_rects(s->id, xywh, 1);
+	}
+
 	t0 = ycn_qpc_now();
 	/* 解码回调在 orig 内部发生；用 TLS 告诉 sink 这一帧属于哪个会话。 */
 	{
@@ -1619,6 +1630,27 @@ int ycn_rdp_direct_attach_panel(int session, void* panel)
 	                                                                 : YCN_ERR_UNSUPPORTED;
 }
 
+int ycn_rdp_direct_set_layout(int session, uint32_t fit_mode, double epsilon)
+{
+	if (!find_session(session))
+		return YCN_ERR_INVALID_ARG;
+	return (ycn_dp_set_layout(session, fit_mode, epsilon) == 0) ? YCN_OK : YCN_ERR_INVALID_ARG;
+}
+
+int ycn_rdp_direct_set_scale(int session, double composition_scale)
+{
+	if (!find_session(session))
+		return YCN_ERR_INVALID_ARG;
+	return (ycn_dp_set_scale(session, composition_scale) == 0) ? YCN_OK : YCN_ERR_INTERNAL;
+}
+
+int ycn_rdp_direct_set_rects(int session, const int32_t* xywh, uint32_t count)
+{
+	if (!find_session(session) || (!xywh && count))
+		return YCN_ERR_INVALID_ARG;
+	return (ycn_dp_set_frame_rects(session, xywh, count) == 0) ? YCN_OK : YCN_ERR_INVALID_ARG;
+}
+
 int ycn_rdp_direct_present(int session, ycn_direct_present_result* out)
 {
 	YcnSession* s = find_session(session);
@@ -1653,6 +1685,38 @@ int ycn_rdp_direct_color_test(uint32_t matrix, uint32_t range, uint32_t width, u
 		return YCN_ERR_INVALID_ARG;
 	out->version = YCN_DIRECT_API_VERSION;
 	status = ycn_dp_color_test(matrix, range, width, height, out);
+	out->version = YCN_DIRECT_API_VERSION;
+	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
+}
+
+int ycn_rdp_direct_bench_rect(uint32_t width, uint32_t height, uint32_t rect_w, uint32_t rect_h,
+                             uint32_t iterations, ycn_direct_present_result* out)
+{
+	int status;
+
+	if (!out || (out->size < sizeof(ycn_direct_present_result)))
+		return YCN_ERR_INVALID_ARG;
+	out->version = YCN_DIRECT_API_VERSION;
+	status = ycn_dp_bench_rect(width, height, rect_w, rect_h, iterations, out);
+	out->version = YCN_DIRECT_API_VERSION;
+	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
+}
+
+int ycn_rdp_direct_set_incremental(int session, uint32_t enable)
+{
+	return ycn_dp_set_incremental(session, enable);
+}
+
+int ycn_rdp_direct_bench_frame(uint32_t width, uint32_t height, uint32_t rect_w,
+                                uint32_t rect_h, uint32_t iterations,
+                                ycn_direct_present_result* out)
+{
+	int status;
+
+	if (!out || (out->size < sizeof(ycn_direct_present_result)))
+		return YCN_ERR_INVALID_ARG;
+	out->version = YCN_DIRECT_API_VERSION;
+	status = ycn_dp_bench_frame(width, height, rect_w, rect_h, iterations, out);
 	out->version = YCN_DIRECT_API_VERSION;
 	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
 }

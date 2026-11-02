@@ -244,6 +244,10 @@ YCN_API int ycn_rdp_direct_enable(int session, uint32_t enable);
 /* UI 线程：把 SwapChainPanel 的 IUnknown* 交给直显呈现器（首次 present 时才建
  * 交换链）。传 NULL 之后 present 返回 YCN_DP_STATUS_NEED_PANEL。 */
 YCN_API int ycn_rdp_direct_attach_panel(int session, void* panel);
+/* 版面 / DPI / 增量矩形。fit_mode: 0=拉伸 1=Viewbox 2=裁切。 */
+YCN_API int ycn_rdp_direct_set_layout(int session, uint32_t fit_mode, double epsilon);
+YCN_API int ycn_rdp_direct_set_scale(int session, double composition_scale);
+YCN_API int ycn_rdp_direct_set_rects(int session, const int32_t* xywh, uint32_t count);
 
 /* UI 线程：转换并呈现已锁存的一帧。out->size 由调用方填。
  * 返回 YCN_OK（看 out->status）或 YCN_ERR_INTERNAL（该路径应关闭）。 */
@@ -257,8 +261,19 @@ YCN_API int ycn_rdp_direct_color_test(uint32_t matrix, uint32_t range, uint32_t 
 /* 成本测量：在给定尺寸上跑 iterations 次真实 VideoProcessorBlt，把 µs 分布放在
  * out->reserved[0..2]（最小 / 均值 / p99），iterations 放在 frames_presented。
  * 不需要会话与面板 —— 计划书要的「每帧 GPU 转色耗时」可以离线取数。 */
+YCN_API int ycn_rdp_direct_bench_rect(uint32_t width, uint32_t height, uint32_t rect_w,
+                                      uint32_t rect_h, uint32_t iterations,
+                                      ycn_direct_present_result* out);
 YCN_API int ycn_rdp_direct_bench(uint32_t width, uint32_t height, uint32_t iterations,
                                  ycn_direct_present_result* out);
+/* 增量直显开关（默认关）：开启后只转 dirty 矩形，前置条件不成立自动退回整幅。 */
+YCN_API int ycn_rdp_direct_set_incremental(int session, uint32_t enable);
+
+/* 在线每帧的完整 GPU 工作（转换 + 落到累积面 + 落到后备缓冲）。
+ * rect_w/rect_h = 0 按整幅帧；reserved[3] 与 convert_ticks 都是每帧纳秒/微秒。 */
+YCN_API int ycn_rdp_direct_bench_frame(uint32_t width, uint32_t height, uint32_t rect_w,
+                                       uint32_t rect_h, uint32_t iterations,
+                                       ycn_direct_present_result* out);
 
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);

@@ -180,6 +180,8 @@ class DirectPresentResult(ctypes.Structure):
         ("last_hresult", ctypes.c_int32),
         ("reserved1", ctypes.c_uint32),
         ("detail", ctypes.c_char * 96),
+        ("bench_rect_w", ctypes.c_uint32),
+        ("bench_rect_h", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32 * 4),
     ]
 
@@ -741,6 +743,118 @@ def check_direct_bench(lib: ctypes.CDLL, width: int = 1920, height: int = 1080,
     }
 
 
+def check_direct_bench_rect(lib: ctypes.CDLL, width: int = 1920, height: int = 1080,
+                            rect: tuple[int, int] = (256, 144), iterations: int = 60) -> dict[str, object]:
+    """S3: cost of converting only one dirty rectangle.
+
+    1080p 桌面上一次交互通常只脏一小块（光标、caret、单个窗口边）。这里量化
+    「只转这一块」的成本，和整幅转换对比就是增量直显的收益。判据只要求：
+    子矩形确实更便宜，且两者都测到了 GPU 时间。
+    """
+    fn = getattr(lib, "ycn_rdp_direct_bench_rect", None)
+    if fn is None:
+        raise AssertionError("bridge has no direct bench_rect export")
+    _configure(fn, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+               ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(DirectPresentResult))
+
+    rect_w, rect_h = rect
+    tiny = DirectPresentResult()
+    tiny.size = ctypes.sizeof(DirectPresentResult)
+    rc = int(fn(width, height, rect_w, rect_h, iterations, ctypes.byref(tiny)))
+    if rc != 0 or tiny.status != 0:
+        raise AssertionError(
+            f"rect bench failed: rc={rc} status={tiny.status} hr=0x{tiny.last_hresult & 0xFFFFFFFF:08X}"
+        )
+    if int(tiny.bench_rect_w) != rect_w or int(tiny.bench_rect_h) != rect_h:
+        raise AssertionError(
+            f"rect bench did not report the rect it used: "
+            f"{int(tiny.bench_rect_w)}x{int(tiny.bench_rect_h)} != {rect_w}x{rect_h}"
+        )
+
+    full = DirectPresentResult()
+    full.size = ctypes.sizeof(DirectPresentResult)
+    rc = int(lib.ycn_rdp_direct_bench(width, height, iterations, ctypes.byref(full)))
+    if rc != 0 or full.status != 0:
+        raise AssertionError(f"full bench failed while comparing: rc={rc} status={full.status}")
+
+    tiny_ns = int(tiny.reserved[3])
+    full_ns = int(full.reserved[3])
+    if tiny_ns <= 0 or full_ns <= 0:
+        raise AssertionError(f"rect bench produced no GPU timing: tiny={tiny_ns} full={full_ns}")
+    if tiny_ns >= full_ns:
+        raise AssertionError(
+            f"a {rect_w}x{rect_h} rect is not cheaper than the full frame: {tiny_ns} vs {full_ns} ns"
+        )
+
+    return {
+        "frame": f"{width}x{height}",
+        "rect": f"{rect_w}x{rect_h}",
+        "iterations": iterations,
+        "full_gpu_us": round(full_ns / 1000.0, 1),
+        "rect_gpu_us": round(tiny_ns / 1000.0, 1),
+        "ratio": round(tiny_ns / full_ns, 4),
+        "frame_cpu_submit_ns": int(full.reserved[1]),
+    }
+
+
+def check_direct_bench_frame(lib: ctypes.CDLL, width: int = 1920, height: int = 1080,
+                            rect: tuple[int, int] = (256, 144), iterations: int = 120) -> dict[str, object]:
+    """S3: 在线每帧的完整 GPU 工作，整幅帧 vs 增量帧。
+
+    口径是「转换 + 落到累积面 + 落到后备缓冲」，与 ycn_dp_present 里真正做的
+    两段 GPU 工作一一对应。判据只要求两条：两个口径都测到了 GPU 时间、
+    增量帧不比整幅帧**明显更贵**（>1.35 倍视为回归 —— 增量多了一次贴片复制，
+    若驱动让两次复制串行化，它就会更贵，这正是必须量出来的风险）。
+    """
+    fn = getattr(lib, "ycn_rdp_direct_bench_frame", None)
+    if fn is None:
+        raise AssertionError("bridge has no direct bench_frame export")
+    _configure(fn, ctypes.c_int, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+               ctypes.c_uint32, ctypes.c_uint32, ctypes.POINTER(DirectPresentResult))
+
+    rect_w, rect_h = rect
+    inc = DirectPresentResult()
+    inc.size = ctypes.sizeof(DirectPresentResult)
+    rc = int(fn(width, height, rect_w, rect_h, iterations, ctypes.byref(inc)))
+    if rc != 0 or inc.status != 0:
+        raise AssertionError(
+            f"frame bench (incremental) failed: rc={rc} status={inc.status} "
+            f"hr=0x{inc.last_hresult & 0xFFFFFFFF:08X}"
+        )
+    if int(inc.bench_rect_w) != rect_w or int(inc.bench_rect_h) != rect_h:
+        raise AssertionError("frame bench did not report the rect it used")
+
+    full = DirectPresentResult()
+    full.size = ctypes.sizeof(DirectPresentResult)
+    rc = int(fn(width, height, 0, 0, iterations, ctypes.byref(full)))
+    if rc != 0 or full.status != 0:
+        raise AssertionError(f"frame bench (full) failed: rc={rc} status={full.status}")
+
+    inc_ns = int(inc.reserved[3])
+    full_ns = int(full.reserved[3])
+    if inc_ns <= 0 or full_ns <= 0:
+        raise AssertionError(f"frame bench produced no GPU timing: inc={inc_ns} full={full_ns}")
+    if inc_ns > full_ns * 1.35:
+        raise AssertionError(
+            f"incremental frame is much more expensive than a full frame: "
+            f"{inc_ns} vs {full_ns} ns"
+        )
+
+    return {
+        "frame": f"{width}x{height}",
+        "rect": f"{rect_w}x{rect_h}",
+        "iterations": iterations,
+        "full_frame_gpu_us": round(full_ns / 1000.0, 1),
+        "incremental_frame_gpu_us": round(inc_ns / 1000.0, 1),
+        "ratio": round(inc_ns / full_ns, 4),
+        "full_cpu_submit_ns": int(full.reserved[1]),
+        "incremental_cpu_submit_ns": int(inc.reserved[1]),
+        "gpu_note": inc.detail.decode("utf-8", "replace")
+        if isinstance(inc.detail, (bytes, bytearray))
+        else str(inc.detail),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dll", type=Path, help="path to ycn_rdp.dll")
@@ -790,6 +904,10 @@ def main() -> int:
             result["direct_contract"] = check_direct_contract(lib)
             if hasattr(lib, "ycn_rdp_direct_bench"):
                 result["direct_bench"] = check_direct_bench(lib)
+            if hasattr(lib, "ycn_rdp_direct_bench_rect"):
+                result["direct_bench_rect"] = check_direct_bench_rect(lib)
+            if hasattr(lib, "ycn_rdp_direct_bench_frame"):
+                result["direct_bench_frame"] = check_direct_bench_frame(lib)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

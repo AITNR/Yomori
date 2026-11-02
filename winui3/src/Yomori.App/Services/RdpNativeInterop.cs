@@ -288,6 +288,9 @@ namespace Yomori.Services
             public int LastHresult;
             public uint Reserved1;
             public fixed byte Detail[96];
+            /// <summary>ycn_dp_bench_rect 实际转过的子矩形（0 = 整幅）。</summary>
+            public uint BenchRectW;
+            public uint BenchRectH;
             public fixed uint Reserved[4];
         }
 
