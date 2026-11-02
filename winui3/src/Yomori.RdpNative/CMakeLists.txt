@@ -104,7 +104,7 @@ foreach(_dll IN LISTS YCN_COPY_RUNTIME_DLLS)
   endif()
 endforeach()
 
-add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c ycn_dirty_snapshot.c ycn_dirty_pending.c ycn_dirty_stats.c ycn_direct_probe.c ycn_direct_present.c ycn_avc444_gate.c ycn_present_layout.c)
+add_library(ycn_rdp SHARED ycn_rdp.c ycn_dirty_diag.c ycn_dirty_snapshot.c ycn_dirty_pending.c ycn_dirty_stats.c)
 # 注意：不要定义 UNICODE/_UNICODE —— 会引发 freerdp rail.h 的 NIIF_* 与 shellapi.h 宏冲突
 target_compile_definitions(ycn_rdp PRIVATE YCN_RDP_EXPORTS)
 target_compile_options(ycn_rdp PRIVATE /utf-8)
@@ -118,8 +118,6 @@ target_link_libraries(ycn_rdp PRIVATE
   "${VCPKG_INST}/lib/freerdp-client3.lib"
   "${VCPKG_INST}/lib/freerdp3.lib"
   "${VCPKG_INST}/lib/winpr3.lib"
-  # 直显 surface 探测：只读地检查解码 surface 能否被 GPU 直接消费。
-  d3d11.lib d3d9.lib dxgi.lib dxguid.lib
   ws2_32.lib)
 
 # Pure tests for the read-only dirty-rectangle aggregator.  They do not link
@@ -165,24 +163,6 @@ if(YCN_BUILD_DIRTY_DIAG_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}")
   target_compile_options(ycn_dirty_stats_tests PRIVATE /utf-8)
   add_test(NAME ycn_dirty_stats_tests COMMAND ycn_dirty_stats_tests)
-
-  # AVC444 整帧提交闸门：纯状态机，不需要服务器也不需要 D3D。
-  add_executable(ycn_avc444_gate_tests
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ycn_avc444_gate_tests.c"
-    ycn_avc444_gate.c)
-  target_include_directories(ycn_avc444_gate_tests PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}")
-  target_compile_options(ycn_avc444_gate_tests PRIVATE /utf-8)
-  add_test(NAME ycn_avc444_gate_tests COMMAND ycn_avc444_gate_tests)
-
-  # 直显版面：缩放（Viewbox/裁切）、DPI 矩阵、dirty 合并与钳位。纯计算。
-  add_executable(ycn_present_layout_tests
-    "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/ycn_present_layout_tests.c"
-    ycn_present_layout.c)
-  target_include_directories(ycn_present_layout_tests PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}")
-  target_compile_options(ycn_present_layout_tests PRIVATE /utf-8)
-  add_test(NAME ycn_present_layout_tests COMMAND ycn_present_layout_tests)
 endif()
 
 # ---- 能力信息（构建时快照，发布包和 CI 都会校验） -------------------------

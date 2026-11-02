@@ -28,20 +28,6 @@ namespace Yomori.Services
         public bool UseGfx { get; init; }
         public string DecodeBackend { get; init; } = DecodeBackends.Auto;
         public string RenderBackend { get; init; } = RenderBackends.Auto;
-
-        /// <summary>
-        /// 是否允许武装 S1 零拷贝直显（默认 **false**）。
-        ///
-        /// <para>为什么默认关：武装会调用 <c>ycn_rdp_direct_enable</c>，它会建一块我们自己的
-        /// D3D11 设备并用 <c>ycn_h264_set_external_d3d11_device</c> 注入解码器。2026-11-02 实测：
-        /// 在 Intel 核显 + <c>dxva2:no-shared-handle</c> 这类不支持共享面的机器上，注入之后
-        /// H.264 硬解会让 igd10um64xe.DLL 在 +0xbc483 访问冲突（连崩两次 + 一次 GPU TDR），
-        /// 回退到不注入的版本则完全正常。而这条路对 AVC444 对端本来也用不上
-        /// （AVC444 的色度只能 CPU 合成，见 docs/rdp-avc-direct-present-s2）。</para>
-        ///
-        /// <para>要试的话在设置里打开开关；出问题取消勾选即可，不必换版本。</para>
-        /// </summary>
-        public bool DirectPresent { get; init; }
     }
 
     /// <summary>一帧就绪的通知（携带可立即 grab 的会话）。</summary>
@@ -86,42 +72,8 @@ namespace Yomori.Services
         private uint _decodeApiVersion;
         private uint _decodeCapabilities;
         private bool _usedVersionedDecodeEntry;
-        private bool _directPresentArmed;
-        private bool _directPresentRequested;
-
-        /// <summary>
-        /// 直显是否已武装（原生层已建 device、注入解码器、打开直显闸门）。
-        /// 这里只记状态，**不持有** RdpDirectPresenter：那个类碰 SwapChainPanel，
-        /// 而冒烟工程（纯控制台，不引用 WinUI）也链接本文件。
-        /// </summary>
-        internal bool DirectPresentArmed { get { lock (_gate) { return _directPresentArmed; } } }
-
-        /// <summary>
-        /// 本次连接是否**允许**直显（配置开关）。UI 侧在创建 presenter 之前必须看这个值：
-        /// <c>RdpDirectPresenter.TryArm()</c> 会自己再调一次 <c>ycn_rdp_direct_enable</c>，
-        /// 只靠 <see cref="ArmDirectPresent"/> 的门禁拦不住它。
-        /// </summary>
-        internal bool DirectPresentRequested { get { lock (_gate) { return _directPresentRequested; } } }
-
-        /// <summary>UI 侧开关直显后同步状态；<c>false</c> 时下一个视图会重新武装。</summary>
-        internal void NoteDirectPresentArmed(bool armed)
-        {
-            lock (_gate) { _directPresentArmed = armed; }
-        }
-
-        /// <summary>武装直显失败的原因（null = 成功或未尝试）。仅诊断用。</summary>
-        internal string? DirectPresentError { get; private set; }
         private static readonly bool s_forceSoftwareFromCommandLine = Array.Exists(
             Environment.GetCommandLineArgs(), a => a == "--embed-nod3d");
-        /// <summary>
-        /// 命令行 <c>--no-direct-present</c>：无视配置强制关掉零拷贝直显。
-        ///
-        /// 逃生口。开着直显时如果一连就崩（注入外部 D3D11 设备可能崩在显卡驱动里，
-        /// 见 2026-11-02 的 igd10um64xe 事故），用这条命令启动就能先进得来，
-        /// 再去设置里把开关关掉 —— 不必手改 config.json。
-        /// </summary>
-        private static readonly bool s_disableDirectPresentFromCommandLine = Array.Exists(
-            Environment.GetCommandLineArgs(), a => a == "--no-direct-present");
         // 最近一次「静音意图」。原生 ycn_rdp_set_muted 在会话不是 RUNNING 时**直接拒绝**，
         // 而调用方普遍在 Connect() 之前就下发（见 MainViewModel.TryStartEmbeddedConnect /
         // RdpSurfaceCell.SetClient）——那一刻 session 还是 0，必然被拒。
@@ -277,10 +229,10 @@ namespace Yomori.Services
 
             var cb = _nativeCallbacks.Value;
             int session;
-            var requestedPolicy = RdpDecodePolicy.Resolve(
-                info.DecodeBackend, info.RenderBackend, s_forceSoftwareFromCommandLine);
             try
             {
+                var requestedPolicy = RdpDecodePolicy.Resolve(
+                    info.DecodeBackend, info.RenderBackend, s_forceSoftwareFromCommandLine);
                 var useVersionedEntry = RdpNativeInterop.TryProbeDecodeApi(
                     out var decodeApiVersion, out var decodeCapabilities);
                 lock (_gate)
@@ -288,7 +240,6 @@ namespace Yomori.Services
                     _decodeBackend = DecodeBackends.Normalize(info.DecodeBackend);
                     _renderBackend = RenderBackends.Normalize(info.RenderBackend);
                     _requestedDecodePolicy = requestedPolicy;
-                    _directPresentRequested = info.DirectPresent && !s_disableDirectPresentFromCommandLine;
                     _decodeApiVersion = decodeApiVersion;
                     _decodeCapabilities = decodeCapabilities;
                     _usedVersionedDecodeEntry = useVersionedEntry;
@@ -345,63 +296,7 @@ namespace Yomori.Services
                 disconnect = _disconnectRequested && !_completion.Task.IsCompleted;
             }
             if (disconnect) { RdpNativeInterop.ycn_rdp_disconnect(session); }
-
-            // S1 直显：**必须在这里武装**，不能等 UI 线程的第一次 tick ——
-            // H264 上下文的解码后端（D3D11VA / DXVA2）在上下文创建那一刻就定死，
-            // 而上下文是在第一帧 AVC420 到达时创建的。晚一步，这个会话就永远
-            // 没有直显帧（表现为直显一直 NoFrame，靠 RdpView 的看门狗回退）。
-            // 只在「自动（优先硬件）」策略下武装：策略=软件时用户明确要避开 GPU。
-            if (!disconnect && requestedPolicy == RdpDecodePolicy.Auto)
-            {
-                DirectPresentError = ArmDirectPresent(session);
-            }
-
             return true;
-        }
-
-        /// <summary>建 device / 注入解码器 / 开直显闸门。返回 null 表示成功。</summary>
-        private string? ArmDirectPresent(int session)
-        {
-            // 默认关。见 RdpConnectInfo.DirectPresent 的注释：注入外部 D3D11 设备会
-            // 让部分机器的 H.264 硬解直接崩在显卡驱动里。
-            if (!_directPresentRequested)
-            {
-                return "disabled";
-            }
-            if (!RdpNativeInterop.SupportsDirectPresent)
-            {
-                // 带上具体缺哪个符号、在哪个模块 —— 只写「exports missing」等于没写。
-                return "probe: " + RdpNativeInterop.DirectPresentProbeDetail;
-            }
-
-            // 已确认 AVC444/v2 的会话不会有 AVC420 帧，武装了也用不上，还白白注入设备。
-            if (RdpNativeInterop.PeerNegotiatedAvc444(session))
-            {
-                return "peer-avc444";
-            }
-
-            try
-            {
-                var rc = RdpNativeInterop.ycn_rdp_direct_enable(session, 1u);
-                if (rc != 0)
-                {
-                    return $"direct enable rc={rc}";
-                }
-                lock (_gate) { _directPresentArmed = true; }
-                return null;
-            }
-            catch (Exception ex) when (ex is EntryPointNotFoundException
-                                       || ex is DllNotFoundException
-                                       || ex is BadImageFormatException)
-            {
-                // 探测通过、实调用缺导出（DLL 被换掉）：降级缓存，免得每帧再试。
-                RdpNativeInterop.MarkDirectPresentUnsupported();
-                return ex.GetType().Name;
-            }
-            catch (Exception ex)
-            {
-                return ex.Message;
-            }
         }
 
         /// <summary>断开会话（语义 = mstsc「断开连接」）。幂等。</summary>

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -46,28 +47,6 @@ class Diagnostics(ctypes.Structure):
     ]
 
 
-# 不要在模块顶部 import hashlib：Python 的 _hashlib.pyd 会先把系统里那份
-# libcrypto-3-x64.dll 映射进进程，而 freerdp3.dll 静态导入的正是 OpenSSL 3。
-# 一旦先被别的版本占用，freerdp3.dll 的导入解析就会报 WinError 127「找不到
-# 指定的程序」——看起来像探针坏了，其实是 DLL 抢占。这里先按路径把原生目录里
-# 的 OpenSSL 钉死，再允许使用 hashlib。
-def _pin_openssl() -> None:
-    if os.name != "nt":
-        return
-    folder = DEFAULT_DLL.parent
-    for name in ("libcrypto-3-x64.dll", "libssl-3-x64.dll"):
-        candidate = folder / name
-        if not candidate.is_file():
-            continue
-        try:
-            ctypes.CDLL(str(candidate))
-        except OSError:
-            pass
-
-
-_pin_openssl()
-
-
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -96,12 +75,6 @@ def fixture(args: argparse.Namespace) -> tuple[Path, bytes, list[int]]:
     return path, data, types
 
 
-def _sha256(data: bytes) -> str:
-    import hashlib  # 延迟导入，见文件头关于 libcrypto 抢占的说明
-
-    return hashlib.sha256(data).hexdigest()
-
-
 def pixels(raw: bytes, width: int, height: int) -> dict[str, Any]:
     if len(raw) != width * height * 4:
         raise RuntimeError("BGRA output size mismatch")
@@ -117,43 +90,15 @@ def pixels(raw: bytes, width: int, height: int) -> dict[str, Any]:
     ratio = nonzero / (width * height)
     return {
         "valid": ratio >= 0.5 and len(colors) >= 32 and sum(v >= 32 for v in ranges) >= 2,
-        "sha256": _sha256(raw), "colors": len(colors),
+        "sha256": hashlib.sha256(raw).hexdigest(), "colors": len(colors),
         "nonzero": round(ratio, 6), "ranges": ranges,
     }
-
-
-# freerdp3.dll 的静态导入按「加载它的那个 DLL 所在目录」解析。Windows 上如果
-# 同目录里还有一份旧的 avcodec/winpr3（或系统目录、其它软件目录里有一份），
-# LoadLibrary 会拿旧版本去解析导入表，缺导出就报 WinError 127「找不到指定的
-# 程序」——这一步错误跟探针本身无关，但会把探针打成 FAIL。显式先按路径把同目录
-# 的依赖加载一遍，就等于把搜索顺序钉死在这个目录上。
-DEPENDENCY_ORDER = (
-    "z.dll", "cjson.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll", "legacy.dll",
-    "avutil-61.dll", "swresample-7.dll", "avcodec-63.dll", "swscale-10.dll",
-    "winpr3.dll", "freerdp-client3.dll",
-)
-
-
-def preload_dependencies(folder: Path) -> list[str]:
-    loaded: list[str] = []
-    for name in DEPENDENCY_ORDER:
-        candidate = folder / name
-        if not candidate.is_file():
-            continue
-        try:
-            ctypes.CDLL(str(candidate))
-            loaded.append(name)
-        except OSError:
-            # 预加载失败不代表主 DLL 一定失败，交给后面加载时报真实错误。
-            pass
-    return loaded
 
 
 def load(path: Path) -> dict[str, Any]:
     if os.name != "nt" or ctypes.sizeof(ctypes.c_void_p) != 8:
         raise RuntimeError("requires 64-bit Windows")
     directory = os.add_dll_directory(str(path.parent))
-    preload_dependencies(path.parent)
     lib = ctypes.CDLL(str(path))
 
     class Rect(ctypes.Structure):

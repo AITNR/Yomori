@@ -65,10 +65,6 @@ function Get-NativeCacheKey {
     (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_dirty_stats.c'),
     (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_dirty_stats.h'),
     (Join-Path $RepoRoot 'winui3\tests\ycn_dirty_stats_tests.c'),
-    (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_direct_probe.c'),
-    (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_direct_probe.h'),
-    (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_direct_present.c'),
-    (Join-Path $RepoRoot 'winui3\src\Yomori.RdpNative\ycn_direct_present.h'),
     (Join-Path $RepoRoot 'winui3\tools\build_native.ps1'),
     (Join-Path $RepoRoot 'winui3\tools\verify_native_runtime.py'),
     (Join-Path $RepoRoot 'winui3\tools\package_release.py')
@@ -298,18 +294,6 @@ function Write-ManifestSnapshot {
   if (-not (Test-Path -LiteralPath (Join-Path $ManifestRoot 'ports\freerdp\portfile.cmake'))) {
     throw "manifest 快照缺少 overlay port：$ManifestRoot\ports\freerdp"
   }
-
-  # vcpkg 的包 ABI 只覆盖 portfile 与 port 目录内的文件；../../patches 里的补丁
-  # 改动不会改变 ABI，于是 vcpkg 会把旧包当成最新，静默发布过期 DLL（实测过一次）。
-  # 因此把补丁复制进 port 目录，使补丁内容进入 ABI，改补丁必然触发重编。
-  $snapshotPortDir = Join-Path $ManifestRoot 'ports\freerdp'
-  $snapshotPatchDir = Join-Path $snapshotPortDir 'patches'
-  if (Test-Path -LiteralPath $PatchDir) {
-    New-Item -ItemType Directory -Force $snapshotPatchDir | Out-Null
-    Copy-Item -Path (Join-Path $PatchDir '*.patch') -Destination $snapshotPatchDir -Force
-    # 顶层 patches 留着会让 portfile 里两条路径都命中；快照里只保留 port 目录内那份。
-    Remove-TreeSafely (Join-Path $ManifestRoot 'patches') $ManifestRoot
-  }
 }
 
 function Install-Deps {
@@ -390,17 +374,6 @@ function Import-VsDevEnv {
     if ($line -match '^([^=]+)=(.*)$') {
       $name = $Matches[1]
       $value = $Matches[2]
-      if ($name -match '(?i)^path$') {
-        # 归一化：vcvars 写的是 Path，而进程里可能已有 PATH，.NET 的
-        # SetEnvironmentVariable 在 Windows 上按大小写敏感地新增条目，于是
-        # 进程环境里会同时出现 PATH/Path。MSBuild 的 CL.exe 任务把它们灌进
-        # StringDictionary 时抛 ArgumentException，cmake 只看得到
-        # "The C compiler identification is unknown"。
-        foreach ($variant in @('Path', 'PATH', 'path')) {
-          [System.Environment]::SetEnvironmentVariable($variant, $null)
-        }
-        $name = 'Path'
-      }
       Set-Item -Path ('Env:' + $name) -Value $value
     }
   }

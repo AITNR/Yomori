@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import math
 import os
@@ -26,7 +27,6 @@ import re
 import subprocess
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +79,7 @@ def image_stats(raw: bytes, width: int, height: int) -> dict[str, Any]:
     count = width * height
     ranges = [hi[index] - lo[index] for index in range(3)]
     return {
-        "sha256": base._sha256(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
         "colors": len(colors),
         "nonzero": round(nonzero / count, 6),
         "ranges": ranges,
@@ -208,8 +208,6 @@ def worker_main(args: argparse.Namespace) -> int:
             output["outputBgra"] = str(args.output_bgra)
     except Exception as exc:
         output["error"] = f"{type(exc).__name__}: {exc}"
-        # 探针失败时必须能看到栈：只报一句 WinError 无法定位是哪一步。
-        traceback.print_exc()
     finally:
         if ctx and api:
             try:
@@ -365,8 +363,8 @@ def split_bgra(api: dict[str, Any], source: bytes, width: int, height: int,
                     ctypes.string_at(buffers[1], c_size) +
                     ctypes.string_at(buffers[2], c_size))
         main, aux = pack_planes(main_buffers), pack_planes(aux_buffers)
-        details = {"version": version, "mainSha256": base._sha256(main),
-                   "auxSha256": base._sha256(aux),
+        details = {"version": version, "mainSha256": hashlib.sha256(main).hexdigest(),
+                   "auxSha256": hashlib.sha256(aux).hexdigest(),
                    "mainBytes": len(main), "auxBytes": len(aux)}
         return main, aux, details
     finally:
@@ -400,7 +398,7 @@ def encode_h264(ffmpeg: Path, yuv: bytes, width: int, height: int, path: Path) -
     if not {7, 8, 5}.issubset(types):
         raise RuntimeError(f"encoded stream lacks SPS/PPS/IDR: {types}")
     return {"path": str(path), "bytes": len(data), "nals": types,
-            "sha256": base._sha256(data)}
+            "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def run_case(dll: Path, main: Path, aux: Path | None, width: int, height: int, policy: int,

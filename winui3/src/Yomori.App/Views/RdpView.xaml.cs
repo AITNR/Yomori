@@ -29,23 +29,6 @@ namespace Yomori.Views
         private Microsoft.UI.Dispatching.DispatcherQueue? _dispatcher;
         private RdpD3DRenderer? _renderer;
         private bool _d3dFailed;               // D3D 初始化失败后本实例不再重试（回退软渲染）
-
-        /// <summary>
-        /// S1 直显：原生层自持交换链 + VideoProcessor，托管侧不算像素。
-        /// 与 <see cref="_renderer"/> **互斥** —— 一块面板只能挂一条链。
-        /// </summary>
-        private RdpDirectPresenter? _direct;
-
-        /// <summary>直显被证伪（挂面板失败 / 上屏持续失败）：本实例不再尝试。</summary>
-        private bool _directVetoed;
-
-        /// <summary>
-        /// 看门狗：连续多少拍「有新帧但没上屏」就放弃直显。
-        /// 约 1.5 秒（16ms 一拍）。判据必须是「有新帧」——远端静止时本来就没帧，
-        /// 拿它当故障会把正常的静止桌面判死。
-        /// </summary>
-        private int _directIdleTicks;
-        private const int DirectIdleTicksBeforeFallback = 90;
         private bool _mappedCopyUnsupportedLogged; // 直填导出实调用缺失只提示一次（诊断用）
         private bool _initQueued;              // 惰性初始化已排队（防高频帧重复排队泄漏渲染器）
         private bool _renderSuspended;         // 全屏时页面内渲染器挂起，避免双路渲染
@@ -352,7 +335,6 @@ namespace Yomori.Views
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
             if (_client is not null) _renderer?.DetachDirtyClient(_client);
-            TearDownDirectOnUi();
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -382,28 +364,6 @@ namespace Yomori.Views
             ShowOverlay("未连接", progress: false);
         }
 
-        /// <summary>
-        /// 解绑本实例的直显（S1）。⚠️ UI 线程。
-        ///
-        /// 会关掉 presenter 的直显闸门 —— <c>DetachClient</c> 把会话交给另一个视图时，
-        /// 那个视图的 <c>TryEnsureDirectOnUi</c> 会重新武装并挂自己的面板。
-        /// 幂等：没直显时什么都不做。
-        /// </summary>
-        private void TearDownDirectOnUi()
-        {
-            var presenter = _direct;
-            _direct = null;
-            _directIdleTicks = 0;
-            _directVetoed = false;
-            if (presenter is null)
-            {
-                return;
-            }
-            try { presenter.Dispose(); }
-            catch (Exception ex) { DiagnosticLog?.Invoke($"[embed] 关直显异常：{ex.Message}"); }
-            _client?.NoteDirectPresentArmed(false);
-        }
-
         /// <summary>断开会话并复位画面。幂等。</summary>
         public void Disconnect()
         {
@@ -412,15 +372,11 @@ namespace Yomori.Views
                 return;
             }
             UnhookClient(_client);
-            // 直显先于客户端关：原生层要 SetSwapChain(NULL) 解绑面板，
-            // 而会话一旦销毁就找不到 presenter 了（那时只剩「面板挂着已释放的链」）。
-            TearDownDirectOnUi();
             _client.Dispose();
             _client = null;
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
             if (_client is not null) _renderer?.DetachDirtyClient(_client);
-            TearDownDirectOnUi();
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -480,7 +436,7 @@ namespace Yomori.Views
         /// </summary>
         private bool EnsureRendererOnUi(uint width, uint height)
         {
-            if (_renderer is { Initialized: true } || _direct is not null)
+            if (_renderer is { Initialized: true })
             {
                 return true;
             }
@@ -490,38 +446,25 @@ namespace Yomori.Views
                 return false;
             }
 
-            // ① 先试直显（S1）：一块面板只能挂一条交换链，所以它一旦成功，
-            //    就绝不能再建托管渲染器（后者会用自己的链把这条顶掉）。
-            if (TryEnsureDirectOnUi(width, height))
+            _renderer = new RdpD3DRenderer();
+            if (_renderer.Initialize(PartPanel, width, height))
             {
                 PartPanel.Visibility = Visibility.Visible;
                 PartViewbox.Visibility = Visibility.Visible;
                 PartFrame.Visibility = Visibility.Collapsed;
-                LogRenderPathOnce("AVC420 直显（D3D11VA → VideoProcessor → SwapChainPanel）");
+                DiagnosticLog?.Invoke($"[embed] D3D 渲染器初始化成功（{width}×{height}）");
+                LogRenderPathOnce("D3D11 / SwapChainPanel");
             }
             else
             {
-                // ② 直显不可用：走原有托管 D3D11 路线。
-                _renderer = new RdpD3DRenderer();
-                if (_renderer.Initialize(PartPanel, width, height))
-                {
-                    PartPanel.Visibility = Visibility.Visible;
-                    PartViewbox.Visibility = Visibility.Visible;
-                    PartFrame.Visibility = Visibility.Collapsed;
-                    DiagnosticLog?.Invoke($"[embed] D3D 渲染器初始化成功（{width}×{height}）");
-                    LogRenderPathOnce("D3D11 / SwapChainPanel");
-                }
-                else
-                {
-                    DiagnosticLog?.Invoke($"[embed] D3D 初始化失败（{_renderer.LastError}），回退 SoftwareBitmap");
-                    _renderer.Dispose();
-                    _renderer = null;
-                    _d3dFailed = true;
-                    CreateSoftRenderState();
-                    PartFrame.Visibility = Visibility.Visible;
-                    PartPanel.Visibility = Visibility.Collapsed;
-                    PartViewbox.Visibility = Visibility.Collapsed;
-                }
+                DiagnosticLog?.Invoke($"[embed] D3D 初始化失败（{_renderer.LastError}），回退 SoftwareBitmap");
+                _renderer.Dispose();
+                _renderer = null;
+                _d3dFailed = true;
+                CreateSoftRenderState();
+                PartFrame.Visibility = Visibility.Visible;
+                PartPanel.Visibility = Visibility.Collapsed;
+                PartViewbox.Visibility = Visibility.Collapsed;
             }
 
             // 面板 DIP 尺寸 = 帧尺寸；Viewbox(Uniform) 负责缩放与居中
@@ -533,72 +476,7 @@ namespace Yomori.Views
             _remoteWidth = width;
             _remoteHeight = height;
 
-            return _renderer is { Initialized: true } || _direct is not null;
-        }
-
-        /// <summary>
-        /// 让原生层接管本面板的交换链（S1 直显）。
-        ///
-        /// ⚠️ 必须在 UI 线程调。失败**不**等价于 D3D 故障：只把本实例的直显标记
-        /// 置为证伪，下一次走托管渲染器，画面照常出来。
-        /// </summary>
-        private bool TryEnsureDirectOnUi(uint width, uint height)
-        {
-            if (_directVetoed || _client is null || Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
-            {
-                return false;
-            }
-
-            // 配置没开就一步都别走。TryArm() 自己会再调一次 ycn_rdp_direct_enable，
-            // 只靠 RdpEmbeddedClient 里的门禁拦不住 —— 那一步会注入外部 D3D11 设备。
-            if (!_client.DirectPresentRequested)
-            {
-                _directVetoed = true;
-                return false;
-            }
-
-            // 服务器已确认 ≥ 10.1（AVC444/v2）时会话只发 codec 14/15，直显永远等不到
-            // AVC420 帧。此时接管面板只会白屏几秒再回退（2026-11-02 现场：约 3 秒），
-            // 所以直接放弃直显，托管渲染器立刻接管，画面从第一帧就是通的。
-            if (RdpNativeInterop.PeerNegotiatedAvc444(_client.Session))
-            {
-                _directVetoed = true;
-                _client.NoteDirectPresentArmed(false);
-                DiagnosticLog?.Invoke(
-                    $"[embed] 服务器确认 CAPS ≥ 10.1（AVC444/v2），直显不适用，走托管渲染");
-                return false;
-            }
-
-            var presenter = new RdpDirectPresenter(_client.Session, _client.DirectPresentArmed);
-            if (!presenter.Armed && !presenter.TryArm(true))
-            {
-                _directVetoed = true;
-                _client.NoteDirectPresentArmed(false);
-                if (!string.IsNullOrEmpty(_client.DirectPresentError))
-                {
-                    DiagnosticLog?.Invoke($"[embed] 直显未武装（{_client.DirectPresentError}），走托管渲染");
-                }
-                else
-                {
-                    DiagnosticLog?.Invoke($"[embed] 直显重新武装失败（{presenter.LastError}），走托管渲染");
-                }
-                presenter.Dispose();
-                return false;
-            }
-            _client.NoteDirectPresentArmed(true);
-
-            if (!presenter.AttachPanel(PartPanel))
-            {
-                _directVetoed = true;
-                DiagnosticLog?.Invoke($"[embed] 直显挂面板失败（{presenter.LastError}），走托管渲染");
-                presenter.Dispose();
-                return false;
-            }
-
-            _direct = presenter;
-            _directIdleTicks = 0;
-            DiagnosticLog?.Invoke($"[embed] 直显已接管面板（{width}×{height}）");
-            return true;
+            return _renderer is { Initialized: true };
         }
 
         private bool IsCurrentClient(RdpEmbeddedClient client, int generation) =>
@@ -806,7 +684,7 @@ namespace Yomori.Views
             // 惰性初始化 D3D（用事件参数里的尺寸，无需 memcpy）；失败后本实例固定走软渲染。
             // 注意：panel 尺寸直接用帧尺寸 —— VM 路径下 Connected 事件可能在挂钩前
             // 已错过（_remoteWidth 为 0），不能依赖它（M5 黑屏根因）
-            if (_renderer is null && _direct is null && !_initQueued && !_d3dFailed && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
+            if (_renderer is null && !_initQueued && !_d3dFailed && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
             {
                 _initQueued = true;
                 if (!IsCurrentClient(client, generation))
@@ -861,9 +739,9 @@ namespace Yomori.Views
                 });
             }
 
-            if (_renderer is { Initialized: true } || _direct is not null)
+            if (_renderer is { Initialized: true })
             {
-                return; // D3D / 直显路线：呈现交给节拍器（OnPresentTick）
+                return; // D3D 路线：呈现交给节拍器（OnPresentTick）
             }
 
             if (!_d3dFailed && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware)
@@ -924,22 +802,6 @@ namespace Yomori.Views
             var tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                // 渲染路线还没定（本实例第一次出帧 / 切页回来）：先用帧元数据建链。
-                // 放在直显判断之前，避免「建好直显又掉进托管分支白拷一帧」。
-                if (_renderer is null && _direct is null && !_d3dFailed
-                    && !Yomori.Services.RdpD3DRenderer.ShouldUseSoftware
-                    && client.TryGetFrameInfo(out var probeW, out var probeH, out _))
-                {
-                    EnsureRendererOnUi(probeW, probeH);
-                }
-
-                // S1 直显：原生层已接管面板，这一拍只需请它 Blt + Present。
-                // 返回 false = 本拍已回退，继续往下走托管路径。
-                if (_direct is not null && TryPresentDirectOnUi(seq))
-                {
-                    return;
-                }
-
                 if (!_d3dFailed && !RdpD3DRenderer.ShouldUseSoftware && client.SupportsDirtyFrameCopy)
                 {
                     if (_renderer is not { Initialized: true })
@@ -1108,77 +970,6 @@ namespace Yomori.Views
         /// 尺寸切换瞬间抓帧会失败，一旦推进就再也等不到这一帧了（切页回来黑屏的一半原因）。
         /// 仅首帧等待有尝试上限，避免会话已断时无限空转。
         /// </summary>
-        /// <summary>
-        /// S1 直显的一拍。返回 true = 本拍已处理（成功上屏或按设计丢帧）；
-        /// false = 已放弃直显，调用方继续走托管路径。
-        ///
-        /// 判据（改前必读）：
-        ///   · NoFrame / NotReady / NeedPanel 是「这一拍没帧」，只丢本拍；
-        ///   · 只有「连续 <see cref="DirectIdleTicksBeforeFallback"/> 拍都没上屏」才判死。
-        ///     不能一拍判死 —— 服务器静止时本来就没有可呈现的帧。
-        ///   · Failed / Disabled 才是真故障，立刻回退。
-        /// </summary>
-        private bool TryPresentDirectOnUi(int seq)
-        {
-            var presenter = _direct;
-            if (presenter is null)
-            {
-                return false;
-            }
-
-            var status = presenter.Present(out var width, out var height, out var ticks);
-            if (status == RdpNativeInterop.YcnDirectStatus.Ok)
-            {
-                _phaseStats.RecordD3D(ticks, width, height, 0, uploaded: true);
-                _presentedSeq = seq;
-                _pendingFirstFrame = false;
-                _pendingFirstFrameTries = 0;
-                _directIdleTicks = 0;
-                FramesRendered++;
-                return true;
-            }
-
-            if (status == RdpNativeInterop.YcnDirectStatus.NoFrame
-                || status == RdpNativeInterop.YcnDirectStatus.NotReady
-                || status == RdpNativeInterop.YcnDirectStatus.NeedPanel)
-            {
-                if (++_directIdleTicks < DirectIdleTicksBeforeFallback)
-                {
-                    MarkFrameUnavailable();
-                    return true;
-                }
-
-                DiagnosticLog?.Invoke(
-                    $"[embed] 直显连续 {_directIdleTicks} 拍未上屏，回退托管渲染（最近：{presenter.LastError}）");
-                FallBackFromDirect();
-                return false;
-            }
-
-            DiagnosticLog?.Invoke($"[embed] 直显失败，回退托管渲染：{presenter.LastError}");
-            FallBackFromDirect();
-            return false;
-        }
-
-        /// <summary>
-        /// 关掉直显并把面板交还托管渲染器。
-        ///
-        /// 🔑 <c>presenter.Dispose()</c> 不是「只关个开关」：原生层会先
-        /// <c>SetSwapChain(NULL)</c> 解绑面板、释放自己的交换链，托管渲染器随后才能
-        /// 把新链挂上去。顺序反了会出现「两条链同时挂在同一面板」，表现为画面卡住。
-        /// ⚠️ 必须在 UI 线程调。
-        /// </summary>
-        private void FallBackFromDirect()
-        {
-            _directVetoed = true;
-            var presenter = _direct;
-            _direct = null;
-            try { presenter?.Dispose(); }
-            catch (Exception ex) { DiagnosticLog?.Invoke($"[embed] 关直显异常：{ex.Message}"); }
-            _client?.NoteDirectPresentArmed(false);
-            _initQueued = false;
-            _directIdleTicks = 0;
-        }
-
         private void MarkFrameUnavailable()
         {
             if (_pendingFirstFrame && ++_pendingFirstFrameTries > PendingFirstFrameMaxTries)
