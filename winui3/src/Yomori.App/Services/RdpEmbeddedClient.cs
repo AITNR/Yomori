@@ -336,6 +336,12 @@ namespace Yomori.Services
                 return "probe: " + RdpNativeInterop.DirectPresentProbeDetail;
             }
 
+            // 已确认 AVC444/v2 的会话不会有 AVC420 帧，武装了也用不上，还白白注入设备。
+            if (RdpNativeInterop.PeerNegotiatedAvc444(session))
+            {
+                return "peer-avc444";
+            }
+
             try
             {
                 var rc = RdpNativeInterop.ycn_rdp_direct_enable(session, 1u);

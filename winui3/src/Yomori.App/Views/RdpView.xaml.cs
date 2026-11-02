@@ -549,6 +549,18 @@ namespace Yomori.Views
                 return false;
             }
 
+            // 服务器已确认 ≥ 10.1（AVC444/v2）时会话只发 codec 14/15，直显永远等不到
+            // AVC420 帧。此时接管面板只会白屏几秒再回退（2026-11-02 现场：约 3 秒），
+            // 所以直接放弃直显，托管渲染器立刻接管，画面从第一帧就是通的。
+            if (RdpNativeInterop.PeerNegotiatedAvc444(_client.Session))
+            {
+                _directVetoed = true;
+                _client.NoteDirectPresentArmed(false);
+                DiagnosticLog?.Invoke(
+                    $"[embed] 服务器确认 CAPS ≥ 10.1（AVC444/v2），直显不适用，走托管渲染");
+                return false;
+            }
+
             var presenter = new RdpDirectPresenter(_client.Session, _client.DirectPresentArmed);
             if (!presenter.Armed && !presenter.TryArm(true))
             {

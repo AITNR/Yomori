@@ -379,9 +379,9 @@ static BOOL process_init(void)
  *   - THINCLIENT 在 8.1 是规范 flag，客户端的 cmdline `/gfx-progressive:off`
  *     正是用 GfxThinClient=!enable 来表达“不要 progressive”。
  *
- * GfxCapsFilter 现在**会**设置（见 ycn_apply_gfx_config 末尾）：把广告版本压到
- * 10.0，从而让服务器发 AVC420 而不是 AVC444/v2。它只限制**版本**，不强制服务器
- * 只选 AVC —— 服务器仍可按 caps 选 CLEAR/PLANAR 等 non-AVC codec。
+ * GfxCapsFilter 默认是 0（不过滤，全量广告到 10.7）。它只限制**版本**，不强制
+ * 服务器只选 AVC —— 服务器仍可按 caps 选 CLEAR/PLANAR 等 non-AVC codec。
+ * 把它压到 10.0 的实验结论见 ycn_apply_gfx_config 末尾的注释（结论：不划算）。
  *
  * 现代 AVC 路径必须置 GfxAVC444=TRUE：FreeRDP 3.32 的 rdpgfx_main.c 只有在
  * (!GfxH264 || GfxAVC444) 时才广告 10.x；GfxH264=TRUE 且 GfxAVC444=FALSE
@@ -391,9 +391,9 @@ static BOOL process_init(void)
  * 服务器选择 AVC444v2(codec 15)。因此 GfxAVC444v2=FALSE 只是设置值，
  * 不能声称“服务器不会发 15”；实际必须以 CAPSADVERTISE/CAPS确认与 codec 统计为准。
  *
- * 2026-11-02 现场结论（决定了下面的 caps 过滤）：本机连真实主机时服务器确认 10.7，
- * 13079 个 surface 全是 codec 15，直显因此一次都没跑起来。所以默认把广告版本压到
- * 10.0（AVC420），靠 GfxCapsFilter 实现，不改 FreeRDP 补丁。 */
+ * 2026-11-02 现场结论：本机连真实主机时服务器确认 10.7，13079 个 surface 全是
+ * codec 15 —— 直显用不上，但**硬件解码是好的**（hwactive=1）。压到 10.0 的实验
+ * 反而让服务器彻底放弃 H.264（见下），所以默认保持全量广告。 */
 typedef struct
 {
 	BOOL gfx_enabled;
@@ -441,19 +441,19 @@ static void ycn_calc_gfx_config(uint32_t use_gfx, uint32_t decode_policy, uint32
  * 本机构建就是这一版（日志 adv n=11 可验）。过滤 101..107 后只剩 8 / 81 / 10。 */
 #define YCN_GFX_CAPS_FILTER_AVC420_ONLY 0x000007F8u
 
-/* 进程级 A/B 诊断：命令行含 --embed-avc444 时**放开** caps 过滤，重新广告到 10.7，
- * 让服务器按老样子发 AVC444/v2。默认（不带该开关）只广告到 10.0 = AVC420。
+/* 进程级诊断：命令行含 --embed-avc420-only 时把广告版本压到 10.0（AVC420），
+ * 默认不压（全量广告到 10.7 = AVC444/v2 + 硬件解码）。
+ * 保留它是因为「压到 10.0 到底会换来什么」在本机已经实测过一次（换来的不是 AVC420
+ * 而是 ClearCodec/Progressive，CPU 更高），以后再遇到别的服务器需要复核时用得上。
  *
- * 历史说明：这个函数原来叫 ycn_avc420_only_requested()，解析 --embed-avc420-only，
- * 做法是把 GfxAVC444 置 FALSE。但 rdpgfx_main.c 的规则是「GfxH264=true 且
- * GfxAVC444=false 时不广告任何 10.x」，于是那个开关实际得到的是 8.1（无 AVC），
- * 不是 AVC420 —— 名字与行为不符。2026-11-02 改为现在的语义：默认过滤到 10.0，
- * 开关用于回退到旧行为。只解析本进程命令行一次。 */
-static BOOL ycn_allow_avc444_requested(void)
+ * 注意别和更早那版混起来：最早它也解析 --embed-avc420-only，但做法是把
+ * GfxAVC444 置 FALSE；按 rdpgfx_main.c 的规则那只会得到 8.1（连 AVC 都没有），
+ * 并不是 AVC420。现在它真的只改 GfxCapsFilter。只解析本进程命令行一次。 */
+static BOOL ycn_avc420_only_requested(void)
 {
 	static volatile LONG cached = -1;
 	LONG v = InterlockedCompareExchange(&cached, 0, 0);
-	const wchar_t token[] = L"--embed-avc444";
+	const wchar_t token[] = L"--embed-avc420-only";
 	const wchar_t* cmd;
 
 	if (v >= 0)
@@ -525,9 +525,19 @@ static void ycn_apply_gfx_config(rdpSettings* settings, const YcnGfxConfig* cfg)
 	 * 代价是色度 4:2:0（AVC444 是 4:4:4），彩色文字边缘会有轻微色渗。
 	 * 这是按「更高性能、更低占用优先」做的取舍；要退回画质优先，把这里改成
 	 * 0（不过滤）即可，其余代码不用动。 */
+	/* ⚠️ 默认**不**过滤（0 = 全量广告到 10.7）。
+	 *
+	 * 2026-11-02 实测教训：一度默认设成 YCN_GFX_CAPS_FILTER_AVC420_ONLY（只广告到
+	 * 10.0），本意是让服务器改发 AVC420(codec 11) 以便直显。结果服务器确认 10.0 后
+	 * **干脆放弃 H.264**，改发 ClearCodec(8) + CapProgressive(9)：一场会话 23883 个
+	 * ClearCodec surface，hwactive=0、hw_frames=0，CPU 占用明显高于 AVC444 时期。
+	 * 也就是说这台服务器在 AVC 上只有「10.1+ 的 AVC444」和「完全不用 AVC」两种选择，
+	 * AVC420 根本不是它会选的档位。所以这里保持 0，把硬件解码拿回来。
+	 *
+	 * 需要复现那次实验时，命令行加 --embed-avc420-only 即可（仅诊断用）。 */
 	freerdp_settings_set_uint32(
 	    settings, FreeRDP_GfxCapsFilter,
-	    ycn_allow_avc444_requested() ? 0u : YCN_GFX_CAPS_FILTER_AVC420_ONLY);
+	    ycn_avc420_only_requested() ? YCN_GFX_CAPS_FILTER_AVC420_ONLY : 0u);
 }
 
 typedef struct
@@ -1734,6 +1744,26 @@ int ycn_rdp_direct_bench_rect(uint32_t width, uint32_t height, uint32_t rect_w, 
 	status = ycn_dp_bench_rect(width, height, rect_w, rect_h, iterations, out);
 	out->version = YCN_DIRECT_API_VERSION;
 	return (status == YCN_DP_STATUS_OK) ? YCN_OK : YCN_ERR_INTERNAL;
+}
+
+/* 服务器在 RDPGFX CAPS 里**确认**的版本（0 = 还没确认 / 无会话）。
+ *
+ * 用途：AVC444 会话（版本 >= 10.1）永远发不出 AVC420 帧，直显对它不可能生效。
+ * 提前知道这一点就别接管面板 —— 否则会出现「直显接管面板 → 几十拍没帧 → 回退」
+ * 那段空白（2026-11-02 现场：约 3 秒黑屏）。
+ *
+ * 版本值见 MS-RDPEGFX：0x000A0000=10.0(仅 AVC420)、0x000A0100=10.1(起有 AVC444)。 */
+int ycn_rdp_gfx_caps_version(int session)
+{
+	YcnSession* s;
+	int version = 0;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (s && s->used)
+		version = (int)s->gfx_caps_version;
+	LeaveCriticalSection(&g_lock);
+	return version;
 }
 
 int ycn_rdp_direct_set_incremental(int session, uint32_t enable)

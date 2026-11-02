@@ -266,6 +266,10 @@ YCN_API int ycn_rdp_direct_bench_rect(uint32_t width, uint32_t height, uint32_t 
                                       ycn_direct_present_result* out);
 YCN_API int ycn_rdp_direct_bench(uint32_t width, uint32_t height, uint32_t iterations,
                                  ycn_direct_present_result* out);
+/* 服务器确认的 RDPGFX CAPS 版本（0 = 尚未确认）。
+ * >= 0x000A0100 表示会话会走 AVC444/v2，直显不可能生效，调用方不应接管面板。 */
+YCN_API int ycn_rdp_gfx_caps_version(int session);
+
 /* 增量直显开关（默认关）：开启后只转 dirty 矩形，前置条件不成立自动退回整幅。 */
 YCN_API int ycn_rdp_direct_set_incremental(int session, uint32_t enable);
 

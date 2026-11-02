@@ -308,6 +308,34 @@ namespace Yomori.Services
         internal static extern int ycn_rdp_direct_enable(int session, uint enable);
         [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_direct_attach_panel")]
         internal static extern int ycn_rdp_direct_attach_panel(int session, IntPtr panel);
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_gfx_caps_version")]
+        internal static extern int ycn_rdp_gfx_caps_version(int session);
+
+        /// <summary>服务器确认的 CAPS 版本；0 = 尚未确认。</summary>
+        internal const int GfxCapsVersion10 = 0x000A0000;   // 10.0：只有 AVC420
+        internal const int GfxCapsVersion101 = 0x000A0100;  // 10.1：起有 AVC444
+
+        /// <summary>
+        /// 会话是否已被服务器确认走 AVC444/v2（版本 ≥ 10.1）。
+        /// 那种会话不会发 AVC420 帧，直显不可能生效 —— 提前跳过，别去接管面板
+        /// （接管了也会因为「连续没帧」回退，中间那几秒是黑屏）。
+        /// </summary>
+        internal static bool PeerNegotiatedAvc444(int session)
+        {
+            try
+            {
+                var v = ycn_rdp_gfx_caps_version(session);
+                return v >= GfxCapsVersion101;
+            }
+            catch (Exception ex) when (ex is EntryPointNotFoundException
+                                       || ex is DllNotFoundException
+                                       || ex is BadImageFormatException)
+            {
+                // 旧 DLL 没有这个导出：当作「不知道」，维持原有行为。
+                return false;
+            }
+        }
+
         [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_direct_present")]
         internal static extern int ycn_rdp_direct_present(int session, ref YcnDirectPresentResult result);
 
