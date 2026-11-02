@@ -314,8 +314,35 @@ namespace Yomori.Services
         private static readonly object s_directProbeGate = new();
         private static bool s_directProbeDone;
         private static bool s_directSupported;
+        private static string s_directProbeDetail = "";
 
-        /// <summary>DLL 是否带 S1 直显导出。结果进程级缓存；缺导出时零副作用。</summary>
+        /// <summary>探测失败的**具体**原因（成功时为空串）。只用于日志与排障。</summary>
+        /// <remarks>
+        /// 2026-11-02 的教训：这条日志以前只会写「native exports missing」，看起来像
+        /// 「DLL 太旧」，实际是**探错了模块** —— `ycn_h264_set_external_d3d11_device`
+        /// 由打过补丁的 `freerdp3.dll` 导出，`ycn_rdp.dll` 只是用 GetProcAddress 去取它。
+        /// 探测一直返回 false，直显从未武装过，而日志里看不出任何异常。
+        /// 所以现在把「缺哪一个符号、在哪个模块」写进 detail。
+        /// </remarks>
+        internal static string DirectPresentProbeDetail
+        {
+            get
+            {
+                _ = SupportsDirectPresent;
+                lock (s_directProbeGate)
+                {
+                    return s_directProbeDetail;
+                }
+            }
+        }
+
+        /// <summary>直显所需的两个模块是否都带齐导出。结果进程级缓存；缺导出时零副作用。</summary>
+        /// <remarks>
+        /// 两类符号分属两个模块，**不能混在一起查**：
+        ///   · `ycn_rdp.dll`（本项目的桥接层）：direct_present / attach_panel / enable；
+        ///   · `freerdp3.dll`（打过 ycn 补丁的上游）：ycn_h264_set_external_d3d11_device，
+        ///     桥接层自己也是运行时 GetProcAddress 去取，所以桥接层的导出表里没有它。
+        /// </remarks>
         internal static bool SupportsDirectPresent
         {
             get
@@ -324,39 +351,77 @@ namespace Yomori.Services
                 {
                     if (!s_directProbeDone)
                     {
-                        var handle = IntPtr.Zero;
-                        try
-                        {
-                            var loaded = NativeLibrary.TryLoad(Lib, out handle)
-                                         || NativeLibrary.TryLoad(
-                                             Lib,
-                                             typeof(RdpNativeInterop).Assembly,
-                                             DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.SafeDirectories,
-                                             out handle);
-                            s_directSupported = loaded
-                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_direct_present", out _)
-                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_direct_attach_panel", out _)
-                                && NativeLibrary.TryGetExport(handle, "ycn_rdp_direct_enable", out _)
-                                && NativeLibrary.TryGetExport(handle, "ycn_h264_set_external_d3d11_device", out _);
-                        }
-                        catch (Exception ex) when (ex is DllNotFoundException
-                                                   || ex is BadImageFormatException
-                                                   || ex is ArgumentException)
-                        {
-                            s_directSupported = false;
-                        }
-                        finally
-                        {
-                            if (handle != IntPtr.Zero)
-                            {
-                                NativeLibrary.Free(handle);
-                            }
-                        }
+                        s_directSupported = ProbeDirectPresent(out s_directProbeDetail);
                         s_directProbeDone = true;
                     }
                     return s_directSupported;
                 }
             }
+        }
+
+        private static bool ProbeDirectPresent(out string detail)
+        {
+            detail = "";
+            var bridge = IntPtr.Zero;
+            var freerdp = IntPtr.Zero;
+            try
+            {
+                if (!TryLoadModule(Lib, out bridge))
+                {
+                    detail = $"load-failed:{Lib}.dll";
+                    return false;
+                }
+                foreach (var name in new[] { "ycn_rdp_direct_present", "ycn_rdp_direct_attach_panel",
+                                             "ycn_rdp_direct_enable" })
+                {
+                    if (!NativeLibrary.TryGetExport(bridge, name, out _))
+                    {
+                        detail = $"missing:{Lib}.dll!{name}";
+                        return false;
+                    }
+                }
+
+                // 外部 D3D11 设备注入钩子在补丁版 FreeRDP 里，不在桥接层。
+                if (!TryLoadModule("freerdp3", out freerdp))
+                {
+                    detail = "load-failed:freerdp3.dll";
+                    return false;
+                }
+                if (!NativeLibrary.TryGetExport(freerdp, "ycn_h264_set_external_d3d11_device", out _))
+                {
+                    detail = "missing:freerdp3.dll!ycn_h264_set_external_d3d11_device";
+                    return false;
+                }
+                return true;
+            }
+            catch (Exception ex) when (ex is DllNotFoundException
+                                       || ex is BadImageFormatException
+                                       || ex is ArgumentException)
+            {
+                detail = ex.GetType().Name;
+                return false;
+            }
+            finally
+            {
+                if (freerdp != IntPtr.Zero)
+                {
+                    NativeLibrary.Free(freerdp);
+                }
+                if (bridge != IntPtr.Zero)
+                {
+                    NativeLibrary.Free(bridge);
+                }
+            }
+        }
+
+        private static bool TryLoadModule(string name, out IntPtr handle)
+        {
+            return NativeLibrary.TryLoad(name, out handle)
+                   || NativeLibrary.TryLoad(
+                       name,
+                       typeof(RdpNativeInterop).Assembly,
+                       DllImportSearchPath.AssemblyDirectory | DllImportSearchPath.SafeDirectories,
+                       out handle);
         }
 
         /// <summary>实调用失败后永久降级（本次进程内不再尝试直显）。</summary>
@@ -366,6 +431,10 @@ namespace Yomori.Services
             {
                 s_directProbeDone = true;
                 s_directSupported = false;
+                if (s_directProbeDetail.Length == 0)
+                {
+                    s_directProbeDetail = "runtime-call-failed";
+                }
             }
         }
 

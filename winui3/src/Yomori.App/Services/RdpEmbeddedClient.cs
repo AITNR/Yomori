@@ -332,7 +332,8 @@ namespace Yomori.Services
         {
             if (!RdpNativeInterop.SupportsDirectPresent)
             {
-                return "native exports missing";
+                // 带上具体缺哪个符号、在哪个模块 —— 只写「exports missing」等于没写。
+                return "probe: " + RdpNativeInterop.DirectPresentProbeDetail;
             }
 
             try

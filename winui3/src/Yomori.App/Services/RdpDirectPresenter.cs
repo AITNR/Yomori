@@ -51,7 +51,7 @@ namespace Yomori.Services
         {
             if (!RdpNativeInterop.SupportsDirectPresent)
             {
-                LastError = "native exports missing";
+                LastError = "probe: " + RdpNativeInterop.DirectPresentProbeDetail;
                 return false;
             }
 
