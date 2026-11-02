@@ -283,6 +283,43 @@ AVC420（codec 11）→ 直显闭环才真正成立。代价是色度 4:2:0。
 `直显连续 90 拍未上屏，回退托管渲染`）。现在新增 `ycn_rdp_gfx_caps_version()`，
 服务器确认的 CAPS ≥ 10.1 时**不武装、不接管面板**，托管渲染器从第一帧就接手。
 
+### 10.4 修好探测之后崩了两次：直显改为默认关（`22e4feb` 之后）
+
+探测修好（§10.1）之后，`ArmDirectPresent` 终于走到了 `ycn_rdp_direct_enable()`，而它
+会做一件副作用很大的事：
+
+```c
+device = ycn_dp_device();              // 我们自己的 D3D11 设备
+probe->setExternalDevice(device);      // 注入解码器
+probe->setDirectSink(...);
+```
+
+**注入之后，H.264 就在我们这块设备上解码。** 这台机器 S0 的取证是
+`dxva2:no-shared-handle`、`format_support: 0x0` —— 解码面本来就不支持共享。结果：
+
+| 版本 | 探测 | 注入设备 | 会话 codec | 结果 |
+|---|---|---|---|---|
+| dev.216 | 坏（恒 false） | 没有 | AVC444 | 正常 |
+| dev.217 / 218 | 好了 | 注入了 | ClearCodec / Progressive（不走 H.264） | 不崩 |
+| dev.219 | 好了 | 注入了 | AVC444（走 H.264） | **崩** |
+
+崩溃签名两次完全一致：`igd10um64xe.DLL+0xbc483`，`0xC0000005`，随后
+`LiveKernelEvent 0x141`（igdkmdn64.sys 页错误 → GPU 复位），最后 XAML 以
+`CoreMessagingXP.dll` + `0xc000027b` 收尾。用 minidump 解析确认崩溃线程
+（54724 / 6028）没有任何托管栈，RIP 直接落在 Intel 用户态驱动里。
+
+注意 §10.3 加的那个 `PeerNegotiatedAvc444` 门禁**拦不住**：它在武装那一刻（刚
+`freerdp_connect` 返回）拿到的 CAPS 版本还是 0（GFX 通道尚未协商完），于是判断为
+「不知道」继续武装。而 `RdpDirectPresenter.TryArm()` 还会自己再调一次
+`ycn_rdp_direct_enable()`，绕过 `RdpEmbeddedClient` 里的门禁。
+
+**结论：零拷贝直显改为配置项 `direct_present_enabled`，默认 `false`。** 关着时解码器
+用自己那块设备，行为与 dev.216 完全一致。设置页给了「零拷贝直显（实验）」勾选开关，
+打开才注入；出问题取消勾选即可，不必换版本。
+
+这个取舍是明确的：这条路对 AVC444 对端本来就用不上（§2），而在解码面不可共享的
+机器上它会直接把显卡驱动搞崩 —— 收益为零、风险极高，所以不能默认开。
+
 ## 11. 复现
 
 ```bash

@@ -4876,6 +4876,7 @@ public sealed class MainViewModel : ObservableObject
             UseGfx = RdpSettings.GfxEnabled,
             DecodeBackend = RdpSettings.DecodeBackend,
             RenderBackend = RdpSettings.RenderBackend,
+            DirectPresent = RdpSettings.DirectPresentEnabled,
         });
         if (!started)
         {

@@ -549,6 +549,14 @@ namespace Yomori.Views
                 return false;
             }
 
+            // 配置没开就一步都别走。TryArm() 自己会再调一次 ycn_rdp_direct_enable，
+            // 只靠 RdpEmbeddedClient 里的门禁拦不住 —— 那一步会注入外部 D3D11 设备。
+            if (!_client.DirectPresentRequested)
+            {
+                _directVetoed = true;
+                return false;
+            }
+
             // 服务器已确认 ≥ 10.1（AVC444/v2）时会话只发 codec 14/15，直显永远等不到
             // AVC420 帧。此时接管面板只会白屏几秒再回退（2026-11-02 现场：约 3 秒），
             // 所以直接放弃直显，托管渲染器立刻接管，画面从第一帧就是通的。

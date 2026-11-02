@@ -553,6 +553,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private bool _gfxEnabled = true;
     private string _decodeBackend = DecodeBackends.Auto;
     private string _renderBackend = RenderBackends.Auto;
+    private bool _directPresentEnabled;
     private int _desktopWidth = RdpResolutions.DefaultWidth;
     private int _desktopHeight = RdpResolutions.DefaultHeight;
     private List<RdpChannel> _channels = new();
@@ -764,6 +765,26 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     {
         get => _renderBackend;
         set => SetProperty(ref _renderBackend, RenderBackends.Normalize(value));
+    }
+
+    /// <summary>
+    /// 实验开关：允许武装 S1 零拷贝直显（默认 **关**）。
+    ///
+    /// <para>关着的时候解码器用自己那块设备，行为和 dev.216 完全一致 —— 这是 2026-11-02
+    /// 事故之后的安全默认值。开着会让原生层建一块我们自己的 D3D11 设备并注入解码器；
+    /// 在「解码面不可共享」的机器上（<c>dxva2:no-shared-handle</c>，典型是核显）注入之后
+    /// H.264 硬解会崩在显卡驱动里（igd10um64xe.DLL+0xbc483，连崩两次 + 一次 GPU TDR）。</para>
+    ///
+    /// <para>另外它对 AVC444 对端本来也用不上：AVC444 的色度是逐像素散写、只能 CPU 合成，
+    /// 永远进不了零拷贝直显（docs/rdp-avc-direct-present-s2 §2）。所以这个开关的实际价值
+    /// 只在于「对端会发 AVC420 且本机解码面可共享」的组合，试之前先看运行日志里的
+    /// <c>直显未武装（…）</c> 那行写的是什么。</para>
+    /// </summary>
+    [JsonPropertyName("direct_present_enabled")]
+    public bool DirectPresentEnabled
+    {
+        get => _directPresentEnabled;
+        set => SetProperty(ref _directPresentEnabled, value);
     }
 
     /// <summary>远程桌面宽度，0 表示自适应（跟随画面区域）。</summary>

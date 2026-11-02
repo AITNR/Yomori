@@ -299,6 +299,32 @@ public sealed partial class SettingsPage : Page
     /// <para>关闭时只取消尚未开始的等待，不重启 UU 服务 —— 撤销动作副作用太大，
     /// 不该藏在一个开关里。已生效的修正随服务重启自然失效。</para>
     /// </summary>
+    /// <summary>
+    /// 零拷贝直显开关。改完只落配置，下一次建连才生效（注入解码器发生在 connect 阶段，
+    /// 已建立的会话不能中途换设备）。
+    /// </summary>
+    private void OnDirectPresentToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncing)
+        {
+            return;
+        }
+
+        if (sender is not ToggleSwitch toggle)
+        {
+            return;
+        }
+
+        var on = toggle.IsOn;
+        if (VM.RdpSettings.DirectPresentEnabled == on)
+        {
+            return;
+        }
+
+        VM.RdpSettings.DirectPresentEnabled = on;
+        VM.SaveConfig();
+    }
+
     private void OnUuFixToggled(object sender, RoutedEventArgs e)
     {
         if (_syncing)

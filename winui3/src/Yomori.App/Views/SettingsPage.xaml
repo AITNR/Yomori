@@ -73,6 +73,20 @@
                                TextWrapping="Wrap"
                                Visibility="Collapsed"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                    <!-- 零拷贝直显（实验）：默认关。
+                         开着会让原生层建自己的 D3D11 设备并注入解码器，部分机器（核显、
+                         解码面不可共享）会崩在显卡驱动里 —— 2026-11-02 事故就是这么来的。
+                         关掉 = 解码器用自己的设备，与 dev.216 行为一致。 -->
+                    <ToggleSwitch x:Name="DirectPresentSwitch"
+                                  Header="零拷贝直显（实验）"
+                                  IsOn="{x:Bind VM.RdpSettings.DirectPresentEnabled, Mode=OneWay}"
+                                  Toggled="OnDirectPresentToggled" />
+
+                    <TextBlock Text="仅对会发 AVC420 的对端有意义；AVC444 对端用不上。开着时若出现画面卡死或程序崩溃，取消勾选即可回到默认路径，不需要换版本。"
+                               TextWrapping="Wrap"
+                               Opacity="0.7"
+                               FontSize="12" />
                 </StackPanel>
             </Border>
 
