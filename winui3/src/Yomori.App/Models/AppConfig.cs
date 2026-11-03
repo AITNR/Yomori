@@ -32,6 +32,7 @@ public sealed class AppConfig : ObservableObject
     private bool _autoStartTasks;
     private bool _windowsStartup;
     private bool _enableTimeoutScreenshot = true;
+    private bool _trimWorkingSetOnIdle = true;
     private bool _developerMode;
     private int _externalLogKeepFiles = ExternalLogDefaults.KeepFiles;
     private int _eventLineLimit = ExternalLogDefaults.EventLineLimit;
@@ -78,6 +79,19 @@ public sealed class AppConfig : ObservableObject
     {
         get => _autoStartTasks;
         set => SetProperty(ref _autoStartTasks, value);
+    }
+
+    /// <summary>
+    /// 连接建立后空闲时回收一次工作集（等价于 Mem Reduct 的"清内存"）。
+    ///
+    /// <para>只影响常驻页，不改变提交量；用于把"连接期一次性提交、之后不再访问"的
+    /// 冷页从物理内存里放掉。任务执行中不做，避免给正在跑的脚本添缺页。</para>
+    /// </summary>
+    [JsonPropertyName("trim_working_set_on_idle")]
+    public bool TrimWorkingSetOnIdle
+    {
+        get => _trimWorkingSetOnIdle;
+        set => SetProperty(ref _trimWorkingSetOnIdle, value);
     }
 
     [JsonPropertyName("windows_startup")]
@@ -371,6 +385,7 @@ public sealed class AppConfig : ObservableObject
         AutoStartTasks = AutoStartTasks,
         WindowsStartup = WindowsStartup,
         EnableTimeoutScreenshot = EnableTimeoutScreenshot,
+        TrimWorkingSetOnIdle = TrimWorkingSetOnIdle,
         DeveloperMode = DeveloperMode,
         UpdateChannel = UpdateChannel,
         UpdateCheckMode = UpdateCheckMode,

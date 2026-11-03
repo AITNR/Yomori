@@ -102,6 +102,49 @@ namespace Yomori.Services
         /// <summary>抓帧复用缓冲（避免每帧分配 8MB 触发 GC）。长度 ≥ 最近一帧的 stride*height。</summary>
         private byte[] _frameBuffer = Array.Empty<byte>();
 
+        // ---- 归因计数（只加计数，不改变行为）----
+        // 用途：分清「托管帧缓冲常驻」与「native/解码表面」各占多少；配合每分钟 [memory] 行判断
+        // Private Bytes 上涨到底跟着谁走。进程级静态量，断开后必须归零。
+        private static long s_liveFrameBuffers;
+        private static long s_liveFrameBufferBytes;
+        private static long s_fullFrameCopies;
+        private static long s_fullFrameCopyBytes;
+
+        /// <summary>当前存活的托管帧缓冲数量与总字节（归因用）。</summary>
+        public static (long Buffers, long Bytes) LiveFrameBuffers()
+            => (System.Threading.Interlocked.Read(ref s_liveFrameBuffers),
+                System.Threading.Interlocked.Read(ref s_liveFrameBufferBytes));
+
+        /// <summary>整帧托管拷贝的累计次数与字节（归因用，累计不清零）。</summary>
+        public static (long Copies, long Bytes) FullFrameCopyTotals()
+            => (System.Threading.Interlocked.Read(ref s_fullFrameCopies),
+                System.Threading.Interlocked.Read(ref s_fullFrameCopyBytes));
+
+        /// <summary>托管帧缓冲与整帧拷贝的一行摘要（挂到每分钟的 [memory] 日志）。</summary>
+        public static string FrameCopySummary()
+        {
+            var (buffers, bufferBytes) = LiveFrameBuffers();
+            var (copies, copyBytes) = FullFrameCopyTotals();
+            return $"frame_bufs={buffers} frame_buf_mib={bufferBytes / 1048576} "
+                   + $"frame_copies={copies} frame_copy_mib={copyBytes / 1048576}";
+        }
+
+        /// <summary>本实例当前占用的托管帧缓冲字节数（切换/释放时按差额结算）。</summary>
+        private long _frameBufferBytes;
+
+        private void SetFrameBuffer(byte[] buffer)
+        {
+            var previous = _frameBufferBytes;
+            _frameBuffer = buffer;
+            _frameBufferBytes = buffer.Length;
+            if (previous != buffer.Length)
+            {
+                System.Threading.Interlocked.Add(ref s_liveFrameBufferBytes, buffer.Length - previous);
+                if (previous == 0 && buffer.Length > 0) { System.Threading.Interlocked.Increment(ref s_liveFrameBuffers); }
+                else if (previous > 0 && buffer.Length == 0) { System.Threading.Interlocked.Decrement(ref s_liveFrameBuffers); }
+            }
+        }
+
         public RdpClientState State { get { lock (_gate) { return _state; } } }
         public int Session => _session;
 
@@ -186,7 +229,7 @@ namespace Yomori.Services
                 {
                     _state = RdpClientStateMachine.Transition(_state, RdpClientEvent.NativeDisconnected);
                     _session = 0;
-                    _frameBuffer = Array.Empty<byte>();
+                    SetFrameBuffer(Array.Empty<byte>());
                 }
                 try { Disconnected?.Invoke(this, (session, reason, detail ?? string.Empty)); }
                 finally
@@ -330,7 +373,7 @@ namespace Yomori.Services
             if (buffer.Length < size)
             {
                 buffer = new byte[size];
-                _frameBuffer = buffer;
+                SetFrameBuffer(buffer);
             }
 
             // 第二步在原生锁内整帧拷贝：与 end_paint 的写入互斥，
@@ -350,6 +393,8 @@ namespace Yomori.Services
             width = w;
             height = h;
             stride = st;
+            System.Threading.Interlocked.Increment(ref s_fullFrameCopies);
+            System.Threading.Interlocked.Add(ref s_fullFrameCopyBytes, size);
             // 注意：pixels 是复用缓冲，长度可能大于 stride*height —— 消费方按 stride/width/height 取值
             pixels = buffer;
             return true;

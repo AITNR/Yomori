@@ -98,7 +98,9 @@ namespace Yomori.Services
         private bool _dirtyAttached;
         private ulong _dirtyToken;
         private static long s_dirtyTokenSource;
-        private readonly RdpNativeInterop.YcnDirtyRect[] _dirtyRects = new RdpNativeInterop.YcnDirtyRect[2048];
+        // Dirty rects are only needed after the native dirty API is attached. Keep the
+        // common renderer path free of a permanent 2048-entry managed allocation.
+        private RdpNativeInterop.YcnDirtyRect[]? _dirtyRects;
         private long _dirtyBoxCalls, _dirtyBoxBytes, _dirtyFullUploads, _dirtyTextureResets;
         private ID3D11Texture2D? _backBuffer;
         private Microsoft.UI.Xaml.Controls.SwapChainPanel? _panel;
@@ -108,6 +110,29 @@ namespace Yomori.Services
 
         private static int _liveRenderers;
         public static int LiveRenderers => System.Threading.Volatile.Read(ref _liveRenderers);
+
+        // ---- 归因计数（只加计数，不改变行为）----
+        // 每路 D3D 固定占用 = 2 张 backbuffer + staging + frame texture，1080p 每张约 7.91 MiB。
+        // 断开后这些数字必须回落到 0；不回落即为资源未释放的直接证据。
+        private static long s_deviceCreates, s_deviceDisposes;
+        private static long s_swapChainCreates, s_swapChainDisposes;
+        private static long s_liveStagingBytes, s_liveFrameTextureBytes;
+        private static long s_stagingAllocs, s_frameTextureAllocs;
+        private long _stagingBytes, _frameTextureBytes;
+
+        /// <summary>D3D 固定资源的存活字节与累计创建次数（归因用）。</summary>
+        public static string ResourceSummary()
+        {
+            var staging = System.Threading.Interlocked.Read(ref s_liveStagingBytes) / 1048576;
+            var frame = System.Threading.Interlocked.Read(ref s_liveFrameTextureBytes) / 1048576;
+            return $"d3d_dev={System.Threading.Interlocked.Read(ref s_deviceCreates)}/"
+                   + $"{System.Threading.Interlocked.Read(ref s_deviceDisposes)} "
+                   + $"d3d_sc={System.Threading.Interlocked.Read(ref s_swapChainCreates)}/"
+                   + $"{System.Threading.Interlocked.Read(ref s_swapChainDisposes)} "
+                   + $"staging_mib={staging} frame_mib={frame} "
+                   + $"staging_alloc={System.Threading.Interlocked.Read(ref s_stagingAllocs)} "
+                   + $"frame_alloc={System.Threading.Interlocked.Read(ref s_frameTextureAllocs)}";
+        }
         public bool Initialized { get; private set; }
 
         public string? LastError { get; private set; }
@@ -151,6 +176,7 @@ namespace Yomori.Services
 
                 _device = device;
                 _context = device.ImmediateContext;
+                System.Threading.Interlocked.Increment(ref s_deviceCreates);
 
                 using var dxgiDevice = device.QueryInterface<IDXGIDevice>();
                 using var adapter = dxgiDevice.GetAdapter();
@@ -178,6 +204,7 @@ namespace Yomori.Services
                     LastError = "CreateSwapChainForComposition returned null";
                     return false;
                 }
+                System.Threading.Interlocked.Increment(ref s_swapChainCreates);
 
                 _panel = panel;
                 _panelPtr = ((IWinRTObject)panel).NativeObject.ThisPtr;
@@ -233,6 +260,7 @@ namespace Yomori.Services
                 CPUAccessFlags = CpuAccessFlags.Write,
                 MiscFlags = ResourceOptionFlags.None,
             });
+            TrackStagingBytes();
         }
 
         private void CreateFrameTexture()
@@ -247,6 +275,27 @@ namespace Yomori.Services
             });
             _frameTextureValid = false;
             _dirtyTextureResets++;
+            TrackFrameTextureBytes();
+        }
+
+        /// <summary>把本实例 staging 纹理的字节变动结算到进程级计数（归因用）。</summary>
+        private void TrackStagingBytes()
+        {
+            var bytes = _staging is null ? 0 : (long)_remoteWidth * _remoteHeight * 4;
+            var delta = bytes - _stagingBytes;
+            _stagingBytes = bytes;
+            if (delta != 0) { System.Threading.Interlocked.Add(ref s_liveStagingBytes, delta); }
+            if (bytes > 0) { System.Threading.Interlocked.Increment(ref s_stagingAllocs); }
+        }
+
+        /// <summary>把本实例 frame texture 的字节变动结算到进程级计数（归因用）。</summary>
+        private void TrackFrameTextureBytes()
+        {
+            var bytes = _frameTexture is null ? 0 : (long)_remoteWidth * _remoteHeight * 4;
+            var delta = bytes - _frameTextureBytes;
+            _frameTextureBytes = bytes;
+            if (delta != 0) { System.Threading.Interlocked.Add(ref s_liveFrameTextureBytes, delta); }
+            if (bytes > 0) { System.Threading.Interlocked.Increment(ref s_frameTextureAllocs); }
         }
 
         internal bool AttachDirtyClient(RdpEmbeddedClient client)
@@ -294,11 +343,12 @@ namespace Yomori.Services
                 mapped = true;
                 var capacity64 = (ulong)(uint)map.RowPitch * _remoteHeight;
                 if (capacity64 == 0 || capacity64 > uint.MaxValue) throw new InvalidOperationException("staging capacity overflow");
-                var rc = client.CopyPendingDirty(_dirtyToken, map.DataPointer, (uint)capacity64, (uint)map.RowPitch, out var info, _dirtyRects);
+                var dirtyRects = _dirtyRects ??= new RdpNativeInterop.YcnDirtyRect[2048];
+                var rc = client.CopyPendingDirty(_dirtyToken, map.DataPointer, (uint)capacity64, (uint)map.RowPitch, out var info, dirtyRects);
                 copyTicks = System.Diagnostics.Stopwatch.GetTimestamp() - start;
                 if (rc != 0) { LastError = $"dirty copy failed: {rc}"; _frameTextureValid = false; return false; }
                 width = info.Width; height = info.Height; stride = info.Stride;
-                if (info.ApiVersion != 1 || info.Token != _dirtyToken || info.RectCount > _dirtyRects.Length || width == 0 || height == 0) { LastError = "invalid dirty frame info"; _frameTextureValid = false; return false; }
+                if (info.ApiVersion != 1 || info.Token != _dirtyToken || info.RectCount > dirtyRects.Length || width == 0 || height == 0) { LastError = "invalid dirty frame info"; _frameTextureValid = false; return false; }
                 if (width != _remoteWidth || height != _remoteHeight) { _context.Unmap(_staging, 0); mapped = false; if (!ResizeRemoteLocked(width,height)) throw new InvalidOperationException("dirty resize failed"); _frameTextureValid=false; return false; }
                 if (info.Kind == RdpNativeInterop.DirtyKindEmpty) { _context.Unmap(_staging,0); mapped=false; return true; }
                 _context.Unmap(_staging,0); mapped=false;
@@ -318,7 +368,7 @@ namespace Yomori.Services
                 {
                     for (uint i=0;i<info.RectCount;i++)
                     {
-                        var b=_dirtyRects[i];
+                        var b=dirtyRects[i];
                         var box=new Vortice.Mathematics.Box(b.X,b.Y,0,b.X+(int)b.W,b.Y+(int)b.H,1);
                         _context.CopySubresourceRegion(_frameTexture,0,(uint)b.X,(uint)b.Y,0,_staging,0,box);
                         _dirtyBoxCalls++;
@@ -605,6 +655,11 @@ namespace Yomori.Services
                 _swapChain?.Dispose();
                 _context?.Dispose();
                 _device?.Dispose();
+                // 计数结算必须在字段清空之前：清零后就看不出这一路曾持有多少固定资源。
+                if (_stagingBytes != 0) { System.Threading.Interlocked.Add(ref s_liveStagingBytes, -_stagingBytes); _stagingBytes = 0; }
+                if (_frameTextureBytes != 0) { System.Threading.Interlocked.Add(ref s_liveFrameTextureBytes, -_frameTextureBytes); _frameTextureBytes = 0; }
+                if (_swapChain is not null) { System.Threading.Interlocked.Increment(ref s_swapChainDisposes); }
+                if (_device is not null) { System.Threading.Interlocked.Increment(ref s_deviceDisposes); }
                 _staging = null;
                 _frameTexture = null;
                 _frameTextureValid = false;

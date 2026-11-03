@@ -38,6 +38,27 @@ namespace Yomori.Views
         private static long s_softRendersInFlight;
 
         /// <summary>
+        /// 主窗口不可见（最小化 / 收进托盘）时为 true：所有 RdpView 停止抓帧与呈现。
+        ///
+        /// <para>为什么需要它：呈现节拍器是 16ms 一跳，每跳都要 Map staging、写纹理、Present。
+        /// 窗口看不见时这些工作对用户没有任何价值，却让整条 D3D 表面链一直处于"热"状态，
+        /// 系统没法把专用工作集裁下去（实测：窗口正常时专用工作集约 730 MiB，
+        /// 没人碰的时候能掉到 238 MiB）。停掉呈现后，页面自然变冷，裁剪才有意义。</para>
+        ///
+        /// <para>会话、网络与解码**完全不受影响** —— 只停"把最后一帧画到屏幕上"。</para>
+        /// </summary>
+        private static volatile bool s_windowOccluded;
+
+        /// <summary>本实例上次 tick 时是否被窗口可见性挡住；恢复后要补一帧。</summary>
+        private bool _resumeNeedsFirstFrame;
+
+        /// <summary>主窗口隐藏/最小化：暂停所有画面的抓帧与呈现。</summary>
+        public static void SuspendAllForHiddenWindow() => s_windowOccluded = true;
+
+        /// <summary>主窗口恢复可见：允许各画面继续呈现（下一拍自行补首帧）。</summary>
+        public static void ResumeAllForHiddenWindow() => s_windowOccluded = false;
+
+        /// <summary>
         /// 渲染世代号。每次 DetachClient / Disconnect 自增；
         /// AwaitSoftRenderAsync 在 await 前后比对自己那一代的号，不匹配就立即放弃。
         ///
@@ -342,7 +363,6 @@ namespace Yomori.Views
             }
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
-            if (_client is not null) _renderer?.DetachDirtyClient(_client);
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -380,12 +400,13 @@ namespace Yomori.Views
             {
                 return;
             }
-            UnhookClient(_client);
-            _client.Dispose();
+            var oldClient = _client;
+            UnhookClient(oldClient);
+            _renderer?.DetachDirtyClient(oldClient);
+            oldClient.Dispose();
             _client = null;
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
-            if (_client is not null) _renderer?.DetachDirtyClient(_client);
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -782,6 +803,19 @@ namespace Yomori.Views
             if (_renderSuspended)
             {
                 return;
+            }
+
+            // 窗口看不见时不做任何抓帧/上传/Present：会话与解码照常跑，只是不往屏幕上画。
+            // 恢复后必须补一帧 —— 远端桌面可能自始至终没变化，拿不到新的 FrameArrived。
+            if (s_windowOccluded)
+            {
+                _resumeNeedsFirstFrame = true;
+                return;
+            }
+            if (_resumeNeedsFirstFrame)
+            {
+                _resumeNeedsFirstFrame = false;
+                MarkPendingFirstFrame();
             }
 
             // 还没上屏（刚 Attach、布局尚未完成）：交换链和软件位图都要往可视树上挂，

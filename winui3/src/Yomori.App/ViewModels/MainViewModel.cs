@@ -81,6 +81,9 @@ public sealed class MainViewModel : ObservableObject
     /// </summary>
     private readonly UuSessionFixScheduler _uuFixScheduler;
 
+    /// <summary>连接后延迟回收工作集（结构照 UuSessionFixScheduler：静置再执行）。</summary>
+    private readonly WorkingSetTrimScheduler _workingSetTrimScheduler;
+
     private ScriptRunner? _runner;
     private Task? _runTask;
     private DispatcherQueueTimer? _memorySampleTimer;
@@ -125,6 +128,11 @@ public sealed class MainViewModel : ObservableObject
             AppendLog,
             () => RdpSettings.UuSessionFixEnabled,
             () => UuSessionFixService.ApplyAsync(CancellationToken.None));
+        _workingSetTrimScheduler = new WorkingSetTrimScheduler(
+            _dispatcher,
+            AppendLog,
+            () => Config.TrimWorkingSetOnIdle,
+            () => IsRunning);
         _configManager = new ConfigManager(AppPaths.ConfigPath);
         _logger = new FileLogger(AppPaths.LogDir);
         _statsManager = new RuntimeStatsManager(AppPaths.StatsDir);
@@ -556,11 +564,14 @@ public sealed class MainViewModel : ObservableObject
         try
         {
             using var process = System.Diagnostics.Process.GetCurrentProcess();
+            // 归因字段（2026-11-03）：把「托管帧缓冲 / 整帧拷贝 / D3D 固定资源」与 Private Bytes
+            // 放在同一行，才能判断上涨究竟跟着哪一项走，而不是一律归给 FreeRDP。
             AppendLog($"[memory] private_mib={process.PrivateMemorySize64 / 1048576} working_set_mib={process.WorkingSet64 / 1048576} " +
                 $"threads={process.Threads.Count} handles={process.HandleCount} managed_mib={GC.GetTotalMemory(false) / 1048576} " +
                 $"renderers={RdpD3DRenderer.LiveRenderers} clients={_embeds.Values.Count(c => c.Client is not null)} " +
                 $"task_workers={ScriptRunner.LiveTaskWorkers} log_workers={ScriptRunner.LiveLogWorkers} " +
-                $"soft_states={Yomori.Views.RdpView.LiveSoftRenderStates} soft_in_flight={Yomori.Views.RdpView.SoftRendersInFlight}");
+                $"soft_states={Yomori.Views.RdpView.LiveSoftRenderStates} soft_in_flight={Yomori.Views.RdpView.SoftRendersInFlight} " +
+                $"{RdpD3DRenderer.ResourceSummary()} {RdpEmbeddedClient.FrameCopySummary()}");
             foreach (var connection in _embeds.Values)
             {
                 if (connection.Client is { } client) { AppendSurfaceLog(connection.Key, "[memory] " + client.Diag()); }
@@ -2261,6 +2272,26 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>关闭 UU 修复开关：取消尚未开始的等待。</summary>
     public void CancelUuFixSchedule() => _uuFixScheduler.Cancel();
+
+    /// <summary>
+    /// 报告一次「连接状态变化」，由调度器在静置 10 秒后回收一次工作集。
+    ///
+    /// <para>为什么不立刻回收：连接时 D3D 设备、交换链、staging、解码表面正在分配并上首帧，
+    /// 此刻刷工作集会把刚写热的页赶走，下一帧全硬缺页。规则与 UU 修复一致 ——
+    /// 「最后一次连接动作之后静置再执行」，两路先后连上只清一次。</para>
+    /// </summary>
+    public void NotifyWorkingSetTrim(string source)
+    {
+        if (!Config.TrimWorkingSetOnIdle)
+        {
+            return;
+        }
+
+        _workingSetTrimScheduler.Notify(source);
+    }
+
+    /// <summary>取消尚未执行的工作集回收（退出时用）。</summary>
+    public void CancelWorkingSetTrim() => _workingSetTrimScheduler.Cancel();
 
     /// <summary>
     /// 请求一次「把控制台切回主控会话」。调用点必须是连接批次收敛之后，
@@ -4191,6 +4222,7 @@ public sealed class MainViewModel : ObservableObject
         // 独立窗口模式会在下面再进 ConnectSurfaceNow，那里也会通知一次 ——
         // 调度器按状态机合并，重复通知只会重置 18 秒，不会叠加执行。
         NotifyUuFixRelevantAction("连接通道");
+        NotifyWorkingSetTrim("连接通道");
 
         if (!IsEmbeddedMode)
         {
@@ -4336,6 +4368,7 @@ public sealed class MainViewModel : ObservableObject
         }
 
         NotifyUuFixRelevantAction("连接通道");
+        NotifyWorkingSetTrim("连接通道");
 
         IsRdpBusy = true;
         RdpStatusText = "正在连接目标会话…";

@@ -266,6 +266,21 @@ public sealed partial class MainWindow : Window
         // 重复调用即刷新倒计时：手停下 PlacementSaveDebounceMs 后才真正写盘
         _placementSaveTimer.Stop();
         _placementSaveTimer.Start();
+
+        // 最小化期间停掉所有画面的抓帧与呈现：会话/解码不动，只是不再往屏幕上画。
+        // 这是"专用工作集能不能降下来"的关键 —— 一直 Present 就等于一直把
+        // staging/纹理/解码表面按在内存里，系统没有机会裁剪。
+        if (args.DidPresenterChange)
+        {
+            if ((AppWindow.Presenter as OverlappedPresenter)?.State == OverlappedPresenterState.Minimized)
+            {
+                RdpView.SuspendAllForHiddenWindow();
+            }
+            else
+            {
+                RdpView.ResumeAllForHiddenWindow();
+            }
+        }
     }
 
     /// <summary>
@@ -480,6 +495,9 @@ public sealed partial class MainWindow : Window
         // 与本机头号未修问题同族，这里先把它停掉。
         SuspendSurfaceRefresh();
 
+        // 收进托盘同样属于"用户看不见"：一并停掉抓帧与呈现（同最小化）。
+        RdpView.SuspendAllForHiddenWindow();
+
         AppWindow.Hide();
         _hiddenToTray = true;
 
@@ -519,6 +537,7 @@ public sealed partial class MainWindow : Window
 
         ClampWindowIntoView();
         ResumeSurfaceRefresh();
+        RdpView.ResumeAllForHiddenWindow();
         ActivateWindow();
     }
 
