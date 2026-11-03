@@ -235,7 +235,9 @@ public int ScopeOrder { get; set; }   // 通道内显示序号，由 RefreshScop
 2. **`ChannelScope` 不能引 `Microsoft.UI.Xaml`** —— 冒烟工程把这些 `.cs` 直接 `Compile Include`
    进纯 .NET 工程编译，连 `Visibility` 都不行。所以模板里用 `x:Load`（配 `x:Name`，XAML 编译器
    强制要求）而不是绑 `Visibility`。
-3. **本地执行与孤儿组不给开关** —— 本地执行恒执行（拨了也没处写），孤儿组的通道配置已不存在。
+3. **孤儿组不给开关** —— 通道配置已不存在，开关写不回去。
+   （本地执行原先也不给开关，2026-11-03 起改为可关：写 `AppConfig.LocalExecutionEnabled`，
+   只影响本轮是否下发本机那批任务，任务本身不删不移动。）
 4. **`Toggled` 里要读控件自己的 `IsOn`，不能读 `scope.Enabled`** —— `Toggled` 早于 TwoWay
    绑定回写，此刻 `scope.Enabled` 还是**旧值**。第一版就是这么写的，症状是：把开关拨到「开」，
    配置却仍是停用、行上还挂着「通道已停用 —— 本轮不会下发」（用户实测截图）。

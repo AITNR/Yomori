@@ -2015,7 +2015,8 @@ public sealed class MainViewModel : ObservableObject
 
         SaveConfig();
 
-        var plan = RdpChannelPlanner.Plan(Tasks, Config.Rdp.Channels, RdpSettings.Enabled);
+        var plan = RdpChannelPlanner.Plan(
+            Tasks, Config.Rdp.Channels, RdpSettings.Enabled, localEnabled: Config.LocalExecutionEnabled);
 
         if (plan.IsEmpty)
         {
@@ -3054,7 +3055,8 @@ public sealed class MainViewModel : ObservableObject
         var keepId = _selectedScope?.Id;
 
         ChannelScopes.Clear();
-        foreach (var scope in TaskScopePlanner.BuildScopes(Tasks, Config.Rdp.Channels, RdpSettings.Enabled))
+        foreach (var scope in TaskScopePlanner.BuildScopes(
+                     Tasks, Config.Rdp.Channels, RdpSettings.Enabled, Config.LocalExecutionEnabled))
         {
             ChannelScopes.Add(scope);
         }
@@ -3076,9 +3078,12 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>
     /// 任务执行页左侧每条通道行上的开关：确认这一条通道本轮要不要执行。
     ///
-    /// 写的是通道自己的 <c>enabled</c>（和「通道管理」页里那个「启用该通道」是**同一份配置**，
+    /// 远程通道：写的是通道自己的 <c>enabled</c>（和「通道管理」页里那个「启用该通道」是**同一份配置**，
     /// 所以两处开关永远同步）。执行规划 <see cref="RdpChannelPlanner.Plan"/> 本来就会跳过
     /// 停用通道，因此执行链路一行都不用改。
+    ///
+    /// 本地执行：写 <see cref="AppConfig.LocalExecutionEnabled"/>（2026-11-03 起本地也能关）。
+    /// 关掉只是本轮不下发本机那批任务，任务本身不删不移动。
     ///
     /// ⚠️ 刻意**不调** <see cref="RefreshChannelScopes"/>：那会整体重建 <c>ChannelScopes</c>，
     /// 而这里正处在 ToggleSwitch 的 <c>Toggled</c> 里 —— 控件还绑着刚被换掉的旧对象，
@@ -3094,6 +3099,12 @@ public sealed class MainViewModel : ObservableObject
         _syncingScopeToggle = true;
         try
         {
+            if (scope.IsLocal)
+            {
+                SetLocalScopeEnabled(scope, enabled);
+                return;
+            }
+
             var channel = Config.Rdp.Channels.FirstOrDefault(
                 c => string.Equals(c.Id, scope.Id, StringComparison.OrdinalIgnoreCase));
 
@@ -3130,6 +3141,34 @@ public sealed class MainViewModel : ObservableObject
         {
             _syncingScopeToggle = false;
         }
+    }
+
+    /// <summary>
+    /// 「本地执行」那一行的开关（2026-11-03 新增）：本轮要不要跑本机那批任务。
+    ///
+    /// <para>只落一个布尔，任务、顺序、归属一概不动 —— 关掉再打开，原样回来。
+    /// 与远程通道开关的区别：远程关的是"这条通道"，本地关的是"主控端当前会话那一组"。</para>
+    /// </summary>
+    private void SetLocalScopeEnabled(ChannelScope scope, bool enabled)
+    {
+        // 列表项实体化时 x:Bind 会先填一次 IsOn，也会走到这里；值没变就空转，别落盘
+        if (Config.LocalExecutionEnabled == enabled)
+        {
+            return;
+        }
+
+        Config.LocalExecutionEnabled = enabled;
+        SaveConfig();
+
+        // 就地刷新这一行（同远程通道：不重建集合）
+        scope.Enabled = enabled;
+        scope.IsUsable = enabled;
+        scope.Subtitle = enabled ? "主控端当前账户" : "主控端当前账户 · 已停用";
+        scope.HintText = enabled ? string.Empty : "本地执行已停用 —— 本轮不会执行";
+
+        AppendLog(enabled
+            ? "[本地执行] 已启用：本机任务会在下一次「开始执行」时一起跑。"
+            : "[本地执行] 已停用：本机任务下一次「开始执行」时不会下发；任务本身保留，随时可以再打开。");
     }
 
     /// <summary>按当前通道重算任务视图 + 通道内序号，并刷新各通道的任务数。</summary>

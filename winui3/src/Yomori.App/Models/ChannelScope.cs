@@ -49,9 +49,15 @@ public sealed class ChannelScope : ObservableObject
     public bool IsMissing { get; init; }
 
     /// <summary>
-    /// 这一行的开关状态 —— **镜像 <see cref="RdpChannel.Enabled"/>，不是第二份数据源**。
-    /// 界面上的改动由 <c>MainViewModel.SetScopeEnabled</c> 写回通道配置并落盘；
-    /// 本地执行 / 未知通道没有开关，这个值对它们没有意义。
+    /// 这一行的开关状态。
+    ///
+    /// <para>远程通道：镜像 <see cref="RdpChannel.Enabled"/>，**不是第二份数据源**，
+    /// 界面改动由 <c>MainViewModel.SetScopeEnabled</c> 写回通道配置并落盘。</para>
+    ///
+    /// <para>本地执行：镜像 <c>AppConfig.LocalExecutionEnabled</c>（2026-11-03 起本地也能关）。
+    /// 关掉只是"本轮不跑本机任务"，任务不会丢。</para>
+    ///
+    /// <para>未知通道没有开关，这个值对它没有意义。</para>
     /// </summary>
     public bool Enabled
     {
@@ -60,10 +66,22 @@ public sealed class ChannelScope : ObservableObject
     }
 
     /// <summary>
-    /// 这一行能不能切开关：本地执行恒执行（不跑远程也要跑本机）、
-    /// 未知通道的配置已经不存在（开关写不回去），都不给开关。
+    /// 这一行能不能切开关。
+    ///
+    /// <para>只有「未知通道」不行 —— 它的配置已经不存在，开关写不回去。
+    /// 本地执行与远程通道一样可以关（2026-11-03 改：原先本地恒执行、不给开关，
+    /// 想单独跑远端时没法把本机那一组按下去）。</para>
     /// </summary>
-    public bool CanToggle => !IsLocal && !IsMissing;
+    public bool CanToggle => !IsMissing;
+
+    /// <summary>
+    /// 开关的悬停说明。本地执行与远程通道的语义不同（本地没有「通道管理」页那一份配置），
+    /// 用同一句会指向一个不存在的地方。
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string ToggleTooltip => IsLocal
+        ? "本地执行本轮要不要跑：关掉后本机那批任务不会下发。任务本身保留，随时可以再打开。"
+        : "这条通道本轮要不要执行：关掉后它的任务不会下发。改动即时保存，下一次「开始执行」生效；与「通道管理」页里的「启用该通道」是同一个开关。";
 
     /// <summary>能不能往里排任务（通道停用 / 未配账户 / RDP 总开关关掉都为 false）。</summary>
     public bool IsUsable

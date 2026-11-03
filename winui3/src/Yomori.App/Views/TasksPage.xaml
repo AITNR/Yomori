@@ -89,9 +89,9 @@
                                                Foreground="{ThemeResource SystemFillColorCautionBrush}" />
                                 </Grid>
 
-                                <!-- 通道级开关：这条通道本轮要不要执行。
-                                     本地执行（恒执行）与「未知通道」（配置已不存在）没有开关可拨 ——
-                                     用 Visibility 收起，省下那一列的宽度。
+                                <!-- 通道级开关：这一行本轮要不要执行。
+                                     本地执行现在也有开关（2026-11-03）：只跑远端时能把这组按下去；
+                                     仍然只有「未知通道」（配置已不存在）没有开关，用 Visibility 收起。
 
                                      ⚠️ 2026-10-29 改：这里原来是 x:Load（+ x:Name），
                                      生成了 XamlMarkupHelper.UnloadObject() / FindName("ScopeEnabledToggle")
@@ -111,7 +111,7 @@
                                               VerticalAlignment="Center"
                                               Toggled="OnScopeEnabledToggled">
                                     <ToolTipService.ToolTip>
-                                        <ToolTip Content="这条通道本轮要不要执行：关掉后它的任务不会下发。改动即时保存，下一次「开始执行」生效；与「通道管理」页里的「启用该通道」是同一个开关。" />
+                                        <ToolTip Content="{x:Bind ToggleTooltip}" />
                                     </ToolTipService.ToolTip>
                                 </ToggleSwitch>
                             </Grid>

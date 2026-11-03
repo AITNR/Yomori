@@ -85,7 +85,8 @@ public static class TaskScopePlanner
     public static List<ChannelScope> BuildScopes(
         IEnumerable<TaskConfig>? tasks,
         IReadOnlyList<RdpChannel>? channels,
-        bool rdpEnabled)
+        bool rdpEnabled,
+        bool localEnabled = true)
     {
         var list = (tasks ?? Enumerable.Empty<TaskConfig>()).Where(t => t is not null).ToList();
         var channelList = channels ?? Array.Empty<RdpChannel>();
@@ -95,9 +96,13 @@ public static class TaskScopePlanner
         {
             Id = LocalScopeId,
             Name = "本地执行（当前会话）",
-            Subtitle = "主控端当前账户",
+            Subtitle = localEnabled ? "主控端当前账户" : "主控端当前账户 · 已停用",
             IsLocal = true,
-            IsUsable = true,
+            // 本地也能关（2026-11-03）：想只跑远端时把本机这一组按下去。
+            // 关掉只是本轮不执行，行里的任务照旧保留、随时能再打开。
+            Enabled = localEnabled,
+            IsUsable = localEnabled,
+            HintText = localEnabled ? string.Empty : "本地执行已停用 —— 本轮不会执行",
             TaskCount = CountForScope(list, LocalScopeId),
         });
 

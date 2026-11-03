@@ -202,6 +202,16 @@ public sealed class AppConfig : ObservableObject
     public string HomeBannerPath { get; set; } = string.Empty;
 
     /// <summary>
+    /// 「本地执行」组本轮要不要跑 —— 任务执行页左侧那一行的开关。
+    ///
+    /// <para>默认 true：老配置里没有这个键，反序列化后仍是 true，行为与改造前一致
+    /// （本机任务照常执行）。关掉只影响"本轮跑不跑"，任务本身不删、不移动、不改归属，
+    /// 下次打开开关原样回来。</para>
+    /// </summary>
+    [JsonPropertyName("local_execution_enabled")]
+    public bool LocalExecutionEnabled { get; set; } = true;
+
+    /// <summary>
     /// <b>只有导出文件里才有</b>：这次导出了哪些内容类别、密码是不是明文。
     ///
     /// 正常 config.json 不写它（<see cref="Models.ExportOptions"/> 默认值不写就是 null）。

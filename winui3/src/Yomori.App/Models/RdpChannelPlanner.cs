@@ -65,7 +65,8 @@ public static class RdpChannelPlanner
         IEnumerable<TaskConfig>? tasks,
         IReadOnlyList<RdpChannel>? channels,
         bool rdpEnabled,
-        int maxParallel = RdpNativeLimits.MaxSessions)
+        int maxParallel = RdpNativeLimits.MaxSessions,
+        bool localEnabled = true)
     {
         var enabledTasks = (tasks ?? Enumerable.Empty<TaskConfig>())
             .Where(t => t is not null && t.Enabled)
@@ -73,8 +74,17 @@ public static class RdpChannelPlanner
             .ToList();
 
         // RDP 总开关关掉：所有任务都在本地跑，行为与改造前一致
+        // （例外：本地执行组自己也被关掉 → 本轮什么都不跑，按"跳过"如实说清）
         if (!rdpEnabled)
         {
+            if (!localEnabled && enabledTasks.Count > 0)
+            {
+                return new ExecutionPlan(
+                    Array.Empty<TaskConfig>(),
+                    Array.Empty<ChannelPlan>(),
+                    new[] { new SkippedChannelPlan(null, "本地执行已停用", enabledTasks) });
+            }
+
             return new ExecutionPlan(
                 enabledTasks,
                 Array.Empty<ChannelPlan>(),
@@ -131,6 +141,14 @@ public static class RdpChannelPlanner
         }
 
         var skipped = new List<SkippedChannelPlan>();
+
+        // 本地执行组被关掉：本机那批任务本轮不下发，但要如实说清"它们去哪了"。
+        // 不能静默清空 —— 用户看到进度总数变小会以为是任务丢了。
+        if (!localEnabled && local.Count > 0)
+        {
+            skipped.Add(new SkippedChannelPlan(null, "本地执行已停用", local));
+            local.Clear();
+        }
 
         foreach (var (id, orphans) in unknown)
         {
