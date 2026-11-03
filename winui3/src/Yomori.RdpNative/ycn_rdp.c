@@ -116,6 +116,12 @@ typedef struct
 	volatile LONG abort_in_progress; /* CONNECTING abort protects context lifetime */
 	volatile LONG connect_in_progress;
 
+	/* teardown 阶段（诊断 + 卡死定位）：0 未开始 / 1 已置 STOPPING / 2 等 abort 引用
+	 * / 3 freerdp_disconnect / 4 gdi_free+context_free / 5 freerdp_free / 6 已释放槽位。
+	 * 2026-11-03 实测：服务器注销会话后 teardown 可能长期不返回，[memory] 诊断行里
+	 * 有了这个阶段号就能一眼看出卡在哪一步。 */
+	volatile LONG teardown_stage;
+
 	ycn_rdp_callbacks cb;
 	void* user;
 
@@ -3006,7 +3012,6 @@ static DWORD WINAPI event_loop(LPVOID arg)
 	int callback_id = 0;
 	uint8_t* frame = NULL;
 	BOOL connected = FALSE;
-	BOOL report_disconnected = FALSE;
 	int fail_reason = YCN_DISCONNECT_ERROR;
 	char detail[YCN_ERRBUF_LEN];
 
@@ -3191,33 +3196,57 @@ teardown:
 	s->frame_capacity = 0;
 	s->frame_valid = FALSE;
 	s->frame_snapshot_complete = FALSE;
+	/* 终态回调马上就要提前发出（见下），先把其余回调摘掉：
+	 * 托管侧收到终态后会释放回调根，此后再有迟到的帧 / 错误回调就是野指针。
+	 * 这里清空之后，本函数与 FreeRDP 的释放路径都不可能再调到托管代码。 */
+	s->cb.on_connected = NULL;
+	s->cb.on_frame_ready = NULL;
+	s->cb.on_desktop_resize = NULL;
+	s->cb.on_error = NULL;
+	s->cb.on_disconnected = NULL;
+	s->user = NULL;
+	InterlockedExchange(&s->teardown_stage, 1);
 	ycn_dirty_force_full_locked(s);
 	LeaveCriticalSection(&g_lock);
 
+	/* 终态回调**提前**发出（2026-11-03 实测后调整顺序）。
+	 *
+	 * 事故：服务器把会话注销之后，下面的 freerdp_disconnect / gdi_free 可能长时间
+	 * 不返回（实测 26 分钟仍未返回；[memory] 诊断行里 live_sessions 一直是 2，
+	 * 托管侧永远收不到断开）。后果是画面定格在"正在注销"、状态停在任务文案、
+	 * 切页回来一片灰，而且槽位一直被占 —— 8 个槽用满后新连接直接失败。
+	 *
+	 * 所以先报终态，托管侧立刻能收口；释放继续在本线程慢慢做。
+	 * 安全性：s->cb 已在锁内清空，本函数之后不会再调用任何托管回调；
+	 * disconnected_reported 保证恰好一次。 */
+	if (InterlockedCompareExchange(&s->disconnected_reported, 1, 0) == 0 && callbacks.on_disconnected)
+		callbacks.on_disconnected(callback_user, callback_id, fail_reason, detail);
+
 	/* References registered before STOPPING protect freerdp_connect/abort from
 	 * teardown. No new abort reference can be acquired after the locked transition. */
+	InterlockedExchange(&s->teardown_stage, 2);
 	while (InterlockedCompareExchange(&s->abort_in_progress, 0, 0) != 0 ||
 	       InterlockedCompareExchange(&s->connect_in_progress, 0, 0) != 0)
 		Sleep(1);
 
-	if (connected)
+	/* 只有"本端主动停、且连接当时还健康"才值得发优雅断开 PDU。
+	 * 服务器已注销会话 / 传输已断（REMOTE、ERROR）时这一步没有意义，
+	 * 而且正是上面那次 teardown 卡死的嫌疑点。 */
+	InterlockedExchange(&s->teardown_stage, 3);
+	if (connected && fail_reason == YCN_DISCONNECT_LOCAL)
 		freerdp_disconnect(instance);
+	InterlockedExchange(&s->teardown_stage, 4);
 	if (instance->context)
 	{
 		gdi_free(instance);
 		freerdp_context_free(instance);
 	}
+	InterlockedExchange(&s->teardown_stage, 5);
 	freerdp_free(instance);
 	free(frame);
 
-	/* FreeRDP and every channel are gone.  Release the slot before the managed
-	 * terminal callback; IDs are never reused, so a late old-client call cannot
-	 * address a newly allocated slot. */
+	/* FreeRDP and every channel are gone. Release the slot. */
 	EnterCriticalSection(&g_lock);
-	callbacks = s->cb;
-	callback_user = s->user;
-	callback_id = s->id;
-	report_disconnected = InterlockedCompareExchange(&s->disconnected_reported, 1, 0) == 0;
 	thread_handle = s->thread;
 	stop_event = s->stop_event;
 	s->instance = NULL;
@@ -3243,15 +3272,10 @@ teardown:
 	s->key_head = s->key_tail = 0;
 	s->sync_flags = 0;
 	s->pending_sync = 0;
-	s->cb.on_connected = NULL;
-	s->cb.on_frame_ready = NULL;
-	s->cb.on_desktop_resize = NULL;
-	s->cb.on_disconnected = NULL;
-	s->cb.on_error = NULL;
-	s->user = NULL;
 	InterlockedExchange(&s->state, YCN_STATE_IDLE);
 	s->used = 0;
 	InterlockedIncrement(&g_total_released);
+	InterlockedExchange(&s->teardown_stage, 6);
 	LeaveCriticalSection(&g_lock);
 
 	if (stop_event)
@@ -3259,10 +3283,8 @@ teardown:
 	if (thread_handle)
 		CloseHandle(thread_handle);
 
-	/* Terminal callback: after this point no FreeRDP/channel/native callback for
-	 * this session can occur, so managed code may release its GCHandle roots. */
-	if (report_disconnected && callbacks.on_disconnected)
-		callbacks.on_disconnected(callback_user, callback_id, fail_reason, detail);
+	/* 终态回调已在进入 teardown 时提前发出（见上面的长注释）。
+	 * 这里不再回调 —— 提前发出保证了托管侧一定收到，也避免重复。 */
 	return 0;
 }
 
@@ -4379,7 +4401,7 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 				adv_last = YCN_GFX_ADV_CAP_MAX - 1;
 		}
 		_snprintf_s(buf, buflen, _TRUNCATE,
-		            "live_sessions=%d load_addins=%d static_ch=%u dyn_ch=%u gfx_state=%d dvc=%u gfx_init=%d codecs_null=%d "
+		            "live_sessions=%d teardown_stage=%ld load_addins=%d static_ch=%u dyn_ch=%u gfx_state=%d dvc=%u gfx_init=%d codecs_null=%d "
 		            "gfx_cfg=[pipeline:%u thin:%u h264:%u avc444:%u progressive:%u] "
 		            "caps=[confirm:%u version:0x%08X flags:0x%08X] "
 		            "adv=[n:%u req:h264%u avc444%u v2:%u v0:0x%08X f0:0x%08X v1:0x%08X f1:0x%08X vlast:0x%08X flast:0x%08X send_rc:%u] "
@@ -4387,7 +4409,7 @@ YCN_API void ycn_rdp_diag(int session, char* buf, size_t buflen)
 		            "hw_compiled=%u hw_init=%u hwactive=%u hw_frames=%llu sw_frames=%llu decode_fail=%llu "
 		            "recovery_pending=%u fallback=%u fallback_detail=[%s] decode_error=%d "
 		            "avc_surface=%llu non_avc_surface=%llu codec_counts_by_id=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]",
-		            live, s->addins_rc,
+		            live, (long)InterlockedCompareExchange(&s->teardown_stage, 0, 0), s->addins_rc,
 		            settings ? (unsigned)freerdp_settings_get_uint32(settings, FreeRDP_StaticChannelCount) : 0u,
 		            settings ? (unsigned)freerdp_settings_get_uint32(settings, FreeRDP_DynamicChannelCount) : 0u,
 		            (int)s->gfx_state, (unsigned)s->dvc_connected,

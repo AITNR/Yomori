@@ -4472,6 +4472,23 @@ public sealed class MainViewModel : ObservableObject
         public DispatcherQueueTimer? Watchdog { get; set; }
 
         /// <summary>
+        /// 收尾释放画面的延迟定时器。
+        ///
+        /// <para>**必须挂字段**：局部 <c>CreateTimer()</c> 会被 GC 回收，Tick 永远不来
+        /// （静默失败，见 MEMORY 里 DispatcherQueueTimer 那条）。</para>
+        /// </summary>
+        public DispatcherQueueTimer? FinishTimer { get; set; }
+
+        /// <summary>
+        /// 这路画面上次结束的原因（"会话已注销" / "会话已断开"）。
+        ///
+        /// <para>为什么不能只靠 client 是否为 null：没有画面时格子的占位文案与角标
+        /// 需要说清"为什么没有"，否则用户看到的就是一句干巴巴的"未连接"，
+        /// 分不出是自己断的、还是收尾把会话注销了。重新连接时清空。</para>
+        /// </summary>
+        public string? EndReason { get; set; }
+
+        /// <summary>
         /// 画面是否已被「弹出独立窗口」占用。
         /// 占用的通道，页面内格子只显示提示、不挂 client —— 两个渲染器挂同一 client 会打架。
         /// </summary>
@@ -4531,6 +4548,13 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>这条通道的画面是否已被「弹出独立窗口」占用。</summary>
     public bool IsSurfacePoppedOut(string? channelId)
         => _embeds.TryGetValue(channelId ?? string.Empty, out var conn) && conn.PoppedOut;
+
+    /// <summary>
+    /// 这路画面上次结束的原因（"会话已注销" / "会话已断开"）；空 = 没有记录。
+    /// 用来在没有画面时给出「为什么没有」——占位文案与格子角标都读它。
+    /// </summary>
+    public string? SurfaceEndReason(string? channelId)
+        => _embeds.TryGetValue(channelId ?? string.Empty, out var conn) ? conn.EndReason : null;
 
     /// <summary>
     /// 这条通道的内嵌画面是否处于「锁定」状态（鼠标穿透 + 键盘映射都说停就停）。
@@ -4712,7 +4736,9 @@ public sealed class MainViewModel : ObservableObject
 
         if (GetSurfaceClient(key) is null)
         {
-            return "未连接";
+            // 收尾把会话注销 / 断开之后，这里要说清"为什么没有画面"，
+            // 否则和"从来没连过"长得一模一样（用户实测分不出来，2026-11-03）。
+            return SurfaceEndReason(key) is { Length: > 0 } ended ? ended : "未连接";
         }
 
         if (IsSurfacePoppedOut(key))
@@ -4796,10 +4822,15 @@ public sealed class MainViewModel : ObservableObject
             user = user[(backslash + 1)..];
         }
 
-        DisposeSurface(key); // 幂等清理本通道的旧实例（不重置黑屏重试计数）
+        DisposeSurface(key, endReason: null); // 幂等清理本通道的旧实例（不重置黑屏重试计数）
 
         var conn = GetOrCreateConnection(key);
         var generation = ++conn.ConnectGeneration;
+        // 重新建连：上次的"已注销 / 已断开"作废，并取消还没落地的收尾释放，
+        // 否则它会在新连接起来之后把画面又拆一遍。
+        conn.EndReason = null;
+        StopFinishTimer(conn);
+
         if (!conn.Teardown.IsCompleted)
         {
             conn.UserDisconnect = false;
@@ -5164,7 +5195,11 @@ public sealed class MainViewModel : ObservableObject
     /// 注意：不重置黑屏重试计数——自动重连链路依赖它跨连接保持。
     /// 另外：字典条目刻意保留（重试计数与「已弹出窗口」标记要跨连接存活）。
     /// </summary>
-    public void DisposeSurface(string? channelId)
+    /// <param name="endReason">
+    /// 这路画面为什么结束（写进 <see cref="EmbedConnection.EndReason"/>，供占位文案与角标显示）。
+    /// 传 null = 不改（建连前的清理走这条，免得旧文案拦住新连接）。
+    /// </param>
+    public void DisposeSurface(string? channelId, string? endReason = "会话已断开")
     {
         var key = channelId ?? string.Empty;
         if (!_embeds.TryGetValue(key, out var conn) || conn.Client is null)
@@ -5175,6 +5210,11 @@ public sealed class MainViewModel : ObservableObject
         var client = conn.Client;
         conn.Client = null;
         conn.PoppedOut = false;
+        StopFinishTimer(conn);
+        if (!string.IsNullOrEmpty(endReason))
+        {
+            conn.EndReason = endReason;
+        }
 
         if (conn.OnConnected is not null)
         {
@@ -5210,8 +5250,82 @@ public sealed class MainViewModel : ObservableObject
             _embedActiveKey = string.Empty;
         }
 
-        AppendSurfaceLog(key, "内嵌连接已断开（目标会话保留中）。");
+        AppendSurfaceLog(key, string.Equals(endReason, "会话已注销", StringComparison.Ordinal)
+            ? "内嵌连接已释放（会话已注销，画面结束）。"
+            : "内嵌连接已断开（目标会话保留中）。");
         EmbedClientChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// 收尾方式把会话交给系统处置（注销 / 断开）时，主动收回这路画面。
+    ///
+    /// <para>**为什么不能等原生的断开回调**（2026-11-03 实测）：会话一注销，RDP 传输就断了，
+    /// 但原生 teardown 可能卡在 <c>freerdp_disconnect</c> 之后的释放里，终态回调永远不来 ——
+    /// 于是画面定格在"正在注销"那一帧、状态停在任务文案、切页回来还是一片灰。
+    /// 这里按"我们自己已经知道的事实"（收尾方式）先收口，不等原生。</para>
+    ///
+    /// <para>延迟一拍（1.5 秒）是让代理先把注销 / 断开真正发出去：我们断的是本端画面，
+    /// 不影响目标会话的处置，但抢在收尾动作之前断开，日志顺序会变成"画面先没了、会话还在"。</para>
+    /// </summary>
+    private void ScheduleSurfaceReleaseAfterFinish(RdpChannelSession session, string finishMode)
+    {
+        if (!session.IsRemote)
+        {
+            return;
+        }
+
+        var mode = SessionFinishModes.Normalize(finishMode);
+        if (mode == SessionFinishModes.Keep)
+        {
+            return;
+        }
+
+        var key = session.ChannelId;
+        if (!HasSurface(key))
+        {
+            return;
+        }
+
+        var endReason = mode == SessionFinishModes.Logoff ? "会话已注销" : "会话已断开";
+
+        Post(() =>
+        {
+            if (!_embeds.TryGetValue(key, out var conn) || conn.Client is null)
+            {
+                return;
+            }
+
+            StopFinishTimer(conn);
+            var timer = _dispatcher.CreateTimer();
+            conn.FinishTimer = timer;   // 必须挂住：局部 timer 会被 GC，Tick 永不来（静默失败）
+            timer.Interval = TimeSpan.FromSeconds(1.5);
+            timer.IsRepeating = false;
+            timer.Tick += (_, _) =>
+            {
+                timer.Stop();
+                if (ReferenceEquals(conn.FinishTimer, timer))
+                {
+                    conn.FinishTimer = null;
+                }
+
+                if (conn.Client is null)
+                {
+                    return;
+                }
+
+                AppendSurfaceLog(key, $"任务已收尾（{SessionFinishModes.Label(mode)}），释放画面：{endReason}。");
+                DisposeSurface(key, endReason);
+            };
+            timer.Start();
+        });
+    }
+
+    /// <summary>停掉还没落地的收尾释放（重新建连 / 重复收尾时用）。</summary>
+    private static void StopFinishTimer(EmbedConnection conn)
+    {
+        var timer = conn.FinishTimer;
+        conn.FinishTimer = null;
+        timer?.Stop();
     }
 
     /// <summary>断开全部内嵌画面（窗口关闭 / 退出应用时用）。</summary>
@@ -6763,6 +6877,10 @@ public sealed class MainViewModel : ObservableObject
         }
 
         AppendChannelLog(session, $"远程执行结束：{summary}（会话处理方式：{SessionFinishModes.Label(finishMode)}）。");
+
+        // 收尾要注销 / 断开会话时，这路画面已经"没内容可看"了：
+        // 不等原生的断开回调（它可能永远不来），按收尾方式主动收口。
+        ScheduleSurfaceReleaseAfterFinish(session, finishMode);
 
         FinishRunPart();
     }

@@ -72,6 +72,14 @@ namespace Yomori.Views
         /// <summary>首帧重试上限：约 10 秒（16ms 一拍）。超过就停手，避免会话已断时空转 P/Invoke。</summary>
         private const int PendingFirstFrameMaxTries = 600;
 
+        /// <summary>
+        /// 「画面已结束」兜底覆盖层是否正在显示。
+        ///
+        /// <para>首帧重试耗尽仍取不到帧时挂上它（见 <see cref="MarkFrameUnavailable"/>）；
+        /// 只要之后又能取到帧（重新连上、会话恢复），就必须撤掉 —— 否则会一直盖着画面。</para>
+        /// </summary>
+        private bool _endingOverlayShown;
+
         /// <summary>本实例当前在飞（已发出、尚未结束）的渲染任务数；仅供诊断。</summary>
         private int _renderInFlight;
 
@@ -349,6 +357,7 @@ namespace Yomori.Views
             _presentTimer = null;
             _pendingFirstFrame = false;
             _pendingFirstFrameTries = 0;
+            _endingOverlayShown = false;
             _lastFrameArrivedTick = 0;
             _frameSeq = 0;
             _presentedSeq = 0;
@@ -391,6 +400,7 @@ namespace Yomori.Views
             _presentTimer = null;
             _pendingFirstFrame = false;
             _pendingFirstFrameTries = 0;
+            _endingOverlayShown = false;
             _lastFrameArrivedTick = 0;
             _frameSeq = 0;
             _presentedSeq = 0;
@@ -426,6 +436,7 @@ namespace Yomori.Views
         {
             _pendingFirstFrame = true;
             _pendingFirstFrameTries = 0;
+            _endingOverlayShown = false;
         }
 
         /// <summary>
@@ -820,6 +831,7 @@ namespace Yomori.Views
                             _presentedSeq = seq;
                             _pendingFirstFrame = false;
                             FramesRendered++;
+                            ClearEndingOverlay();
                             return;
                         }
 
@@ -855,6 +867,7 @@ namespace Yomori.Views
                             _presentedSeq = seq;
                             _pendingFirstFrame = false;
                             FramesRendered++;
+                            ClearEndingOverlay();
                             return;
                         }
                         if (result == RdpD3DPresentResult.NoFrame)
@@ -928,6 +941,7 @@ namespace Yomori.Views
                         _presentedSeq = seq;
                         _pendingFirstFrame = false;
                         FramesRendered++;
+                        ClearEndingOverlay();
                     }
                     else
                     {
@@ -972,10 +986,47 @@ namespace Yomori.Views
         /// </summary>
         private void MarkFrameUnavailable()
         {
-            if (_pendingFirstFrame && ++_pendingFirstFrameTries > PendingFirstFrameMaxTries)
+            if (!_pendingFirstFrame || ++_pendingFirstFrameTries <= PendingFirstFrameMaxTries)
             {
-                _pendingFirstFrame = false;
+                return;
             }
+
+            _pendingFirstFrame = false;
+
+            // 10 秒都取不到「最后一帧」：原生侧已经没有可用的画面缓冲了
+            // （会话被注销 / teardown 卡住时 s->frame 已释放，grab 恒失败）。
+            //
+            // 这时只把 _pendingFirstFrame 关掉，控件就是一片纯灰底 ——
+            // 用户分不出「画面卡住」和「会话已经没了」（2026-11-03 实测：切页回来一直灰屏）。
+            // 宁可显式说一句，也不要留一块让人猜的灰。
+            if (!_endingOverlayShown)
+            {
+                _endingOverlayShown = true;
+                // 分两种话说：连上过再取不到帧 = 画面结束了；压根没连上 = 连接没建立起来。
+                // 混成一句会把"目标账户还没登录"报成"画面已结束"，那是误导。
+                var connected = _client?.State == Yomori.Models.RdpClientState.Connected;
+                ShowOverlay(
+                    connected
+                        ? "画面已结束：连接已失效，请重新连接这条通道。"
+                        : "连接未完成：没有收到任何画面，请确认目标账户已登录后重试。",
+                    progress: false);
+                DiagnosticLog?.Invoke($"[embed] 首帧重试耗尽（connected={connected}）：显示无画面提示");
+            }
+        }
+
+        /// <summary>
+        /// 又能取到帧了 → 撤掉「画面已结束」覆盖层。
+        /// 只在它确实挂着时动 DOM（避免每帧都去写一次覆盖层属性）。
+        /// </summary>
+        private void ClearEndingOverlay()
+        {
+            if (!_endingOverlayShown)
+            {
+                return;
+            }
+
+            _endingOverlayShown = false;
+            ShowOverlay(string.Empty, progress: false, hide: true);
         }
 
         /// <summary>把当前实际渲染路径写一次日志（撕裂排查的第一手依据）。</summary>
@@ -1177,6 +1228,7 @@ namespace Yomori.Views
                 _presentedSeq = sequence;
                 _pendingFirstFrame = false;
                 FramesRendered++;
+                ClearEndingOverlay();
             }
             catch
             {

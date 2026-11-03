@@ -178,6 +178,12 @@ public sealed partial class RdpSurfaceCell : UserControl
                 "当前客户端模式是「独立窗口（mstsc）」，画面在系统自带的远程桌面窗口里，应用内不显示。\n" +
                 "想在这里看到内嵌画面，请到「通道管理…」把客户端模式改为「内嵌」。";
         }
+        else if (VM.SurfaceEndReason(_channelId) is { Length: > 0 } endReason)
+        {
+            // 收尾把会话注销 / 断开之后，这里必须说清"为什么没有画面"——
+            // 否则与"从来没连过"长得一模一样，用户会以为连接还在。
+            PlaceholderText.Text = $"这路画面已经结束：{endReason}。\n点下面的按钮可以重新连接。";
+        }
         else
         {
             PlaceholderText.Text = "这条通道还没有画面。\n点下面的按钮建连（开始执行时也会自动连上）。";
