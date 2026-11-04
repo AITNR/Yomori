@@ -33,6 +33,9 @@ internal sealed class WorkingSetTrimScheduler : IDisposable
     /// <summary>等待到期时刻（Environment.TickCount64 基准，不受系统时间调整影响）。</summary>
     private long _waitingUntil;
 
+    /// <summary>上一次真正执行回收的时刻（用于空闲巡检的间隔判断）。</summary>
+    private long _lastTrimTicks;
+
     private bool _disposed;
 
     public WorkingSetTrimScheduler(
@@ -72,6 +75,41 @@ internal sealed class WorkingSetTrimScheduler : IDisposable
         _log(wasWaiting
             ? $"[内存] {source}：重置回收计时，再等 {SettleSeconds} 秒。"
             : $"[内存] {source}：开始计时，{SettleSeconds} 秒后回收工作集。");
+    }
+
+    /// <summary>
+    /// 空闲巡检：长时间挂着时，工作集会被"零散触碰"慢慢拉回去，隔一段时间补清一次。
+    ///
+    /// <para>与 <see cref="Notify"/> 的区别：这里有最小间隔闸门 —— 刚清过就什么都不做，
+    /// 避免每分钟采样都重置等待、把回收拖成"永远不来"。</para>
+    /// </summary>
+    /// <param name="minIntervalMinutes">两次回收之间的最小间隔（分钟）。</param>
+    public void NotifyIdle(int minIntervalMinutes)
+    {
+        if (_disposed || !_isEnabled())
+        {
+            return;
+        }
+
+        if (!_dispatcher.HasThreadAccess)
+        {
+            _dispatcher.TryEnqueue(() => NotifyIdle(minIntervalMinutes));
+            return;
+        }
+
+        // 已在等待中就不要再插手：否则每次采样都把 10 秒等待重置，永远到不了期
+        if (_timer?.IsRunning == true)
+        {
+            return;
+        }
+
+        var elapsed = Environment.TickCount64 - _lastTrimTicks;
+        if (_lastTrimTicks != 0 && elapsed < minIntervalMinutes * 60000L)
+        {
+            return;
+        }
+
+        Notify("空闲巡检");
     }
 
     /// <summary>关闭开关或退出时调用：取消尚未开始的回收。</summary>
@@ -157,13 +195,15 @@ internal sealed class WorkingSetTrimScheduler : IDisposable
         }
 
         // 任务正在跑时不做：刷工作集等于给正在执行的脚本添缺页。
-        // 不重排 —— 下一次连接会重新触发，避免在任务执行期间反复试探。
+        // 仍然记一次时间戳 —— 否则空闲巡检会每分钟重来一遍，日志被"跳过"刷满。
         if (_isBusy())
         {
+            _lastTrimTicks = Environment.TickCount64;
             _log("[内存] 任务执行中，跳过本次工作集回收。");
             return;
         }
 
+        _lastTrimTicks = Environment.TickCount64;
         var result = WorkingSetTrimmer.TryTrim();
         _log(result is { } r
             ? $"[内存] 已请求回收工作集（当前 {r.Before} MiB），提交量不变；实际常驻值见下一行 [memory] 采样。"

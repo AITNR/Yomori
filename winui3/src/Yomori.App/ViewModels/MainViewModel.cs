@@ -576,6 +576,13 @@ public sealed class MainViewModel : ObservableObject
             {
                 if (connection.Client is { } client) { AppendSurfaceLog(connection.Key, "[memory] " + client.Diag()); }
             }
+
+            // 长时间挂着时工作集会被零散触碰慢慢拉回去，隔 30 分钟补清一次。
+            // 只有「有连接且没有任务在跑」才做；调度器内部还有最小间隔闸门。
+            if (_embeds.Values.Any(c => c.Client is not null))
+            {
+                _workingSetTrimScheduler.NotifyIdle(30);
+            }
         }
         catch (Exception) { /* Sampling must not interrupt execution. */ }
     }
@@ -5189,6 +5196,11 @@ public sealed class MainViewModel : ObservableObject
         // （直接设 RdpStatusText 会触发 x:Bind 跨线程 set_Text → RPC_E_WRONG_THREAD 崩溃）
         AppendSurfaceLog(conn.Key, $"连接建立：桌面 {e.Width}×{e.Height}，画面已嵌入窗口。");
         conn.AutoReconnects = 0; // 连接成功：清零自动重连计数
+
+        // 回收工作集必须挂在「真正连上」这里，不能只挂在「连接通道」按钮上：
+        // 任务批次会自动连接通道（2026-11-04 实测：整批自动连接一次都没触发回收，
+        // 因为那条路径不经过按钮入口）。重复写只会重置 10 秒等待，不会多清一次。
+        NotifyWorkingSetTrim("内嵌已连接");
 
         // 手动连接走这里：只有真正连上了才请求切回。
         // 任务批次期间不在这里动手 —— RunChannelsAsync 会在所有通道收敛后统一切一次。
