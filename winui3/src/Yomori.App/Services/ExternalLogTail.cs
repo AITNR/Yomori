@@ -55,8 +55,26 @@ public sealed class ExternalLogTail : IDisposable
     /// <summary>递归时最多收多少个匹配文件；超了只留前 N 个并在诊断里说明。</summary>
     private const int MaxRecursiveFiles = 500;
 
+    /// <summary>内容探针最多看多少行；到量仍未命中就放弃（显式线索缺失时才会走到这里）。</summary>
+    private const int AdapterProbeLimit = 32;
+
     private readonly ExternalLogProjector _projector;
     private readonly string _view;
+
+    /// <summary>
+    /// 逐脚本深度适配器；为 <c>null</c> 时整条链路与改造前逐行等价。
+    ///
+    /// <para>识别只在构造时做一次（显式线索），或在头 32 行内容探针命中时绑定一次；
+    /// 绑定后整份文件生命周期内不再切换 —— 通道里前后两种日志形态混着出现比不精简更难读。</para>
+    /// </summary>
+    private IExternalLogAdapter? _adapter;
+
+    /// <summary>内容探针累积的原始行（最多 <see cref="AdapterProbeLimit"/> 条）。</summary>
+    private readonly List<string> _adapterProbeLines = new();
+
+    /// <summary>探针已结束（命中或到量）：不再累积行，也不再反复尝试识别。</summary>
+    private bool _adapterProbeDone;
+
     private int _labelsLoading;
     private string? _currentFile;
     private string _lastError = string.Empty;
@@ -73,8 +91,13 @@ public sealed class ExternalLogTail : IDisposable
     /// 显示视图（<c>panel</c> / <c>node</c> / <c>raw</c>）。原文视图直接跳过投影 ——
     /// 用户要看原文时再套一层"重写"就自相矛盾了。
     /// </param>
+    /// <param name="adapterHint">
+    /// 深度适配的识别线索（预设 id / 入口名 / 日志路径与模式）。命中就整份文件走适配器；
+    /// 为 <c>null</c> 或都没命中时按原样走粗略链路，行为与改造前完全一致。
+    /// </param>
     public ExternalLogTail(string path, string? pattern, string? encodingName, bool followTail,
-        string? baseDirectory = null, bool recursive = false, string? view = null)
+        string? baseDirectory = null, bool recursive = false, string? view = null,
+        ExternalLogAdapterHint? adapterHint = null)
     {
         var expanded = Environment.ExpandEnvironmentVariables((path ?? string.Empty).Trim());
         _rootPath = expanded.Length == 0 ? string.Empty : Path.GetFullPath(expanded,
@@ -83,6 +106,9 @@ public sealed class ExternalLogTail : IDisposable
         _recursive = recursive;
         _view = ExternalLogViews.Normalize(view);
         _encodingMode = ExternalLogEncodings.Normalize(encodingName);
+        // 显式线索命中就直接绑定，不再做内容探针（探针只是线索缺失时的兜底）。
+        _adapter = ExternalLogAdapterRegistry.Select(adapterHint);
+        _adapterProbeDone = _adapter is not null;
         // 族判定在"打开文件之前"做一次：MaaFW 归档的头几十行往往是外壳启动日志
         // （`[INFO][mxu_lib::commands::…]`），只在逐行流里判会把这些行当"不认识"原样放出来。
         _projector = new ExternalLogProjector(LogLabelMap.Empty, ProbeMaafw()) { View = _view };
@@ -582,29 +608,91 @@ public sealed class ExternalLogTail : IDisposable
             return;
         }
 
-        // 投影必须发生在外部日志过滤器之后、截断之前 —— Parse 只做级别识别与规整，
-        // 真正的截断在 NormalizeLine 里，而它作用在投影文本上（投影文本本来就很短）。
-        var projection = _projector.Project(raw);
-        if (!projection.Emit) { return; }
-        if (projection.UseRaw)
+        // 显式线索缺失时，用前 32 行做一次内容探针（字节时代就知道是哪家的日志最好，
+        // 但预设缺省也得能用）。探针期间的行已按粗略链路上屏，不做回溯改写 ——
+        // 前面那几行留在面板上不影响阅读，反倒是"重排历史"会让人找不到自己刚才看到的那条。
+        if (_adapter is null && !_adapterProbeDone)
+        {
+            _adapterProbeLines.Add(raw);
+            _adapter = ExternalLogAdapterRegistry.DetectByContent(_adapterProbeLines);
+            if (_adapter is not null || _adapterProbeLines.Count >= AdapterProbeLimit)
+            {
+                _adapterProbeDone = true;
+            }
+        }
+
+        // 未识别脚本：**这条链路一个字符都不改**，保证改造前后逐行一致。
+        if (_adapter is null)
+        {
+            // 投影必须发生在外部日志过滤器之后、截断之前 —— Parse 只做级别识别与规整，
+            // 真正的截断在 NormalizeLine 里，而它作用在投影文本上（投影文本本来就很短）。
+            var projection = _projector.Project(raw);
+            if (!projection.Emit) { return; }
+            if (projection.UseRaw)
+            {
+                result.Add(line);
+                return;
+            }
+
+            if (projection.PanelText.Length == 0 && projection.NodeText.Length == 0) { return; }
+
+            // Text 是"这个视图该显示的那一行"：节点视图下节点名才是内容，面板视图下 focus 才是内容。
+            var display = _view == ExternalLogViews.Node
+                ? (projection.NodeText.Length > 0 ? projection.NodeText : projection.PanelText)
+                : projection.PanelText;
+            result.Add(new ExternalLogLine
+            {
+                Text = display,
+                NodeText = projection.NodeText,
+                Kind = projection.Kind,
+                Level = line.Level,
+                KeywordHit = line.KeywordHit,
+            });
+            return;
+        }
+
+        // 已识别脚本：交给适配器决定这一行的形态。
+        var adapted = _adapter.Project(raw, Environment.TickCount64);
+
+        // fail-open：适配器不认识这一行，原样交给粗略链路（Compact 保持 false）。
+        if (adapted.UseRaw)
         {
             result.Add(line);
             return;
         }
 
-        if (projection.PanelText.Length == 0 && projection.NodeText.Length == 0) { return; }
+        if (!adapted.Emit)
+        {
+            // 关键字命中与警告/错误行**绝不吞**：适配器的降噪规则针对的是过程噪声，
+            // 用户自己配的关键字与脚本自己打的告警必须照常出现，否则就是在藏问题。
+            if (line.KeywordHit || line.Level is ExternalLogLevel.Warn or ExternalLogLevel.Error)
+            {
+                result.Add(line);
+            }
 
-        // Text 是"这个视图该显示的那一行"：节点视图下节点名才是内容，面板视图下 focus 才是内容。
-        var display = _view == ExternalLogViews.Node
-            ? (projection.NodeText.Length > 0 ? projection.NodeText : projection.PanelText)
-            : projection.PanelText;
+            return;
+        }
+
+        if (adapted.PanelText.Length == 0 && adapted.NodeText.Length == 0) { return; }
+
+        // 面板档可能为空（节点档独有的行）：与现有投影链路保持一致，照样交出 ——
+        // 上屏侧按"Text 为空"决定不显示，但归档仍要拿到 NodeText，不能在这里就把行丢掉。
+        var adaptedDisplay = _view == ExternalLogViews.Node
+            ? (adapted.NodeText.Length > 0 ? adapted.NodeText : adapted.PanelText)
+            : adapted.PanelText;
+
+        // 级别前缀（[错误] / [警告]）不在这里加：深度适配的正文已经自带 ✗ / ⚠ 符号，
+        // 再加一层级别文字就重复了。NodeText 填原始行，归档因此仍与脚本自己的日志一致。
         result.Add(new ExternalLogLine
         {
-            Text = display,
-            NodeText = projection.NodeText,
-            Kind = projection.Kind,
+            Text = adaptedDisplay,
+            NodeText = adapted.NodeText,
+            Raw = raw,
+            Kind = adapted.Kind,
             Level = line.Level,
             KeywordHit = line.KeywordHit,
+            Compact = adapted.Compact,
+            SourceTime = adapted.SourceTime,
         });
     }
 
@@ -612,19 +700,50 @@ public sealed class ExternalLogTail : IDisposable
     /// 采集节拍上的一次检查：任务在跑却没有输出时补心跳，长时间空档补一条"日志中断"。
     ///
     /// <para>必须由采集循环调用 —— 没有新行的时候才更需要它，否则长任务在面板上看起来就是卡死。</para>
+    ///
+    /// <para>返回**一批**而不是一条：适配器内部会积压（一行产两条、合并组收尾、节流窗口到期），
+    /// 每拍只取一条会让队列越堆越长，用户看到的日志越来越滞后。这里一次排空，
+    /// 但受 <see cref="MaxOutputLinesPerPoll"/> 约束，排不完的留到下一拍。</para>
     /// </summary>
-    public ExternalLogLine? Tick()
+    public IReadOnlyList<ExternalLogLine> Tick()
     {
-        if (_disposed) { return null; }
-        var projection = _projector.Tick(Environment.TickCount64);
-        if (projection is null) { return null; }
-        return new ExternalLogLine
+        var result = new List<ExternalLogLine>();
+        if (_disposed) { return result; }
+
+        var now = Environment.TickCount64;
+
+        if (_adapter is not null)
         {
-            Text = projection.PanelText,
-            NodeText = projection.NodeText,
-            Kind = projection.Kind,
+            while (result.Count < MaxOutputLinesPerPoll)
+            {
+                var projection = _adapter.Tick(now);
+                if (projection is null) { break; }
+                if (projection.PanelText.Length == 0 && projection.NodeText.Length == 0) { continue; }
+
+                result.Add(new ExternalLogLine
+                {
+                    Text = projection.PanelText,
+                    NodeText = projection.NodeText,
+                    Kind = projection.Kind,
+                    Level = ExternalLogLevel.Info,
+                    Compact = true,
+                    SourceTime = projection.SourceTime,
+                });
+            }
+
+            return result;
+        }
+
+        var tick = _projector.Tick(now);
+        if (tick is null) { return result; }
+        result.Add(new ExternalLogLine
+        {
+            Text = tick.PanelText,
+            NodeText = tick.NodeText,
+            Kind = tick.Kind,
             Level = ExternalLogLevel.Info,
-        };
+        });
+        return result;
     }
 
     /// <summary>投影器的会话状态（顶部状态条：当前任务 / 已进节点数 / 失败数）。</summary>

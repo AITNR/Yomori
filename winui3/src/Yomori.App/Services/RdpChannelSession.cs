@@ -341,17 +341,27 @@ public sealed class RdpChannelSession
     /// 为什么单独开一个入口：远程通道的事件是从 status.json 里按 Seq 去重收进来的，
     /// 本地没有桥，只能由 VM 拿到行之后就地补一条；序号仍按本次运行批次自增。
     /// </summary>
-    public void AddExternalLogLine(string text, bool abnormal, string level = "info", string? taskName = null)
+    /// <param name="compact">
+    /// true = 这一行来自逐脚本适配器，界面用单行模板。不传时保持 false，旧调用行为逐字节不变。
+    /// </param>
+    /// <param name="kind">语义类型（<c>ExternalLogKind</c> 的名字），空串表示正文色。</param>
+    /// <param name="sourceTime">脚本行自带的 <c>HH:mm:ss</c>；为空时退回本机采集时间。</param>
+    public void AddExternalLogLine(string text, bool abnormal, string level = "info",
+        string? taskName = null, bool compact = false, string kind = "", string sourceTime = "")
     {
         AddLiveLog(new RdpLiveLog
         {
             CommandId = _liveLogCommandId,
             Seq = _lastLiveLogSeq + 1,
-            Time = DateTime.Now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
+            Time = sourceTime.Length > 0
+                ? sourceTime
+                : DateTime.Now.ToString("HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture),
             TaskName = taskName ?? CurrentTask ?? string.Empty,
             Message = text,
             Level = level,
             IsAbnormal = abnormal,
+            Compact = compact,
+            Kind = kind,
         });
     }
 

@@ -209,3 +209,196 @@ public static class ExternalLogGrammar
         return false;
     }
 }
+
+/// <summary>
+/// March7thAssistant（三月七小助手 / March7th Launcher）日志的文法常量。
+///
+/// <para>和 <see cref="ExternalLogGrammar"/> 分开放的原因：那一套是 MaaFramework 内核日志的格式事实，
+/// 这一套全是三月七自己 print 出来的中文行 + ASCII 边框，两者的判据没有一条能复用。
+/// 混在一起会让"到底是谁的格式"变得看不出来。</para>
+///
+/// <para>每条正则都注明了出处行（`2026-11-05.log` / `2026-10-29.log`，
+/// 位于 `C:\Program Files\March7thAssistant_v2.7.0\logs\`），
+/// 统计口径见《外部脚本实时日志深度适配计划书》§1.4。</para>
+/// </summary>
+public static class March7thGrammar
+{
+    /// <summary>
+    /// 标准行：`2026-11-05 21:32:05,502 | INFO | 游戏启动：…`。
+    ///
+    /// <para>全天 389/497 行都是它（78.3%）。级别字段实测只出现 `INFO / WARNING / ERROR` 三种，
+    /// 这里仍用 `[A-Z]+` 兜住将来新增的级别 —— 认不出来只会掉进 INFO 分支，不会漏行。</para>
+    /// </summary>
+    public static readonly Regex StandardLine = new(
+        @"^(?<date>\d{4}-\d{2}-\d{2}) (?<hms>\d{2}:\d{2}:\d{2}),(?<ms>\d{3}) \| (?<lvl>[A-Z]+) \| (?<body>.*)$",
+        RegexOptions.Compiled);
+
+    /// <summary>完整框线：`+-------------------------------------------------------------------+`（42 行，8.5%）。</summary>
+    public static readonly Regex BoxRule = new(@"^\+-+\+$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 窄栏折行后的左半截框线：`+-----------------------------`。
+    ///
+    /// <para>不是脚本写出来的，是宽控制台的行在 360px 栏宽下被截断后的形态；
+    /// 归档里不会有，但实时读取时如果用户把 Yomori 自己的归档当源，就会遇到。</para>
+    /// </summary>
+    public static readonly Regex BoxRuleLeft = new(@"^\+-*$", RegexOptions.Compiled);
+
+    /// <summary>窄栏折行后的右半截框线：`-----------------------------+`。</summary>
+    public static readonly Regex BoxRuleRight = new(@"^-*\+$", RegexOptions.Compiled);
+
+    /// <summary>框内标题：`|                            开始运行                                |`（21 行）。</summary>
+    public static readonly Regex BoxTitle = new(@"^\|\s*(?<title>.+?)\s*\|$", RegexOptions.Compiled);
+
+    /// <summary>完成线：`----------------------- 完成 -----------------------`（19 行，全部无时间戳）。</summary>
+    public static readonly Regex DoneRule = new(@"^-+\s*完成\s*-+$", RegexOptions.Compiled);
+
+    /// <summary>等号小标题：`============= 开始查询日常任务完成情况 =============`（6 行）。</summary>
+    public static readonly Regex EqualsTitle = new(@"^=+\s*(?<title>.*?)\s*=+$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 横线子步骤：`------------ 准备分解四星及以下遗器 ------------`（19 行）。
+    ///
+    /// <para>纯分隔符也会命中（标题为空），调用方按"标题为空即丢弃"处理。</para>
+    /// </summary>
+    public static readonly Regex DashTitle = new(@"^-+\s*(?<title>.*?)\s*-+$", RegexOptions.Compiled);
+
+    /// <summary>只由分隔符组成的行（纯 `---` / `===` / `+++`）：绝不能上屏。</summary>
+    public static readonly Regex SeparatorOnly = new(@"^[+\-=_*~\s]+$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 批量刷的横线标题：`开始刷饰品提取 - 浴火钢心，总计1轮，每轮包含6次`
+    /// （`2026-11-05.log:108`）。压成 `刷 饰品提取 - 浴火钢心（1轮×6次）`。
+    /// </summary>
+    public static readonly Regex BatchStart = new(
+        @"^开始刷\s*(?<what>.+?)\s*[，,]\s*总计\s*(?<rounds>\d+)\s*轮[，,]\s*每轮包含\s*(?<per>\d+)\s*次$",
+        RegexOptions.Compiled);
+
+    /// <summary>游戏启动：`游戏启动：D:\mhy\Star Rail Game\StarRail.exe`（`2026-11-05.log:13`）。</summary>
+    public static readonly Regex GameLaunch = new(@"^游戏启动\s*[:：]\s*(?<path>.+)$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Windows 绝对路径（允许路径段里有空格 —— 实测 `D:\mhy\Star Rail Game\` 就带空格）。
+    /// 其它正文里的路径压成文件名，避免窄栏折成 2～3 行。
+    /// </summary>
+    public static readonly Regex WinPath = new(
+        @"[A-Za-z]:\\(?:[^\\/:*?""<>|\r\n]*\\)*(?<path>[^\\/:*?""<>|\r\n]*)",
+        RegexOptions.Compiled);
+
+    /// <summary>新版本提示：`GitHub 发现新版本: v2026.10.31`（`2026-11-05.log:1`）。</summary>
+    public static readonly Regex NewVersion = new(
+        @"^GitHub\s*发现新版本\s*[:：]\s*(?<ver>v?[0-9][\w.\-]*)$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// 界面状态：`切换到：手机菜单` / `当前界面：月卡`（全天 100+ 行，占四分之一）。
+    /// 两者同类节流 —— 对用户来说都是"现在在哪个界面"。
+    /// </summary>
+    public static readonly Regex UiSwitch = new(
+        @"^(?:切换到|当前界面)\s*[:：]\s*(?<name>.+?)\s*$", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 识别失败告警：`未识别出任何界面，请确保游戏画面干净，按ESC后重试`（13 行）。
+    /// 实测是 WARNING 级，但少数版本会打成 INFO，两条路径都要认。
+    /// </summary>
+    public static readonly Regex UnrecognizedUi = new(@"^未识别出任何界面", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 资源状态：`开拓力: 300/300` / `沉浸器: 0/12`（`2026-11-05.log:61,100`）。
+    ///
+    /// <para>只认 `N/N` 这种纯数值形态 —— `开拓力: 300 + 沉浸器: 0 = 7 次挑战` 是算式，
+    /// 每次内容不同，压成状态去重反而会吞掉有用信息。</para>
+    /// </summary>
+    public static readonly Regex ResourceStatus = new(
+        @"^(?<key>开拓力|沉浸器|体力|星琼|信用点)\s*[:：]\s*(?<value>\d+\s*/\s*\d+)\s*$",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 列表型续行：`侵蚀隧洞 - 密伶之径, 霜风之径`（`2026-11-05.log:33`）。
+    ///
+    /// <para>实测这几行**带**时间戳（旧版本里不带），所以续行不能只按"没有时间戳"判断；
+    /// 这里用"短前缀 + 空格连字符 + 空格"的列表形状补一条判据。</para>
+    /// </summary>
+    public static readonly Regex ContinuationItem = new(@"^\S[^:：]{0,24}\s-\s\S", RegexOptions.Compiled);
+
+    /// <summary>
+    /// 内部机制噪声：`准备发送 winotify 通知（…）`（22 行）、`winotify 通知发送完成`、
+    /// `[config-watch] …` / `[config-save] …`（10 行）。用户视角零信息量。
+    /// </summary>
+    public static readonly string[] NoisePrefixes =
+    {
+        "准备发送 winotify",
+        "winotify 通知发送完成",
+        "[config-watch]",
+        "[config-save]",
+    };
+
+    /// <summary>别的族混进同一份日志时的标记 —— 命中任意一条就不许判定为 March7th。</summary>
+    private static readonly string[] ForeignMarkers =
+    {
+        "!!!OnEventNotify!!!",
+        "[msg=",
+        "MaaNS::",
+        "][INF][Px",
+    };
+
+    /// <summary>是不是内部机制噪声（按前缀判定，前缀之后可能带参数）。</summary>
+    public static bool IsNoiseBody(string body)
+    {
+        if (body.Length == 0) { return false; }
+        foreach (var prefix in NoisePrefixes)
+        {
+            if (body.StartsWith(prefix, StringComparison.Ordinal)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>这一行是不是别的脚本族（MaaFramework）的标记行。</summary>
+    public static bool IsForeignFamily(string line)
+    {
+        foreach (var marker in ForeignMarkers)
+        {
+            if (line.Contains(marker, StringComparison.Ordinal)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 这一行看起来已经是**精简形态**（`▶ …` / `  正文` / `⚠ …`）。
+    ///
+    /// <para>和 <see cref="ExternalLogGrammar.LooksProjected"/> 是同一份纪律：投影必须幂等，
+    /// 否则主控端对老代理发来的行再投一次就会二次加工。区别是这里还要认 `■`（停止运行）
+    /// 与两空格缩进（March7th 的普通正文前缀）。</para>
+    /// </summary>
+    public static bool LooksCompact(string line)
+    {
+        if (line.Length == 0) { return false; }
+        if (StandardLine.IsMatch(line) ||
+            BoxRule.IsMatch(line) ||
+            BoxRuleLeft.IsMatch(line) ||
+            BoxRuleRight.IsMatch(line) ||
+            BoxTitle.IsMatch(line) ||
+            DoneRule.IsMatch(line) ||
+            EqualsTitle.IsMatch(line) ||
+            DashTitle.IsMatch(line))
+        {
+            return false;
+        }
+
+        if (line.StartsWith("  ", StringComparison.Ordinal)) { return true; }
+
+        var text = line.TrimStart();
+        if (text.Length == 0 || text.Length != line.Length) { return false; }
+        return text.StartsWith("▶", StringComparison.Ordinal) ||
+               text.StartsWith("✔", StringComparison.Ordinal) ||
+               text.StartsWith("✘", StringComparison.Ordinal) ||
+               text.StartsWith("■", StringComparison.Ordinal) ||
+               text.StartsWith("▸", StringComparison.Ordinal) ||
+               text.StartsWith("⚠", StringComparison.Ordinal) ||
+               text.StartsWith("✗", StringComparison.Ordinal) ||
+               text.StartsWith("⋯", StringComparison.Ordinal) ||
+               text.StartsWith("✓", StringComparison.Ordinal);
+    }
+}

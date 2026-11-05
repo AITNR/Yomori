@@ -388,7 +388,8 @@ public sealed class RdpAgentRunner
             ExternalLogStore.Append(archivePath, $"[{FormatHelper.NowTimeText()}] {archiveText}");
 
             // 上屏只发当前视图的文本；节点档独有的行（中间层 WRN）不发，免得面板上冒出代码。
-            var text = ExternalLogText(line.Text, line.Level);
+            // 深度适配行自带 ✗ / ⚠ 符号，再套一层 [警告] 就重复了 —— 计划书 §7 要求单行模板不带级别文字。
+            var text = line.Compact ? line.Text : ExternalLogText(line.Text, line.Level);
             if (line.Text.Length == 0) { return; }
 
             lock (_liveLogGate)
@@ -409,11 +410,14 @@ public sealed class RdpAgentRunner
                 {
                     CommandId = _command.Id,
                     Seq = ++_liveLogSeq,
-                    Time = FormatHelper.NowTimeText(),
+                    // 优先用脚本行自带的时间：两边时间轴必须一致，否则用户对着脚本日志排障会对不上。
+                    Time = line.SourceTime.Length > 0 ? line.SourceTime : FormatHelper.NowTimeText(),
                     TaskName = item.TaskName,
                     Message = text,
                     Level = line.Level.ToString().ToLowerInvariant(),
                     IsAbnormal = line.Level == ExternalLogLevel.Error,
+                    Compact = line.Compact,
+                    Kind = line.Kind.ToString(),
                 });
             }
         }

@@ -21,6 +21,19 @@ public sealed class RdpLogRow
     {
         Seq = source.Seq;
         Time = source.Time;
+        Compact = source.Compact;
+        Kind = source.Kind ?? string.Empty;
+
+        // 深度适配行：正文已是精简文本（自带符号），不再重复脚本名与级别文字，
+        // 时间由界面在正文行首给一列（见计划书 §3.1 / §7）。
+        if (Compact)
+        {
+            Task = string.Empty;
+            Level = string.Empty;
+            Body = source.Message;
+            return;
+        }
+
         Task = string.IsNullOrWhiteSpace(source.TaskName) ? "－" : source.TaskName;
 
         if (source.IsAbnormal || string.Equals(source.Level, "error", StringComparison.OrdinalIgnoreCase))
@@ -50,6 +63,25 @@ public sealed class RdpLogRow
     public string Level { get; }
     public string Body { get; }
 
+    /// <summary>是否深度适配行（单行形态：时间 + 精简正文）。</summary>
+    public bool Compact { get; }
+
+    /// <summary>语义类别（TaskStart / TaskDone / Warn / TaskFail / Notice / Node / Heartbeat）。</summary>
+    public string Kind { get; }
+
+    // ---------------- 供 DataTemplate 绑定的派生属性 ----------------
+
+    /// <summary>元信息行（时间 / 脚本名 / 级别）：只有旧形态才需要，Compact 时整行收起。</summary>
+    public Visibility MetaVisibility => Compact ? Visibility.Collapsed : Visibility.Visible;
+
+    /// <summary>正文行首那一列时间：只有 Compact 需要（旧形态的时间在元信息行里）。</summary>
+    public Visibility CompactTimeVisibility => Compact ? Visibility.Visible : Visibility.Collapsed;
+
+    /// <summary>Compact 单行不折行，旧形态照旧折行。</summary>
+    public TextWrapping BodyWrapping => Compact ? TextWrapping.NoWrap : TextWrapping.Wrap;
+
+    /// <summary>Compact 超出栏宽用省略号截断，旧形态不截断（与原行为一致）。</summary>
+    public TextTrimming BodyTrimming => Compact ? TextTrimming.CharacterEllipsis : TextTrimming.None;
 }
 
 /// <summary>

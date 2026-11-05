@@ -6726,8 +6726,11 @@ public sealed class MainViewModel : ObservableObject
         for (var i = 0; i < 500 && _localLiveLogs.TryDequeue(out var entry); i++)
         {
             var line = entry.Item.Line;
-            entry.Session.AddExternalLogLine(ExternalLogText(line.Text, line.Level), line.Level == ExternalLogLevel.Error,
-                line.Level.ToString().ToLowerInvariant(), entry.Item.TaskName);
+            // 深度适配行自带 ✗ / ⚠ 符号，再套一层 [警告] 就重复了（与远程通道同一口径）。
+            var text = line.Compact ? line.Text : ExternalLogText(line.Text, line.Level);
+            entry.Session.AddExternalLogLine(text, line.Level == ExternalLogLevel.Error,
+                line.Level.ToString().ToLowerInvariant(), entry.Item.TaskName,
+                line.Compact, line.Kind.ToString(), line.SourceTime);
         }
         Interlocked.Exchange(ref _localLiveLogPostPending, 0);
         if (!_localLiveLogs.IsEmpty && Interlocked.Exchange(ref _localLiveLogPostPending, 1) == 0)

@@ -200,13 +200,32 @@
                                     <ListView.ItemTemplate>
                                         <DataTemplate x:DataType="views:RdpLogRow">
                                             <StackPanel Spacing="1" Padding="0,2">
-                                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <!-- 元信息行（时间 / 脚本名 / 级别）：深度适配行整行收起，
+                                                     否则时间、级别、脚本名会与正文里的信息三重重复。 -->
+                                                <StackPanel Orientation="Horizontal" Spacing="8"
+                                                            Visibility="{x:Bind MetaVisibility}">
                                                     <TextBlock Text="{x:Bind Time}" Opacity="0.55" FontSize="12" />
                                                     <TextBlock Text="{x:Bind Task}" FontSize="12"
                                                                Opacity="0.7" TextTrimming="CharacterEllipsis" />
                                                     <TextBlock Text="{x:Bind Level}" Opacity="0.7" FontSize="12" />
                                                 </StackPanel>
-                                                <TextBlock Text="{x:Bind Body}" TextWrapping="Wrap" FontSize="12" />
+                                                <!-- 正文：旧形态与改造前一致（整宽、折行、不截断）；
+                                                     深度适配行是「时间 + 精简正文」一行两列，正文不折行、超出省略。
+                                                     ⚠️ 时间块收起时宽度与 Margin 都不参与布局，旧形态排版分毫不动。 -->
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Grid.Column="0" Text="{x:Bind Time}"
+                                                               Margin="0,0,8,0"
+                                                               Opacity="0.55" FontSize="12"
+                                                               Visibility="{x:Bind CompactTimeVisibility}" />
+                                                    <TextBlock Grid.Column="1" Text="{x:Bind Body}"
+                                                               TextWrapping="{x:Bind BodyWrapping}"
+                                                               TextTrimming="{x:Bind BodyTrimming}"
+                                                               FontSize="12" />
+                                                </Grid>
                                             </StackPanel>
                                         </DataTemplate>
                                     </ListView.ItemTemplate>

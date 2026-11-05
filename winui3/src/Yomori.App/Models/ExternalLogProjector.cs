@@ -25,6 +25,22 @@ public sealed class ExternalLogProjection
     /// <summary>语义类型，界面按它上色。</summary>
     public ExternalLogKind Kind { get; private init; }
 
+    /// <summary>
+    /// true = 这一行来自逐脚本适配器，界面用单行模板（`HH:mm:ss` + 正文），不再占两行。
+    ///
+    /// <para>MaaFW 的投影（<see cref="New"/> / <see cref="PanelOnly"/> / <see cref="NodeOnly"/>）
+    /// 一律保持 false —— 那套两行渲染是既有观感，本期不动。</para>
+    /// </summary>
+    public bool Compact { get; private init; }
+
+    /// <summary>
+    /// 脚本行自带的时间（`HH:mm:ss`）。空串 = 这一行没有自带时间，由下层退回采集时间。
+    ///
+    /// <para>用脚本时间而不是采集时间：跨进程传输有延迟，用户对着脚本保存的日志排障时
+    /// 两边的时间轴必须一致。</para>
+    /// </summary>
+    public string SourceTime { get; private init; } = string.Empty;
+
     /// <summary>丢弃一条（噪声、重复、中间层自检）。</summary>
     public static readonly ExternalLogProjection Drop = new() { Emit = false };
 
@@ -46,6 +62,22 @@ public sealed class ExternalLogProjection
     /// <summary>只有节点档显示（例如中间层的 WRN：实时面板上没信息量，排障时要看）。</summary>
     internal static ExternalLogProjection NodeOnly(string text, ExternalLogKind kind) =>
         New(string.Empty, text, kind);
+
+    /// <summary>
+    /// 逐脚本适配器专用：面板档一行 + 脚本自带时间。
+    ///
+    /// <para>`Compact = true` 是界面切单行模板的唯一开关，所以只能由适配器路径产生；
+    /// 其余静态工厂保持默认值，MaaFW 的输出因此逐像素不变。</para>
+    /// </summary>
+    public static ExternalLogProjection CompactLine(string panel, string node, ExternalLogKind kind, string sourceTime) => new()
+    {
+        Emit = true,
+        PanelText = panel,
+        NodeText = node,
+        Kind = kind,
+        Compact = true,
+        SourceTime = sourceTime,
+    };
 }
 
 /// <summary>

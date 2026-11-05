@@ -998,13 +998,25 @@ public sealed class RdpStopRequest
     public string RequestedAt { get; set; } = DateTimeOffset.Now.ToString("o");
 }
 
-/// <summary>主控与代理共同使用的实时日志协议版本。</summary>
+/// <summary>
+/// 主控与代理共同使用的实时日志协议版本。
+///
+/// <para>新增字段一律**追加式**，版本号保持 <c>1</c> 不动：老端反序列化时会忽略不认识的字段，
+/// 老代理不写 <c>Compact</c> / <c>Kind</c> 时新主控读出来就是 <c>false</c> / 空串（即旧的两行形态）。
+/// 一旦升版本，新主控会把老代理判成"不支持独立实时日志"，那才是真的破兼容。</para>
+/// </summary>
 public static class RdpLiveLogProtocol
 {
     public const int Current = 1;
 }
 
-/// <summary>独立 NDJSON 流中的一条外部脚本日志。</summary>
+/// <summary>
+/// 独立 NDJSON 流中的一条外部脚本日志。
+///
+/// <para><see cref="Compact"/> / <see cref="Kind"/> 为追加字段（协议版本仍是 1）：
+/// 老代理不发这两个字段时反序列化为 <c>false</c> / 空串，界面自然退回两行旧形态；
+/// 新代理发给老主控时老主控忽略它们，同样不崩。</para>
+/// </summary>
 public sealed class RdpLiveLog
 {
     public string CommandId { get; set; } = string.Empty;
@@ -1014,6 +1026,17 @@ public sealed class RdpLiveLog
     public string Message { get; set; } = string.Empty;
     public string Level { get; set; } = "info";
     public bool IsAbnormal { get; set; }
+
+    /// <summary>
+    /// true = 这一行经过逐脚本适配器精简，界面用单行模板（时间 + 正文），不再占两行。
+    /// 老代理不写这个字段 → 反序列化为 false → 走原来的两行渲染。
+    /// </summary>
+    public bool Compact { get; set; }
+
+    /// <summary>
+    /// 语义类型（<c>ExternalLogKind</c> 的名字），界面据此上色。空串 = 正文色。
+    /// </summary>
+    public string Kind { get; set; } = string.Empty;
 }
 
 /// <summary>Agent 回写给主控端的一条事件（序号单调递增，主控端按序号去重）。</summary>

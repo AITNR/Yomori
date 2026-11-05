@@ -248,9 +248,16 @@ public sealed class ScriptRunner
             {
                 // WaitFirst 并发任务可能仍在启动，队列收尾后禁止再注册 worker。
                 if (_externalLogTailsClosed) { return; }
+                var hint = new ExternalLogAdapterHint
+                {
+                    PresetId = task.LaunchPresetId,
+                    EntryName = EntryNameOf(task.ScriptPath),
+                    LogPath = task.ExternalLogPath,
+                    LogPattern = task.ExternalLogPattern,
+                };
                 var tail = new ExternalLogTail(task.ExternalLogPath, task.ExternalLogPattern,
                     task.ExternalLogEncoding, task.ExternalLogFollowTail, scriptDirectory,
-                    task.ExternalLogRecursive, task.ExternalLogView);
+                    task.ExternalLogRecursive, task.ExternalLogView, hint);
                 var state = new ExternalLogTailState(task, tail);
                 _externalLogTails[task] = state;
                 var start = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -266,6 +273,21 @@ public sealed class ScriptRunner
         {
             EmitExternalLogDiagnostic(task, $"日志采集无法启动：{ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 取入口可执行文件名（识别深度适配器用）。
+    ///
+    /// <para>纯字符串处理、不做文件 IO：任务可能指向远程会话里的路径，本进程根本读不到；
+    /// 同时认 `\` 与 `/`，Windows 路径与 Linux 风格路径都能取对。首尾引号先去掉 ——
+    /// 用户从资源管理器「复制文件地址」粘进来的路径是带引号的。</para>
+    /// </summary>
+    private static string EntryNameOf(string? scriptPath)
+    {
+        var text = (scriptPath ?? string.Empty).Trim().Trim('"').Trim();
+        if (text.Length == 0) { return string.Empty; }
+        var cut = text.LastIndexOfAny(new[] { '\\', '/' });
+        return cut >= 0 ? text[(cut + 1)..].Trim() : text;
     }
 
     private void StopAllExternalLogTails()
@@ -359,9 +381,9 @@ public sealed class ScriptRunner
         }
         foreach (var line in lines) { EmitExternalLogLine(state.Task, line); }
 
-        // 心跳 / 日志中断：没有新行的时候才更需要它（否则长任务在面板上看起来像卡死）。
-        var tick = state.Tail.Tick();
-        if (tick is not null) { EmitExternalLogLine(state.Task, tick); }
+        // 心跳 / 日志中断 / 适配器积压：没有新行的时候才更需要它（否则长任务在面板上看起来像卡死）。
+        // Tick 一次可能吐出多条（适配器内部的合并组收尾、节流窗口到期），逐条照样发。
+        foreach (var tick in state.Tail.Tick()) { EmitExternalLogLine(state.Task, tick); }
 
         return lines.Count;
     }

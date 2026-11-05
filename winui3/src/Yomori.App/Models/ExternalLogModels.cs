@@ -99,6 +99,19 @@ public sealed class ExternalLogLine
     /// <summary>是否命中了用户配置的关键字。</summary>
     public bool KeywordHit { get; init; }
 
+    /// <summary>
+    /// true = 这一行经过逐脚本适配器精简（单行形态：时间 + 正文）。
+    ///
+    /// <para>为 false 的行保持既有两行渲染，逐像素不变。远程通道的旧代理不会写这个字段，
+    /// 反序列化即 false —— 兼容矩阵见计划书 §4.5。</para>
+    /// </summary>
+    public bool Compact { get; init; }
+
+    /// <summary>
+    /// 脚本行自带的时间（`HH:mm:ss`）。空串 = 没有自带时间，显示层退回采集时间。
+    /// </summary>
+    public string SourceTime { get; init; } = string.Empty;
+
     /// <summary>按视图取显示文本（原文视图没有 <see cref="Raw"/> 时退回投影文本，绝不返回空）。</summary>
     public string TextFor(string? view)
     {
