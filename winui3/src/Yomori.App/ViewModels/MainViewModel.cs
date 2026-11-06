@@ -843,6 +843,28 @@ public sealed class MainViewModel : ObservableObject
         // 自动保存从这里开始生效：此前的一切赋值都是程序自己的加载与规整，不该写盘。
         EnableAutoSave();
 
+        // 默认勾选「通道账户密码永不过期」：错开几秒，把已添加进 Yomori 的本机本地
+        // 通道账户幂等补一次标志位。账户快照此刻（UI 线程）取好，后面整段在线程池跑，
+        // 不碰绑定属性；失败只写运行日志，不阻塞启动、也不动凭据管理器里的密码。
+        var policyAccounts = GetChannelPolicyAccounts();
+        if (Config.Rdp.ChannelPasswordNeverExpires && policyAccounts.Count > 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(ChannelPolicyStartupDelaySeconds)).ConfigureAwait(false);
+                    var result = await ApplyChannelPasswordPolicyAsync(policyAccounts, true).ConfigureAwait(false);
+                    AppendLog("[账户策略] 启动巡检：" + result.Summary);
+                }
+                catch (Exception ex)
+                {
+                    var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+                    AppendLog("[账户策略] 启动巡检失败：" + detail);
+                }
+            });
+        }
+
         _memorySampleTimer = _dispatcher.CreateTimer();
         _memorySampleTimer.Interval = TimeSpan.FromMinutes(1);
         _memorySampleTimer.Tick += (_, _) => LogMemorySample();
@@ -857,6 +879,57 @@ public sealed class MainViewModel : ObservableObject
                 Post(Start);
             });
         }
+    }
+
+    // ---------------- 通道账户密码策略 ----------------
+
+    private const int ChannelPolicyStartupDelaySeconds = 3;
+
+    /// <summary>
+    /// 取得「已添加进 Yomori 且允许维护」的通道账户快照。必须在 UI 线程调用：
+    /// <c>Config.Rdp.Channels</c> 是普通 List，跨线程读它属于自找麻烦。
+    /// </summary>
+    public IReadOnlyList<string> GetChannelPolicyAccounts() =>
+        LocalUserPasswordPolicy.CollectChannelAccounts(Config.Rdp.Channels, Environment.MachineName);
+
+    /// <summary>
+    /// 把标志位对齐到目标状态。整段在线程池跑，不读写任何绑定属性；
+    /// 返回的结果由调用方自己收口回 UI 线程（await 的续体在 WinUI 3 不保证回界面线程）。
+    /// </summary>
+    public Task<(bool AllOk, string Summary, int Changed)> ApplyChannelPasswordPolicyAsync(
+        IReadOnlyList<string> accounts, bool neverExpires) =>
+        Task.Run(() => LocalUserPasswordPolicy.Apply(accounts, neverExpires));
+
+    /// <summary>
+    /// 保存凭据之后的静默补置：新增账户也算「添加进 Yomori」，不能等下次启动才生效。
+    /// fire-and-forget，失败只记日志，不打断保存流程、不改配置。
+    /// </summary>
+    private void MaintainChannelPasswordPolicyQuietly(string source)
+    {
+        if (!Config.Rdp.ChannelPasswordNeverExpires)
+        {
+            return;
+        }
+
+        var accounts = GetChannelPolicyAccounts();
+        if (accounts.Count == 0)
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var result = await ApplyChannelPasswordPolicyAsync(accounts, true).ConfigureAwait(false);
+                AppendLog($"[账户策略] {source}：{result.Summary}");
+            }
+            catch (Exception ex)
+            {
+                var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+                AppendLog($"[账户策略] {source} 失败：{detail}");
+            }
+        });
     }
 
     // ---------------- 任务编辑（在选中的执行通道内编排） ----------------
@@ -3760,6 +3833,9 @@ public sealed class MainViewModel : ObservableObject
         // 保存账户 = 明确提交动作：本机通道顺手完成组授权（计划书 §8）。
         // 字段失焦 / 导入配置 / 复制通道都走不到这里，那些路径不修改系统权限。
         StartAccountAuthorization(channel);
+
+        // 同上：保存凭据意味着这个账户正式添加进 Yomori，顺手补一次密码永不过期标志位。
+        MaintainChannelPasswordPolicyQuietly("保存凭据");
     }
 
     /// <summary>

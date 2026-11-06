@@ -545,6 +545,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private bool _notifyLocalTaskDone = true;
     private bool _autoReturnToControllerSession;
     private bool _uuSessionFixEnabled;
+    private bool _channelPasswordNeverExpires = true;
     private int _connectTimeoutSeconds = 120;
     private bool _credentialSaved;
     private bool _embedRemoteDesktop;
@@ -664,6 +665,24 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     {
         get => _uuSessionFixEnabled;
         set => SetProperty(ref _uuSessionFixEnabled, value);
+    }
+
+    /// <summary>
+    /// 默认勾选：自动把「已添加进 Yomori 的本机本地通道账户」设为密码永不过期
+    /// （UF_DONT_EXPIRE_PASSWD）。
+    ///
+    /// <para>默认 true 靠字段初始化器保证：老 config.json 里没有这个键，反序列化后仍是开启，
+    /// 升级用户无需手工拨动；用户显式存了 false 也不会被 <see cref="Sanitize"/> 拨回 ——
+    /// 所以这里**绝不能**在 Sanitize 里写 <c>= true</c>。</para>
+    ///
+    /// <para>这一项只是「是否自动维护」的长期意愿，不是标志位本身的状态快照。
+    /// 真正的状态在 Windows 账户上，由 <c>LocalUserPasswordPolicy</c> 读回并幂等对齐。</para>
+    /// </summary>
+    [JsonPropertyName("channel_password_never_expires")]
+    public bool ChannelPasswordNeverExpires
+    {
+        get => _channelPasswordNeverExpires;
+        set => SetProperty(ref _channelPasswordNeverExpires, value);
     }
 
     /// <summary>每完成一个任务都弹系统通知。</summary>

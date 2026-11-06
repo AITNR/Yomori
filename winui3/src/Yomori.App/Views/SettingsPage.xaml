@@ -80,6 +80,13 @@
                                TextWrapping="Wrap"
                                Visibility="Collapsed"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                    <!-- 通道账户密码永不过期：默认勾选，只作用于已添加进 Yomori 的通道账户。
+                         按约定本开关不带说明文字；执行结果只写运行日志，失败时把开关拨回。 -->
+                    <ToggleSwitch x:Name="ChannelPasswordPolicySwitch"
+                                  Header="通道账户密码永不过期"
+                                  IsOn="{x:Bind VM.RdpSettings.ChannelPasswordNeverExpires, Mode=OneWay}"
+                                  Toggled="OnChannelPasswordPolicyToggled" />
                 </StackPanel>
             </Border>
 

@@ -376,6 +376,80 @@ public sealed partial class SettingsPage : Page
         }
     }
 
+    /// <summary>
+    /// 「通道账户密码永不过期」开关：默认勾选，只作用于已添加进 Yomori 的本机本地通道账户。
+    ///
+    /// <para>刻意用 OneWay + Toggled：必须**先执行成功再落配置**。执行失败或被拒绝还原时
+    /// 把开关拨回原位，不留下「看着是开的、其实没做」的状态。</para>
+    ///
+    /// <para>取消勾选会还原 Windows 账户的标志位；若某个账户的密码年龄已达系统策略上限，
+    /// 服务整批拒绝还原 —— 那种情况下清掉标志位会让密码立刻过期、通道当场断连。</para>
+    /// </summary>
+    private async void OnChannelPasswordPolicyToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncing)
+        {
+            return;
+        }
+
+        if (sender is not ToggleSwitch toggle)
+        {
+            return;
+        }
+
+        var on = toggle.IsOn;
+        if (VM.RdpSettings.ChannelPasswordNeverExpires == on)
+        {
+            return;
+        }
+
+        // 账户快照在界面线程取好；服务本身不读配置，也就不会碰到绑定对象。
+        var accounts = VM.GetChannelPolicyAccounts();
+        (bool AllOk, string Summary, int Changed) result;
+        try
+        {
+            result = await VM.ApplyChannelPasswordPolicyAsync(accounts, on).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+            result = (false, "执行异常：" + detail, 0);
+        }
+
+        // await 的续体不保证在界面线程：所有控件写入与配置写入都显式投递回去。
+        RunOnUi(DispatcherQueue, () =>
+        {
+            try
+            {
+                VM.AppendLog($"[账户策略] {(on ? "开启" : "关闭")}：{result.Summary}");
+
+                if (!result.AllOk)
+                {
+                    _syncing = true;
+                    try
+                    {
+                        toggle.IsOn = !on;
+                    }
+                    finally
+                    {
+                        _syncing = false;
+                    }
+
+                    VM.AppendLog("[账户策略] 执行未全部成功，开关已拨回原位，配置保持原值。");
+                    return;
+                }
+
+                VM.RdpSettings.ChannelPasswordNeverExpires = on;
+                VM.SaveConfig();
+            }
+            catch (Exception ex)
+            {
+                var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+                VM.AppendLog("[账户策略] 收尾失败：" + detail);
+            }
+        });
+    }
+
     private async void OnExport(object sender, RoutedEventArgs e) => await VM.ExportConfigAsync();
 
     private async void OnImport(object sender, RoutedEventArgs e) => await VM.ImportConfigAsync();
