@@ -194,7 +194,10 @@ public sealed class AppConfig : ObservableObject
         set => SetProperty(ref _updateProxyUrl, (value ?? string.Empty).Trim());
     }
 
-    /// <summary>是否对 RDP 解锁链路的下载启用 GitHub 加速前缀（勾选开关）。默认关闭，保持原有行为。</summary>
+    /// <summary>
+    /// 兼容旧配置保留：加速不再由设置页开关控制。
+    /// 现在由解锁流程里的「测速选节点」弹窗决定，结果仅当轮生效。
+    /// </summary>
     [JsonPropertyName("rdp_accel_enabled")]
     public bool RdpAccelerationEnabled
     {
@@ -202,7 +205,7 @@ public sealed class AppConfig : ObservableObject
         set => SetProperty(ref _rdpAccelerationEnabled, value);
     }
 
-    /// <summary>自定义加速前缀，形如 <c>https://gh-proxy.com/</c>；留空则按内置候选轮换。</summary>
+    /// <summary>测速弹窗里填的自定义节点，形如 <c>https://gh-proxy.com/</c>；留空则只用内置候选。</summary>
     [JsonPropertyName("rdp_accel_prefix")]
     public string RdpAccelerationPrefix
     {

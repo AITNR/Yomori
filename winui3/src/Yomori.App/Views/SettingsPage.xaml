@@ -385,29 +385,6 @@
                                    Visibility="Collapsed" />
                     </StackPanel>
 
-                    <!-- RDP 解锁下载加速：勾选开关（勾选即启用、取消即还原）。
-                         说明放开关下方，不堆在弹窗里；Toggled 早于 TwoWay，故不用绑定，
-                         由代码在 _syncing 里摆初值、在事件里读控件 IsOn。 -->
-                    <StackPanel Spacing="4" Margin="0,8,0,0">
-                        <ToggleSwitch x:Name="RdpAccelerationSwitch"
-                                      Header="RDP 解锁下载加速"
-                                      OnContent="已启用"
-                                      OffContent="已关闭"
-                                      Toggled="OnRdpAccelerationToggled" />
-
-                        <TextBlock Text="启用后，RDP 解锁组件的发布解析、安装器与 INI 下载会经 GitHub 加速前缀；候选按「自定义前缀 → 内置候选 → 官方直连」轮换，且不会把 GitHub 访问令牌发给加速服务。只影响 RDP 解锁，不影响主程序检查更新。"
-                                   TextWrapping="Wrap" FontSize="12" Opacity="0.7" />
-
-                        <TextBox x:Name="RdpAccelerationPrefixBox"
-                                 Header="自定义加速前缀（可选）"
-                                 PlaceholderText="https://gh-proxy.com/"
-                                 Visibility="Collapsed"
-                                 LostFocus="OnRdpAccelerationPrefixLostFocus" />
-
-                        <TextBlock x:Name="RdpAccelerationHint"
-                                   TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
-                    </StackPanel>
-
                     <Grid ColumnSpacing="8" RowSpacing="8">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />

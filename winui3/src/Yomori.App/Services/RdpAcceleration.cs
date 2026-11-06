@@ -130,6 +130,7 @@ public static class RdpAcceleration
         return result;
     }
 
-    private static string HostOf(string prefix) =>
+    /// <summary>取前缀的主机名，用于给用户看的节点名。</summary>
+    public static string HostOf(string prefix) =>
         Uri.TryCreate(prefix, UriKind.Absolute, out var uri) ? uri.Host : prefix;
 }

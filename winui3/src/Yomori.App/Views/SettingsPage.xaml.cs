@@ -101,7 +101,6 @@ public sealed partial class SettingsPage : Page
                 UpdateProxyModes.Items, UpdateProxyModes.Normalize(VM.Config.UpdateProxyMode));
             UpdateProxyUrlBox.Text = VM.Config.UpdateProxyUrl;
             ApplyProxyMode(VM.Config.UpdateProxyMode, DescribeStoredProxy(VM.Config.UpdateProxyUrl));
-            ApplyRdpAccelerationUi();
         }
         finally
         {
@@ -817,125 +816,7 @@ public sealed partial class SettingsPage : Page
         return true;
     }
 
-    // ---------------- RDP 解锁下载加速（勾选开关） ----------------
-
-    /// <summary>
-    /// 摆好开关、输入框与说明。程序性赋值期间屏蔽 Toggled，别把「读配置」当成「用户改设置」。
-    /// 用 wasSyncing 恢复原值：构造函数本身已经在 _syncing 里，不能把外层的保护提前拆掉。
-    /// </summary>
-    private void ApplyRdpAccelerationUi()
-    {
-        var enabled = VM.Config.RdpAccelerationEnabled;
-        var wasSyncing = _syncing;
-
-        _syncing = true;
-        try
-        {
-            RdpAccelerationSwitch.IsOn = enabled;
-            RdpAccelerationPrefixBox.Text = VM.Config.RdpAccelerationPrefix;
-        }
-        finally
-        {
-            _syncing = wasSyncing;
-        }
-
-        RdpAccelerationPrefixBox.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-
-        var custom = VM.Config.RdpAccelerationPrefix;
-        if (!enabled)
-        {
-            RdpAccelerationHint.Text = "当前关闭：发布解析与下载走官方直连。";
-            return;
-        }
-
-        if (custom.Length == 0)
-        {
-            RdpAccelerationHint.Text = "未填自定义前缀：按内置候选轮换，全部失败后回退官方直连。";
-            return;
-        }
-
-        var normalized = RdpAcceleration.NormalizePrefix(custom);
-        RdpAccelerationHint.Text = normalized.Length > 0
-            ? $"当前自定义前缀：{normalized}（优先于内置候选）。"
-            : "自定义前缀格式不对，本次已忽略，按内置候选轮换。需要 https:// 开头、无用户名密码、无 ?/#。";
-    }
-
-    private void OnRdpAccelerationToggled(object sender, RoutedEventArgs e)
-    {
-        if (_syncing || sender is not ToggleSwitch toggle)
-        {
-            return;
-        }
-
-        // Toggled 早于 TwoWay 绑定生效：直接读控件状态，不读配置
-        var wanted = toggle.IsOn;
-        var previous = VM.Config.RdpAccelerationEnabled;
-        if (wanted == previous)
-        {
-            return;
-        }
-
-        try
-        {
-            VM.Config.RdpAccelerationEnabled = wanted;
-            VM.SaveConfig();
-        }
-        catch (Exception ex)
-        {
-            // 落盘失败：开关必须拨回原位，不能留下「看着是开的、其实没做」
-            VM.Config.RdpAccelerationEnabled = previous;
-            _syncing = true;
-            toggle.IsOn = previous;
-            _syncing = false;
-            SetRdpAction($"下载加速设置没保存：{ex.GetType().Name}: {ex.Message}");
-            return;
-        }
-
-        UpdateService.InvalidateClients();
-        ApplyRdpAccelerationUi();
-        VM.AppendLog(wanted
-            ? "[RDP 解锁] 下载加速已启用：解析与下载走加速前缀，不附 GitHub 访问令牌。"
-            : "[RDP 解锁] 下载加速已关闭：恢复官方直连。");
-        SetRdpAction(wanted ? "已启用 RDP 解锁下载加速。" : "已关闭 RDP 解锁下载加速。");
-    }
-
-    private void OnRdpAccelerationPrefixLostFocus(object sender, RoutedEventArgs e)
-    {
-        var typed = (RdpAccelerationPrefixBox.Text ?? string.Empty).Trim();
-        if (typed == VM.Config.RdpAccelerationPrefix)
-        {
-            return;
-        }
-
-        var normalized = typed.Length == 0 ? string.Empty : RdpAcceleration.NormalizePrefix(typed);
-
-        // 非法前缀不落盘，输入框拨回上次保存的值（等价于「动作被取消要还原」）
-        if (typed.Length > 0 && normalized.Length == 0)
-        {
-            RdpAccelerationPrefixBox.Text = VM.Config.RdpAccelerationPrefix;
-            SetRdpAction("加速前缀没保存：需要 https:// 开头的完整地址，且不能带用户名密码或 ?/#。");
-            ApplyRdpAccelerationUi();
-            return;
-        }
-
-        try
-        {
-            VM.Config.RdpAccelerationPrefix = normalized;
-            VM.SaveConfig();
-        }
-        catch (Exception ex)
-        {
-            RdpAccelerationPrefixBox.Text = VM.Config.RdpAccelerationPrefix;
-            SetRdpAction($"加速前缀没保存：{ex.GetType().Name}: {ex.Message}");
-            return;
-        }
-
-        UpdateService.InvalidateClients();
-        ApplyRdpAccelerationUi();
-        VM.AppendLog(normalized.Length > 0
-            ? $"[RDP 解锁] 下载加速自定义前缀已设为 {normalized}。"
-            : "[RDP 解锁] 下载加速自定义前缀已清空，按内置候选轮换。");
-    }
+    // 下载节点不再在设置页配置：改为解锁流程里的测速选节点弹窗（RdpNodePickerDialog）。
 
     /// <summary>
     /// 查一次更新。查询是网络 IO，所以丢到线程池；结果用 <see cref="RunOnUi"/> 搬回 UI 线程再画 ——
@@ -1674,14 +1555,53 @@ public sealed partial class SettingsPage : Page
             antivirusConfirmed = true;
         }
 
+        var network = UpdateNetworkSettings.FromConfig(VM.Config);
+        var savedPrefix = VM.Config.RdpAccelerationPrefix;
+
+        // ---- 3. 选择下载节点：两个确认弹窗都过完才弹 ----
+        // 对话框在界面线程上创建；测速与后续下载共用同一个 network，代理语义一致。
+        RdpAccelerationSettings acceleration;
+        if (!needDownload && _rdpSnapshot?.IniState == RdpSupportState.FullySupported)
+        {
+            // 本轮既不需要下载组件、INI 也已覆盖当前版本：不打扰用户
+            acceleration = RdpAccelerationSettings.Disabled;
+        }
+        else
+        {
+            var pick = await RunOnUiAsync(queue, async () =>
+            {
+                var picker = new RdpNodePickerDialog(network, savedPrefix);
+                return await picker.ShowDialogAsync();
+            });
+
+            if (pick is null)
+            {
+                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
+                return;
+            }
+
+            // 配置写入必须回界面线程：SetProperty 会触发绑定的 PropertyChanged，
+            // 跨线程改绑定会抛 0x8001010E 并掀掉进程。
+            if (VM.Config.RdpAccelerationPrefix != pick.CustomPrefix)
+            {
+                RunOnUi(queue, () =>
+                {
+                    VM.Config.RdpAccelerationPrefix = pick.CustomPrefix;
+                    VM.SaveConfig();
+                });
+                UpdateService.InvalidateClients();
+            }
+
+            acceleration = pick.Acceleration;
+        }
+
         var request = new RdpUnlockRequest
         {
             AntivirusConfirmed = antivirusConfirmed,
             ManualInstallerPath = _rdpManualInstaller,
             ManualIniPath = _rdpManualIni,
-            Acceleration = RdpAccelerationSettings.FromConfig(VM.Config),
+            Acceleration = acceleration,
         };
-        var network = UpdateNetworkSettings.FromConfig(VM.Config);
 
         await RunRdpOperationAsync("解锁 RDP",
             (progress, token) => RdpUnlockService.UnlockAsync(request, network, progress, token));
@@ -1786,10 +1706,12 @@ public sealed partial class SettingsPage : Page
             antivirusConfirmed = true;
         }
 
+        // 卸载不弹测速界面：沿用已保存的自定义节点，其余交给内置候选轮换兜底。
+        // 同样走 network 里的代理设置。
         var request = new RdpUninstallRequest
         {
             AntivirusConfirmed = antivirusConfirmed,
-            Acceleration = RdpAccelerationSettings.FromConfig(VM.Config),
+            Acceleration = new RdpAccelerationSettings(true, VM.Config.RdpAccelerationPrefix),
         };
         var network = UpdateNetworkSettings.FromConfig(VM.Config);
 

@@ -278,3 +278,83 @@ INI 的国内可达路径优先使用 `cdn.jsdelivr.net/gh/sebaxakerhtc/rdpwrap.
 - 重试策略放宽：`LooksRetryable` 目前只认「不是可执行文件 / 读不出来」，超时、连接重置、大小不符均不重试；INI 下载零重试；默认 20 秒超时偏紧。
 - 断点续传：反代已返回 206，具备前提。
 - 自建国内镜像：仅在公益反代长期不可用时评估。
+
+---
+
+## 十一、变更（2026-11-06 21:20）：节点选择改为解锁流程内的测速界面
+
+> 本章 supersedes §四、§六 中关于「设置页勾选开关 / 自定义前缀框」的部分。§一～§三、§七～§十 继续有效。
+>
+> **2026-11-06 21:46 确认并实施**：Q1 整体移除设置页开关，Q2 / Q3 按推荐，镜像与测速请求均走 `UpdateNetworkSettings` 代理。主工程 build、Agent publish、冒烟全部通过。
+
+### 11.1 需求
+
+用户指出「解锁下载的位置不对」：加速节点不应在设置页静态配置，而应在点击「解锁 RDP」并完成确认弹窗之后，弹出测速界面，自动测速 → 按延迟升序排序（最低在前）→ 默认选中第一项 → 用户可自行改选 → **必须点「确定」才继续**。取消则不下载、不改动系统。
+
+### 11.2 已核实的现状
+
+| 项 | 结论 |
+|---|---|
+| `OnRdpUnlock` | `SettingsPage.xaml.cs:1647–1688`。顺序：`EnsureRdpSnapshotAsync` → `ConfirmUnlockRiskAsync`（:1903）→ `ConfirmAntivirusAsync`（:1948，仅 `needDownload`）→ 构造 `RdpUnlockRequest`（:1677）→ `RunRdpOperationAsync`（:2007） |
+| 对话框范式 | 全部是代码构造的 `ContentDialog`，统一 `RunOnUiAsync(queue, ...)` 里创建 + `DialogHelper.ShowAsync` 显示（`DialogHelper.cs:177` 是全项目唯一入口） |
+| 单选模板 | `SettingsPage.xaml.cs:1828–1869`（ComboBox + Primary/Close）、`MainViewModel.cs:3662–3713` |
+| 测速代码 | **未找到**。项目没有任何 HTTP 计时 / RTT / 测速逻辑；`RdpAcceleration` 只拼候选 URL |
+| UI 线程纪律 | 禁 `new Progress<`；进度必须 `DispatcherProgress<T>` + `RunOnUi` / `SafeUiInvoke`；`RunRdpOperationAsync:2025–2033` 是现成范式 |
+| 冒烟约束 | `RdpUnlockFlowCheck.cs:267–282` 断言 `!code.Contains("new Progress<")`、`DispatcherProgress<`、`SafeUiInvoke`、`RunOnUiAsync(`，以及保留 `RunOnUiAsync(queue, ConfirmAntivirusAsync)` 字面串 |
+| 设置页现有区块 | `SettingsPage.xaml:388–409`；`ApplyRdpAccelerationUi`:826、`OnRdpAccelerationToggled`:863、`OnRdpAccelerationPrefixLostFocus`:902 |
+| INI 是否需要更新 | `RdpUnlockSnapshot.IniState != RdpSupportState.FullySupported`（`RdpUnlockModels.cs:314`） |
+
+### 11.3 方案
+
+1. **新增 `Services/RdpAccelerationProbe.cs`（纯 C#，可被 Agent 工程链接）**
+   - 输入节点列表 + `UpdateNetworkSettings`（沿用实际下载时的代理语义，测出来的延迟才有意义）。
+   - 每个节点用 `HttpClient` + `HttpCompletionOption.ResponseHeadersRead` 发一个 `Range: bytes=0-0` 的 GET，用 `Stopwatch` 计到响应头返回（TTFB），不下载完整文件。
+   - 所有节点**并行**测，单节点超时预算 4 秒；超时 / 非 2xx / DNS 失败标记「不可达」。
+   - 返回 `IReadOnlyList<RdpNodeMeasurement>`（名称、前缀、`LatencyMs`、是否成功、失败原因）。纯函数部分便于冒烟断言排序与失败置底。
+
+2. **新增测速选节点对话框（代码构造 `ContentDialog`，放在 `SettingsPage.xaml.cs` 或独立 `Views/RdpNodePickerDialog.cs`）**
+   - 打开即自动开始测速，测速中显示「正在测速…」，逐项回 UI 刷新（走 `DispatcherProgress` / `RunOnUi`，**不用 `Progress<T>`**）。
+   - 测完按延迟升序排序，不可达项置底并标注；默认 `SelectedIndex = 0`。
+   - 列表用 `ListView` + `RadioButton`（或 `RadioButtons`），显示「节点名 · 延迟 / 不可达」，用户可改选。
+   - 提供「重新测速」与「自定义节点」输入（替代原设置页前缀框，填入后加入候选并保存）。
+   - 按钮：`PrimaryButtonText = "确定"`、`CloseButtonText = "取消"`、`DefaultButton = ContentDialogButton.Primary`；只有点「确定」才返回选中节点，取消返回 null。
+
+3. **时序**：`ConfirmUnlockRiskAsync` → `ConfirmAntivirusAsync`（`needDownload` 时）→ **测速弹窗** → 构造 `RdpUnlockRequest`。插入点在 `:1675` 之后、`:1677` 之前，**不改写** `RunOnUiAsync(queue, ConfirmAntivirusAsync)` 与 `OnRdpUninstall` 里的同形状调用，避免冒烟 280–282 变红。
+
+4. **结果传递**：对话框返回节点 → 构造 `RdpAccelerationSettings`（选「官方直连」时 `Enabled=false`，否则 `true` + `CustomPrefix=选中前缀`）→ 写入 `RdpUnlockRequest.Acceleration`。**仅本次生效**，不改全局配置；自定义节点地址单独持久化到 `rdp_accel_prefix`。
+
+5. **下游不变**：`RdpReleaseResolver` / `RdpToolDownloader` / `RdpUnlockService` 仍按「自定义 → 内置 → 官方直连」轮换，选中节点只是把自定义前缀固定下来，失败仍有兜底。
+
+### 11.4 待确认项（无异议按推荐执行）
+
+| 编号 | 问题 | 推荐 | 备选 |
+|---|---|---|---|
+| Q1 | 设置页的勾选开关与前缀框是否移除 | **移除** `SettingsPage.xaml:388–409` 与三个方法；`AppConfig` 两个字段保留（旧配置兼容、自定义节点持久化），`RdpAccelerationEnabled` 不再有写入点 | 保留开关作为「是否启用加速」总开关，测速弹窗只在开关打开时出现 |
+| Q2 | 测速哪些节点 | 2 个内置反代（gh-proxy.com / ghfast.top）+ **官方直连** + 配置过的自定义节点；jsDelivr 不作为节点（它只是 INI 的独立 CDN，仍由 `IniCandidates` 自动优先） | 把 jsDelivr 也列为节点 |
+| Q3 | 何时弹 | 所有确认弹窗之后、构造 request 之前**总是弹**；仅当 `needDownload == false && IniState == FullySupported`（本轮完全不下载）时跳过 | 只在 `needDownload == true` 时弹 |
+
+### 11.5 线程与显示纪律
+
+- 对话框必须包在 `RunOnUiAsync(queue, ...)` 里创建，经 `DialogHelper.ShowAsync` 显示。
+- 测速在 `Task.Run` 后台跑；逐项结果用 `DispatcherProgress<RdpNodeMeasurement>` 或 `RunOnUi` 回 UI 刷新列表，不得用 `System.Progress<T>`。
+- 测速过程中用户点「确定」：禁用 Primary 直到测速完成，避免选中未完成排序的第一项。
+- 用户取消 / 测速全部失败：返回 null，中止解锁，`SetRdpAction("已取消：没有下载任何东西，也没有改动系统。")`。
+
+### 11.6 改动清单（预估）
+
+| 文件 | 改动 |
+|---|---|
+| `Services/RdpAccelerationProbe.cs`（新增） | 节点测速、排序、失败置底 |
+| `Views/RdpNodePickerDialog.cs`（新增）或 `SettingsPage.xaml.cs` | 测速选节点 ContentDialog |
+| `Views/SettingsPage.xaml.cs` | `OnRdpUnlock` 插入测速步骤；移除三个加速方法；结果写入 request |
+| `Views/SettingsPage.xaml` | 移除 388–409 区块（Q1 取推荐时） |
+| `Models/AppConfig.cs` | 字段注释按新语义改写（字段本身保留） |
+| `Models/RdpAccelerationSettings.cs` | 可能新增 `FromNode(...)` 工厂 |
+| `_smoke/RdpAccelerationCheck.cs` | 新增测速排序 / 失败置底 / 结果映射断言 |
+| `_smoke/Smoke.csproj` | 链入新文件 |
+
+### 11.7 验证
+
+- 主工程 `dotnet build -p:Platform=x64`（程序须完全退出）；`dotnet publish Yomori.Agent.csproj -c Release -p:Platform=x64`（新 Services 文件会被链接）。
+- 冒烟（不带 `-p:Platform=x64`，确认 `_smoke/bin/Debug/net8.0-windows/Smoke.exe` mtime 更新），重点回归 `RdpUnlockFlowCheck.cs:267–282` 五条 UI 线程断言。
+- 真机：点解锁 → 两个确认弹窗 → 测速界面自动完成并排序 → 默认选第一项 → 改选 / 重新测速 / 填自定义节点 → 确定后正常下载；取消后不下载不改动。
