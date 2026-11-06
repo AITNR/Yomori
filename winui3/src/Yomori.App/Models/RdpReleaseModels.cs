@@ -322,6 +322,15 @@ public sealed class RdpUnlockRequest
 
     /// <summary>是否在 INI 更新后显式重启 TermService（计划书 6.2 的既定要求）。</summary>
     public bool RestartService { get; init; } = true;
+
+    /// <summary>
+    /// 本轮下载使用的 GitHub 加速设置快照。默认关闭，保持原有直连行为。
+    /// </summary>
+    /// <remarks>
+    /// 传快照而不是让服务层去读 <see cref="AppConfig"/>：解锁流程跑在后台线程上，
+    /// 期间配置可能被界面改动。
+    /// </remarks>
+    public RdpAccelerationSettings Acceleration { get; init; } = RdpAccelerationSettings.Disabled;
 }
 
 /// <summary>一次修改操作的结果。</summary>

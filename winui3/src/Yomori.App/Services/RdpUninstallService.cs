@@ -23,6 +23,9 @@ public sealed class RdpUninstallRequest
     /// 计划书 6.1 要求「最新版卸载器与旧安装兼容性不明时停止并提示，不盲目混配」。
     /// </summary>
     public bool AllowMismatchedUninstaller { get; init; }
+
+    /// <summary>本轮重新下载卸载器时使用的 GitHub 加速设置快照。默认关闭，保持原有直连行为。</summary>
+    public RdpAccelerationSettings Acceleration { get; init; } = RdpAccelerationSettings.Disabled;
 }
 
 /// <summary>
@@ -485,7 +488,8 @@ public static class RdpUninstallService
         }
 
         var (release, resolveError) = await RdpReleaseResolver
-            .ResolveLatestAsync(network, cancellationToken, forceRefresh: true)
+            .ResolveLatestAsync(network, cancellationToken, forceRefresh: true,
+                acceleration: request.Acceleration)
             .ConfigureAwait(false);
 
         if (release is null)
@@ -511,7 +515,8 @@ public static class RdpUninstallService
         }
 
         var (downloaded, downloadError) = await RdpToolDownloader
-            .DownloadAsync(uninstallerAsset, release.Id, network, progress: null, cancellationToken)
+            .DownloadAsync(uninstallerAsset, release.Tag, release.Id, network,
+                progress: null, cancellationToken, request.Acceleration)
             .ConfigureAwait(false);
 
         if (downloaded is null)

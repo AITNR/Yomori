@@ -64,7 +64,8 @@ public static class RdpReleaseResolver
     public static async Task<(RdpReleaseInfo? Release, string Error)> ResolveLatestAsync(
         UpdateNetworkSettings network,
         CancellationToken cancellationToken = default,
-        bool forceRefresh = false)
+        bool forceRefresh = false,
+        RdpAccelerationSettings? acceleration = null)
     {
         // ---- 1. 新鲜缓存：连请求都不发 ----
         // ⚠️ forceRefresh=true 时**跳过**这一层：真正要下载东西的时候，
@@ -84,63 +85,91 @@ public static class RdpReleaseResolver
             _ = cachedError;   // 缓存坏了就当没有，往下走接口
         }
 
-        string apiFailure;
+        var accel = acceleration ?? RdpAccelerationSettings.Disabled;
+        string apiFailure = "官方接口未返回可用结果";
+        var attempts = new List<string>();
 
-        try
+        // 多源轮换（R1）：保持「每次真正下载时重新解析 latest」不变，
+        // 只是让同一条解析请求也能经国内可达的前缀发出去。
+        foreach (var candidate in RdpAcceleration.Candidates(LatestApiUrl, accel))
         {
-            var client = UpdateService.NetworkClient(network);
-
-            using var request = new HttpRequestMessage(HttpMethod.Get, LatestApiUrl);
-            // GitHub 对匿名请求要求 User-Agent；Accept 固定版本化媒体类型，避免字段语义漂移
-            request.Headers.UserAgent.ParseAdd("Yomori-RdpUnlock");
-            request.Headers.Accept.ParseAdd("application/vnd.github+json");
-
-            // 配了令牌就用：匿名 60 次/小时 → 认证 5000 次/小时（见 GitHubTokenStore）
-            var token = GitHubTokenStore.Read();
-            if (token is not null)
+            try
             {
-                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
-            }
+                var client = UpdateService.NetworkClient(network);
 
-            using var response = await client
-                .SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken)
-                .ConfigureAwait(false);
+                using var request = new HttpRequestMessage(HttpMethod.Get, candidate.Url);
+                // GitHub 对匿名请求要求 User-Agent；Accept 固定版本化媒体类型，避免字段语义漂移
+                request.Headers.UserAgent.ParseAdd("Yomori-RdpUnlock");
+                request.Headers.Accept.ParseAdd("application/vnd.github+json");
 
-            if (response.StatusCode == HttpStatusCode.NotFound)
-            {
-                return (null, "上游还没有正式发布（releases/latest 返回 404）。");
-            }
+                // 经加速前缀重写的请求一律不带令牌：不能把凭据递给第三方反代（D1）。
+                // 未重写时也只有 api.github.com 该带（RdpAcceleration.ShouldSendToken）。
+                var token = GitHubTokenStore.Read();
+                if (token is not null && RdpAcceleration.ShouldSendToken(candidate.Url, candidate.Accelerated))
+                {
+                    request.Headers.Authorization =
+                        new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+                }
 
-            if (response.StatusCode == HttpStatusCode.Forbidden || response.StatusCode == (HttpStatusCode)429)
-            {
-                apiFailure = DescribeRateLimit(response);
-            }
-            else if (!response.IsSuccessStatusCode)
-            {
-                apiFailure = $"查询上游发布失败：HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
-            }
-            else
-            {
-                var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                using var response = await client
+                    .SendAsync(request, HttpCompletionOption.ResponseContentRead, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    return (null, "上游还没有正式发布（releases/latest 返回 404）。");
+                }
+
+                if (response.StatusCode == HttpStatusCode.Forbidden
+                    || response.StatusCode == (HttpStatusCode)429)
+                {
+                    apiFailure = DescribeRateLimit(response);
+                    attempts.Add($"{candidate.Source}：{apiFailure}");
+                    continue;
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    apiFailure = $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
+                    attempts.Add($"{candidate.Source}：{apiFailure}");
+                    continue;
+                }
+
+                var json = await response.Content.ReadAsStringAsync(cancellationToken)
+                    .ConfigureAwait(false);
                 var (release, error) = Parse(json);
 
                 if (release is not null)
                 {
                     WriteCache(json);
-                    release.Source = "官方接口";
+                    release.Source = accel.Enabled
+                        ? $"官方接口（经 {candidate.Source}）"
+                        : "官方接口";
+                    return (release, "");
                 }
 
-                return (release, error);
+                // 反代可能塞回网页或验证页：换下一个候选，别把脏内容写进缓存
+                apiFailure = error.Length > 0 ? error : "返回内容不是有效的发布 JSON";
+                attempts.Add($"{candidate.Source}：{apiFailure}");
+            }
+            catch (OperationCanceledException)
+            {
+                // 取消 / 超时不再继续换源，避免让用户等更久；仍走下面的缓存降级
+                apiFailure = "查询上游发布被取消或超时。";
+                attempts.Add(apiFailure);
+                break;
+            }
+            catch (Exception ex)
+            {
+                // 断网 / TLS / 代理配错：换下一个候选
+                apiFailure = $"{ex.GetType().Name}: {ex.Message}";
+                attempts.Add($"查询上游发布失败（{candidate.Source}）：{apiFailure}");
             }
         }
-        catch (OperationCanceledException)
+
+        if (attempts.Count > 0)
         {
-            apiFailure = "查询上游发布被取消或超时。";
-        }
-        catch (Exception ex)
-        {
-            // 断网/TLS/代理配错都到这里。不自动换镜像、不重试到别的源（计划书 4.1）
-            apiFailure = $"查询上游发布失败：{ex.GetType().Name}: {ex.Message}";
+            apiFailure = string.Join("；", attempts);
         }
 
         // ---- 2. 接口不通：过期缓存也比没有强 ----
@@ -159,7 +188,7 @@ public static class RdpReleaseResolver
         }
 
         // ---- 3. 最后一条路：不碰 api.github.com，直接读发布页跳转 ----
-        var (tag, tagError) = await TryResolveTagFromReleasePageAsync(network, cancellationToken)
+        var (tag, tagError) = await TryResolveTagFromReleasePageAsync(network, accel, cancellationToken)
             .ConfigureAwait(false);
 
         if (tag.Length > 0)
@@ -206,34 +235,52 @@ public static class RdpReleaseResolver
     /// </remarks>
     private static async Task<(string Tag, string Error)> TryResolveTagFromReleasePageAsync(
         UpdateNetworkSettings network,
+        RdpAccelerationSettings acceleration,
         CancellationToken cancellationToken)
     {
-        try
+        var url = $"https://github.com/{Owner}/{Repo}/releases/latest";
+        var failures = new List<string>();
+
+        foreach (var candidate in RdpAcceleration.Candidates(url, acceleration))
         {
-            var client = UpdateService.NetworkClient(network);
-            var url = $"https://github.com/{Owner}/{Repo}/releases/latest";
-
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            // 不要求 HTML：只要跳转后的地址
-            request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-
-            using var response = await client
-                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                .ConfigureAwait(false);
-
-            if (!response.IsSuccessStatusCode)
+            try
             {
-                return ("", $"HTTP {(int)response.StatusCode}");
-            }
+                var client = UpdateService.NetworkClient(network);
 
-            var finalUri = response.RequestMessage?.RequestUri?.ToString() ?? "";
-            var tag = TagFromUrl(finalUrl: finalUri);
-            return tag.Length > 0 ? (tag, "") : ("", "跳转后的地址里没有 tag：" + finalUri);
+                using var request = new HttpRequestMessage(HttpMethod.Get, candidate.Url);
+                // 不要求 HTML：只要跳转后的地址。发布页请求从不带令牌。
+                request.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+
+                using var response = await client
+                    .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    failures.Add($"{candidate.Source}：HTTP {(int)response.StatusCode}");
+                    continue;
+                }
+
+                var finalUri = response.RequestMessage?.RequestUri?.ToString() ?? "";
+                var tag = TagFromUrl(finalUrl: finalUri);
+                if (tag.Length > 0)
+                {
+                    return (tag, "");
+                }
+
+                failures.Add($"{candidate.Source}：跳转后的地址里没有 tag：{finalUri}");
+            }
+            catch (OperationCanceledException)
+            {
+                return ("", "查询发布页被取消或超时。");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{candidate.Source}：{ex.GetType().Name}: {ex.Message}");
+            }
         }
-        catch (Exception ex)
-        {
-            return ("", $"{ex.GetType().Name}: {ex.Message}");
-        }
+
+        return ("", failures.Count > 0 ? string.Join("；", failures) : "没有可用的发布页地址");
     }
 
     /// <summary>从 <c>.../releases/tag/&lt;tag&gt;</c> 里取 tag。纯函数，供冒烟断言。</summary>

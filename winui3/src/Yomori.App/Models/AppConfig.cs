@@ -40,6 +40,8 @@ public sealed class AppConfig : ObservableObject
     private string _updateCheckMode = UpdateCheckModes.Notify;
     private string _updateProxyMode = UpdateProxyModes.System;
     private string _updateProxyUrl = string.Empty;
+    private bool _rdpAccelerationEnabled;
+    private string _rdpAccelerationPrefix = string.Empty;
 
     public AppConfig()
     {
@@ -190,6 +192,22 @@ public sealed class AppConfig : ObservableObject
     {
         get => _updateProxyUrl;
         set => SetProperty(ref _updateProxyUrl, (value ?? string.Empty).Trim());
+    }
+
+    /// <summary>是否对 RDP 解锁链路的下载启用 GitHub 加速前缀（勾选开关）。默认关闭，保持原有行为。</summary>
+    [JsonPropertyName("rdp_accel_enabled")]
+    public bool RdpAccelerationEnabled
+    {
+        get => _rdpAccelerationEnabled;
+        set => SetProperty(ref _rdpAccelerationEnabled, value);
+    }
+
+    /// <summary>自定义加速前缀，形如 <c>https://gh-proxy.com/</c>；留空则按内置候选轮换。</summary>
+    [JsonPropertyName("rdp_accel_prefix")]
+    public string RdpAccelerationPrefix
+    {
+        get => _rdpAccelerationPrefix;
+        set => SetProperty(ref _rdpAccelerationPrefix, (value ?? string.Empty).Trim());
     }
 
     [JsonPropertyName("tasks")]

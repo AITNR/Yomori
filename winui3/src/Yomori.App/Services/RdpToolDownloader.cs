@@ -1,5 +1,6 @@
 // -*- coding: utf-8 -*-
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -50,7 +51,7 @@ public readonly record struct RdpPeInspection(
 /// <para>计划书 4.1 / 4.2 的落点：</para>
 /// <list type="bullet">
 /// <item>下到受保护的 staging 目录，用临时扩展名，完整性通过后才改名为 <c>.exe</c>。</item>
-/// <item>校验顺序：大小 → 官方 digest（有才算）→ PE 有效性 → 本地 SHA-256 记录。
+/// <item>校验顺序：大小 → 官方 digest（有才算）→ 内置 SHA-256 基线（有才算）→ PE 有效性 → 本地 SHA-256 记录。</item>
 /// <b>架构只记录不拦截</b>：上游安装器/卸载器本身就是 32 位程序。</item>
 /// <item>官方没给 digest 时**不编造通过**：<see cref="RdpDownloadedTool.Limits"/> 如实写出来。</item>
 /// <item>执行前二次核对（<see cref="VerifyExisting"/>）：从下载完成到真正执行之间，
@@ -120,12 +121,21 @@ public static class RdpToolDownloader
     /// <summary>
     /// 下载一个资产并校验。成功返回本地路径与哈希；失败返回原因（不含异常）。
     /// </summary>
+    /// <summary>
+    /// 下载一个资产并校验。按加速设置轮换候选地址，任一条通过完整校验即返回。
+    /// </summary>
+    /// <remarks>
+    /// 每个候选都独立下载、独立校验；被反代塞了网页、断流或哈希不符时换下一条，
+    /// 不把上一个候选的半成品留给下一个。官方直连恒为最后一个候选。
+    /// </remarks>
     public static async Task<(RdpDownloadedTool? Tool, string Error)> DownloadAsync(
         RdpAsset asset,
+        string releaseTag,
         long releaseId,
         UpdateNetworkSettings network,
         IProgress<double>? progress = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        RdpAccelerationSettings? acceleration = null)
     {
         if (asset.DownloadUrl.Length == 0)
         {
@@ -152,96 +162,137 @@ public static class RdpToolDownloader
             return (null, $"无法创建下载目录：{ex.GetType().Name}: {ex.Message}");
         }
 
-        var (ok, message) = await UpdateService
-            .DownloadAsync(asset.DownloadUrl, stagingPath, network, progress, cancellationToken)
-            .ConfigureAwait(false);
+        var accel = acceleration ?? RdpAccelerationSettings.Disabled;
+        var expectedBaseline = RdpToolHashes.Find(releaseTag, asset.Name);
+        var failures = new List<string>();
 
-        if (!ok)
-        {
-            return (null, message);
-        }
-
-        try
-        {
-            var fileInfo = new FileInfo(stagingPath);
-            if (!fileInfo.Exists || fileInfo.Length == 0)
-            {
-                return (null, $"{asset.Name} 下载后为空文件");
-            }
-
-            if (asset.Size > 0 && fileInfo.Length != asset.Size)
-            {
-                TryDelete(stagingPath);
-                return (null, $"{asset.Name} 大小不符：期望 {asset.Size} 字节，实际 {fileInfo.Length} 字节");
-            }
-
-            var sha = RdpTransactionStore.Sha256File(stagingPath);
-            var officialSha = asset.Sha256FromDigest;
-            var verifiedAgainstOfficial = false;
-
-            if (officialSha.Length > 0)
-            {
-                if (!string.Equals(officialSha, sha, StringComparison.OrdinalIgnoreCase))
-                {
-                    TryDelete(stagingPath);
-                    return (null, $"{asset.Name} SHA-256 与官方摘要不符：官方 {officialSha}，本地 {sha}");
-                }
-
-                verifiedAgainstOfficial = true;
-            }
-
-            var pe = InspectPe(stagingPath);
-            if (!pe.IsPe)
-            {
-                TryDelete(stagingPath);
-                return (null, $"{asset.Name} {pe.ProblemText}（实际 {fileInfo.Length} 字节）");
-            }
-
-            // ⚠️ 这里**不**按架构拦截。计划书 4.2 写的是「错误架构时安全失败」，但实测上游
-            // RDPW_Installer.exe / RDPW_Uninstaller.exe 本身就是 **32 位**（Delphi 程序），
-            // 它负责装的是 64 位的 rdpwrap.dll。按 x64 拦一道等于永远装不上（2026-10-26 真机反馈）。
-            // 架构只作为诊断信息记下来：真拿到一个陌生的可执行文件时，写错了架构仍会在
-            // 大小/摘要/签名三项上暴露。
-
-            // 校验全过之后才改名成 .exe —— 中途失败的文件永远带着 .download 后缀
-            if (File.Exists(finalPath))
-            {
-                File.Delete(finalPath);
-            }
-
-            File.Move(stagingPath, finalPath);
-
-            var limits = new System.Collections.Generic.List<string>
-            {
-                "校验能力说明：",
-            };
-
-            limits.Add(verifiedAgainstOfficial
-                ? "已按官方提供的 SHA-256 摘要校验。"
-                : "上游未提供 SHA-256 摘要，本次只能校验大小、PE 有效性与来源 HTTPS —— 这不构成密码学意义上的发布者认证。");
-
-            // 架构只报告不拦截：上游工具本身就是 32 位（见上面的说明）
-            limits.Add($"工具架构：{pe.MachineName}（上游安装器为 32 位程序，属正常）。");
-
-            limits.Add(pe.HasSignatureDirectory
-                ? "文件带 Authenticode 签名目录（Yomori 未对证书链做信任校验）。"
-                : "文件没有 Authenticode 签名。");
-
-            return (new RdpDownloadedTool
-            {
-                Asset = asset,
-                LocalPath = finalPath,
-                Sha256 = sha,
-                SizeBytes = fileInfo.Length,
-                VerifiedAgainstOfficialDigest = verifiedAgainstOfficial,
-                Limits = string.Join(" ", limits),
-            }, "");
-        }
-        catch (Exception ex)
+        foreach (var candidate in RdpAcceleration.Candidates(asset.DownloadUrl, accel))
         {
             TryDelete(stagingPath);
-            return (null, $"校验 {asset.Name} 时出错：{ex.GetType().Name}: {ex.Message}");
+
+            var (ok, message) = await UpdateService
+                .DownloadAsync(candidate.Url, stagingPath, network, progress, cancellationToken)
+                .ConfigureAwait(false);
+
+            if (!ok)
+            {
+                failures.Add($"[{candidate.Source}] {message}");
+                continue;
+            }
+
+            try
+            {
+                var fileInfo = new FileInfo(stagingPath);
+                if (!fileInfo.Exists || fileInfo.Length == 0)
+                {
+                    failures.Add($"[{candidate.Source}] {asset.Name} 下载后为空文件");
+                    continue;
+                }
+
+                if (asset.Size > 0 && fileInfo.Length != asset.Size)
+                {
+                    failures.Add($"[{candidate.Source}] {asset.Name} 大小不符：期望 {asset.Size} 字节，实际 {fileInfo.Length} 字节");
+                    continue;
+                }
+
+                var sha = RdpTransactionStore.Sha256File(stagingPath);
+                var officialSha = asset.Sha256FromDigest;
+                var verifiedAgainstOfficial = false;
+
+                if (officialSha.Length > 0)
+                {
+                    if (!string.Equals(officialSha, sha, StringComparison.OrdinalIgnoreCase))
+                    {
+                        failures.Add($"[{candidate.Source}] {asset.Name} SHA-256 与官方摘要不符：官方 {officialSha}，本地 {sha}");
+                        continue;
+                    }
+
+                    verifiedAgainstOfficial = true;
+                }
+
+                // 内置基线（D3）：只覆盖已核实的 release + 文件名，命中就必须相等。
+                // 反代属不可信第三方，这一步是防投毒的主要闸门。
+                var verifiedAgainstBaseline = false;
+                if (expectedBaseline.Length > 0)
+                {
+                    if (!string.Equals(expectedBaseline, sha, StringComparison.OrdinalIgnoreCase))
+                    {
+                        failures.Add($"[{candidate.Source}] {asset.Name} 与内置 SHA-256 基线不符：期望 {expectedBaseline}，本地 {sha}");
+                        continue;
+                    }
+
+                    verifiedAgainstBaseline = true;
+                }
+
+                var pe = InspectPe(stagingPath);
+                if (!pe.IsPe)
+                {
+                    failures.Add($"[{candidate.Source}] {asset.Name} {pe.ProblemText}（实际 {fileInfo.Length} 字节）");
+                    continue;
+                }
+
+                // ⚠️ 这里**不**按架构拦截。计划书 4.2 写的是「错误架构时安全失败」，但实测上游
+                // RDPW_Installer.exe / RDPW_Uninstaller.exe 本身就是 **32 位**（Delphi 程序），
+                // 它负责装的是 64 位的 rdpwrap.dll。按 x64 拦一道等于永远装不上（2026-10-26 真机反馈）。
+                // 架构只作为诊断信息记下来：真拿到一个陌生的可执行文件时，写错了架构仍会在
+                // 大小/摘要/签名三项上暴露。
+
+                // 校验全过之后才改名成 .exe —— 中途失败的文件永远带着 .download 后缀
+                if (File.Exists(finalPath))
+                {
+                    File.Delete(finalPath);
+                }
+
+                File.Move(stagingPath, finalPath);
+
+                var limits = new List<string>
+                {
+                    "校验能力说明：",
+                };
+
+                if (verifiedAgainstOfficial)
+                {
+                    limits.Add("已按官方提供的 SHA-256 摘要校验。");
+                }
+                else if (verifiedAgainstBaseline)
+                {
+                    limits.Add("上游未提供官方摘要，已按 Yomori 内置的 SHA-256 基线校验。");
+                }
+                else
+                {
+                    limits.Add("上游未提供 SHA-256 摘要、本版本也未收录内置基线，本次只能校验大小、PE 有效性与来源 HTTPS —— 这不构成密码学意义上的发布者认证。");
+                }
+
+                limits.Add($"下载来源：{candidate.Source}。");
+
+                // 架构只报告不拦截：上游工具本身就是 32 位（见上面的说明）
+                limits.Add($"工具架构：{pe.MachineName}（上游安装器为 32 位程序，属正常）。");
+
+                limits.Add(pe.HasSignatureDirectory
+                    ? "文件带 Authenticode 签名目录（Yomori 未对证书链做信任校验）。"
+                    : "文件没有 Authenticode 签名。");
+
+                return (new RdpDownloadedTool
+                {
+                    Asset = asset,
+                    LocalPath = finalPath,
+                    Sha256 = sha,
+                    SizeBytes = fileInfo.Length,
+                    VerifiedAgainstOfficialDigest = verifiedAgainstOfficial,
+                    Limits = string.Join(" ", limits),
+                }, "");
+            }
+            catch (Exception ex)
+            {
+                TryDelete(stagingPath);
+                failures.Add($"[{candidate.Source}] 校验 {asset.Name} 时出错：{ex.GetType().Name}: {ex.Message}");
+            }
         }
+
+        TryDelete(stagingPath);
+        return (null, failures.Count > 0
+            ? string.Join("；", failures)
+            : $"{asset.Name} 没有可用的下载地址");
     }
 
     /// <summary>

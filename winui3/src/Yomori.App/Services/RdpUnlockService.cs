@@ -81,6 +81,15 @@ public static class RdpUnlockService
         CancellationToken cancellationToken = default)
     {
         var steps = new List<RdpStepRecord>();
+        var acceleration = request.Acceleration;
+
+        // 加速是否生效、走了哪条源，要在步骤里留痕 —— 排障时先看这一行
+        if (acceleration.Enabled)
+        {
+            Add(steps, "acceleration", "下载加速", RdpStepOutcome.Ok,
+                "已启用 GitHub 加速前缀；候选按「自定义前缀 → 内置候选 → 官方直连」轮换，"
+                + "发布解析与下载请求均不附 GitHub 访问令牌。");
+        }
 
         // ---- 互斥锁：三个修改动作共享 ----
         if (!RdpOperationLock.TryAcquire(LockTimeout, out var lease, out var lockReason))
@@ -156,7 +165,8 @@ public static class RdpUnlockService
 
                 Report(progress, 2, "解析官方最新正式版");
                 var (resolved, resolveError) = await RdpReleaseResolver
-                    .ResolveLatestAsync(network, cancellationToken, forceRefresh: true)
+                    .ResolveLatestAsync(network, cancellationToken, forceRefresh: true,
+                        acceleration: acceleration)
                     .ConfigureAwait(false);
 
                 if (resolved is null)
@@ -199,7 +209,8 @@ public static class RdpUnlockService
                 {
                     Report(progress, 3, "下载安装器");
                     var (downloadedInstaller, installerError) = await DownloadWithRetryAsync(
-                        installerAsset, resolved.Id, network, steps, "安装器", cancellationToken)
+                        installerAsset, resolved.Tag, resolved.Id, network, acceleration,
+                        steps, "安装器", cancellationToken)
                         .ConfigureAwait(false);
 
                     if (downloadedInstaller is null)
@@ -214,7 +225,8 @@ public static class RdpUnlockService
                 // ---- 卸载器：手动模式允许没有（装完就有本地控制台工具可卸） ----
                 Report(progress, 3, "下载卸载器");
                 var (downloadedUninstaller, uninstallerError) = await DownloadWithRetryAsync(
-                    uninstallerAsset, resolved.Id, network, steps, "卸载器", cancellationToken)
+                    uninstallerAsset, resolved.Tag, resolved.Id, network, acceleration,
+                    steps, "卸载器", cancellationToken)
                     .ConfigureAwait(false);
 
                 if (downloadedUninstaller is null)
@@ -236,7 +248,7 @@ public static class RdpUnlockService
 
                     Add(steps, "download", "下载与校验", RdpStepOutcome.Ok,
                         $"安装器 {installer.SizeBytes} 字节 sha256={Short(installer.Sha256)}，卸载器同批下载；"
-                        + "上游无官方摘要与签名");
+                        + installer.Limits);
                 }
             }
             else
@@ -547,7 +559,8 @@ public static class RdpUnlockService
                 Report(progress, 7, "更新 INI");
                 var acquired = await AcquireIniAsync(
                     manifest, installDir, iniPathNow, termsrvVersion,
-                    request.ManualIniPath, network, steps, cancellationToken).ConfigureAwait(false);
+                    request.ManualIniPath, network, acceleration, steps, cancellationToken)
+                    .ConfigureAwait(false);
 
                 if (acquired.Unknown)
                 {
@@ -1132,6 +1145,7 @@ public static class RdpUnlockService
         string version,
         string manualIniPath,
         UpdateNetworkSettings network,
+        RdpAccelerationSettings acceleration,
         List<RdpStepRecord> steps,
         CancellationToken cancellationToken)
     {
@@ -1157,7 +1171,7 @@ public static class RdpUnlockService
         }
 
         // ---- 2. 程序自己下载（走设置里的代理，与「检查更新」同一套语义）----
-        var online = await DownloadIniAsync(manifest, iniPath, version, network, steps, cancellationToken)
+        var online = await DownloadIniAsync(manifest, iniPath, version, network, acceleration, cancellationToken)
             .ConfigureAwait(false);
 
         if (online.Ok)
@@ -1190,63 +1204,86 @@ public static class RdpUnlockService
     }
 
     /// <summary>
-    /// 用本程序的 HTTP 客户端（因此**走设置里那个代理**）从上游取一份 rdpwrap.ini 并写入。
+    /// 按加速设置轮换 INI 来源，取一份能覆盖当前构建的配置并写入。
     /// </summary>
     /// <remarks>
+    /// <para>启用加速时首选 jsDelivr CDN（上游 INI 的纯文本镜像），其后是 raw 的反代候选，
+    /// 官方直连恒为最后一项；未启用时只走官方 raw，保持原有行为。</para>
     /// <para>落盘前先下到事务目录里，写成 <c>.download</c> 后缀 —— 半截的 INI 被替换上去会让
     /// TermService 加载失败，比没有更糟；<see cref="WriteIni"/> 内部还会再做一次原子替换。</para>
-    /// <para>校验只做一项：正文里得有 <c>[当前构建号]</c> 段。上游这份文件没有签名与摘要可比，
-    /// 传输安全靠 HTTPS。这话要如实写进步骤说明，不能让它看起来像「验过发布者」。</para>
+    /// <para>校验只做内容判据：得像 INI（<c>[Main]</c> / <c>Updated=</c>），且含 <c>[当前构建号]</c> 段。
+    /// 上游这份文件没有签名与摘要可比，INI 又是滚动更新的，所以<b>不设固定哈希</b>（D3）。
+    /// 这话要如实写进步骤说明，不能让它看起来像「验过发布者」。</para>
     /// </remarks>
     private static async Task<(bool Ok, string Message)> DownloadIniAsync(
         RdpTransactionManifest manifest,
         string iniPath,
         string version,
         UpdateNetworkSettings network,
-        List<RdpStepRecord> steps,
+        RdpAccelerationSettings acceleration,
         CancellationToken cancellationToken)
     {
         var stagingPath = Path.Combine(
             RdpTransactionStore.DirectoryFor(manifest.Id),
             "rdpwrap.ini" + RdpToolDownloader.PartialExtension);
 
+        var failures = new List<string>();
+
         try
         {
-            var (downloaded, message) = await UpdateService
-                .DownloadAsync(
-                    IniDownloadUrl,
-                    stagingPath,
-                    network,
-                    progress: null,
-                    cancellationToken,
-                    IniDownloadTimeout)
-                .ConfigureAwait(false);
-
-            if (!downloaded)
+            foreach (var candidate in RdpAcceleration.IniCandidates(IniDownloadUrl, acceleration))
             {
-                return (false, "在线下载 rdpwrap.ini 失败：" + message);
+                TryDeleteFile(stagingPath);
+
+                var (downloaded, message) = await UpdateService
+                    .DownloadAsync(
+                        candidate.Url,
+                        stagingPath,
+                        network,
+                        progress: null,
+                        cancellationToken,
+                        IniDownloadTimeout)
+                    .ConfigureAwait(false);
+
+                if (!downloaded)
+                {
+                    failures.Add($"[{candidate.Source}] {message}");
+                    continue;
+                }
+
+                var info = new FileInfo(stagingPath);
+                if (!info.Exists || info.Length == 0)
+                {
+                    failures.Add($"[{candidate.Source}] 得到的是空文件");
+                    continue;
+                }
+
+                var text = ReadText(stagingPath);
+
+                // 先自己判一次再交给 WriteIni：反代塞了网页、或给了不含当前版本的旧 INI 时，
+                // 不能让脏内容进入原子替换流程。
+                if (!text.Contains("[Main]", StringComparison.Ordinal)
+                    || !text.Contains("Updated=", StringComparison.Ordinal)
+                    || !IniCovers(text, version))
+                {
+                    failures.Add($"[{candidate.Source}] 内容不像可用的 rdpwrap.ini（缺 [Main] / Updated= / [{version}] 段），换下一源");
+                    continue;
+                }
+
+                var (written, writeMessage) = WriteIni(manifest, iniPath, text, version);
+                if (!written)
+                {
+                    failures.Add($"[{candidate.Source}] {writeMessage}");
+                    continue;
+                }
+
+                var updated = ReadIniUpdated(iniPath);
+
+                return (true, $"已从 {candidate.Source} 下载 INI 并写入（{info.Length} 字节，"
+                              + $"{IniSectionCount(text)} 个段"
+                              + (updated.Length > 0 ? $"，Updated={updated}" : "")
+                              + "；来源为社区维护的纯文本配置，无签名与摘要可比对）");
             }
-
-            var info = new FileInfo(stagingPath);
-            if (!info.Exists || info.Length == 0)
-            {
-                return (false, "在线下载 rdpwrap.ini 失败：得到的是空文件");
-            }
-
-            var text = ReadText(stagingPath);
-            var (written, writeMessage) = WriteIni(manifest, iniPath, text, version);
-
-            if (!written)
-            {
-                return (false, "在线下载的 rdpwrap.ini 不可用：" + writeMessage);
-            }
-
-            var updated = ReadIniUpdated(iniPath);
-
-            return (true, $"已按设置里的代理从上游下载 INI 并写入（{info.Length} 字节，"
-                          + $"{IniSectionCount(text)} 个段"
-                          + (updated.Length > 0 ? $"，Updated={updated}" : "")
-                          + "；来源 GitHub 原始文件，无签名与摘要可比对）");
         }
         catch (OperationCanceledException)
         {
@@ -1261,6 +1298,9 @@ public static class RdpUnlockService
             // 下载用的临时文件不该留在事务目录里：它看起来像一份 INI 备份，会误导后面的「历史备份」排查
             TryDeleteFile(stagingPath);
         }
+
+        var reason = failures.Count > 0 ? string.Join("；", failures) : "没有可用的 INI 来源";
+        return (false, "在线下载 rdpwrap.ini 失败：" + reason);
     }
 
     private static void TryDeleteFile(string path)
@@ -1907,43 +1947,34 @@ public static class RdpUnlockService
         + "可以用浏览器手动下载 RDPW_Installer.exe，再点「指定安装包」选中它，然后重试。";
 
     /// <summary>
-    /// 下载一个资产；如果是「内容不对 / 读不出来」这类偶发问题，原样再下一次。
+    /// 下载一个资产。候选地址轮换已在 <see cref="RdpToolDownloader.DownloadAsync"/> 内部完成。
     /// </summary>
     /// <remarks>
-    /// 值一次重试的理由：Release 附件走 <c>objects.githubusercontent.com</c>，
-    /// 国内链路上偶发断流与被代理塞网页都是随机的；而「拒绝非 HTTPS」「没有下载地址」
-    /// 这类确定性失败在 <see cref="RdpToolDownloader.LooksRetryable"/> 里已经被排除，
-    /// 不会浪费用户时间。
+    /// 每个候选都独立下载、独立校验，任一通过即返回；官方直连是最后一个候选。
+    /// 因此这里不再额外重试一次 —— 那会把所有候选再跑一遍，只会拖长等待。
+    /// 失败时在步骤里留一条 Warn，把各候选的原因原样带出来。
     /// </remarks>
     private static async Task<(RdpDownloadedTool? Tool, string Error)> DownloadWithRetryAsync(
         RdpAsset asset,
+        string releaseTag,
         long releaseId,
         UpdateNetworkSettings network,
+        RdpAccelerationSettings acceleration,
         List<RdpStepRecord> steps,
         string label,
         CancellationToken cancellationToken)
     {
         var (tool, error) = await RdpToolDownloader
-            .DownloadAsync(asset, releaseId, network, progress: null, cancellationToken)
+            .DownloadAsync(asset, releaseTag, releaseId, network,
+                progress: null, cancellationToken, acceleration)
             .ConfigureAwait(false);
 
-        if (tool is not null || !RdpToolDownloader.LooksRetryable(error))
+        if (tool is null)
         {
-            return (tool, error);
+            Add(steps, "download-fail", $"{label}下载未成功", RdpStepOutcome.Warn, error);
         }
 
-        Add(steps, "retry", $"重新下载{label}", RdpStepOutcome.Warn,
-            $"首次下载不可用（{error}），正在重试。");
-
-        await Task.Delay(600, cancellationToken).ConfigureAwait(false);
-
-        var (retryTool, retryError) = await RdpToolDownloader
-            .DownloadAsync(asset, releaseId, network, progress: null, cancellationToken)
-            .ConfigureAwait(false);
-
-        return retryTool is not null
-            ? (retryTool, "")
-            : (null, retryError + "（已自动重试一次）");
+        return (tool, error);
     }
 
     private static void Add(List<RdpStepRecord> steps, string key, string title, RdpStepOutcome outcome, string detail) =>
