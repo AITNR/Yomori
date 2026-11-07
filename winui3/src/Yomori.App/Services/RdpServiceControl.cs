@@ -356,7 +356,45 @@ public static class RdpServiceControl
     /// 把它混进 CoreOk 会让「刚装好的解锁组件因为一个依赖服务被整体回滚」，
     /// 那不是用户想要的。</para>
     /// </remarks>
-    public static RdpServiceRestartResult Restart(string serviceName, TimeSpan? wait = null)
+    public static RdpServiceRestartResult Restart(string serviceName, TimeSpan? wait = null) =>
+        RestartCore(serviceName, null, wait);
+
+    /// <summary>
+    /// 在「宿主服务已停、尚未启动」的空档执行一段操作（例如覆写被服务占着句柄的配置文件）。
+    /// </summary>
+    /// <remarks>
+    /// <para>为什么需要它：rdpwrap.dll 常驻 TermService 进程并持有 rdpwrap.ini 的句柄，
+    /// 服务在跑时 <c>File.Replace</c> / <c>File.Copy</c> 都抛「文件正由另一进程使用」
+    /// （2026-11-07 真机：程序已是管理员，报的仍是 IOException，不是拒绝访问）。
+    /// 提权解决不了句柄占用，只能先把服务停下来释放句柄。</para>
+    /// <para><b>无论 work 成功失败，服务都必须被拉回来</b>：work 的异常吞进 <c>WorkError</c> 返回，
+    /// 不让它打断「启动宿主 + 恢复依赖」这一段，否则会留一个停摆的远程桌面服务。</para>
+    /// <para><c>WorkInvoked</c> 为 false 表示宿主没停下来（例如被依赖服务挡住），
+    /// <b>work 根本没有执行</b>。调用方必须把它当失败，不能因为 WorkError 为 null 就当成写成功了。</para>
+    /// </remarks>
+    public static (RdpServiceRestartResult Result, Exception? WorkError, bool WorkInvoked) RestartWithWork(
+        string serviceName, Action work, TimeSpan? wait = null)
+    {
+        Exception? workError = null;
+        var workInvoked = false;
+        var result = RestartCore(serviceName, () =>
+        {
+            workInvoked = true;
+            try
+            {
+                work();
+            }
+            catch (Exception ex)
+            {
+                workError = ex;
+            }
+        }, wait);
+
+        return (result, workError, workInvoked);
+    }
+
+    private static RdpServiceRestartResult RestartCore(
+        string serviceName, Action? between, TimeSpan? wait)
     {
         var touched = new List<string>();
         var notes = new List<string>();
@@ -405,6 +443,10 @@ public static class RdpServiceControl
             notes.AddRange(RestoreDependents(stoppedDependents, wait));
             return new RdpServiceRestartResult(false, true, string.Join("；", notes), touched);
         }
+
+        // 宿主已停、依赖服务也已停：此刻 rdpwrap.dll 不再持有 rdpwrap.ini 的句柄，
+        // 是覆写它的唯一安全窗口。异常由 RestartWithWork 吞下，保证下面一定会把服务拉回来。
+        between?.Invoke();
 
         var (startOk, startMessage) = Start(serviceName, wait);
         notes.Add(startMessage);

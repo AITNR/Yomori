@@ -135,7 +135,6 @@ public static class RdpUnlockService
             return Fail(steps, "没有写入：", merge.Message, before);
         }
 
-        Step(3, "写入 INI");
         var (backupOk, backupMessage) = BackupManualIni(iniPath);
         if (!backupOk)
         {
@@ -143,45 +142,34 @@ public static class RdpUnlockService
             return Fail(steps, "没有写入：", backupMessage, before);
         }
 
-        try
-        {
-            var dir = Path.GetDirectoryName(iniPath);
-            if (!string.IsNullOrEmpty(dir))
-            {
-                Directory.CreateDirectory(dir);
-            }
-
-            // 先写临时文件再替换：半截的 INI 会让服务加载失败，比没有更糟
-            var temp = iniPath + ".yomori.tmp";
-            File.WriteAllText(temp, merge.MergedText);
-            if (File.Exists(iniPath))
-            {
-                File.Replace(temp, iniPath, null);
-            }
-            else
-            {
-                File.Move(temp, iniPath);
-            }
-        }
-        catch (Exception ex)
-        {
-            Add(steps, "ini-write", "写入 INI 配置", RdpStepOutcome.Fail, $"{ex.GetType().Name}: {ex.Message}");
-            return Fail(steps, "写入失败：",
-                $"{ex.GetType().Name}: {ex.Message}。原文件已备份，未被替换（若需要管理员权限，请以管理员身份运行）。", before);
-        }
-
         var writeDetail = $"{RdpIniMerge.DescribeSections(submission.SectionNames)}："
             + $"替换 {merge.ReplacedSections} 段、追加 {merge.AddedSections} 段；{backupMessage}";
-        Add(steps, "ini-write", "写入 INI 配置", RdpStepOutcome.Ok, writeDetail);
 
+        // rdpwrap.ini 被 TermService 进程里的 rdpwrap.dll 持有句柄：服务在跑的时候
+        // File.Replace / File.Copy 都抛「正由另一进程使用」，提权也解决不了（2026-11-07 真机）。
+        // 版本对得上时走「停服务 → 写 → 起服务」，把覆写放进服务停摆的空档；
+        // 这同时就是让新配置生效所必需的重启，不额外多停一次。
         var restarted = false;
         var restartNote = "";
+        Exception? writeError = null;
+        string? writeBlockedReason = null;
+
         if (submission.VersionMatches)
         {
-            Step(4, "重启远程桌面服务");
-            var restart = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
+            Step(3, "停服务 → 写 INI → 起服务");
+            var (restart, workError, workInvoked) = RdpServiceControl.RestartWithWork(
+                RdpServiceControl.TermServiceName,
+                () => WriteIniAtomically(iniPath, merge.MergedText));
             restarted = restart.CoreOk;
             restartNote = restart.Message;
+            writeError = workError;
+
+            // 宿主没停下来 → 覆写窗口压根没打开，work 没跑。WorkError 为 null 不代表写过。
+            if (!workInvoked && writeError is null)
+            {
+                writeBlockedReason = "TermService 没能停下来，覆写窗口没有打开，INI 未改动。";
+            }
+
             Add(steps, "service", "重启远程桌面服务",
                 restart.CoreOk ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, restart.Message);
 
@@ -193,26 +181,144 @@ public static class RdpUnlockService
         }
         else
         {
+            // 版本读不到：用户要求「是正确版本号再重启」，所以不动服务，只尝试就地写。
+            Step(3, "写入 INI（不重启服务）");
+            try
+            {
+                WriteIniAtomically(iniPath, merge.MergedText);
+            }
+            catch (Exception ex)
+            {
+                writeError = ex;
+            }
+
             Add(steps, "service", "跳过服务重启", RdpStepOutcome.Skipped,
-                "本机 termsrv.dll 版本未知，没有重启服务；配置已落盘但需自行重启服务才生效。");
+                "本机 termsrv.dll 版本未知，没有重启服务；配置需自行重启服务才生效。");
         }
 
+        if (writeError is not null || writeBlockedReason is not null)
+        {
+            var reason = writeError is not null
+                ? $"{writeError.GetType().Name}: {writeError.Message}"
+                : writeBlockedReason!;
+            Add(steps, "ini-write", "写入 INI 配置", RdpStepOutcome.Fail, reason);
+
+            // 别再把占用误说成权限：用户已经以管理员运行，那句提示只会把人带偏。
+            var hint = writeError is not null && IsSharingViolation(writeError)
+                ? "rdpwrap.ini 仍被其它进程占用（常见：RDPConf、安全软件实时扫描，或服务没完全停下）。"
+                  + "关掉相关程序后重试；这与管理员权限无关。"
+                : writeBlockedReason is not null
+                    ? "请检查 TermService 状态后重试。"
+                    : "详情见「查看诊断」里的完整错误。";
+
+            var serviceNote = submission.VersionMatches
+                ? (restarted ? "服务已恢复运行。" : "服务未能恢复，请立即检查 TermService 状态。")
+                : "服务未改动。";
+
+            return Fail(steps, "写入失败：",
+                $"{reason}。{hint} 原文件已备份，未被改动；{serviceNote}", before);
+        }
+
+        Add(steps, "ini-write", "写入 INI 配置", RdpStepOutcome.Ok, writeDetail);
+
+        Step(4, "复核检测结果");
         var final = RdpReadOnlyDetector.Detect();
         var summary = submission.VersionMatches
             ? (restarted
                 ? $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini，并重启 TermService 使其生效。"
-                : $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini，但服务重启失败，请手动重启 TermService。")
-            : $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini；本机版本号未知，未重启服务。";
+                : $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini，但服务重启失败，请手动检查 TermService。")
+            : $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini；本机版本号未知，未重启服务，请手动重启使其生效。";
 
         return new RdpOperationResult
         {
-            Success = restarted || !submission.VersionMatches,
+            Success = submission.VersionMatches ? restarted : true,
             Summary = summary,
             Detail = writeDetail + (restartNote.Length > 0 ? Environment.NewLine + restartNote : ""),
             Steps = new List<RdpStepRecord>(steps),
             Final = final,
         };
     }
+
+    /// <summary>
+    /// 原子写入 rdpwrap.ini：先写同目录临时文件，再替换目标。
+    /// 被占用时短暂重试，最后降级成覆盖复制；无论哪条路失败都清掉临时文件。
+    /// </summary>
+    private static void WriteIniAtomically(string iniPath, string content)
+    {
+        var dir = Path.GetDirectoryName(iniPath);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            Directory.CreateDirectory(dir);
+        }
+
+        var temp = iniPath + ".yomori.tmp";
+        File.WriteAllText(temp, content);
+
+        try
+        {
+            IOException? last = null;
+            for (var attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    if (File.Exists(iniPath))
+                    {
+                        File.Replace(temp, iniPath, null);
+                    }
+                    else
+                    {
+                        File.Move(temp, iniPath);
+                    }
+
+                    return;
+                }
+                catch (IOException ex) when (IsSharingViolation(ex))
+                {
+                    last = ex;
+                    Thread.Sleep(200);
+                }
+            }
+
+            // ReplaceFileW 要求能删除/重命名目标；占用方只放了读共享时也过不去。
+            // 覆盖复制只要写句柄，条件更松，作为最后一条路再试一次。
+            try
+            {
+                File.Copy(temp, iniPath, overwrite: true);
+            }
+            catch
+            {
+                if (last is not null)
+                {
+                    throw last;
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            TryDeleteTempIni(temp);
+        }
+    }
+
+    private static void TryDeleteTempIni(string temp)
+    {
+        try
+        {
+            if (File.Exists(temp))
+            {
+                File.Delete(temp);
+            }
+        }
+        catch
+        {
+            // 临时文件留在安装目录不影响 rdpwrap（它只读 rdpwrap.ini），别为清理再抛一次
+        }
+    }
+
+    /// <summary>Win32 32=共享冲突、33=锁冲突。IOException.HResult 低 16 位就是原始 Win32 码。</summary>
+    private static bool IsSharingViolation(Exception ex) =>
+        ex is IOException && (ex.HResult & 0xFFFF) is 32 or 33;
 
     /// <summary>写之前把原 INI 单独备份一份；备份不成功就停手，不带着无回滚的修改往前走。</summary>
     private static (bool Ok, string Message) BackupManualIni(string iniPath)
