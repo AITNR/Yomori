@@ -28,6 +28,12 @@ public static class DialogHelper
     /// <summary>全局对话框闸门：保证同一时刻只有一个 ContentDialog 存活。</summary>
     private static readonly SemaphoreSlim Gate = new(1, 1);
 
+    /// <summary>连续两次对话框之间留给关闭动画的间隔（毫秒）。</summary>
+    private const int ContinuousDialogGapMs = 150;
+
+    /// <summary>上一次释放闸门的时刻（Environment.TickCount64），用于判断是否需要等关闭动画。</summary>
+    private static long _lastReleasedAt;
+
     /// <summary>
     /// 把当前续体搬回 UI 线程（无返回值）。
     /// 见 <see cref="ReturnToUiThreadAsync{T}"/> 的说明。
@@ -190,6 +196,16 @@ public static class DialogHelper
         await Gate.WaitAsync();
         try
         {
+            // WinUI 的 ContentDialog 在 ShowAsync 返回后仍有一小段关闭动画；
+            // 闸门释放得太早，紧接着的下一个 ShowAsync 会撞上
+            // "Only a single ContentDialog can be open at any time"（异常被下面吞掉，
+            // 表现就是前一个弹窗被顶掉、后一个干脆不出现）。连续弹窗留一拍给关闭动画。
+            var sinceRelease = Environment.TickCount64 - Interlocked.Read(ref _lastReleasedAt);
+            if (sinceRelease >= 0 && sinceRelease < ContinuousDialogGapMs)
+            {
+                await Task.Delay((int)(ContinuousDialogGapMs - sinceRelease));
+            }
+
             return await dialog.ShowAsync();
         }
         catch (Exception ex)
@@ -200,6 +216,7 @@ public static class DialogHelper
         }
         finally
         {
+            Interlocked.Exchange(ref _lastReleasedAt, Environment.TickCount64);
             Gate.Release();
         }
     }

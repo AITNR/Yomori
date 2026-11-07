@@ -319,7 +319,9 @@ INI 的国内可达路径优先使用 `cdn.jsdelivr.net/gh/sebaxakerhtc/rdpwrap.
    - 提供「重新测速」与「自定义节点」输入（替代原设置页前缀框，填入后加入候选并保存）。
    - 按钮：`PrimaryButtonText = "确定"`、`CloseButtonText = "取消"`、`DefaultButton = ContentDialogButton.Primary`；只有点「确定」才返回选中节点，取消返回 null。
 
-3. **时序**：`ConfirmUnlockRiskAsync` → `ConfirmAntivirusAsync`（`needDownload` 时）→ **测速弹窗** → 构造 `RdpUnlockRequest`。插入点在 `:1675` 之后、`:1677` 之前，**不改写** `RunOnUiAsync(queue, ConfirmAntivirusAsync)` 与 `OnRdpUninstall` 里的同形状调用，避免冒烟 280–282 变红。
+3. **时序（2026-11-07 修订）**：`ConfirmUnlockRiskAsync` → **测速弹窗** → `ConfirmAntivirusAsync`（`needDownload` 时）→ 构造 `RdpUnlockRequest`。**杀软确认必须是下载前最后一道弹窗**：按钮文案是「确定并开始下载」，点完就该真的开始下载，不能再被测速界面顶掉或打断。原实现把测速放在杀软确认之后（第三个连续 ContentDialog），已纠正。**不改写** `RunOnUiAsync(queue, ConfirmAntivirusAsync)` 与 `OnRdpUninstall` 里的同形状调用，避免冒烟 280–282 变红。
+
+   连续弹窗保护：`DialogHelper.ShowAsync` 在释放闸门后的 150ms 内再显示下一个对话框时先等一拍（`ContinuousDialogGapMs`），让前一个 ContentDialog 的关闭动画完成，避免 WinUI「Only a single ContentDialog can be open at any time」把前一个顶掉。
 
 4. **结果传递**：对话框返回节点 → 构造 `RdpAccelerationSettings`（选「官方直连」时 `Enabled=false`，否则 `true` + `CustomPrefix=选中前缀`）→ 写入 `RdpUnlockRequest.Acceleration`。**仅本次生效**，不改全局配置；自定义节点地址单独持久化到 `rdp_accel_prefix`。
 
@@ -331,7 +333,7 @@ INI 的国内可达路径优先使用 `cdn.jsdelivr.net/gh/sebaxakerhtc/rdpwrap.
 |---|---|---|---|
 | Q1 | 设置页的勾选开关与前缀框是否移除 | **移除** `SettingsPage.xaml:388–409` 与三个方法；`AppConfig` 两个字段保留（旧配置兼容、自定义节点持久化），`RdpAccelerationEnabled` 不再有写入点 | 保留开关作为「是否启用加速」总开关，测速弹窗只在开关打开时出现 |
 | Q2 | 测速哪些节点 | 2 个内置反代（gh-proxy.com / ghfast.top）+ **官方直连** + 配置过的自定义节点；jsDelivr 不作为节点（它只是 INI 的独立 CDN，仍由 `IniCandidates` 自动优先） | 把 jsDelivr 也列为节点 |
-| Q3 | 何时弹 | 所有确认弹窗之后、构造 request 之前**总是弹**；仅当 `needDownload == false && IniState == FullySupported`（本轮完全不下载）时跳过 | 只在 `needDownload == true` 时弹 |
+| Q3 | 何时弹 | 风险确认之后、杀软确认之前**弹**（杀软确认保留为下载前最后一道）；仅当 `needDownload == false && IniState == FullySupported`（本轮完全不下载）时跳过 | 只在 `needDownload == true` 时弹 |
 
 ### 11.5 线程与显示纪律
 

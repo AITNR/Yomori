@@ -1649,12 +1649,13 @@ public sealed partial class SettingsPage : Page
     // ---------------- 远程桌面解锁：修改动作（M2–M4） ----------------
 
     /// <summary>
-    /// 解锁：先弹系统修改风险，再（缺组件时）弹杀软人工确认，最后才进流程。
+    /// 解锁：系统修改风险确认 → 选择下载节点 → （缺组件时）下载前的杀软人工确认 → 开始。
     /// </summary>
     /// <remarks>
-    /// 三个对话框的**顺序**是计划书定的，不能合并：
-    /// ① 系统修改风险（3.2 第一层）→ ② 下载前的人肉确认（3.2 第二层，只在需要下载时）。
-    /// 合并成一个对话框的话，用户点"确定"到底同意了哪一件事就说不清了。
+    /// <para>三个对话框的**顺序**是计划书定的，不能合并：系统修改风险（3.2 第一层）、
+    /// 下载节点测速选择、下载前的人肉确认（3.2 第二层，只在需要下载时）。</para>
+    /// <para>杀软确认必须是最后一道弹窗：它的按钮是「确定并开始下载」，
+    /// 点完就该真的开始下载，不能再被别的界面顶掉或打断。</para>
     /// </remarks>
     private async void OnRdpUnlock(object sender, RoutedEventArgs e)
     {
@@ -1674,23 +1675,12 @@ public sealed partial class SettingsPage : Page
             return;
         }
 
-        var antivirusConfirmed = false;
-        if (needDownload)
-        {
-            if (!await RunOnUiAsync(queue, ConfirmAntivirusAsync))
-            {
-                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
-                return;
-            }
-
-            antivirusConfirmed = true;
-        }
-
         var network = UpdateNetworkSettings.FromConfig(VM.Config);
         var savedPrefix = VM.Config.RdpAccelerationPrefix;
 
-        // ---- 3. 选择下载节点：两个确认弹窗都过完才弹 ----
-        // 对话框在界面线程上创建；测速与后续下载共用同一个 network，代理语义一致。
+        // ---- 2. 选择下载节点：风险确认之后、下载前的人工确认之前 ----
+        // 杀软确认必须是下载前最后一道弹窗：它的按钮写着「确定并开始下载」，
+        // 点完就该真的开始下载，不能再被别的界面顶掉。
         RdpAccelerationSettings acceleration;
         if (!needDownload && _rdpSnapshot?.IniState == RdpSupportState.FullySupported)
         {
@@ -1724,6 +1714,19 @@ public sealed partial class SettingsPage : Page
             }
 
             acceleration = pick.Acceleration;
+        }
+
+        // ---- 3. 下载前的人肉确认（计划书 3.2）：必须是最后一道弹窗 ----
+        var antivirusConfirmed = false;
+        if (needDownload)
+        {
+            if (!await RunOnUiAsync(queue, ConfirmAntivirusAsync))
+            {
+                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
+                return;
+            }
+
+            antivirusConfirmed = true;
         }
 
         var request = new RdpUnlockRequest
