@@ -177,13 +177,22 @@ public sealed class OnboardingController
 
         if (target is not null)
         {
-            try
+            if (step.ScrollToTop)
             {
-                target.StartBringIntoView();
+                // 精确滚到最顶部、无动画：长卡片不再停在视口下半截被截，
+                // 也不会因滚动动画中途测坐标而让高亮框套歪
+                _window.ScrollOnboardingTargetToTop(step.TargetName!);
             }
-            catch (Exception ex)
+            else
             {
-                _window.VM.AppendLog("[引导] 滚动到目标失败：" + ex.Message);
+                try
+                {
+                    target.StartBringIntoView();
+                }
+                catch (Exception ex)
+                {
+                    _window.VM.AppendLog("[引导] 滚动到目标失败：" + ex.Message);
+                }
             }
         }
 
@@ -218,7 +227,9 @@ public sealed class OnboardingController
             _window.VM.AppendLog("[引导] 未找到目标控件 " + step.TargetName + "，降级为居中气泡");
         }
 
-        _overlay.RenderStep(step, _index + 1, _steps.Count, focus);
+        // 顶到最上的长卡片会占满视口，气泡不能按「目标上方/下方」找位置，
+        // 否则会盖住卡片正文或跑出窗口；这类步骤把气泡固定在视口右上角。
+        _overlay.RenderStep(step, _index + 1, _steps.Count, focus, step.ScrollToTop);
     }
 
     private FrameworkElement? FindTarget(OnboardingStep step) =>

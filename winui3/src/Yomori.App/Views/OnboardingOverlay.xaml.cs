@@ -57,7 +57,7 @@ public sealed partial class OnboardingOverlay : UserControl
     /// 画一步。<paramref name="focus"/> 是目标控件相对本覆盖层左上角的矩形，
     /// 宽高为 0 表示不挖洞（最后一步的配图卡片居中展示）。
     /// </summary>
-    public void RenderStep(OnboardingStep step, int index, int total, Rect focus)
+    public void RenderStep(OnboardingStep step, int index, int total, Rect focus, bool pinBubbleTopRight = false)
     {
         StepTitle.Text = step.Title;
         StepBody.Text = step.Body;
@@ -82,7 +82,7 @@ public sealed partial class OnboardingOverlay : UserControl
             FocusBorder.Visibility = Visibility.Collapsed;
         }
 
-        var hasImage = PrepareImage(step);
+        var hasImage = PrepareImage(step, out var imageAspect);
         var bubbleMaxWidth = hasImage
             ? Math.Min(ImageBubbleMaxWidth, Math.Max(320, width - 48))
             : Math.Min(TextBubbleMaxWidth, Math.Max(200, width - 32));
@@ -101,8 +101,23 @@ public sealed partial class OnboardingOverlay : UserControl
 
         if (hasImage)
         {
-            StepImage.MaxWidth = Math.Max(240, bubbleMaxWidth - 24);
-            StepImage.MaxHeight = Math.Max(160, height - baseHeight - 32);
+            // 显式给图片定尺寸。BitmapImage 是异步解码的：只设 MaxWidth/MaxHeight 时，
+            // 第二次 Measure 可能还拿不到图片的自然尺寸，气泡按「没有图片」的高度居中，
+            // 等图片一撑开就整个掉出窗口底部（2026-11-07 14:41 真机反馈）。
+            var imageMaxWidth = Math.Max(240, bubbleMaxWidth - 24);
+            var imageMaxHeight = Math.Max(160, height - baseHeight - 32);
+            var imageHeight = imageMaxHeight;
+            var imageWidth = imageHeight * imageAspect;
+            if (imageWidth > imageMaxWidth)
+            {
+                imageWidth = imageMaxWidth;
+                imageHeight = imageWidth / imageAspect;
+            }
+
+            StepImage.MaxWidth = double.PositiveInfinity;
+            StepImage.MaxHeight = double.PositiveInfinity;
+            StepImage.Width = imageWidth;
+            StepImage.Height = imageHeight;
             StepImage.Visibility = Visibility.Visible;
         }
 
@@ -114,21 +129,31 @@ public sealed partial class OnboardingOverlay : UserControl
         if (hasImage && bubbleHeight > height - 2 * ViewportMargin)
         {
             var overflow = bubbleHeight - (height - 2 * ViewportMargin);
-            StepImage.MaxHeight = Math.Max(120, StepImage.MaxHeight - overflow);
+            var shrunkHeight = Math.Max(120, StepImage.Height - overflow);
+            StepImage.Height = shrunkHeight;
+            StepImage.Width = shrunkHeight * imageAspect;
             Bubble.Measure(new Size(bubbleMaxWidth, double.PositiveInfinity));
             bubbleWidth = Bubble.DesiredSize.Width;
             bubbleHeight = Bubble.DesiredSize.Height;
         }
 
-        PositionBubble(focus, width, height, bubbleWidth, bubbleHeight);
+        PositionBubble(focus, width, height, bubbleWidth, bubbleHeight, pinBubbleTopRight);
     }
 
-    /// <summary>只准备图片源，尺寸与显隐交给 RenderStep 的两阶段测量。</summary>
-    private bool PrepareImage(OnboardingStep step)
+    /// <summary>
+    /// 只准备图片源与宽高比，尺寸与显隐交给 RenderStep 的两阶段测量。
+    /// 宽高比从 PNG 文件头读（同步、不依赖 BitmapImage 的异步解码）——
+    /// 图片没解码完时 Measure 拿不到自然尺寸，气泡会按「没有图片」的高度居中，
+    /// 之后图片一撑开就整个掉出窗口底部。
+    /// </summary>
+    private bool PrepareImage(OnboardingStep step, out double aspect)
     {
+        aspect = 1804.0 / 1401.0; // 兜底：随包资产的已知比例
         StepImage.Source = null;
         StepImage.Visibility = Visibility.Collapsed;
         ImageErrorText.Visibility = Visibility.Collapsed;
+        StepImage.Width = double.NaN;
+        StepImage.Height = double.NaN;
 
         if (string.IsNullOrEmpty(step.ImageRelativePath))
         {
@@ -145,6 +170,7 @@ public sealed partial class OnboardingOverlay : UserControl
                 return false;
             }
 
+            aspect = ReadPngAspect(path, aspect);
             StepImage.Source = new BitmapImage(new Uri(path, UriKind.Absolute));
             return true;
         }
@@ -156,12 +182,55 @@ public sealed partial class OnboardingOverlay : UserControl
         }
     }
 
+    /// <summary>从 PNG 的 IHDR 读宽高比，只读前 24 字节；读不出来用兜底值。</summary>
+    private static double ReadPngAspect(string path, double fallback)
+    {
+        try
+        {
+            var header = new byte[24];
+            using (var stream = File.OpenRead(path))
+            {
+                if (stream.Read(header, 0, header.Length) != header.Length)
+                {
+                    return fallback;
+                }
+            }
+
+            // PNG 签名 89 50 4E 47
+            if (header[0] != 0x89 || header[1] != 0x50 || header[2] != 0x4E || header[3] != 0x47)
+            {
+                return fallback;
+            }
+
+            var w = (header[16] << 24) | (header[17] << 16) | (header[18] << 8) | header[19];
+            var h = (header[20] << 24) | (header[21] << 16) | (header[22] << 8) | header[23];
+            return w > 0 && h > 0 ? (double)w / h : fallback;
+        }
+        catch (Exception)
+        {
+            return fallback;
+        }
+    }
+
     /// <summary>
     /// 气泡优先放在目标下方，放不下改上方，再放不下居中；始终夹在视口内。
     /// 调用方已经 Measure 过，宽高直接传进来，避免用尚未布局完的 ActualWidth/Height。
     /// </summary>
-    private void PositionBubble(Rect focus, double width, double height, double bubbleWidth, double bubbleHeight)
+    private void PositionBubble(Rect focus, double width, double height, double bubbleWidth, double bubbleHeight, bool pinBubbleTopRight)
     {
+        if (pinBubbleTopRight)
+        {
+            // 卡片已顶到视口最上、自身又比视口高，按「目标上下方」找位置会盖住正文
+            // 或跑出窗口。固定在右上角，位置不随滚动与分辨率漂移。
+            var pinnedLeft = Math.Clamp(width - bubbleWidth - 24, ViewportMargin,
+                Math.Max(ViewportMargin, width - bubbleWidth - ViewportMargin));
+            var pinnedTop = Math.Clamp(24, ViewportMargin,
+                Math.Max(ViewportMargin, height - bubbleHeight - ViewportMargin));
+            Canvas.SetLeft(Bubble, pinnedLeft);
+            Canvas.SetTop(Bubble, pinnedTop);
+            return;
+        }
+
         double left;
         double top;
         if (focus.Width > 0 && focus.Height > 0)

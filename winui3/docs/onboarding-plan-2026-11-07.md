@@ -288,3 +288,9 @@ if (VM.IsFreshInstall
 自测：`dotnet build ... -p:Platform=x64` 0 错误（4 个既有 nullability 警告）；冒烟 `===== 全部通过 =====`、0 FAIL，新增 24 条引导断言全 PASS，强制重建后 `Smoke.exe` mtime 13:54:14 已更新。真机 UI 流程（自动弹出、7 次点击、跳过、设置页重看）需用户启动程序后验证。
 
 8. **配图放大（14:17 真机反馈）**：用户截图显示第 7 步的添加用户截图只有约 270px 宽、气泡约 320px 宽，红色标注看不清。根因是 `StepImage.MaxHeight = 视口高 - 280` 这个拍脑袋的常数在矮窗口里把 1804×1401 的图压得过小。改为两阶段测量：先 Measure 不含图片的固有高度，再用剩余视口高度反推图片上限，并保证气泡整体不溢出窗口；配图步骤气泡上限从 460 提到 900，收紧 Padding 与 Spacing，图片居中。冒烟补 3 条回归断言盯住「宽气泡 + 精确高度分配」。
+
+9. **配图卡片居中、不裁切（14:41 真机反馈）**：放大后气泡仍被放到偏下位置，图片下半截掉出窗口。根因是 `BitmapImage` 异步解码，第二次 `Measure` 时拿不到图片自然尺寸，气泡按「没有图片」的高度去居中，等图片撑开就溢出。改为从 PNG 的 IHDR 同步读宽高比（只读前 24 字节），按剩余视口高度算出确切 `Width`/`Height` 显式赋给 `StepImage`；气泡 `Measure` 于是拿到真实高度，水平垂直都居中；超高兜底时同步缩放宽高，保持比例不裁切。冒烟再补 1 条回归断言。
+
+10. **RDP 模块滚到显示区域最顶部、修聚焦错位（14:47 真机反馈）**：第 5 步的 RDP 卡片没有滚到内容视口最上方，换分辨率后底部被截；`StartBringIntoView()` 的异步滚动动画还让 350ms 后测出的高亮框套在错误位置。`OnboardingStep` 新增 `ScrollToTop`（仅第 5 步为真），`MainWindow.ScrollOnboardingTargetToTop()` 用 `TransformToVisual(SettingsScroll)` 算目标在内容中的绝对位置，`ChangeView(..., disableAnimation: true)` 把它顶到距顶 12px；控制器据此分支，不再对该步骤用 `StartBringIntoView`。卡片顶到最上后会占满视口，气泡改固定在视口右上角（`pinBubbleTopRight`），位置不随滚动与分辨率漂移。冒烟补 3 条断言。
+
+    **已知边界**：RDP 卡片本身高于视口时，底部仍会有一截在窗口外 —— 这是窗口高度的物理限制，滚到顶部已保证标题、说明、按钮行与四项状态的主要部分可见。

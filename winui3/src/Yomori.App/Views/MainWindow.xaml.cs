@@ -234,6 +234,40 @@ public sealed partial class MainWindow : Window
             ? page.FindName(name) as FrameworkElement
             : null;
 
+    /// <summary>
+    /// 把引导目标精确滚到内容视口最顶部，并禁用滚动动画。
+    ///
+    /// <para>不用 StartBringIntoView 的原因：它只做「刚好可见」的最小滚动，长卡片会停在
+    /// 视口下半截，分辨率一变底部就被截；而且是异步动画，动画中途测 TransformToVisual
+    /// 会让高亮框套在错误位置（2026-11-07 14:47 真机反馈的「聚焦错位」）。</para>
+    /// </summary>
+    internal void ScrollOnboardingTargetToTop(string targetName)
+    {
+        if (ContentFrame.Content is not FrameworkElement page)
+        {
+            return;
+        }
+
+        var target = page.FindName(targetName) as FrameworkElement;
+        var scroll = page.FindName(OnboardingPlan.SettingsScrollName) as ScrollViewer;
+        if (target is null || scroll is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // top 是目标左上角在 ScrollViewer 视口里的位置（可能为负），
+            // 加上当前 VerticalOffset 就是它在内容中的绝对位置。
+            var top = target.TransformToVisual(scroll).TransformPoint(new Point(0, 0)).Y;
+            scroll.ChangeView(null, scroll.VerticalOffset + top - 12, null, true);
+        }
+        catch (Exception ex)
+        {
+            VM.AppendLog("[引导] 滚动 RDP 模块到顶部失败：" + ex.Message);
+        }
+    }
+
     /// <summary>设置页「重新观看开始引导」：无条件重播一次，不写配置。</summary>
     public void RestartOnboarding() => _onboarding?.Start(force: true);
 

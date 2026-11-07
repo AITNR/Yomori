@@ -16,7 +16,8 @@ public sealed class OnboardingStep
         string? targetName,
         string title,
         string body,
-        string? imageRelativePath)
+        string? imageRelativePath,
+        bool scrollToTop = false)
     {
         Index = index;
         PageTag = pageTag;
@@ -24,6 +25,7 @@ public sealed class OnboardingStep
         Title = title;
         Body = body;
         ImageRelativePath = imageRelativePath;
+        ScrollToTop = scrollToTop;
     }
 
     /// <summary>从 1 开始的步骤序号。</summary>
@@ -41,6 +43,13 @@ public sealed class OnboardingStep
 
     /// <summary>相对 AppPaths.AssetsDir 的图片路径；null = 该步没有配图。</summary>
     public string? ImageRelativePath { get; }
+
+    /// <summary>
+    /// 换页后是否把目标精确滚到内容视口最顶部。
+    /// 长卡片（设置页 RDP 模块）必须这么做：StartBringIntoView 只做最小滚动，
+    /// 卡片会停在视口下半截，不同分辨率下底部被截，且滚动动画中测坐标会让高亮框套歪。
+    /// </summary>
+    public bool ScrollToTop { get; }
 }
 
 /// <summary>引导的静态步骤表与全部文案。改文案时冒烟里的文字锚点会同步变红，按约定换锚点、不删判据。</summary>
@@ -94,7 +103,8 @@ public static class OnboardingPlan
             new OnboardingStep(5, SettingsTag, TargetRdpUnlockCard,
                 "远程桌面解锁（RDP）",
                 "通道功能依赖本机支持多账户同时远程连接。这里四项检测结果全部显示「通过」（全绿）后，通道才能正常使用。点「解锁 RDP」开始；组件需要联网下载，网络波动可能导致解锁失败，可以多点击几次重试。",
-                null),
+                null,
+                scrollToTop: true),
 
             new OnboardingStep(6, ChannelMgmtTag, TargetAddChannel,
                 "新建通道",
