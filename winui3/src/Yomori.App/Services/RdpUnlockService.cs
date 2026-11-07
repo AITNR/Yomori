@@ -70,6 +70,174 @@ public static class RdpUnlockService
     private const int TotalSteps = 10;
 
     /// <summary>
+    /// 「指定 INI」的立即写入入口：把用户粘贴的补丁段按段名合并进本机 rdpwrap.ini。
+    /// </summary>
+    /// <remarks>
+    /// <para>与 <see cref="UnlockAsync"/> 分开：这是设置页上的独立动作，不建解锁事务、不装组件。
+    /// 返回 <see cref="RdpOperationResult"/> 是为了复用界面那套「结果条 + 步骤 + 最终检测」渲染。</para>
+    /// <para><b>重启门槛</b>：只有提交文本里的段名与本机 termsrv.dll 构建号一致时才重启
+    /// TermService。重启会断开当前所有远程桌面会话，版本都没对上就不要动服务（2026-11-07 定）。</para>
+    /// <para>刻意不开事务账本：这一动只改一个纯文本文件，备份单独落到
+    /// <see cref="RdpTransactionStore.RootDir"/> 下的专用目录，不污染解锁事务的状态机。</para>
+    /// </remarks>
+    public static Task<RdpOperationResult> ApplyManualIniAsync(
+        string submittedText,
+        IProgress<RdpProgressInfo>? progress,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(ApplyManualIni(submittedText, progress));
+    }
+
+    private static RdpOperationResult ApplyManualIni(
+        string submittedText,
+        IProgress<RdpProgressInfo>? progress)
+    {
+        const int total = 4;
+        void Step(int n, string text) => progress?.Report(new RdpProgressInfo(n, total, text));
+
+        var steps = new List<RdpStepRecord>();
+
+        Step(1, "读取本机状态");
+        var before = RdpReadOnlyDetector.Detect();
+        var version = before.TermsrvVersion;
+        var iniPath = before.IniPath;
+
+        var submission = RdpIniMerge.ValidateSubmitted(submittedText, version);
+        if (!submission.Ok)
+        {
+            Add(steps, "ini-validate", "校验配置文本", RdpStepOutcome.Fail, submission.Message);
+            return Fail(steps, "没有写入：", submission.Message, before);
+        }
+
+        if (iniPath.Length == 0)
+        {
+            Add(steps, "ini-path", "定位 INI 文件", RdpStepOutcome.Fail, "检测没给出 rdpwrap.ini 路径。");
+            return Fail(steps, "没有写入：", "找不到 rdpwrap.ini 的位置，请先安装解锁组件或点「指定安装包」。", before);
+        }
+
+        Step(2, "合并配置段");
+        string existing;
+        try
+        {
+            existing = File.Exists(iniPath) ? File.ReadAllText(iniPath) : "";
+        }
+        catch (Exception ex)
+        {
+            Add(steps, "ini-read", "读取现有 INI", RdpStepOutcome.Fail, $"{ex.GetType().Name}: {ex.Message}");
+            return Fail(steps, "没有写入：", $"读不了现有的 rdpwrap.ini：{ex.GetType().Name}: {ex.Message}", before);
+        }
+
+        var merge = RdpIniMerge.Merge(existing, submittedText);
+        if (!merge.Ok)
+        {
+            Add(steps, "ini-merge", "合并配置段", RdpStepOutcome.Fail, merge.Message);
+            return Fail(steps, "没有写入：", merge.Message, before);
+        }
+
+        Step(3, "写入 INI");
+        var (backupOk, backupMessage) = BackupManualIni(iniPath);
+        if (!backupOk)
+        {
+            Add(steps, "ini-backup", "备份原 INI", RdpStepOutcome.Fail, backupMessage);
+            return Fail(steps, "没有写入：", backupMessage, before);
+        }
+
+        try
+        {
+            var dir = Path.GetDirectoryName(iniPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            // 先写临时文件再替换：半截的 INI 会让服务加载失败，比没有更糟
+            var temp = iniPath + ".yomori.tmp";
+            File.WriteAllText(temp, merge.MergedText);
+            if (File.Exists(iniPath))
+            {
+                File.Replace(temp, iniPath, null);
+            }
+            else
+            {
+                File.Move(temp, iniPath);
+            }
+        }
+        catch (Exception ex)
+        {
+            Add(steps, "ini-write", "写入 INI 配置", RdpStepOutcome.Fail, $"{ex.GetType().Name}: {ex.Message}");
+            return Fail(steps, "写入失败：",
+                $"{ex.GetType().Name}: {ex.Message}。原文件已备份，未被替换（若需要管理员权限，请以管理员身份运行）。", before);
+        }
+
+        var writeDetail = $"{RdpIniMerge.DescribeSections(submission.SectionNames)}："
+            + $"替换 {merge.ReplacedSections} 段、追加 {merge.AddedSections} 段；{backupMessage}";
+        Add(steps, "ini-write", "写入 INI 配置", RdpStepOutcome.Ok, writeDetail);
+
+        var restarted = false;
+        var restartNote = "";
+        if (submission.VersionMatches)
+        {
+            Step(4, "重启远程桌面服务");
+            var restart = RdpServiceControl.Restart(RdpServiceControl.TermServiceName);
+            restarted = restart.CoreOk;
+            restartNote = restart.Message;
+            Add(steps, "service", "重启远程桌面服务",
+                restart.CoreOk ? RdpStepOutcome.Ok : RdpStepOutcome.Fail, restart.Message);
+
+            if (restart.CoreOk && !restart.DependentsOk)
+            {
+                Add(steps, "service-deps", "依赖服务恢复", RdpStepOutcome.Warn,
+                    "依赖服务未能恢复；设备/驱动器重定向可能失效，重启电脑可恢复。");
+            }
+        }
+        else
+        {
+            Add(steps, "service", "跳过服务重启", RdpStepOutcome.Skipped,
+                "本机 termsrv.dll 版本未知，没有重启服务；配置已落盘但需自行重启服务才生效。");
+        }
+
+        var final = RdpReadOnlyDetector.Detect();
+        var summary = submission.VersionMatches
+            ? (restarted
+                ? $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini，并重启 TermService 使其生效。"
+                : $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini，但服务重启失败，请手动重启 TermService。")
+            : $"已把 {submission.SectionNames.Count} 个段合并进 rdpwrap.ini；本机版本号未知，未重启服务。";
+
+        return new RdpOperationResult
+        {
+            Success = restarted || !submission.VersionMatches,
+            Summary = summary,
+            Detail = writeDetail + (restartNote.Length > 0 ? Environment.NewLine + restartNote : ""),
+            Steps = new List<RdpStepRecord>(steps),
+            Final = final,
+        };
+    }
+
+    /// <summary>写之前把原 INI 单独备份一份；备份不成功就停手，不带着无回滚的修改往前走。</summary>
+    private static (bool Ok, string Message) BackupManualIni(string iniPath)
+    {
+        if (!File.Exists(iniPath))
+        {
+            return (true, "本机原本没有 rdpwrap.ini，无需备份");
+        }
+
+        try
+        {
+            var id = "ini-manual-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            var dir = RdpTransactionStore.DirectoryFor(id);
+            Directory.CreateDirectory(dir);
+            var target = Path.Combine(dir, RdpTransactionStore.IniBackupFileName);
+            File.Copy(iniPath, target, overwrite: true);
+            return (true, $"原文件已备份到 {target}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"备份原 INI 失败（{ex.GetType().Name}: {ex.Message}），已停手没有改盘。");
+        }
+    }
+
+    /// <summary>
     /// 解锁流程。
     /// </summary>
     /// <param name="request">必须带 <see cref="RdpUnlockRequest.AntivirusConfirmed"/> 才能下载。</param>
@@ -563,7 +731,7 @@ public static class RdpUnlockService
                 Report(progress, 7, "更新 INI");
                 var acquired = await AcquireIniAsync(
                     manifest, installDir, iniPathNow, termsrvVersion,
-                    request.ManualIniPath, network, acceleration, steps, cancellationToken)
+                    request.ManualIniText, network, acceleration, steps, cancellationToken)
                     .ConfigureAwait(false);
 
                 if (acquired.Unknown)
@@ -709,15 +877,15 @@ public static class RdpUnlockService
                 : iniFailure.Length > 0
                     ? iniNotAdapted
                         ? "没有适配：rdpwrap.ini 里没有当前系统版本的段。组件已装好，但远程桌面暂不可用；"
-                          + "需等社区补上该版本，拿到含该段的 INI 后点「指定 INI」再解锁一次，不需要重装。"
+                          + "需等社区补上该版本，拿到配置段后点「指定 INI」粘贴即可，不需要重装。"
                         : "网络问题：rdpwrap.ini 下载失败。组件已装好，但 INI 没能更新，远程桌面暂不可用；"
-                          + "检查网络或代理设置后重试，也可点「指定 INI」手动提供文件，不需要重装。"
+                          + "检查网络或代理设置后重试，也可点「指定 INI」粘贴配置文本，不需要重装。"
                     : needsReboot
                         ? "解锁组件已安装，但远程桌面监听（RDP-Tcp）还没出现，所以现在还不能远程登录。"
                           + "请重启电脑，开机后再点「重新检测」——系统刚更新过时这一条尤其常见。"
                         : final.SupportState == RdpSupportState.NotSupported
                             ? "没有适配：本机 rdpwrap.ini 不含当前系统版本的段，远程桌面暂不可用。"
-                              + "需等社区补上该版本，或点「指定 INI」手动提供。详情见「查看诊断」。"
+                              + "需等社区补上该版本，或点「指定 INI」粘贴配置段。详情见「查看诊断」。"
                             : "解锁流程已执行，但内置检测没有全部通过。逐项结果见下方诊断。";
 
             RdpTransactionStore.Finish(
@@ -1133,13 +1301,15 @@ public static class RdpUnlockService
     private readonly record struct RegistryApplyOutcome(bool Ok, string Message, string LedgerError);
 
     /// <summary>
-    /// 取一份能覆盖当前构建的 INI：用户指定 → 程序走设置里的代理自己下载 → <c>RDPWInst.exe -w</c>。
+    /// 取一份能覆盖当前构建的 INI：用户提交的补丁段 → 程序走设置里的代理自己下载 → <c>RDPWInst.exe -w</c>。
     /// </summary>
     /// <remarks>
     /// <para><b>为什么中间那条是新增的</b>：<c>-w</c> 用 RDPWInst 自己的 WinInet，只认系统代理，
     /// 不认本程序设置里的自定义代理。用户把代理配在 Yomori 里、系统代理空着的时候，
     /// 前面几步（查发布、下安装器）都能走通，唯独 INI 这一步必然失败 ——
     /// 表现就是「组件装好了，但远程桌面还是用不了」。2026-10-29 按用户要求补上这条路。</para>
+    /// <para>第一路从「选本地 ini 文件」改成了「粘贴补丁段文本」（2026-11-07）：文本按段名合并进
+    /// 本机 rdpwrap.ini，不整份替换。安装器会无条件覆盖 ini，所以这里再合并一次兜底。</para>
     /// <para>顺序也变了：先自己下。<c>-w</c> 只作回退 —— 它在系统代理可用、本程序代理没配的机器上仍有效，
     /// 而且它还会顺带用内置样本兜底（虽然那份样本往往不含当前构建，回读校验会识破）。</para>
     /// <para>三条路都失败也不让整轮失败：组件已经装好了，回滚只会让人从头再来一遍。
@@ -1150,7 +1320,7 @@ public static class RdpUnlockService
         string installDir,
         string iniPath,
         string version,
-        string manualIniPath,
+        string manualIniText,
         UpdateNetworkSettings network,
         RdpAccelerationSettings acceleration,
         List<RdpStepRecord> steps,
@@ -1163,18 +1333,18 @@ public static class RdpUnlockService
 
         var failures = new List<string>();
 
-        // ---- 1. 用户指定的 INI ----
-        if (manualIniPath.Length > 0)
+        // ---- 1. 界面粘贴的补丁段 ----
+        if (manualIniText.Length > 0)
         {
-            var (ok, message) = ApplyIniFile(manifest, iniPath, manualIniPath, version);
+            var (ok, message) = ApplyIniTextToPath(manifest, iniPath, manualIniText, version);
             if (ok)
             {
-                Add(steps, "ini-manual", "使用指定的 INI", RdpStepOutcome.Ok, message);
+                Add(steps, "ini-manual", "合并提交配置", RdpStepOutcome.Ok, message);
                 return new IniAcquisition(true, message, true, false);
             }
 
-            failures.Add("手动指定的 INI 不可用：" + message);
-            Add(steps, "ini-manual", "使用指定的 INI", RdpStepOutcome.Warn, message);
+            failures.Add("提交的 INI 配置不可用：" + message);
+            Add(steps, "ini-manual", "合并提交配置", RdpStepOutcome.Warn, message);
         }
 
         // ---- 2. 程序自己下载（走设置里的代理，与「检查更新」同一套语义）----
@@ -1347,22 +1517,29 @@ public static class RdpUnlockService
     private readonly record struct IniAcquisition(
         bool Ok, string Message, bool Changed, bool Unknown, bool NotAdapted = false);
 
-    /// <summary>把一个本地 INI 文件应用到安装目录（先备份，再校验，最后原子替换）。</summary>
-    private static (bool Ok, string Message) ApplyIniFile(
+    /// <summary>
+    /// 把界面粘贴的补丁段按段名合并进本机 rdpwrap.ini（先备份，再校验，最后原子替换）。
+    /// </summary>
+    /// <remarks>
+    /// 不整份替换：提交文本通常只有 <c>[版本]</c> 与 <c>[版本-SLInit]</c> 两段，
+    /// 直接覆盖会把 <c>[Main]</c> / <c>Updated=</c> / <c>[PatchCodes]</c> 一起抹掉。
+    /// </remarks>
+    private static (bool Ok, string Message) ApplyIniTextToPath(
         RdpTransactionManifest manifest,
         string iniPath,
-        string sourcePath,
+        string submittedText,
         string version)
     {
         try
         {
-            if (!File.Exists(sourcePath))
+            var existing = ReadText(iniPath);
+            var merge = RdpIniMerge.Merge(existing, submittedText);
+            if (!merge.Ok)
             {
-                return (false, $"文件不存在：{sourcePath}");
+                return (false, merge.Message);
             }
 
-            var text = File.ReadAllText(sourcePath);
-            return WriteIni(manifest, iniPath, text, version);
+            return WriteIni(manifest, iniPath, merge.MergedText, version);
         }
         catch (Exception ex)
         {
@@ -1905,7 +2082,7 @@ public static class RdpUnlockService
         {
             text += "　注意：没有 RDPWInst.exe（上游 Release 安装器不带它），"
                     + "所以「在线更新 INI」与「用本地工具卸载」都不可用 —— "
-                    + "前者请用「指定 INI」，后者会自动改用下载的卸载器。";
+                    + "前者请用「指定 INI」粘贴配置段，后者会自动改用下载的卸载器。";
         }
 
         return (true, text);
@@ -1957,12 +2134,12 @@ public static class RdpUnlockService
     /// </summary>
     /// <remarks>
     /// <c>-w</c> 走的是 RDPWInst 自己的 WinInet 下载，不认本程序的代理设置；
-    /// 国内网络下它经常直接失败（退出码 5）。这时唯一的办法是手工把最新的
-    /// <c>rdpwrap.ini</c> 放到安装目录 —— 比让用户去猜「为什么更新不了」有用。
+    /// 国内网络下它经常直接失败（退出码 5）。这时让用户去 issues 里复制当前版本的补丁段，
+    /// 用「指定 INI」粘贴进来 —— 比让用户去猜「为什么更新不了」有用。
     /// </remarks>
     private static string IniManualHint(string installDir) =>
-        "；拿到能覆盖本机版本的 INI 后点「指定 INI」，再解锁一次即可"
-        + (installDir.Length == 0 ? "" : $"（也可直接覆盖 {Path.Combine(installDir, "rdpwrap.ini")}）");
+        "；拿到能覆盖本机版本的配置段后点「指定 INI」粘贴即可"
+        + (installDir.Length == 0 ? "" : $"（本机 INI 在 {Path.Combine(installDir, "rdpwrap.ini")}）");
 
     /// <summary>下载失败时附在后面的出口：告诉用户「还可以手动给一个安装包」。</summary>
     private const string ManualHint =

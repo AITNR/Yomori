@@ -28,8 +28,11 @@ public sealed partial class SettingsPage : Page
     /// <summary>用户手动指定的安装包路径；空串表示按官方发布下载。</summary>
     private string _rdpManualInstaller = "";
 
-    /// <summary>用户手动指定的 rdpwrap.ini 路径；空串表示自己下载或交给 RDPWInst -w。</summary>
-    private string _rdpManualIni = "";
+    /// <summary>
+    /// 用户在「指定 INI」里粘贴的补丁段文本。点「写入 INI」时已就地合并落盘；
+    /// 这里再留一份，是为了解锁流程里的安装器覆盖 rdpwrap.ini 之后能重新合并回来。
+    /// </summary>
+    private string _rdpManualIniText = "";
 
     /// <summary>上一次修改操作的完整报告（含逐步现场）。「查看诊断」优先把它带出来。</summary>
     private string _rdpLastReport = "";
@@ -1307,11 +1310,15 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// 指定本地 rdpwrap.ini：在线取不到（RDPWInst 的下载不认代理）时的唯一可控来源。
+    /// 「指定 INI」：粘贴社区在 rdpwrap issues 里针对当前系统版本贴出的补丁段，
+    /// 程序按段名合并写入本机 rdpwrap.ini。
     /// </summary>
     /// <remarks>
-    /// 选完就地校验两件事：像不像 INI、有没有当前 termsrv 版本对应的段。
-    /// 不含那一段的文件换上去也不会生效，当场拦住比装完再报「Support 未覆盖」有用。
+    /// <para>2026-11-07 从「选本地 .ini 文件」改成「粘贴配置文本」：社区适配新版本时给的是
+    /// 两三段补丁配置，不是完整 ini。整份替换会抹掉 <c>[Main]</c>/<c>Updated=</c>/<c>[PatchCodes]</c>，
+    /// 所以服务层按段名 upsert（见 <see cref="RdpIniMerge"/>）。</para>
+    /// <para>对话框走 <see cref="DialogHelper.ShowAsync"/> 单入口；写入复用
+    /// <see cref="RunRdpOperationAsync"/> 的后台线程 + 结果条框架，UI 线程不碰文件与服务停启。</para>
     /// </remarks>
     private async void OnRdpPickIni(object sender, RoutedEventArgs e)
     {
@@ -1320,45 +1327,95 @@ public sealed partial class SettingsPage : Page
             return;
         }
 
-        var path = await DialogHelper.PickOpenFileAsync(("INI 文件", ".ini"));
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return;
-        }
-
-        string text;
-        try
-        {
-            text = File.ReadAllText(path);
-        }
-        catch (Exception ex)
-        {
-            _rdpManualIni = "";
-            SetRdpAction($"读不了这个文件：{ex.GetType().Name}: {ex.Message}");
-            return;
-        }
-
-        if (!text.Contains("Updated=", StringComparison.OrdinalIgnoreCase))
-        {
-            _rdpManualIni = "";
-            SetRdpAction($"{Path.GetFileName(path)} 不像 rdpwrap.ini（没有 Updated 字段）。");
-            return;
-        }
-
-        // 有当前 termsrv 版本就顺手对一下段名，没有版本号就只做上面的粗检
+        const string issuesUrl = "https://github.com/stascorp/rdpwrap/issues";
         var version = _rdpSnapshot?.TermsrvVersion ?? "";
-        if (version.Length > 0 && !text.Contains($"[{version}]", StringComparison.Ordinal))
+
+        var box = new TextBox
         {
-            _rdpManualIni = "";
-            SetRdpAction($"{Path.GetFileName(path)} 里没有 [{version}] 段 —— "
-                         + "这个文件覆盖不到本机的系统版本，换上去也不会生效。");
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            FontFamily = new FontFamily("Consolas"),
+            FontSize = 12,
+            MinHeight = 240,
+            MaxHeight = 320,
+            IsSpellCheckEnabled = false,
+            PlaceholderText = "[10.0.26100.9818]" + Environment.NewLine
+                + "SingleUserPatch.x64=1" + Environment.NewLine
+                + "SingleUserOffset.x64=AC5DB" + Environment.NewLine
+                + "..." + Environment.NewLine
+                + "[10.0.26100.9818-SLInit]" + Environment.NewLine
+                + "bInitialized.x64=135350",
+        };
+
+        var latest = new Button { Content = "获取最新", HorizontalAlignment = HorizontalAlignment.Left };
+        latest.Click += (_, _) =>
+        {
+            if (UpdateService.OpenUrl(issuesUrl))
+            {
+                SetRdpAction("已在浏览器打开 rdpwrap issues；找到当前系统版本的补丁段后复制粘贴到下面。");
+            }
+            else
+            {
+                SetRdpAction($"打不开浏览器，请手动访问：{issuesUrl}");
+            }
+        };
+
+        var scroll = new ScrollViewer
+        {
+            Content = box,
+            MaxWidth = 640,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+        };
+
+        var panel = new StackPanel { Spacing = 8 };
+        panel.Children.Add(latest);
+        panel.Children.Add(new TextBlock
+        {
+            Text = "社区还没适配本机系统版本时，在这里粘贴针对该版本的补丁段；程序按段名合并写入 rdpwrap.ini，不会覆盖其它段。",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Opacity = 0.7,
+        });
+        panel.Children.Add(new TextBlock
+        {
+            Text = version.Length > 0
+                ? $"本机 termsrv.dll 版本：{version}（配置里必须有 [{version}] 段）"
+                : "本机 termsrv.dll 版本：读不到（此时只写入、不重启服务）",
+            TextWrapping = TextWrapping.Wrap,
+            FontSize = 12,
+            Opacity = 0.7,
+        });
+        panel.Children.Add(scroll);
+
+        var dialog = new ContentDialog
+        {
+            Title = "指定 INI 配置",
+            Content = panel,
+            PrimaryButtonText = "写入 INI",
+            CloseButtonText = "取消",
+            DefaultButton = ContentDialogButton.Close,
+            IsPrimaryButtonEnabled = false,
+        };
+
+        box.TextChanged += (_, _) => dialog.IsPrimaryButtonEnabled = !string.IsNullOrWhiteSpace(box.Text);
+
+        if (await DialogHelper.ShowAsync(dialog) != ContentDialogResult.Primary)
+        {
             return;
         }
 
-        _rdpManualIni = path;
-        SetRdpAction($"已指定 INI：{Path.GetFileName(path)}（{new FileInfo(path).Length} 字节"
-                     + (version.Length > 0 ? $"，含 [{version}] 段" : "") + "）。"
-                     + "下次点「解锁 RDP」会先用它。");
+        var text = box.Text;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        _rdpManualIniText = text;
+
+        // 只有「段名与本机版本一致」时服务层才重启 TermService；重启会断开当前远控会话。
+        await RunRdpOperationAsync("写入 INI 配置",
+            (progress, token) => RdpUnlockService.ApplyManualIniAsync(text, progress, token));
     }
 
     /// <summary>
@@ -1673,7 +1730,7 @@ public sealed partial class SettingsPage : Page
         {
             AntivirusConfirmed = antivirusConfirmed,
             ManualInstallerPath = _rdpManualInstaller,
-            ManualIniPath = _rdpManualIni,
+            ManualIniText = _rdpManualIniText,
             Acceleration = acceleration,
         };
 

@@ -309,13 +309,17 @@ public sealed class RdpUnlockRequest
     public string ManualInstallerPath { get; init; } = "";
 
     /// <summary>
-    /// 用户手动指定的 <c>rdpwrap.ini</c>。空串表示按「自己下载 → RDPWInst -w」的顺序取。
+    /// 用户直接提交的 <c>rdpwrap.ini</c> 配置文本（补丁段）。空串表示按「自己下载 → RDPWInst -w」的顺序取。
     /// </summary>
     /// <remarks>
-    /// 网络拿不到上游 INI 时（RDPWInst 的下载不认代理），这是唯一能救回来的输入。
-    /// 应用前会校验它确实含当前 <c>termsrv.dll</c> 版本对应的段，不含就不写入。
+    /// <para>2026-11-07 起界面不再让用户选本地 ini 文件，而是粘贴社区在
+    /// <c>stascorp/rdpwrap/issues</c> 里针对当前系统版本贴出的补丁段。服务层按段名合并进本机
+    /// rdpwrap.ini（见 <see cref="RdpIniMerge"/>），不是整份替换 —— 完整 INI 还有
+    /// <c>[Main]</c> / <c>Updated=</c> / <c>[SLInit]</c> / <c>[PatchCodes]</c> 与上千个历史版本段。</para>
+    /// <para>界面点「写入 INI」时已经就地合并落盘；这里再带一次是兜底：解锁流程里的安装器会
+    /// 无条件覆盖 rdpwrap.ini，带着文本就能在覆盖之后重新合并回来。</para>
     /// </remarks>
-    public string ManualIniPath { get; init; } = "";
+    public string ManualIniText { get; init; } = "";
 
     /// <summary>是否在安装后更新 INI（<c>RDPWInst -w</c>）。</summary>
     public bool UpdateIni { get; init; } = true;
