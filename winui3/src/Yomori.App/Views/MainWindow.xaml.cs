@@ -84,6 +84,9 @@ public sealed partial class MainWindow : Window
     /// <summary>窗口是否收在状态栏里（供外部判断，例如单实例激活时决定要不要 Show）。</summary>
     public bool IsHiddenToTray => _hiddenToTray;
 
+    /// <summary>首次启动引导控制器。挂字段保活：它内部有一个 DispatcherQueueTimer。</summary>
+    private OnboardingController? _onboarding;
+
     public MainWindow()
     {
         InitializeComponent();
@@ -191,6 +194,17 @@ public sealed partial class MainWindow : Window
         // 启动时按设置检查一次更新（后台跑，6 秒后开始；结论进铃铛）
         VM.BeginStartupUpdateCheck();
 
+        // 首次启动引导：全新安装后自动弹一次。
+        // 代理 / 部署 / 自检等启动路径要么在 Program.Main 里已分流，要么带 EmbedVmArgs，
+        // 都不该弹。启动本身延后一拍，等窗口与首页布局完成再定位目标控件。
+        _onboarding = new OnboardingController(this, OnboardingLayer, DispatcherQueue);
+        if (VM.IsFreshInstall && Program.EmbedVmArgs is null)
+        {
+            DispatcherQueue.TryEnqueue(
+                Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+                () => _onboarding.Start(force: false));
+        }
+
 
         // M5/M6 自检通道：自动导航到「通道管理」页（页面 Loaded 里自动连接、画面挂在本页）
         if (Program.EmbedVmArgs is not null)
@@ -202,6 +216,26 @@ public sealed partial class MainWindow : Window
     }
 
     public MainViewModel VM => App.ViewModel;
+
+    // ---------------- 首次启动引导接线 ----------------
+
+    /// <summary>引导控制器用来判断要不要换页的当前页面 tag。</summary>
+    internal string CurrentPageTag => _currentTag;
+
+    /// <summary>引导专用导航入口：复用统一的 NavigateTo，不另起一套选中态逻辑。</summary>
+    internal void NavigateForOnboarding(string tag) => NavigateTo(tag);
+
+    /// <summary>
+    /// 在当前页面里按 x:Name 找引导目标。目标都是页面的直接具名元素、不在 DataTemplate 里；
+    /// 找不到时控制器会降级为居中气泡并记一行运行日志，不会让引导卡住。
+    /// </summary>
+    internal FrameworkElement? FindOnboardingTarget(string name) =>
+        ContentFrame.Content is FrameworkElement page
+            ? page.FindName(name) as FrameworkElement
+            : null;
+
+    /// <summary>设置页「重新观看开始引导」：无条件重播一次，不写配置。</summary>
+    public void RestartOnboarding() => _onboarding?.Start(force: true);
 
     // ---------------- 窗口位置 / 尺寸记忆 ----------------
 
@@ -1837,6 +1871,14 @@ public sealed partial class MainWindow : Window
 
     private void OnRootKeyDown(object sender, KeyRoutedEventArgs e)
     {
+        // 引导期间 Esc = 跳过（覆盖层没有输入焦点，靠根元素的冒泡接住）
+        if (_onboarding is { IsRunning: true } && e.Key == Windows.System.VirtualKey.Escape)
+        {
+            _onboarding.Finish();
+            e.Handled = true;
+            return;
+        }
+
         if (e.Key == Windows.System.VirtualKey.F8)
         {
             VM.Stop();

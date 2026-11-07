@@ -7,7 +7,8 @@
 
     <!-- 横向必须 Stretch：ScrollViewer 默认不给内容无限宽，StackPanel 若再带
          HorizontalAlignment="Left" 就会按内容期望宽度收缩，卡片宽度不随窗口变。 -->
-    <ScrollViewer Padding="16,12"
+    <ScrollViewer x:Name="SettingsScroll"
+                  Padding="16,12"
                   HorizontalScrollBarVisibility="Disabled"
                   HorizontalScrollMode="Disabled"
                   HorizontalContentAlignment="Stretch"
@@ -130,7 +131,8 @@
                  本版（计划书 M1）只做只读检测：读注册表值、服务状态、会话枚举、文件版本与 INI，
                  不写任何键、不下载、不装组件。三个修改按钮因此保持禁用并说明原因 ——
                  宁可明确摆出「还没接」，也不要留一个点了没反应的按钮。 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+            <!-- x:Name 供首次启动引导定位整张卡片（见 OnboardingPlan.TargetRdpUnlockCard）。 -->
+            <Border x:Name="RdpUnlockCard" Padding="16" Style="{StaticResource YomoriCardStyle}">
                 <StackPanel Spacing="12">
                     <TextBlock Text="远程桌面解锁（RDP）" FontWeight="SemiBold" />
                     <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.7"
@@ -318,6 +320,15 @@
             <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
                 <StackPanel Spacing="12">
                     <TextBlock Text="关于" FontWeight="SemiBold" />
+
+                    <!-- 首次启动引导的手动重看入口。一次性动作、不是持续状态，
+                         按约定用按钮而不是 ToggleSwitch；不写配置、不需要二次确认。 -->
+                    <StackPanel Spacing="4">
+                        <Button Content="重新观看开始引导" Click="OnRestartOnboarding" />
+                        <TextBlock Text="按首次启动的顺序重新播放一遍引导，不改变任何配置。"
+                                   TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                    </StackPanel>
+
                     <TextBlock Text="Yomori —— 让每日清体力变得更省心。"
                                TextWrapping="Wrap" Opacity="0.8" />
                     <TextBlock Text="本程序不提供任何游戏内自动化逻辑，只负责把已有脚本按预设顺序稳定地跑完。"

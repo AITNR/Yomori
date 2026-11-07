@@ -96,6 +96,7 @@
                 </StackPanel>
 
                 <!-- 四张入口卡：只留图标 + 标题。描述文字占地方又没什么信息量，去掉后一行就够高 -->
+                <!-- 四个入口各带 x:Name：首次启动引导按名字定位并逐个聚焦（见 OnboardingPlan）。 -->
                 <Grid ColumnSpacing="10" Height="76">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*" />
@@ -104,7 +105,7 @@
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
 
-                    <Button Grid.Column="0" Padding="16,0"
+                    <Button x:Name="QuickTasksButton" Grid.Column="0" Padding="16,0"
                             Style="{StaticResource OverviewCardStyle}"
                             Click="OnOpenTasks">
                         <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
@@ -115,7 +116,7 @@
                         </StackPanel>
                     </Button>
 
-                    <Button Grid.Column="1" Padding="16,0"
+                    <Button x:Name="QuickStatsButton" Grid.Column="1" Padding="16,0"
                             Style="{StaticResource OverviewCardStyle}"
                             Click="OnOpenStats">
                         <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
@@ -126,7 +127,7 @@
                         </StackPanel>
                     </Button>
 
-                    <Button Grid.Column="2" Padding="16,0"
+                    <Button x:Name="QuickLogsButton" Grid.Column="2" Padding="16,0"
                             Style="{StaticResource OverviewCardStyle}"
                             Click="OnOpenLogs">
                         <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
@@ -137,7 +138,7 @@
                         </StackPanel>
                     </Button>
 
-                    <Button Grid.Column="3" Padding="16,0"
+                    <Button x:Name="QuickChannelsButton" Grid.Column="3" Padding="16,0"
                             Style="{StaticResource OverviewCardStyle}"
                             Click="OnOpenChannels">
                         <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">

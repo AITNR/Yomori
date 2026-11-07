@@ -9,7 +9,7 @@
     xmlns:models="using:Yomori.Models"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">
 
-    <Grid>
+    <Grid x:Name="RootGrid">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
@@ -530,5 +530,12 @@
                 </Grid>
             </NavigationView.Content>
         </NavigationView>
+
+        <!-- 首次启动引导覆盖层：只盖 Row 1（NavigationView 区域），标题栏拖拽区与
+             系统按钮不受影响；Canvas.ZIndex 保证压在页面与左侧菜单之上。 -->
+        <views:OnboardingOverlay x:Name="OnboardingLayer"
+                                 Grid.Row="1"
+                                 Canvas.ZIndex="100"
+                                 Visibility="Collapsed" />
     </Grid>
 </Window>

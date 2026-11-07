@@ -159,6 +159,12 @@ public sealed class MainViewModel : ObservableObject
         };
     }
 
+    /// <summary>
+    /// 本次启动是否为全新安装（config.json 由 <see cref="ConfigManager.Load"/> 新建）。
+    /// 首次启动引导据此自动弹出；升级安装恒为 false。
+    /// </summary>
+    public bool IsFreshInstall => _configManager.WasCreated;
+
     // ---------------- 通知中心（铃铛） ----------------
 
     /// <summary>通知中心。消息落盘在程序目录的 <c>notifications.json</c>。</summary>

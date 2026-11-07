@@ -33,10 +33,22 @@ public sealed class ConfigManager
 
     public string ConfigPath { get; }
 
+    /// <summary>
+    /// 本次 <see cref="Load"/> 是否新建了 config.json。文件不存在 = 全新安装后第一次启动，
+    /// 是「首次启动引导」唯一的自动弹出判据。
+    ///
+    /// <para>Load 在文件不存在时会立即把默认配置落盘，所以同一次安装里不会弹第二次；
+    /// 升级安装时 config.json 已存在，恒为 false，不会骚扰老用户。</para>
+    /// </summary>
+    public bool WasCreated { get; private set; }
+
     public AppConfig Load()
     {
+        WasCreated = false;
+
         if (!File.Exists(ConfigPath))
         {
+            WasCreated = true;
             var created = new AppConfig();
             Save(created);
             return created;

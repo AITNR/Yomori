@@ -61,7 +61,7 @@
                         <TextBlock Grid.Column="0" Text="通道" FontWeight="SemiBold" VerticalAlignment="Center" />
 
                         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
-                            <Button Content="新建通道" Click="OnAddChannel"
+                            <Button x:Name="AddChannelButton" Content="新建通道" Click="OnAddChannel"
                                     ToolTipService.ToolTip="加一条通道：填目标主机与账户，然后保存凭据" />
                             <Button Content="复制" Click="OnDuplicateChannel"
                                     ToolTipService.ToolTip="按当前选中的通道复制一条（凭据需要重新保存）" />

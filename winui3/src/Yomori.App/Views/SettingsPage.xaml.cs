@@ -60,6 +60,15 @@ public sealed partial class SettingsPage : Page
     /// </summary>
     private bool _rdpAutoDetectDone;
 
+    /// <summary>
+    /// 「重新观看开始引导」：一次性重播，不写配置、不改首次启动标记。
+    /// 放在设置页是为了让跳过引导的用户有回头路。
+    /// </summary>
+    private void OnRestartOnboarding(object sender, RoutedEventArgs e)
+    {
+        App.MainWindow?.RestartOnboarding();
+    }
+
     public SettingsPage()
     {
         InitializeComponent();
