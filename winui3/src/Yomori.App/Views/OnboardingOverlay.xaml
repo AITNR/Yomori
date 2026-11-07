@@ -40,7 +40,7 @@
                     Padding="18"
                     BorderBrush="{StaticResource YomoriAccentBrush}"
                     BorderThickness="1">
-                <StackPanel Spacing="10">
+                <StackPanel x:Name="BubbleContent" Spacing="10">
                     <TextBlock x:Name="StepTitle"
                                FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap" />
                     <TextBlock x:Name="StepBody"
@@ -49,7 +49,7 @@
 
                     <Image x:Name="StepImage"
                            Stretch="Uniform"
-                           HorizontalAlignment="Left"
+                           HorizontalAlignment="Center"
                            Visibility="Collapsed" />
                     <TextBlock x:Name="ImageErrorText"
                                Visibility="Collapsed"

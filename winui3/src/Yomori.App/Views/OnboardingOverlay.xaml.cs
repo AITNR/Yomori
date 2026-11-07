@@ -17,6 +17,15 @@ namespace Yomori.Views;
 /// </summary>
 public sealed partial class OnboardingOverlay : UserControl
 {
+    /// <summary>配图步骤的气泡上限：截图是这一步的主角，别把它挤在窄条里。</summary>
+    private const double ImageBubbleMaxWidth = 900;
+
+    /// <summary>普通步骤的气泡上限。</summary>
+    private const double TextBubbleMaxWidth = 460;
+
+    /// <summary>气泡与视口之间至少留的边距。</summary>
+    private const double ViewportMargin = 12;
+
     public OnboardingOverlay()
     {
         InitializeComponent();
@@ -54,8 +63,6 @@ public sealed partial class OnboardingOverlay : UserControl
         StepBody.Text = step.Body;
         ProgressText.Text = $"{index}/{total}";
 
-        RenderImage(step);
-
         var width = ActualWidth;
         var height = ActualHeight;
         FullGeometry.Rect = new Rect(0, 0, width, height);
@@ -75,10 +82,49 @@ public sealed partial class OnboardingOverlay : UserControl
             FocusBorder.Visibility = Visibility.Collapsed;
         }
 
-        PositionBubble(focus, width, height);
+        var hasImage = PrepareImage(step);
+        var bubbleMaxWidth = hasImage
+            ? Math.Min(ImageBubbleMaxWidth, Math.Max(320, width - 48))
+            : Math.Min(TextBubbleMaxWidth, Math.Max(200, width - 32));
+
+        // 配图步骤收紧内边距与行距，把腾出来的高度全给图片。
+        // 之前固定减 280 的做法在矮窗口里把 1804×1401 的截图压到 270px 宽，看不清标注。
+        Bubble.Padding = hasImage ? new Thickness(12) : new Thickness(18);
+        BubbleContent.Spacing = hasImage ? 6 : 10;
+        Bubble.MaxWidth = bubbleMaxWidth;
+
+        // 两阶段测量：先量「不含图片」的固有高度，再用剩余视口高度反推图片上限，
+        // 保证气泡整体不溢出窗口；比拍脑袋减一个常数精确得多。
+        StepImage.Visibility = Visibility.Collapsed;
+        Bubble.Measure(new Size(bubbleMaxWidth, double.PositiveInfinity));
+        var baseHeight = Bubble.DesiredSize.Height;
+
+        if (hasImage)
+        {
+            StepImage.MaxWidth = Math.Max(240, bubbleMaxWidth - 24);
+            StepImage.MaxHeight = Math.Max(160, height - baseHeight - 32);
+            StepImage.Visibility = Visibility.Visible;
+        }
+
+        Bubble.Measure(new Size(bubbleMaxWidth, double.PositiveInfinity));
+        var bubbleWidth = Bubble.DesiredSize.Width;
+        var bubbleHeight = Bubble.DesiredSize.Height;
+
+        // 正文特别长时仍可能超高：按超出的量把图片再压一档，不裁气泡
+        if (hasImage && bubbleHeight > height - 2 * ViewportMargin)
+        {
+            var overflow = bubbleHeight - (height - 2 * ViewportMargin);
+            StepImage.MaxHeight = Math.Max(120, StepImage.MaxHeight - overflow);
+            Bubble.Measure(new Size(bubbleMaxWidth, double.PositiveInfinity));
+            bubbleWidth = Bubble.DesiredSize.Width;
+            bubbleHeight = Bubble.DesiredSize.Height;
+        }
+
+        PositionBubble(focus, width, height, bubbleWidth, bubbleHeight);
     }
 
-    private void RenderImage(OnboardingStep step)
+    /// <summary>只准备图片源，尺寸与显隐交给 RenderStep 的两阶段测量。</summary>
+    private bool PrepareImage(OnboardingStep step)
     {
         StepImage.Source = null;
         StepImage.Visibility = Visibility.Collapsed;
@@ -86,7 +132,7 @@ public sealed partial class OnboardingOverlay : UserControl
 
         if (string.IsNullOrEmpty(step.ImageRelativePath))
         {
-            return;
+            return false;
         }
 
         try
@@ -96,48 +142,40 @@ public sealed partial class OnboardingOverlay : UserControl
             if (!File.Exists(path))
             {
                 ImageErrorText.Visibility = Visibility.Visible;
-                return;
+                return false;
             }
 
             StepImage.Source = new BitmapImage(new Uri(path, UriKind.Absolute));
-            StepImage.MaxWidth = Math.Max(200, Math.Min(520, ActualWidth - 80));
-            StepImage.MaxHeight = Math.Max(160, ActualHeight - 280);
-            StepImage.Visibility = Visibility.Visible;
+            return true;
         }
         catch (Exception)
         {
             // 图片坏了不能挡住引导结束：退回到文字说明
             ImageErrorText.Visibility = Visibility.Visible;
+            return false;
         }
     }
 
     /// <summary>
     /// 气泡优先放在目标下方，放不下改上方，再放不下居中；始终夹在视口内。
-    /// 先手动 Measure 拿 DesiredSize 再定 Canvas 坐标，避免用尚未布局完的 ActualWidth/Height。
+    /// 调用方已经 Measure 过，宽高直接传进来，避免用尚未布局完的 ActualWidth/Height。
     /// </summary>
-    private void PositionBubble(Rect focus, double width, double height)
+    private void PositionBubble(Rect focus, double width, double height, double bubbleWidth, double bubbleHeight)
     {
-        var available = Math.Min(460, Math.Max(200, width - 32));
-        // 显式设 MaxWidth：Canvas 布局时给的是无限空间，只靠 Measure 的入参约束不住
-        Bubble.MaxWidth = available;
-        Bubble.Measure(new Size(available, double.PositiveInfinity));
-        var bubbleWidth = Bubble.DesiredSize.Width;
-        var bubbleHeight = Bubble.DesiredSize.Height;
-
         double left;
         double top;
         if (focus.Width > 0 && focus.Height > 0)
         {
             left = focus.X;
             top = focus.Bottom + 14;
-            if (top + bubbleHeight > height - 12)
+            if (top + bubbleHeight > height - ViewportMargin)
             {
                 top = focus.Y - bubbleHeight - 14;
             }
 
-            if (top < 12)
+            if (top < ViewportMargin)
             {
-                top = Math.Max(12, (height - bubbleHeight) / 2);
+                top = Math.Max(ViewportMargin, (height - bubbleHeight) / 2);
             }
         }
         else
@@ -146,8 +184,8 @@ public sealed partial class OnboardingOverlay : UserControl
             top = (height - bubbleHeight) / 2;
         }
 
-        left = Math.Clamp(left, 12, Math.Max(12, width - bubbleWidth - 12));
-        top = Math.Clamp(top, 12, Math.Max(12, height - bubbleHeight - 12));
+        left = Math.Clamp(left, ViewportMargin, Math.Max(ViewportMargin, width - bubbleWidth - ViewportMargin));
+        top = Math.Clamp(top, ViewportMargin, Math.Max(ViewportMargin, height - bubbleHeight - ViewportMargin));
         Canvas.SetLeft(Bubble, left);
         Canvas.SetTop(Bubble, top);
     }
