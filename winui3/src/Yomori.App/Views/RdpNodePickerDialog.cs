@@ -87,7 +87,7 @@ internal sealed class RdpNodePickerDialog
         {
             Title = "选择下载节点",
             Content = panel,
-            PrimaryButtonText = "确定",
+            PrimaryButtonText = "确定并开始下载",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Primary,
             // 测速完成前不允许确认，避免选中还没排好序的第一项

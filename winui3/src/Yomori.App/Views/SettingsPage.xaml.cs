@@ -1658,13 +1658,13 @@ public sealed partial class SettingsPage : Page
     // ---------------- 远程桌面解锁：修改动作（M2–M4） ----------------
 
     /// <summary>
-    /// 解锁：系统修改风险确认 → 选择下载节点 → （缺组件时）下载前的杀软人工确认 → 开始。
+    /// 解锁：系统修改风险确认 → （缺组件时）下载前的杀软人工确认 → 选择下载节点 → 开始。
     /// </summary>
     /// <remarks>
     /// <para>三个对话框的**顺序**是计划书定的，不能合并：系统修改风险（3.2 第一层）、
-    /// 下载节点测速选择、下载前的人肉确认（3.2 第二层，只在需要下载时）。</para>
-    /// <para>杀软确认必须是最后一道弹窗：它的按钮是「确定并开始下载」，
-    /// 点完就该真的开始下载，不能再被别的界面顶掉或打断。</para>
+    /// 下载前的人肉确认（3.2 第二层，只在需要下载时）、下载节点测速选择。</para>
+    /// <para>最后一道是测速界面，按钮「确定并开始下载」—— 点它才真正开始下载。
+    /// 两个前置确认的按钮都是「继续」，不再许诺「开始下载」。</para>
     /// </remarks>
     private async void OnRdpUnlock(object sender, RoutedEventArgs e)
     {
@@ -1684,12 +1684,23 @@ public sealed partial class SettingsPage : Page
             return;
         }
 
+        // ---- 2. 下载前的人肉确认（计划书 3.2）----
+        var antivirusConfirmed = false;
+        if (needDownload)
+        {
+            if (!await RunOnUiAsync(queue, ConfirmAntivirusAsync))
+            {
+                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
+                return;
+            }
+
+            antivirusConfirmed = true;
+        }
+
         var network = UpdateNetworkSettings.FromConfig(VM.Config);
         var savedPrefix = VM.Config.RdpAccelerationPrefix;
 
-        // ---- 2. 选择下载节点：风险确认之后、下载前的人工确认之前 ----
-        // 杀软确认必须是下载前最后一道弹窗：它的按钮写着「确定并开始下载」，
-        // 点完就该真的开始下载，不能再被别的界面顶掉。
+        // ---- 3. 选择下载节点：两个确认弹窗都过完才弹 ----
         RdpAccelerationSettings acceleration;
         if (!needDownload && _rdpSnapshot?.IniState == RdpSupportState.FullySupported)
         {
@@ -1698,6 +1709,12 @@ public sealed partial class SettingsPage : Page
         }
         else
         {
+            // 连续弹窗留一拍：前一个 ContentDialog 关闭动画没走完就显示下一个，
+            // WinUI 会「Only a single ContentDialog can be open at any time」把前一个顶掉。
+            // 延迟放在调用方；后续对话框仍由 RunOnUiAsync 搬回界面线程，线程安全。
+            // （绝不能把 Task.Delay 放进 DialogHelper.ShowAsync：那里 await 后不保证回界面线程。）
+            await Task.Delay(150);
+
             var pick = await RunOnUiAsync(queue, async () =>
             {
                 var picker = new RdpNodePickerDialog(network, savedPrefix);
@@ -1723,19 +1740,6 @@ public sealed partial class SettingsPage : Page
             }
 
             acceleration = pick.Acceleration;
-        }
-
-        // ---- 3. 下载前的人肉确认（计划书 3.2）：必须是最后一道弹窗 ----
-        var antivirusConfirmed = false;
-        if (needDownload)
-        {
-            if (!await RunOnUiAsync(queue, ConfirmAntivirusAsync))
-            {
-                SetRdpAction("已取消：没有下载任何东西，也没有改动系统。");
-                return;
-            }
-
-            antivirusConfirmed = true;
         }
 
         var request = new RdpUnlockRequest
@@ -2022,7 +2026,7 @@ public sealed partial class SettingsPage : Page
         panel.Children.Add(new TextBlock
         {
             Text = "此操作将从 RDP Wrapper 官方 Releases 下载最新正式版。"
-                   + "请确认已关闭所有杀毒软件（包括系统自带防护及第三方安全软件）后再点击「确定并开始下载」。"
+                   + "请确认已关闭所有杀毒软件（包括系统自带防护及第三方安全软件）后再点击「继续」。"
                    + "Yomori 不检测、不验证也不修改杀毒软件状态。取消后不会开始下载。"
                    + "操作完成、失败或取消后，请及时重新开启安全防护。",
             TextWrapping = TextWrapping.Wrap,
@@ -2042,7 +2046,7 @@ public sealed partial class SettingsPage : Page
         {
             Title = "下载前确认",
             Content = panel,
-            PrimaryButtonText = "确定并开始下载",
+            PrimaryButtonText = "继续",
             CloseButtonText = "取消",
             DefaultButton = ContentDialogButton.Close,
             IsPrimaryButtonEnabled = false,
