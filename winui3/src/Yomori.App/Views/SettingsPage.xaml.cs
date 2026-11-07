@@ -2080,16 +2080,16 @@ public sealed partial class SettingsPage : Page
         RdpResultBar.Message = result.Summary;
         RdpResultBar.IsOpen = true;
 
-        // 步骤：界面只列骨架，说明一律进「运行日志」—— 十几步铺开会把结果条顶出屏幕
+        // 步骤：页面与运行日志都只记短行，完整明细留在「查看诊断」的报告里
         RdpStepsLines.Children.Clear();
         foreach (var step in result.Steps)
         {
             RdpStepsLines.Children.Add(BuildStepLine(step));
-            VM.AppendLog($"[RDP 解锁] {step.ToLine()}");
+            VM.AppendLog($"[RDP 解锁] {step.BriefLine()}");
         }
 
         RdpStepsTitle.Text = result.Steps.Count > 0
-            ? $"执行步骤（{result.Steps.Count} 步）· 明细见「运行日志」"
+            ? $"执行步骤（{result.Steps.Count} 步）· 明细见「查看诊断」"
             : "执行步骤";
         RdpStepsPanel.Visibility = result.Steps.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
 
@@ -2109,7 +2109,7 @@ public sealed partial class SettingsPage : Page
             SetRdpAction($"{title} 结束：{(result.Success ? "成功" : "未全部成功")} —— {DateTime.Now:HH:mm:ss}");
         }
 
-        VM.AppendLog($"[RDP 解锁] {title}：{result.Summary}");
+        VM.AppendLog($"[RDP 解锁] {title}：{(result.Success ? "完成" : "未全部成功")}");
 
         // 失败时把完整报告留一份，用户点「查看诊断」就能拿到逐步现场
         _rdpLastReport = result.FormatReport();
@@ -2119,18 +2119,18 @@ public sealed partial class SettingsPage : Page
     /// 一行步骤。
     /// </summary>
     /// <remarks>
-    /// 通过 / 跳过的步骤只写「等级 + 标题」，说明部分写进运行日志 —— 本页要回答的是
-    /// 「走到第几步」，不是审计正文。注意 / 失败例外：它必须在本页就说清哪里不对，
-    /// 否则用户得先翻日志才知道出了什么事。
+    /// 所有等级统一只画「等级 + 标题」的短行（十个字以内）。本页要回答的是
+    /// 「走到第几步、哪一步出事」，不是审计正文；完整说明只留在「查看诊断」的报告里。
+    /// 以前 Warn / Fail 会把整段 Detail 直接铺在本页，十几步展开后整列都是长句，
+    /// 反而看不清。
     /// </remarks>
     private static FrameworkElement BuildStepLine(RdpStepRecord step)
     {
-        var needsDetail = step.Outcome is RdpStepOutcome.Warn or RdpStepOutcome.Fail;
         var panel = new StackPanel { Spacing = 1 };
 
         panel.Children.Add(new TextBlock
         {
-            Text = needsDetail ? step.ToLine() : step.BriefLine(),
+            Text = step.BriefLine(),
             FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
             Foreground = StepBrush(step.Outcome),

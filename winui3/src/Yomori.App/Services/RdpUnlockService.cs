@@ -113,7 +113,7 @@ public static class RdpUnlockService
 
             if (stale.Message.Length > 0)
             {
-                Add(steps, "stale", "收尾上一次未完成的事务", RdpStepOutcome.Warn, stale.Message);
+                Add(steps, "stale", "收尾未完成事务", RdpStepOutcome.Warn, stale.Message);
             }
             Add(steps, "precheck", "只读预检", before.AllPass ? RdpStepOutcome.Ok : RdpStepOutcome.Warn,
                 $"Wrapper={RdpProbeText.WrapperLabel(before.WrapperState)}，"
@@ -201,7 +201,7 @@ public static class RdpUnlockService
                     }
 
                     installer = manual;
-                    Add(steps, "manual", "使用手动指定的安装包", RdpStepOutcome.Warn,
+                    Add(steps, "manual", "手动指定安装包", RdpStepOutcome.Warn,
                         $"{Path.GetFileName(request.ManualInstallerPath)}（{manual.SizeBytes} 字节，"
                         + $"sha256={Short(manual.Sha256)}）；来源由用户提供，未与官方摘要比对。");
                 }
@@ -530,6 +530,10 @@ public static class RdpUnlockService
             // ---- 7. 备份 INI + Update INI ----
             var iniUpdated = false;
             var iniFailure = "";
+            // INI 拿不到的两种原因必须分开说：网络断了 / 社区还没适配当前版本。
+            // 以前汇总里写「通常是上不了 GitHub 或这个系统版本还没被社区覆盖」，
+            // 用户看完仍不知道自己属于哪一种（2026-11-07 反馈）。
+            var iniNotAdapted = false;
 
             // ⚠️ 判据用**安装之后**的状态，不是安装之前那个 before：
             // 全新机器上 before 是「未知」（那时还没有 INI 文件），拿它判必然要走一次在线更新；
@@ -600,9 +604,11 @@ public static class RdpUnlockService
                         // 不再因为取不到 INI 就把整轮判死并回滚：组件已经装好了，
                         // 回滚等于让用户从头再下一遍、再装一遍（2026-10-26 真机就是这个后果，
                         // 还顺带弹了个 CnC 的错）。
-                        // 取不到 INI 是「上不了 GitHub」或「这个系统版本还没被覆盖」，
-                        // 两种都不是回滚能解决的问题 —— 交给最后的内置检测如实说 Support 未覆盖。
+                        // 取不到 INI 是「网络问题」或「没有适配」，两种都不是回滚能解决的，
+                        // 交给最后的内置检测如实说 Support 未覆盖。原因分类往上带，
+                        // 让汇总条只说一种，不再把两种揉成「通常是 A 或 B」。
                         iniFailure = acquired.Message + IniManualHint(installDir);
+                        iniNotAdapted = acquired.NotAdapted;
                         Add(steps, "ini", "更新 INI", RdpStepOutcome.Warn, iniFailure);
                     }
                 }
@@ -701,17 +707,18 @@ public static class RdpUnlockService
                     ? "本机已经处于解锁状态，本轮没有需要改动的地方（注册表与 INI 都无需更新），服务也没有重启。"
                     : "成功，可以前往「设置 → 账户 → 其他用户」里添加新用户。添加完成后，在 Yomori 通道管理中保存该账户。"
                 : iniFailure.Length > 0
-                    ? "组件已安装，但本机 rdpwrap.ini 没能更新 —— 所以远程桌面暂时还用不了。"
-                      + "这一步失败通常是上不了 GitHub（该命令要联网）或这个系统版本还没被社区覆盖，"
-                      + "换 INI 也解决不了的情况只能等上游。"
-                      + "拿到能覆盖本机版本的 INI 后点「指定 INI」，再点一次「解锁 RDP」即可，不需要重装。"
-                : needsReboot
-                    ? "解锁组件已安装，但远程桌面监听（RDP-Tcp）还没出现，所以现在还不能远程登录。"
-                      + "请重启电脑，开机后再点「重新检测」——系统刚更新过时这一条尤其常见。"
-                    : final.SupportState == RdpSupportState.NotSupported
-                        ? "当前系统版本在本机 INI 中未找到完整支持项，可能是系统较新、社区暂未覆盖，也可能是 INI 更新未成功。"
-                          + "当前 FileVersion、INI 更新结果和版本匹配详情见下方诊断。"
-                        : "解锁流程已执行，但内置检测没有全部通过。逐项结果见下方诊断。";
+                    ? iniNotAdapted
+                        ? "没有适配：rdpwrap.ini 里没有当前系统版本的段。组件已装好，但远程桌面暂不可用；"
+                          + "需等社区补上该版本，拿到含该段的 INI 后点「指定 INI」再解锁一次，不需要重装。"
+                        : "网络问题：rdpwrap.ini 下载失败。组件已装好，但 INI 没能更新，远程桌面暂不可用；"
+                          + "检查网络或代理设置后重试，也可点「指定 INI」手动提供文件，不需要重装。"
+                    : needsReboot
+                        ? "解锁组件已安装，但远程桌面监听（RDP-Tcp）还没出现，所以现在还不能远程登录。"
+                          + "请重启电脑，开机后再点「重新检测」——系统刚更新过时这一条尤其常见。"
+                        : final.SupportState == RdpSupportState.NotSupported
+                            ? "没有适配：本机 rdpwrap.ini 不含当前系统版本的段，远程桌面暂不可用。"
+                              + "需等社区补上该版本，或点「指定 INI」手动提供。详情见「查看诊断」。"
+                            : "解锁流程已执行，但内置检测没有全部通过。逐项结果见下方诊断。";
 
             RdpTransactionStore.Finish(
                 manifest,
@@ -1181,6 +1188,7 @@ public static class RdpUnlockService
 
         failures.Add(online.Message);
         Add(steps, "ini-online", "在线下载 INI", RdpStepOutcome.Warn, online.Message);
+        var notAdapted = online.NotAdapted;
 
         // ---- 3. 回退给 RDPWInst -w ----
         // 先看工具在不在：上游 Release 安装器不带 RDPWInst.exe，
@@ -1189,18 +1197,19 @@ public static class RdpUnlockService
         {
             failures.Add("安装目录里没有 RDPWInst.exe —— 上游的 Release 安装器不带这个控制台工具，"
                          + "所以在这里没法用工具在线更新 INI（CnC 的「Update ini」按钮同样会报 not found）。");
-            return new IniAcquisition(false, string.Join("；", failures), false, false);
+            return new IniAcquisition(false, string.Join("；", failures), false, false, notAdapted);
         }
 
         var update = await UpdateIniAsync(manifest, installDir, version, steps, cancellationToken)
             .ConfigureAwait(false);
         if (update.Ok)
         {
-            return new IniAcquisition(true, update.Message, true, false);
+            return new IniAcquisition(true, update.Message, true, false, notAdapted);
         }
 
         failures.Add(update.Message);
-        return new IniAcquisition(false, string.Join("；", failures), false, update.Unknown);
+        return new IniAcquisition(false, string.Join("；", failures), false, update.Unknown,
+            notAdapted || update.NotAdapted);
     }
 
     /// <summary>
@@ -1215,7 +1224,7 @@ public static class RdpUnlockService
     /// 上游这份文件没有签名与摘要可比，INI 又是滚动更新的，所以<b>不设固定哈希</b>（D3）。
     /// 这话要如实写进步骤说明，不能让它看起来像「验过发布者」。</para>
     /// </remarks>
-    private static async Task<(bool Ok, string Message)> DownloadIniAsync(
+    private static async Task<(bool Ok, string Message, bool NotAdapted)> DownloadIniAsync(
         RdpTransactionManifest manifest,
         string iniPath,
         string version,
@@ -1228,6 +1237,9 @@ public static class RdpUnlockService
             "rdpwrap.ini" + RdpToolDownloader.PartialExtension);
 
         var failures = new List<string>();
+        // 只要有一条路径真的下到了像 INI 的内容、却没有当前构建号的段，
+        // 就是「社区还没适配」，与网络通不通无关。
+        var notAdapted = false;
 
         try
         {
@@ -1266,6 +1278,14 @@ public static class RdpUnlockService
                     || !text.Contains("Updated=", StringComparison.Ordinal)
                     || !IniCovers(text, version))
                 {
+                    // 内容本身是 INI（有 [Main] / Updated=），只是不含 [{version}] 段
+                    // —— 这是「没有适配」；反代塞回来的网页归网络/来源问题。
+                    if (text.Contains("[Main]", StringComparison.Ordinal)
+                        && text.Contains("Updated=", StringComparison.Ordinal))
+                    {
+                        notAdapted = true;
+                    }
+
                     failures.Add($"[{candidate.Source}] 内容不像可用的 rdpwrap.ini（缺 [Main] / Updated= / [{version}] 段），换下一源");
                     continue;
                 }
@@ -1282,16 +1302,16 @@ public static class RdpUnlockService
                 return (true, $"已从 {candidate.Source} 下载 INI 并写入（{info.Length} 字节，"
                               + $"{IniSectionCount(text)} 个段"
                               + (updated.Length > 0 ? $"，Updated={updated}" : "")
-                              + "；来源为社区维护的纯文本配置，无签名与摘要可比对）");
+                              + "；来源为社区维护的纯文本配置，无签名与摘要可比对）", false);
             }
         }
         catch (OperationCanceledException)
         {
-            return (false, "在线下载 rdpwrap.ini 被取消。");
+            return (false, "在线下载 rdpwrap.ini 被取消。", false);
         }
         catch (Exception ex)
         {
-            return (false, $"在线下载 rdpwrap.ini 失败：{ex.GetType().Name}: {ex.Message}");
+            return (false, $"在线下载 rdpwrap.ini 失败：{ex.GetType().Name}: {ex.Message}", false);
         }
         finally
         {
@@ -1300,7 +1320,7 @@ public static class RdpUnlockService
         }
 
         var reason = failures.Count > 0 ? string.Join("；", failures) : "没有可用的 INI 来源";
-        return (false, "在线下载 rdpwrap.ini 失败：" + reason);
+        return (false, "在线下载 rdpwrap.ini 失败：" + reason, notAdapted);
     }
 
     private static void TryDeleteFile(string path)
@@ -1321,8 +1341,11 @@ public static class RdpUnlockService
     /// <summary>
     /// 取 INI 的结果。<see cref="Unknown"/> 为真表示工具结果不明（超时且进程可能还在写文件），
     /// 调用方必须停手，而不是当成普通「注意」继续重启服务。
+    /// <see cref="NotAdapted"/> 表示至少有一条路径**下到了内容**，但里面没有当前构建号的段 ——
+    /// 也就是社区还没适配，跟网络能不能通无关；汇总条据此只说一种原因。
     /// </summary>
-    private readonly record struct IniAcquisition(bool Ok, string Message, bool Changed, bool Unknown);
+    private readonly record struct IniAcquisition(
+        bool Ok, string Message, bool Changed, bool Unknown, bool NotAdapted = false);
 
     /// <summary>把一个本地 INI 文件应用到安装目录（先备份，再校验，最后原子替换）。</summary>
     private static (bool Ok, string Message) ApplyIniFile(
@@ -1425,7 +1448,7 @@ public static class RdpUnlockService
     /// 「系统代理这条路也上不了 GitHub」，不说明本机 INI 有问题。
     /// 因此调用方只在「本地 INI 确实不覆盖当前版本」时才该跑它。
     /// </remarks>
-    private static async Task<(bool Ok, string Message, bool Unknown)> UpdateIniAsync(
+    private static async Task<(bool Ok, string Message, bool Unknown, bool NotAdapted)> UpdateIniAsync(
         RdpTransactionManifest manifest,
         string installDir,
         string version,
@@ -1434,13 +1457,13 @@ public static class RdpUnlockService
     {
         if (string.IsNullOrWhiteSpace(installDir))
         {
-            return (false, "不知道安装目录，无法定位 RDPWInst.exe", false);
+            return (false, "不知道安装目录，无法定位 RDPWInst.exe", false, false);
         }
 
         var tool = Path.Combine(installDir, "RDPWInst.exe");
         if (!File.Exists(tool))
         {
-            return (false, $"安装目录里没有 RDPWInst.exe：{installDir}", false);
+            return (false, $"安装目录里没有 RDPWInst.exe：{installDir}", false, false);
         }
 
         // 更新前的 INI 再备份一次：安装器可能已经动过它
@@ -1465,14 +1488,14 @@ public static class RdpUnlockService
             return (false,
                 $"-w 在 {IniTimeout.TotalSeconds:0} 秒内未结束，结果不明（未强制结束）"
                 + (toolRunning ? $"；它还在运行（{toolDetail}）" : ""),
-                true);
+                true, false);
         }
 
         if (run.ExitCode != 0)
         {
             return (false,
                 $"-w 退出码 {run.ExitCode}（它只走系统代理，不认本程序设的代理；该步需联网访问 GitHub）",
-                false);
+                false, false);
         }
 
         // 成功退出不等于已更新：回读正文，确认它真的含当前构建的段。
@@ -1489,7 +1512,7 @@ public static class RdpUnlockService
                 $"-w 退出码 0，写入的 INI 只有 {IniSectionCount(text)} 个段、不含 [{version}] 段"
                 + "（下载失败后回落的内置样本）"
                 + (restored ? "；已换回安装前那份" : ""),
-                false);
+                false, true);
         }
 
         var updated = ReadIniUpdated(iniPath);
@@ -1497,7 +1520,7 @@ public static class RdpUnlockService
             $"已写入含 [{version}] 段的 INI（{IniSectionCount(text)} 个段"
             + (updated.Length > 0 ? $"，Updated={updated}" : "") + "）");
 
-        return (true, "", false);
+        return (true, "", false, false);
     }
 
     private static string ReadIniUpdated(string iniPath)
@@ -1726,7 +1749,7 @@ public static class RdpUnlockService
             });
         }
 
-        Add(steps, "residue", "第三方界面进程仍在运行", RdpStepOutcome.Warn,
+        Add(steps, "residue", "界面进程仍在运行", RdpStepOutcome.Warn,
             $"安装器拉起了 {string.Join("、", pids)}，窗口在隐藏桌面；不影响使用，重启后消失。");
     }
 
@@ -1805,13 +1828,13 @@ public static class RdpUnlockService
         try
         {
             File.Copy(older, iniPath, overwrite: true);
-            Add(steps, "ini-restore", "恢复历史 INI 备份",
+            Add(steps, "ini-restore", "恢复历史 INI",
                 RdpStepOutcome.Warn,
                 $"安装器自带的 INI 不含 [{version}] 段，已从历史事务换回一份含该段的 INI。");
         }
         catch (Exception ex)
         {
-            Add(steps, "ini-restore", "恢复历史 INI 备份", RdpStepOutcome.Fail,
+            Add(steps, "ini-restore", "恢复历史 INI", RdpStepOutcome.Fail,
                 $"从 {older} 复制到 {iniPath} 失败：{ex.GetType().Name}: {ex.Message}");
         }
     }
