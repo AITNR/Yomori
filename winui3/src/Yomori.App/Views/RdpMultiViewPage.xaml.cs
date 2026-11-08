@@ -56,8 +56,8 @@ public sealed partial class RdpMultiViewPage : Page
             cell.ConnectRequested += OnCellConnect;
         }
 
-        // 锁定 / 静音这类开关变了要立刻反映到格子顶部条，不能等下一拍 1Hz
-        VM.SurfaceRefreshRequested += OnSurfaceRefreshRequested;
+        // SurfaceRefreshRequested 改在 OnNavigatedTo 成对订阅：OnNavigatedFrom 会退订，
+        // 只在构造函数订一次的话，切页回来后这条即时刷新就永久失效。
     }
 
     private void OnSurfaceRefreshRequested()
@@ -77,11 +77,18 @@ public sealed partial class RdpMultiViewPage : Page
     {
         base.OnNavigatedTo(e);
 
+        // 与 OnNavigatedFrom 成对：先退后订保证重复导航时也只订一次。
+        VM.SurfaceRefreshRequested -= OnSurfaceRefreshRequested;
+        VM.SurfaceRefreshRequested += OnSurfaceRefreshRequested;
+
         _pageAlive = true;
         _gridPage = 0;
         LayoutSurfaces();
 
-        // 与主控端 1Hz 轮询同节奏刷新展示
+        // 与主控端 1Hz 轮询同节奏刷新展示。重复导航先停掉上一实例，
+        // 否则旧定时器不会自动回收，会累积成每拍多次重排。
+        _refreshTimer?.Stop();
+        _refreshTimer = null;
         _refreshTimer = DispatcherQueue.CreateTimer();
         _refreshTimer.Interval = TimeSpan.FromSeconds(1);
         _refreshTimer.IsRepeating = true;

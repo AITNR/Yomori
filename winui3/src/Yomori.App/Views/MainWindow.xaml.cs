@@ -107,6 +107,10 @@ public sealed partial class MainWindow : Window
 
         AppWindow.Changed += OnAppWindowChanged;
 
+        // 窗口重新可见/激活是「把画面叫回来」的可靠信号：AppWindow.Changed 在最小化还原时
+        // 不一定带 DidPresenterChange，单靠它会把遮挡闸门永久停在暂停态（2026-11-08 黑屏）。
+        Activated += OnWindowActivated;
+
         // 关闭按钮不再等于退出：先按策略决定"收进状态栏"还是"真退"。
         // 注意这是**同步**事件，处理器里不能 await —— 处理方式是先 Cancel 拦下来，再去问。
         AppWindow.Closing += OnAppWindowClosing;
@@ -324,8 +328,46 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// 按窗口当前实际状态同步内嵌画面的遮挡闸门。幂等，所有窗口状态入口都调它。
+    ///
+    /// <para>判据必须同时含 <c>_hiddenToTray</c>：<c>AppWindow.Hide()</c> 不改变
+    /// <c>OverlappedPresenter.State</c>，只看 State 会把「已收进状态栏」误判成可见。</para>
+    ///
+    /// <para>不依赖 <c>AppWindowChangedEventArgs</c> 的任何标志位：最小化还原时
+    /// <c>DidPresenterChange</c> 可能不触发，事件回调里读 State 也可能有竞态，
+    /// 那种情况下闸门会永久停在「暂停」，表现为画面定格、切页后全黑（2026-11-08）。</para>
+    /// </summary>
+    private void SyncOcclusionGate()
+    {
+        var minimized = (AppWindow.Presenter as OverlappedPresenter)?.State
+                        == OverlappedPresenterState.Minimized;
+        if (_hiddenToTray || minimized)
+        {
+            RdpView.SuspendAllForHiddenWindow();
+        }
+        else
+        {
+            RdpView.ResumeAllForHiddenWindow();
+        }
+    }
+
+    /// <summary>窗口获得焦点即可视为可见，兜底解除遮挡闸门。失焦分支不做任何 Suspend。</summary>
+    private void OnWindowActivated(object sender, WindowActivatedEventArgs args)
+    {
+        // 焦点变化不等于窗口隐藏，也不等于会话锁定 —— Deactivated 绝不能拿来置暂停。
+        if (args.WindowActivationState != WindowActivationState.Deactivated)
+        {
+            SyncOcclusionGate();
+        }
+    }
+
     private void OnAppWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
     {
+        // 闸门同步放在最前：任何 AppWindow 变化都按当前实际状态重判一次，
+        // 不受下面「只关心几何变化」的 early-return 影响。
+        SyncOcclusionGate();
+
         if (!args.DidSizeChange && !args.DidPositionChange && !args.DidPresenterChange)
         {
             return;
@@ -334,21 +376,6 @@ public sealed partial class MainWindow : Window
         // 重复调用即刷新倒计时：手停下 PlacementSaveDebounceMs 后才真正写盘
         _placementSaveTimer.Stop();
         _placementSaveTimer.Start();
-
-        // 最小化期间停掉所有画面的抓帧与呈现：会话/解码不动，只是不再往屏幕上画。
-        // 这是"专用工作集能不能降下来"的关键 —— 一直 Present 就等于一直把
-        // staging/纹理/解码表面按在内存里，系统没有机会裁剪。
-        if (args.DidPresenterChange)
-        {
-            if ((AppWindow.Presenter as OverlappedPresenter)?.State == OverlappedPresenterState.Minimized)
-            {
-                RdpView.SuspendAllForHiddenWindow();
-            }
-            else
-            {
-                RdpView.ResumeAllForHiddenWindow();
-            }
-        }
     }
 
     /// <summary>
@@ -563,11 +590,13 @@ public sealed partial class MainWindow : Window
         // 与本机头号未修问题同族，这里先把它停掉。
         SuspendSurfaceRefresh();
 
-        // 收进托盘同样属于"用户看不见"：一并停掉抓帧与呈现（同最小化）。
-        RdpView.SuspendAllForHiddenWindow();
-
-        AppWindow.Hide();
+        // 顺序要紧：先置 _hiddenToTray，再 Hide，最后统一同步闸门。
+        // AppWindow.Hide() 会触发 AppWindow.Changed → SyncOcclusionGate()；
+        // 若置位晚于 Hide，那一拍会把「已隐藏」误判成可见，把刚停的呈现又打开，
+        // 隐藏期间继续 Present，工作集裁剪就失效了（2026-11-08）。
         _hiddenToTray = true;
+        AppWindow.Hide();
+        SyncOcclusionGate();
 
         UpdateTrayState();
 
@@ -605,8 +634,10 @@ public sealed partial class MainWindow : Window
 
         ClampWindowIntoView();
         ResumeSurfaceRefresh();
-        RdpView.ResumeAllForHiddenWindow();
         ActivateWindow();
+        // 收口放在最后：Maximize / Restore / Activate 都可能触发 AppWindow.Changed，
+        // 由 SyncOcclusionGate 按最终状态统一判定，避免中途把闸门又置回暂停。
+        SyncOcclusionGate();
     }
 
     private void ActivateWindow()
@@ -632,6 +663,9 @@ public sealed partial class MainWindow : Window
         {
             // 抢焦点失败无所谓
         }
+
+        // 放在 try/catch 外：即便抢焦点抛异常被吞，闸门也必须按当前状态同步一次。
+        SyncOcclusionGate();
     }
 
     /// <summary>把窗口钳制回某个显示器的可见区域内（复用 WindowPlacement 的"标题栏至少露出"规则）。</summary>

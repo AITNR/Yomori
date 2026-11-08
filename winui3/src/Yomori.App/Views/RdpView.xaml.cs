@@ -32,6 +32,7 @@ namespace Yomori.Views
         private bool _mappedCopyUnsupportedLogged; // 直填导出实调用缺失只提示一次（诊断用）
         private bool _initQueued;              // 惰性初始化已排队（防高频帧重复排队泄漏渲染器）
         private bool _renderSuspended;         // 全屏时页面内渲染器挂起，避免双路渲染
+        private bool _occlusionLogged;         // 遮挡闸门变化诊断只记一次（不逐拍刷屏）
         private long _lastFrameArrivedTick;    // 最近一次 end_paint（原生线程写，帧节奏统计用）
         private Microsoft.UI.Dispatching.DispatcherQueueTimer? _presentTimer;  // 16ms 呈现节拍器（≈60Hz）
         private static long s_liveSoftRenderStates;
@@ -290,6 +291,8 @@ namespace Yomori.Views
         /// <summary>接管外部 client（全屏窗口复用同一会话时用）。</summary>
         public void AttachClient(RdpEmbeddedClient client)
         {
+            // DetachClient 会顺带复位 _renderSuspended / _occlusionLogged，
+            // 保证接管一条已连上的会话时不会继承上一个实例的挂起态。
             DetachClient();
 
             // 同 Connect：入口处同步一次渲染后端选择。
@@ -363,6 +366,10 @@ namespace Yomori.Views
             }
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
+            // 交接/切页后本实例不再处于全屏挂起态；该标志原先从不复位，
+            // 会像遮挡闸门一样跨重建残留，使新 renderer 永不呈现（2026-11-08）。
+            _renderSuspended = false;
+            _occlusionLogged = false;
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -407,6 +414,10 @@ namespace Yomori.Views
             _client = null;
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出
             System.Threading.Interlocked.Increment(ref _renderGeneration);
+            // 交接/切页后本实例不再处于全屏挂起态；该标志原先从不复位，
+            // 会像遮挡闸门一样跨重建残留，使新 renderer 永不呈现（2026-11-08）。
+            _renderSuspended = false;
+            _occlusionLogged = false;
             _renderer?.Dispose();
             _renderer = null;
             _initQueued = false;
@@ -800,6 +811,17 @@ namespace Yomori.Views
         /// </summary>
         private void OnPresentTick(object? sender, object e)
         {
+            // 闸门翻转只记一行诊断：这次故障最难查的就是「静默黑屏」——
+            // 帧与解码都在跑、日志里却没有任何线索（2026-11-08）。
+            var occluded = s_windowOccluded;
+            if (occluded != _occlusionLogged)
+            {
+                _occlusionLogged = occluded;
+                DiagnosticLog?.Invoke(occluded
+                    ? "[embed] 呈现已暂停：窗口隐藏闸门生效，帧与解码继续"
+                    : "[embed] 呈现已恢复：窗口隐藏闸门解除，补抓首帧");
+            }
+
             if (_renderSuspended)
             {
                 return;
@@ -807,7 +829,7 @@ namespace Yomori.Views
 
             // 窗口看不见时不做任何抓帧/上传/Present：会话与解码照常跑，只是不往屏幕上画。
             // 恢复后必须补一帧 —— 远端桌面可能自始至终没变化，拿不到新的 FrameArrived。
-            if (s_windowOccluded)
+            if (occluded)
             {
                 _resumeNeedsFirstFrame = true;
                 return;
