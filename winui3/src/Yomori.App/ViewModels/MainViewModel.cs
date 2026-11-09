@@ -3249,14 +3249,17 @@ public sealed class MainViewModel : ObservableObject
 
             AppendLog($"[会话通道] 通道「{channel.DisplayName}」已{(enabled ? "启用" : "停用")}"
                       + "，改动在下一次「开始执行」生效。");
-
-            // 左侧「会话通道」子项只列启用中的通道 → 开关一拨就得重算。
-            // 事件在 finally 之前发，但窗口那边自己会延后一拍重建，不会落在 Toggled 栈里。
-            RaiseChannelMenuChanged();
         }
         finally
         {
             _syncingScopeToggle = false;
+
+            // 「用户拨了开关」就必须重算一次左侧「会话通道」子菜单，**不管这次有没有真的写进配置**。
+            // 以前只在值真的变了（写盘之后）才发信号：一旦界面开关与配置因 ChannelScopes
+            // 重建 / ListView 容器复用而不同步，就会走进「值没变」的空转分支，菜单永远不刷新。
+            // 窗口那边自己延后一拍并合并重复触发；本地执行 / 空转这类无内容变化的情况
+            // 会被签名短路消化掉，不会落在 Toggled 栈里，也没有额外副作用。
+            RaiseChannelMenuChanged();
         }
     }
 

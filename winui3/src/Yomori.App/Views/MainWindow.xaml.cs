@@ -1738,38 +1738,27 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// 菜子里该列哪些通道：① 配置里启用中的通道（不跑任务也能点进去手动连画面看）；
-    /// ② 本轮在跑的通道（含配置里已删 / 已停用的 —— 在跑就必须看得见）。
+    /// 子菜单里该列哪些通道：① 配置里启用中的通道（不跑任务也能点进去手动连画面看）；
+    /// ② 本轮**还没收尾**的远程会话（含配置里已删 / 已停用的 —— 还在跑就必须看得见）。
+    ///
+    /// <para>判定全部交给 <see cref="ChannelMenuPolicy"/>（Models 层纯函数），这里只做取数与映射：
+    /// 冒烟能脱离 WinUI 直接跑行为断言，不必靠源码文字锚点盯页面里的 if。</para>
+    ///
+    /// <para>🔑 ② 以前写的是 <c>Where(s => s.IsRemote)</c>，但 <c>IsRemote</c> 只表示
+    /// 「这是远程通道」，跟是否在跑无关；<c>_sessions</c> 又只在「开始执行」时清空，
+    /// 于是跑过一轮的旧通道会被永久加回菜单 —— 停用也关不掉（2026-11-09 实测）。
+    /// 现在按「未收尾」判定，会话结束后就不再常驻。</para>
     /// </summary>
     private List<(string Id, string Name, string Tooltip)> EnumerateChannelMenuEntries()
     {
-        var entries = new List<(string, string, string)>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var configured = VM.Config.Rdp.Channels.Select(channel => new ChannelMenuChannel(
+            channel.Id, channel.DisplayName, channel.Host, channel.User, channel.Enabled));
 
-        foreach (var channel in VM.Config.Rdp.Channels)
-        {
-            if (!channel.Enabled || string.IsNullOrWhiteSpace(channel.Id) || !seen.Add(channel.Id))
-            {
-                continue;
-            }
+        var sessions = VM.Sessions.Select(session => new ChannelMenuSession(
+            session.ChannelId, session.DisplayName, session.TargetHost, session.TargetUser,
+            session.StatusText, session.IsRemote, session.CompletionReported));
 
-            entries.Add((channel.Id, channel.DisplayName, $"{channel.Host} / {channel.User}"));
-        }
-
-        foreach (var session in VM.Sessions.Where(s => s.IsRemote))
-        {
-            if (!seen.Add(session.ChannelId))
-            {
-                continue;
-            }
-
-            entries.Add((
-                session.ChannelId,
-                session.DisplayName,
-                $"{session.TargetHost} / {session.TargetUser} · {session.StatusText}"));
-        }
-
-        return entries;
+        return ChannelMenuPolicy.BuildEntries(configured, sessions);
     }
 
     private void OnNavigationSelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
