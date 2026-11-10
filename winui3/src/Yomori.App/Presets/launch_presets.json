@@ -820,6 +820,24 @@
       "checkedOn": "2026-10-28",
       "frontend": "mfw",
       "manualHint": "指定配置手写：--direct-run --config-id c_xxxx",
+      "log": {
+        "dirs": [
+          "debug"
+        ],
+        "pattern": "maafw.log",
+        "encoding": "auto",
+        "followTail": true,
+        "recursive": false,
+        "keywords": [
+          "TaskChainError",
+          "SubTaskError"
+        ],
+        "enabled": true,
+        "summary": "命令行入口 mab.exe 只写 MaaFW 内核日志；gui.log 仅 MFW.exe 图形前端启动时才写（实测任务运行期间停在 10-23 不动）。要看 Python 侧任务流转，手动开 MFW.exe 跑一次并把模式改成 gui.log",
+        "source": "本机实测 D:\\Program Files\\bh\\MAA_bbb（修改完成_1023_0301）\\debug：运行期间只有 maafw.log 增长",
+        "checkedOn": "2026-11-10",
+        "confidence": "measured"
+      },
       "cleanup": {
         "launcher": [],
         "main": [],
