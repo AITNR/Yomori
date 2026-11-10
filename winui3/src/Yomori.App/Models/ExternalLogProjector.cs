@@ -144,6 +144,22 @@ public sealed class MaafwDetails
         return _focusMap.TryGetValue("*", out var any) ? any : string.Empty;
     }
 
+    /// <summary>
+    /// focus 是**单键对象**时返回该键的值，多键或没有 focus 返回空串。
+    ///
+    /// <para>为什么需要：MaaEnd 实测把提示写在与当前事件不同的键上 ——
+    /// <c>[msg=Node.Recognition.Starting]</c> 配
+    /// <c>{"focus":{"Node.Recognition.Succeeded":"环境监测菜单未解锁"}}</c>。
+    /// <see cref="FocusFor"/> 按事件名精确匹配取不到，通用投影器因此丢掉这条中文提示。
+    /// MaaEnd 专属适配器在精确匹配落空后调用本方法补回。仅追加方法，不改任何投影逻辑。</para>
+    /// </summary>
+    public string SingleFocus()
+    {
+        if (_focusMap is null || _focusMap.Count != 1) { return string.Empty; }
+        foreach (var value in _focusMap.Values) { return value; }
+        return string.Empty;
+    }
+
     private Dictionary<string, string>? _focusMap;
 
     /// <summary>解析失败一律返回空对象（调用方按"没有字段"处理，不抛）。</summary>

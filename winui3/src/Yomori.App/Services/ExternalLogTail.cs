@@ -764,9 +764,19 @@ public sealed class ExternalLogTail : IDisposable
     {
         if (Interlocked.Exchange(ref _labelsLoading, 1) == 1) { return; }
         var directory = baseDirectory;
+        // 构造时捕获一次：适配器在整份文件生命周期内只绑定一次，
+        // 这里拿局部引用即可，不必与内容探针期的 _adapter 写入抢锁。
+        var labelAware = _adapter as IExternalLogLabelAware;
         _ = Task.Run(() =>
         {
-            try { _projector.SetLabels(LogLabelStore.Get(directory)); }
+            try
+            {
+                var map = LogLabelStore.Get(directory);
+                _projector.SetLabels(map);
+                // 已适配族（目前只有 MaaEnd）也要拿中文任务名 / 节点名：
+                // 它不再走投影器，缺了这张表界面上就只剩英文 entry。
+                labelAware?.SetLabels(map);
+            }
             catch (Exception)
             {
                 // 读不到项目资源只是"任务名显示英文"，不该影响日志采集本身。

@@ -4,6 +4,7 @@
 适用范围：`repo/winui3/src/Yomori.App` 的外部脚本实时日志采集与通道页显示
 首个适配脚本：March7th Launcher / March7th Assistant（`m7a`，提交 `2d65404`）
 第二个适配脚本：BetterGI 更好的原神（`bgi`，2026-11-10）
+第三个适配脚本：MaaEnd（`maaend`，2026-11-10，MaaFW 内核日志专属适配）
 
 ## 0. 必要条件（先读）
 
@@ -338,9 +339,22 @@ BetterGI 的日志是 Serilog 风格的**三行一组**：头行 `[11:54:39.123]
 | ok-script 系 | 中文任务行 + 大量 http / 截图；丢 `ok.http` / `screenshot` / 心跳，留任务、完成、错误 |
 | 一条龙 | 中文，高频「点击 xxx」；折叠连续点击行，保留任务轮次与退出码 |
 | AUTO-MAS | `时间 \| 级别 \| 模块 \| 消息`，混 `POST /api/...`；丢 API 请求行，保留配置 / 进程 / 任务 |
-| MaaFramework 系 | 已由 `ExternalLogProjector` 深度投影，不在本框架适配范围内 |
+| MaaFramework 系（MaaEnd 除外） | 仍由 `ExternalLogProjector` + `LogLabelStore` 深度投影，保持两行旧形态 |
+| MaaEnd | **已单独适配（§12.1）**：`maaend` 族专属适配器，单行 Compact 形态；其它 MaaFW 项目不受影响 |
 
 各族没有 `focus` 与 `label` 机制，面板档与节点档差异主要在「是否折叠连续点击 / 一次性初始化行」。
+
+### 12.1 参考实现：MaaEnd（`maaend`，2026-11-10 第三期）
+
+MaaEnd 是 MaaFramework 系里唯一走专属适配的项目：`debug\maafw.log`（MaaFW 5.x 内核日志）由 `MaaEndLogAdapter` 处理，产出单行 Compact 形态；其余 MaaFW 项目仍用 `ExternalLogProjector`。固定 30,000 行快照里 100% 是单行内核行、TRC+DBG 占 79%，语义在 `[msg=…]` 事件与 `[details={…}]` 的 `entry` / `name` / `focus` 里。
+
+三个与前两期不同的实现要点：
+
+1. **中文标签注入**：新增可选接口 `IExternalLogLabelAware.SetLabels(LogLabelMap)`，由 `ExternalLogTail.BeginLoadLabels` 在异步装载完成后透传给适配器；不改 `IExternalLogAdapter` 签名。任务名取 `Resolve(entry)`，节点名取 `ResolveNode(name)`。
+2. **内容探针不启用**：MaaFW 内核日志跨项目同形，探针一命中会把 45+ 项目一起劫持。只认 `maaend:*` / `MaaEnd.exe` / 日志路径含 `MaaEnd` 三类显式线索；线索缺失时退回原投影器（fail-open）。`maafw.log` 是通用文件名，不能当独立信号。
+3. **专属改进**：`MaafwDetails.SingleFocus()` 补回「focus 是单键对象且键不等于当前事件」的中文提示；WRN 首条必出、同类每满 100 条再出一条，其余只进归档（用 `CompactLine("", 原文, …)` 而非 `Drop`，否则已适配分支会按 Warn 级别强制原样放行）；心跳与日志中断由适配器 `Tick` 自补。
+
+`ExternalLogProjector` 的投影逻辑、`ExternalLogFilter`、桥协议（仍为 1）与界面模板均未改动。完整规则表、前后对照与实测统计见 `整合/外部脚本实时日志深度适配计划书-MaaEnd.md`。
 
 ## 13. 检查清单（提交前逐项确认）
 
@@ -358,6 +372,8 @@ BetterGI 的日志是 Serilog 风格的**三行一组**：头行 `[11:54:39.123]
 - [ ] 冒烟覆盖十组判据且全绿；`Smoke.exe` mtime 已更新
 - [ ] `<AgentVersion>` 已 +1
 - [ ] 本文档已补新脚本条目，`live-script-logs.md` 已修正「原样显示」类描述
+- [ ] 第三期：`IExternalLogLabelAware` 只影响已适配分支；MaaEnd 未启用内容探针；`Reset()` 保留注入的标签
+- [ ] 第三期：WRN 折叠用「面板为空、原文进归档」而非 `Drop`；心跳由适配器 `Tick` 自补
 - [ ] 编译、代理发布、冒烟结果已汇报，等待提交指示
 
 ## 附录 A：代码锚点（按方法名定位，不写行号）

@@ -627,3 +627,87 @@ public static class BetterGIGrammar
         return cut >= 0 ? text[(cut + 1)..].Trim() : text;
     }
 }
+
+/// <summary>
+/// MaaEnd（MaaFramework 5.x 内核日志）的文法常量。
+///
+/// <para>单独一套的原因：March7th 是「中文正文 + ASCII 边框」，BetterGI 是「头行 + 中文正文 + 空行」，
+/// 这一族是「时间戳 + 级别 + 源文件 + 函数 + 事件正文」，语义在 <c>[details={…}]</c> 的 JSON 里，
+/// 没有任何一条判据能复用。每条形状都来自 <c>D:\Program Files\MaaEnd\debug\maafw.log</c>
+/// （v3.1.0-beta.2 / MaaFW v5.16.0-beta.2）的前 30,000 行固定快照，统计口径见
+/// 《外部脚本实时日志深度适配计划书-MaaEnd.md》§2。</para>
+///
+/// <para>解析层（<c>EventName</c> / <c>DetailsStart</c> / <c>Noise</c> / <c>InternalFiles</c> /
+/// <c>NoiseFiles</c>）仍复用 <see cref="ExternalLogGrammar"/>：那些是 MaaFramework 的格式事实，
+/// 不是 MaaEnd 独有，抄一份只会让两边将来漂移。</para>
+/// </summary>
+public static class MaaEndGrammar
+{
+    /// <summary>
+    /// 内核行：<c>[2026-11-10 12:28:11.931][INF][Px51880][Tx50410][Tasker.cpp][L343][MaaNS::Tasker::run_task] 正文</c>。
+    ///
+    /// <para><c>[Lnn][函数]</c> 做成**可选**：启动横幅
+    /// <c>[…][DBG][Px][Tx][Logger] ----------------------------- </c> 没有这两段，
+    /// 但同属本族，让它命中后按 DBG 级丢弃，比落到 fail-open 原样放行更干净。</para>
+    /// </summary>
+    public static readonly Regex KernelLine = new(
+        @"^\[(?<date>\d{4}-\d{2}-\d{2}) (?<hms>\d{2}:\d{2}:\d{2})\.(?<ms>\d{3})\]" +
+        @"\[(?<lvl>TRC|DBG|INF|WRN|ERR)\]\[\w+\]\[\w+\]\[(?<file>[^\]]+)\]" +
+        @"(?:\[L\d+\]\[[^\]]*\])?\s*(?<rest>.*)$",
+        RegexOptions.Compiled);
+
+    /// <summary>AgentClient 的 <c>[message=…]</c> 转发行（TRC 级，把同一事件再发一遍）。</summary>
+    public static readonly Regex AgentForward = new(@"\[message=", RegexOptions.Compiled);
+
+    /// <summary>Windows 绝对路径（允许路径段里有空格），压成文件名避免窄栏折行。</summary>
+    public static readonly Regex WinPath = new(
+        @"[A-Za-z]:\\(?:[^\\/:*?""<>|\r\n]*\\)*(?<path>[^\\/:*?""<>|\r\n]*)",
+        RegexOptions.Compiled);
+
+    /// <summary>内核三字母级别 → Yomori 级别枚举（供「只看错误」筛选器与归档闸使用）。</summary>
+    public static ExternalLogLevel LevelOf(string level) => level switch
+    {
+        "ERR" => ExternalLogLevel.Error,
+        "WRN" => ExternalLogLevel.Warn,
+        "INF" => ExternalLogLevel.Info,
+        "DBG" => ExternalLogLevel.Debug,
+        "TRC" => ExternalLogLevel.Trace,
+        _ => ExternalLogLevel.Unknown,
+    };
+
+    /// <summary>
+    /// 已精简形态判定（幂等）。内核原始行以 <c>[</c> 开头，天然不命中符号前缀；
+    /// 仍显式排除一次，防止将来形状变化时把原始行短路成 <c>Pass</c>。
+    /// </summary>
+    public static bool LooksCompact(string line)
+    {
+        if (line.Length == 0) { return false; }
+        if (KernelLine.IsMatch(line)) { return false; }
+        if (line.Length >= 3 && line[0] == ' ' && line[1] == ' ' && line[2] != ' ') { return true; }
+
+        var text = line.TrimStart();
+        if (text.Length == 0 || text.Length != line.Length) { return false; }
+        return text.StartsWith("▶", StringComparison.Ordinal) ||
+               text.StartsWith("✔", StringComparison.Ordinal) ||
+               text.StartsWith("✘", StringComparison.Ordinal) ||
+               text.StartsWith("■", StringComparison.Ordinal) ||
+               text.StartsWith("▸", StringComparison.Ordinal) ||
+               text.StartsWith("⚠", StringComparison.Ordinal) ||
+               text.StartsWith("✗", StringComparison.Ordinal) ||
+               text.StartsWith("⋯", StringComparison.Ordinal) ||
+               text.StartsWith("✓", StringComparison.Ordinal);
+    }
+
+    /// <summary>路径压成文件名。</summary>
+    public static string CompressPaths(string body) =>
+        WinPath.Replace(body, match => FileNameOf(match.Groups["path"].Value));
+
+    /// <summary>取文件名（同时认 `\` 与 `/`）。</summary>
+    public static string FileNameOf(string path)
+    {
+        var text = path.Trim().Trim('"');
+        if (text.Length == 0) { return string.Empty; }
+        var cut = text.LastIndexOfAny(new[] { '\\', '/' });
+        return cut >= 0 ? text[(cut + 1)..].Trim() : text;
+    }
+}

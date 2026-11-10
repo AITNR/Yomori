@@ -58,6 +58,20 @@ public interface IExternalLogAdapter
 }
 
 /// <summary>
+/// 可选能力：适配器需要项目资源里的中文任务名 / 节点名时实现它。
+///
+/// <para><see cref="LogLabelMap"/> 由 <c>LogLabelStore</c> 异步装载，而适配器在 tail 构造时
+/// 就已绑定。因此由 <c>ExternalLogTail.BeginLoadLabels</c> 装载完成后主动注入，
+/// 而不是把标签塞进 <see cref="IExternalLogAdapter"/> 的构造签名 —— 那样每加一个族
+/// 都要改动另外两个适配器。目前只有 MaaEnd（MaaFW 内核日志）需要它。</para>
+/// </summary>
+public interface IExternalLogLabelAware
+{
+    /// <summary>注入（或整体替换）项目资源映射；实现方必须容忍空表与多次调用。</summary>
+    void SetLabels(LogLabelMap labels);
+}
+
+/// <summary>
 /// 适配器注册表 —— 白名单式识别。
 ///
 /// <para>没登记过的脚本一律返回 null，即使内容探针"看起来像"，也不启用精简：
@@ -70,6 +84,9 @@ public static class ExternalLogAdapterRegistry
 
     /// <summary>BetterGI（更好的原神）的 id，与 `launch_presets.json` 的 `projects[id=bgi]` 对齐。</summary>
     public const string BetterGIId = "bgi";
+
+    /// <summary>MaaEnd 的 id，与 `launch_presets.json` 的 `projects[id=maaend]` 对齐。</summary>
+    public const string MaaEndId = "maaend";
 
     /// <summary>两个入口同属一个项目，实测日志语法一致。</summary>
     private static readonly string[] March7thEntries =
@@ -88,6 +105,12 @@ public static class ExternalLogAdapterRegistry
         "BetterGI.exe",
     };
 
+    /// <summary>MaaEnd 只有一个入口（`projects[id=maaend].entries`）。</summary>
+    private static readonly string[] MaaEndEntries =
+    {
+        "MaaEnd.exe",
+    };
+
     /// <summary>按线索选适配器；都不命中返回 null（调用方走粗略兜底）。</summary>
     public static IExternalLogAdapter? Select(ExternalLogAdapterHint? hint)
     {
@@ -100,6 +123,10 @@ public static class ExternalLogAdapterRegistry
         if (LooksLikeBetterGIPreset(hint.PresetId)) { return new BetterGILogAdapter(); }
         if (LooksLikeBetterGIEntry(hint.EntryName)) { return new BetterGILogAdapter(); }
         if (LooksLikeBetterGILogPath(hint.LogPath, hint.LogPattern)) { return new BetterGILogAdapter(); }
+
+        if (LooksLikeMaaEndPreset(hint.PresetId)) { return new MaaEndLogAdapter(); }
+        if (LooksLikeMaaEndEntry(hint.EntryName)) { return new MaaEndLogAdapter(); }
+        if (LooksLikeMaaEndLogPath(hint.LogPath)) { return new MaaEndLogAdapter(); }
         return null;
     }
 
@@ -112,6 +139,12 @@ public static class ExternalLogAdapterRegistry
     /// <para>BetterGI 必须满足：至少两条带 `BetterGenshinImpact.` 模块名的头行 +
     /// 至少一条非分隔的正文行，且没有 March7th 标准行。注意
     /// `ExternalLogGrammar.ForeignLine` 与 BetterGI 头行同形，**不能**拿它当排除项。</para>
+    ///
+    /// <para>**MaaEnd 故意不接入内容探针**：MaaFW 内核日志跨项目同形（45+ 个项目共用一套
+    /// `[msg=…]` / `[details=…]` 事件格式），没有 MaaEnd 专属标记；探针一命中就会把
+    /// 其它 MaaFW 项目一起劫持到单行形态。它只靠三类显式线索（见
+    /// 《外部脚本实时日志深度适配计划书-MaaEnd.md》§5.1）。探针里的 MaaFW 外族标记
+    /// 已使内核日志天然不会命中前两族，这里保持白名单为加法，不新增分支。</para>
     /// </summary>
     public static IExternalLogAdapter? DetectByContent(IReadOnlyList<string> lines)
     {
@@ -219,6 +252,40 @@ public static class ExternalLogAdapterRegistry
         return path.IndexOf("BetterGI", StringComparison.OrdinalIgnoreCase) >= 0 ||
                path.IndexOf("better-genshin-impact", StringComparison.OrdinalIgnoreCase) >= 0 ||
                pattern.IndexOf("better-genshin-impact", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>`maaend:auto-on-launch` / `maaend:autostart` → 前段是 `maaend`。</summary>
+    private static bool LooksLikeMaaEndPreset(string? presetId)
+    {
+        var text = (presetId ?? string.Empty).Trim();
+        if (text.Length == 0) { return false; }
+        var head = text.Split(':')[0].Trim();
+        return string.Equals(head, MaaEndId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>`D:\Program Files\MaaEnd\MaaEnd.exe` → 只看文件名。</summary>
+    private static bool LooksLikeMaaEndEntry(string? entryName)
+    {
+        var name = FileNameOf((entryName ?? string.Empty).Trim());
+        if (name.Length == 0) { return false; }
+        foreach (var candidate in MaaEndEntries)
+        {
+            if (string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 日志路径里带 `MaaEnd`（实测 `D:\Program Files\MaaEnd\debug`）。
+    ///
+    /// <para>**不把 `maafw.log` 当独立信号**：它是 MaaFramework 通用文件名，
+    /// 单独命中会把同一套内核日志的其它项目一起判成 MaaEnd。只有路径已含项目名时才认定。</para>
+    /// </summary>
+    private static bool LooksLikeMaaEndLogPath(string? logPath)
+    {
+        var path = (logPath ?? string.Empty).Trim();
+        return path.Length > 0 && path.IndexOf("MaaEnd", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     /// <summary>取文件名（同时认 `\` 与 `/`，远程日志路径是 Linux 风格时也不吃亏）。</summary>

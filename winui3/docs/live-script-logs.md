@@ -35,7 +35,7 @@
 |---|---|---|
 | BetterGI | `C:\Program Files\BetterGI\log` | `better-genshin-impact*.log` |
 | March7thAssistant | `C:\Program Files\March7thAssistant_v2.7.0\logs` | `20??-??-??.log`（避免跟到 `config_diag.log`） |
-| MaaEnd | `D:\Program Files\MaaEnd\debug` | 先确认要看 `mxu-tauri.log`、`maafw.log` 或其他组件；优先指定文件 |
+| MaaEnd | `D:\Program Files\MaaEnd\debug` | `maafw.log`（已做专属深度适配）；前端自身问题再看 `mxu-tauri.log` |
 
 ## 显示视图
 
@@ -56,6 +56,7 @@ MaaFramework 系（MFAAvalonia / MXU / MFW / MaaPiCli，40 余个项目）默认
 - **过程提示**取自内核日志的 `details.focus`（项目作者自己写的那句话），
   例如「正在检查画面，提示登出账号是正常现象」「画面检查通过」。
   该字段只在"键等于当前事件"时显示，避免同一句跟着五个事件重复。
+  MaaEnd 专属适配器额外放宽：focus 是单键对象时，即使键不等于当前事件也取那句话（项目里常见这种写法）。
 - **节点名**取自项目资源的 `resource/pipeline/*.json`：节点名本身是英文
   （`AncientTreeQuickTeleport`），中文在节点的 `desc` 里（「在古树任务地图中点击传送」），
   实测 MaaEnd 6,561 个节点里 5,776 个带 `desc`。面板显示 `desc`，节点档仍记原名。
@@ -70,7 +71,9 @@ MaaFramework 系（MFAAvalonia / MXU / MFW / MaaPiCli，40 余个项目）默认
 - 节点名 30 秒内只出一条，避免同一节点反复触发刷屏；任务长时间没有输出时补一条心跳，
   日志出现 5 分钟以上空档时补一条「日志中断」。
 
-非 MaaFramework 的日志按「逐脚本深度适配」逐个接入：已适配的脚本（三月七小助手 / March7th Launcher、BetterGI）把阶段框、正文自带的日期与级别、机制噪声压成「时间 + 一句话」的单行形态；BetterGI 还会把「元数据头行 + 中文正文 + 空行」的三行组合成一条，任务边界用 `▶ / ✔ / ▸` 标识。尚未适配的脚本（ok-script / 一条龙 / AUTO-MAS 等）仍走粗略适配，原样显示。识别不到已适配脚本时一律退回原样显示，不会丢行；归档与「原文」视图始终保留脚本写入的原始行。接入方式、契约与检查清单见 `external-log-adapter-guide.md`。
+「逐脚本深度适配」按脚本逐个接入：三月七小助手 / March7th Launcher、BetterGI 把阶段框、正文自带的日期与级别、机制噪声压成「时间 + 一句话」的单行形态；BetterGI 还会把「元数据头行 + 中文正文 + 空行」的三行组合成一条。**MaaEnd 是 MaaFramework 系里唯一单独适配的项目**：它的 `debug` 目录下的 `maafw.log` 走专属适配器，同样每条一行，任务名与节点中文仍取自项目资源；其余 MaaFW 项目继续用上一节的通用投影（两行形态）。尚未适配的脚本仍走粗略适配，原样显示。识别不到已适配脚本时一律退回原样显示，不会丢行；归档与「原文」视图始终保留脚本写入的原始行。
+
+MaaEnd 的专属识别只认三类显式线索（预设 `maaend:*`、入口 `MaaEnd.exe`、日志路径含 `MaaEnd`）：MaaFW 内核日志跨项目同形，不启用内容探针，避免把其它项目一起切到专属形态。若三个线索都缺失（例如手写日志路径），MaaEnd 会退回通用投影，显示仍正常、只是回到两行形态。中文任务名依赖安装目录里的 `interface.json`、`tasks/`、`locales/`、`resource/pipeline/`；缺了会退化成英文条目名，但不会丢行。接入方式、契约与检查清单见 `external-log-adapter-guide.md`。
 
 「从文件末尾开始跟踪」开启时，为脚本启动前已存在的文件建立末尾基线；本次新建或轮转的文件从头读取。关闭时可读取已有内容。编码支持自动、UTF-8 和 GBK；无法确认编码时可显式选择。仅转发完整行，半行等待后续换行；单行按既有规则规整和截断。外部程序自身缓冲未写入磁盘的内容无法采集。
 
