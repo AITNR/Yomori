@@ -210,12 +210,35 @@ public sealed class ExternalLogTail : IDisposable
     /// <summary>停止时读取最后新增字节并发送最后一条未换行文本；应在 Dispose 前调用。</summary>
     public IReadOnlyList<ExternalLogLine> Drain(IReadOnlyList<string>? keywords) => Read(keywords, true);
 
+    /// <summary>
+    /// 已适配脚本的关键字预处理：剔除**恰好是级别词**的关键字。
+    ///
+    /// <para>第三期实测：MaaFW 原始内核行里 `save_on_error` / `CloseErrorDialog` 会命中
+    /// 裸 `ERROR`，而「关键字命中绝不吞」会把整条英文长行以两行旧形态推上屏。
+    /// 已适配脚本的 ERR / WRN 由适配器自己必出，不依赖关键字；用户自定义的业务关键字
+    /// （`TaskChainError` / `SubTaskError` 等）一律保留。未适配族不受影响。</para>
+    /// </summary>
+    private IReadOnlyList<string>? EffectiveKeywords(IReadOnlyList<string>? keywords)
+    {
+        if (_adapter is null || keywords is null || keywords.Count == 0) { return keywords; }
+        var kept = new List<string>(keywords.Count);
+        foreach (var keyword in keywords)
+        {
+            var word = (keyword ?? string.Empty).Trim();
+            if (word.Length == 0 || ExternalLogFilter.IsBareLevelWord(word)) { continue; }
+            kept.Add(keyword ?? string.Empty);
+        }
+
+        return kept;
+    }
+
     private IReadOnlyList<ExternalLogLine> Read(IReadOnlyList<string>? keywords, bool final)
     {
         lock (_sync)
         {
             var result = new List<ExternalLogLine>();
             if (_disposed) { return result; }
+            var effective = EffectiveKeywords(keywords);
             try
             {
                 var candidates = Candidates().OrderByDescending(File.GetLastWriteTimeUtc).ToList();
@@ -244,7 +267,7 @@ public sealed class ExternalLogTail : IDisposable
                         if (bytesRemaining <= 0 || result.Count >= MaxOutputLinesPerPoll) { break; }
                         if (File.Exists(file))
                         {
-                            ReadFile(file, result, keywords, final, ref bytesRemaining);
+                            ReadFile(file, result, effective, final, ref bytesRemaining);
                         }
 
                         // 重命名后不再匹配的旧文件最多再收一拍；删除文件则直接淘汰。
@@ -663,13 +686,31 @@ public sealed class ExternalLogTail : IDisposable
 
         if (!adapted.Emit)
         {
-            // 关键字命中与警告/错误行**绝不吞**：适配器的降噪规则针对的是过程噪声，
-            // 用户自己配的关键字与脚本自己打的告警必须照常出现，否则就是在藏问题。
+            // 关键字命中**绝不吞**，但已适配脚本不回到两行旧模板：MaaFW 内核原始行里
+            // `save_on_error` / `CloseErrorDialog` 这类技术词会命中宽泛的 `ERROR` 关键字，
+            // 第三期实测 124/124 条 Compact:false 行都含 error，整条英文长行以两行形态刷屏。
+            // 改用一条单行短句承载命中事实，原始行仍逐字进归档。
+            if (line.KeywordHit)
+            {
+                result.Add(new ExternalLogLine
+                {
+                    Text = "⚠ 关键字命中：" + ExternalLogFilter.FirstKeyword(raw, keywords),
+                    NodeText = raw,
+                    Raw = raw,
+                    Kind = ExternalLogKind.Warn,
+                    Level = line.Level is ExternalLogLevel.Warn or ExternalLogLevel.Error
+                        ? line.Level : ExternalLogLevel.Warn,
+                    KeywordHit = true,
+                    Compact = true,
+                    SourceTime = adapted.SourceTime,
+                });
+                return;
+            }
+
+            // 警告/错误行绝不吞：适配器的降噪规则针对的是过程噪声。
             // 例外：适配器明确标记 MetaOnly 的结构 / 元数据行（BetterGI 头行只有类名、
             // 没有消息体），它的语义已并入紧随的业务行，按级别强制放行只会推上一条空壳行。
-            // 关键字命中仍无条件放行，保证用户配置的关键字一个都不丢。
-            if (line.KeywordHit ||
-                ((line.Level is ExternalLogLevel.Warn or ExternalLogLevel.Error) && !adapted.MetaOnly))
+            if ((line.Level is ExternalLogLevel.Warn or ExternalLogLevel.Error) && !adapted.MetaOnly)
             {
                 result.Add(line);
             }

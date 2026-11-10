@@ -22,15 +22,24 @@ public sealed class LogLabelMap
     /// <summary>空表：读不到项目资源时的兜底，`Resolve` 原样返回 entry。</summary>
     public static readonly LogLabelMap Empty = new(
         new Dictionary<string, string>(StringComparer.Ordinal),
+        new Dictionary<string, string>(StringComparer.Ordinal),
         new Dictionary<string, string>(StringComparer.Ordinal));
 
     private readonly Dictionary<string, string> _labels;
     private readonly Dictionary<string, string> _nodes;
 
-    private LogLabelMap(Dictionary<string, string> labels, Dictionary<string, string> nodes)
+    /// <summary>
+    /// `locales/**/zh_cn.json` 的原始词条表（`task.X.focus.Y` → 中文）。
+    /// 第三期追加：`details.focus` 里大量是 i18n 键而不是中文文本，见 <see cref="ResolveI18n"/>。
+    /// </summary>
+    private readonly Dictionary<string, string> _locale;
+
+    private LogLabelMap(Dictionary<string, string> labels, Dictionary<string, string> nodes,
+        Dictionary<string, string> locale)
     {
         _labels = labels;
         _nodes = nodes;
+        _locale = locale;
     }
 
     /// <summary>条目数（0 表示这份项目没有可用的 label）。</summary>
@@ -39,12 +48,32 @@ public sealed class LogLabelMap
     /// <summary>带中文描述的节点数（`resource/pipeline` 里的 `desc`）。</summary>
     public int NodeCount => _nodes.Count;
 
+    /// <summary>i18n 词条数（`locales/**/zh_cn.json`）。</summary>
+    public int LocaleCount => _locale.Count;
+
     /// <summary>按 entry 取中文名；取不到就原样返回 entry（fail-open，绝不返回空串丢信息）。</summary>
     public string Resolve(string? entry)
     {
         var key = (entry ?? string.Empty).Trim();
         if (key.Length == 0) { return string.Empty; }
         return _labels.TryGetValue(key, out var label) && label.Length > 0 ? label : key;
+    }
+
+    /// <summary>
+    /// 解析 <c>$i18n.key</c> 词条（例如 <c>$task.DijiangRewards.focus.entry_unrecognized</c>）；
+    /// 查不到返回空串，由调用方决定回退。
+    ///
+    /// <para>第三期实测：MaaEnd 的 <c>details.focus</c> 大量写成词条键而不是中文文本。
+    /// <see cref="Resolve"/> 只存 <c>entry → 中文任务名</c>，查这种键必然落空，
+    /// 于是界面上出现一整行 <c>$task.…</c>。词条表来自 <c>locales/**/zh_cn.json</c>，
+    /// 实测 MaaEnd 有 2,936 条。</para>
+    /// </summary>
+    public string ResolveI18n(string? key)
+    {
+        var text = (key ?? string.Empty).Trim();
+        if (text.Length == 0 || text[0] != '$') { return string.Empty; }
+        var name = text.Substring(1);
+        return _locale.TryGetValue(name, out var value) && value.Length > 0 ? value : string.Empty;
     }
 
     /// <summary>
@@ -116,7 +145,14 @@ public sealed class LogLabelMap
                 {
                     if (property.Value.ValueKind == JsonValueKind.String)
                     {
+                        // 顶层字符串词条：直接用键。
                         locale[property.Name] = property.Value.GetString() ?? string.Empty;
+                    }
+                    else if (property.Value.ValueKind == JsonValueKind.Object)
+                    {
+                        // 嵌套词条（MaaEnd 的 `task.DijiangRewards.focus.*` 写成
+                        // {"task": {"DijiangRewards": {"focus": {"entry_unrecognized": "…"}}}}）。
+                        FlattenLocale(property.Value, property.Name, locale);
                     }
                 }
             }
@@ -196,9 +232,27 @@ public sealed class LogLabelMap
             }
         }
 
-        return labels.Count == 0 && nodes.Count == 0
+        return labels.Count == 0 && nodes.Count == 0 && locale.Count == 0
             ? Empty
-            : new LogLabelMap(labels, nodes);
+            : new LogLabelMap(labels, nodes, locale);
+    }
+
+    /// <summary>把嵌套的 i18n 对象摊平成 `task.X.focus.Y` → 文本，供 <see cref="ResolveI18n"/> 查询。</summary>
+    private static void FlattenLocale(JsonElement element, string prefix,
+        Dictionary<string, string> target)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            var key = prefix + "." + property.Name;
+            if (property.Value.ValueKind == JsonValueKind.String)
+            {
+                target[key] = property.Value.GetString() ?? string.Empty;
+            }
+            else if (property.Value.ValueKind == JsonValueKind.Object)
+            {
+                FlattenLocale(property.Value, key, target);
+            }
+        }
     }
 
     /// <summary>`"$task.X.label"` → 查词条；查不到返回去掉 `$` 的键名（可读、可定位）。</summary>
@@ -342,12 +396,25 @@ public static class LogTextSanitizer
 
         if (value[0] == '$' && labels is not null)
         {
-            value = labels.Resolve(value);
-            // 单个换行也算行界：focus 里带 `\n` 时不能把它带进一行文本（会撑成两条并错位时间戳）。
-        value = value.Replace("\r\n", " ", StringComparison.Ordinal)
-            .Replace('\r', ' ')
-            .Replace('\n', ' ');
-        value = Whitespace.Replace(value, " ").Trim();
+            // 第三期：`$task.X.focus.Y` 是 i18n 词条键，不是 entry。
+            // 先查词条表（locales/**/zh_cn.json），查不到再退回 entry 映射，
+            // 仍查不到就去掉 `$` 显示键名，至少不留一整行 `$task.…`。
+            var i18n = labels.ResolveI18n(value);
+            if (i18n.Length > 0)
+            {
+                value = i18n;
+            }
+            else
+            {
+                value = labels.Resolve(value);
+                if (value.Length > 0 && value[0] == '$') { value = value.Substring(1); }
+            }
+
+            // 解析出来的词条同样可能带换行，再洗一次。
+            value = value.Replace("\r\n", " ", StringComparison.Ordinal)
+                .Replace('\r', ' ')
+                .Replace('\n', ' ');
+            value = Whitespace.Replace(value, " ").Trim();
         }
 
         if (raw.Length > 0 && value.Length == 0) { return Whitespace.Replace(raw, " ").Trim(); }

@@ -207,6 +207,44 @@ public static class ExternalLogFilter
         return false;
     }
 
+    /// <summary>
+    /// 裸级别词（`ERROR` / `WARN` / `INFO` …）不能当已适配脚本的关键字。
+    ///
+    /// <para>第三期实测：MaaFW 内核行里 `save_on_error` / `CloseErrorDialog` 满地都是，
+    /// 预设里一个裸 `ERROR` 让 124/124 条未适配行全部命中关键字，整条英文长行刷屏。
+    /// 已适配脚本自己按级别输出错误，不需要靠关键字抓级别；用户自定义的业务关键字一律保留。</para>
+    /// </summary>
+    private static readonly HashSet<string> BareLevelWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "ERROR", "WARN", "WARNING", "INFO", "DEBUG", "TRACE", "FATAL", "CRITICAL",
+    };
+
+    public static bool IsBareLevelWord(string? word) =>
+        BareLevelWords.Contains((word ?? string.Empty).Trim());
+
+    /// <summary>
+    /// 返回第一个命中的关键字（供已适配分支构造单行短句）；没有命中返回 "关键字"。
+    ///
+    /// <para>第三期实测：已适配脚本的「关键字命中绝不吞」不能再用两行旧模板放原始行 ——
+    /// MaaFW 内核日志里 `save_on_error` 这类技术词会命中宽泛的 `ERROR` 关键字，
+    /// 于是整条英文长行被推上屏。改用一行短句承载命中事实，原文仍逐字进归档。</para>
+    /// </summary>
+    public static string FirstKeyword(string? raw, IReadOnlyList<string>? keywords)
+    {
+        var text = raw ?? string.Empty;
+        if (text.Length == 0 || keywords is null) { return "关键字"; }
+        foreach (var keyword in keywords)
+        {
+            var needle = (keyword ?? string.Empty).Trim();
+            if (needle.Length > 0 && text.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return needle;
+            }
+        }
+
+        return "关键字";
+    }
+
     /// <summary>把原始行解析成结构化的一行（规整 + 级别 + 关键字）。</summary>
     public static ExternalLogLine Parse(string? raw, IReadOnlyList<string>? keywords)
         => Parse(raw, keywords, wasTruncated: false);

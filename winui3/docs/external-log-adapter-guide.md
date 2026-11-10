@@ -374,6 +374,8 @@ MaaEnd 是 MaaFramework 系里唯一走专属适配的项目：`debug\maafw.log`
 - [ ] 本文档已补新脚本条目，`live-script-logs.md` 已修正「原样显示」类描述
 - [ ] 第三期：`IExternalLogLabelAware` 只影响已适配分支；MaaEnd 未启用内容探针；`Reset()` 保留注入的标签
 - [ ] 第三期：WRN 折叠用「面板为空、原文进归档」而非 `Drop`；心跳由适配器 `Tick` 自补
+- [ ] 第三期修复：已适配族过滤裸级别词关键字（`ERROR` 等），关键字命中产出单行 Compact 而非两行旧形态
+- [ ] 第三期修复：`$i18n` 词条键通过 `LogLabelMap.ResolveI18n` 解析（`locales/**/zh_cn.json` 顶层点分键）
 - [ ] 编译、代理发布、冒烟结果已汇报，等待提交指示
 
 ## 附录 A：代码锚点（按方法名定位，不写行号）
