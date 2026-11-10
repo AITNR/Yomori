@@ -2127,6 +2127,133 @@ public sealed class MainViewModel : ObservableObject
             return;
         }
 
+        // 执行前闸门：部署与登录自启都是全局单例状态（ProgramData 副本 + 公共启动目录快捷方式），
+        // 整轮只查一次，不能下沉到逐通道的 ValidateChannel —— 多通道并行会弹 N 个窗抢闸门。
+        // 只有本轮确实要启动「本机通道」时才查；远程通道的代理在对方机器上，本机查不到也不该拦。
+        if (HasLocalChannelToLaunch(plan) && !AgentStartGate.EvaluateDefault().Ready)
+        {
+            LaunchAgentStartGate(plan);
+            return;
+        }
+
+        StartCore(plan);
+    }
+
+    /// <summary>本轮是否有要启动的本机会话通道（远程通道不算）。</summary>
+    private static bool HasLocalChannelToLaunch(ExecutionPlan plan) =>
+        plan.ToLaunch.Any(p => RdpTargets.IsLocal(RdpTargets.Normalize(p.Channel.Host)));
+
+    /// <summary>
+    /// 闸门不满足时的入口：保证整个异步流程从 UI 线程起步（ContentDialog 必须在 UI 线程创建），
+    /// 用 fire-and-forget 发起 —— Start() 保持同步 void，按钮 / 托盘两处调用方都不用改。
+    /// </summary>
+    private void LaunchAgentStartGate(ExecutionPlan plan)
+    {
+        if (!_dispatcher.HasThreadAccess)
+        {
+            _dispatcher.TryEnqueue(() => LaunchAgentStartGate(plan));
+            return;
+        }
+
+        // 连点两次「开始」不要叠两个窗、也不要部署两遍
+        if (_agentGatePending)
+        {
+            return;
+        }
+
+        _agentGatePending = true;
+        _ = EnsureAgentAndStartAsync(plan);
+    }
+
+    /// <summary>
+    /// 弹窗 → 用户点动作 → 等动作做完 → 才回 UI 线程继续 <see cref="StartCore"/>（连接通道）。
+    ///
+    /// <para>⚠️ 每条纪律都对应一次真机事故：</para>
+    /// <para>① DialogHelper.ShowAsync 的 Gate 只在 ShowAsync 返回后才释放，所以必须先 await 完弹窗
+    /// 再触发动作，否则动作自带的完成/失败弹窗会和当前窗抢闸门，排队到「看着没反应」。</para>
+    /// <para>② WinUI 3 没有 SynchronizationContext，await 续体不保证回 UI 线程，而 StartCore 里
+    /// 全是绑定修改（ResetSessions / IsRunning / RaisePanelChanged），跨线程改会 0x8001010E → 原生 AV。
+    /// 所以所有 UI 动作一律经 <see cref="RunOnUiThreadAsync"/> 收口。</para>
+    /// <para>③ fire-and-forget 的异常必须吞掉，未观察异常会掀掉进程。</para>
+    /// </summary>
+    private async Task EnsureAgentAndStartAsync(ExecutionPlan plan)
+    {
+        try
+        {
+            var gate = AgentStartGate.EvaluateDefault();
+            var result = await DialogHelper.ShowMessageAsync(
+                AgentStartGate.Title(gate),
+                AgentStartGate.Body(gate),
+                "取消",
+                primaryText: AgentStartGate.PrimaryText(gate));
+
+            if (result != ContentDialogResult.Primary)
+            {
+                return;   // 取消 / None：本轮不连接通道
+            }
+
+            // 弹窗已关闭（Gate 已释放），下面再触发动作不会撞闸门
+            (bool Ok, string Message) done;
+
+            if (AgentStartGate.ChooseAction(gate) == AgentStartGate.Action.Deploy)
+            {
+                // 部署会顺带建自启项，一步到位；showDialogs=false 让闸门流程自己给回执，
+                // 避免完成窗与随后连接流程的窗叠在一起。
+                done = await DeployAgentAsync(showDialogs: false);
+            }
+            else
+            {
+                done = await EnableAutoStartAsync();
+                await RunOnUiThreadAsync(() =>
+                {
+                    AppendLog(done.Ok
+                        ? $"会话代理：{Flatten(done.Message)}"
+                        : $"[远程桌面] 开启登录自启失败：{Flatten(done.Message)}");
+                    RefreshRdpReadiness();
+                });
+            }
+
+            if (!done.Ok)
+            {
+                // 动作失败就不连接通道：别明知代理没起来还去跑一轮
+                await RunOnUiThreadAsync(() =>
+                    _ = DialogHelper.ShowMessageAsync("处理未完成", done.Message));
+                return;
+            }
+
+            await RunOnUiThreadAsync(() =>
+            {
+                AppendLog("会话代理已就绪，开始连接通道。");
+                StartCore(plan);
+            });
+        }
+        catch (Exception ex)
+        {
+            _dispatcher.TryEnqueue(() =>
+                AppendLog($"[界面] 执行前检查异常：{ex.Message}"));
+        }
+        finally
+        {
+            _dispatcher.TryEnqueue(() => _agentGatePending = false);
+        }
+    }
+
+    /// <summary>只补登录自启项：PowerShell 建 .lnk 丢到线程池，回来只回填状态。</summary>
+    private async Task<(bool Ok, string Message)> EnableAutoStartAsync()
+    {
+        var bridge = RdpSettings.BridgePath;
+        return await Task.Run(() =>
+        {
+            var ok = RdpSessionService.EnableAgentAutoStart(bridge, out var message);
+            return (Ok: ok, Message: message);
+        });
+    }
+
+    /// <summary>
+    /// 本轮真正的执行主体（连接通道）。只允许从 UI 线程进入 —— 见 <see cref="EnsureAgentAndStartAsync"/>。
+    /// </summary>
+    private void StartCore(ExecutionPlan plan)
+    {
         // 没启动的任务必须说明原因（通道停用 / 没配账户 / 超并发上限 / 引用了不存在的通道）。
         // 静默丢掉最糟 —— 用户会以为它们在跑。
         foreach (var skipped in plan.Skipped)
@@ -5975,44 +6102,85 @@ public sealed class MainViewModel : ObservableObject
 
     private void DeployRdpAgent()
     {
-        // 首次部署要把整个程序（约 140MB）复制到公共目录，同步做会卡住界面
-        IsRdpBusy = true;
-        RdpStatusText = "正在部署会话代理（首次会复制程序文件，稍等）…";
-        AppendLog("正在部署会话代理：把程序复制到所有用户都能访问的公共目录…");
+        _ = SafeDeployAsync();
+
+        // 手动按钮是 fire-and-forget：异常必须自己接住，未观察异常会掀掉进程
+        async Task SafeDeployAsync()
+        {
+            try
+            {
+                await DeployAgentAsync(showDialogs: true);
+            }
+            catch (Exception ex)
+            {
+                _dispatcher.TryEnqueue(() =>
+                {
+                    AppendLog($"[远程桌面] 会话代理部署异常：{ex.Message}");
+                    RdpStatusText = "会话代理部署失败";
+                    IsRdpBusy = false;
+                    RefreshRdpReadiness();
+                });
+            }
+        }
+    }
+
+    /// <summary>
+    /// 部署会话代理：重活在线程池，界面状态一律经 <see cref="RunOnUiThreadAsync"/> 收口，
+    /// 返回值可等待 —— 「开始执行前闸门」要等部署做完才继续连接通道。
+    ///
+    /// <para>showDialogs=false 供闸门用：不能让完成/失败弹窗在这里自己弹（会和随后连接流程
+    /// 抢 ContentDialog 闸门），回执统一由闸门流程给；手动点按钮仍保留原来的完成/失败弹窗。</para>
+    /// </summary>
+    private async Task<(bool Ok, string Message)> DeployAgentAsync(bool showDialogs)
+    {
+        await RunOnUiThreadAsync(() =>
+        {
+            // 首次部署要把整个程序（约 140MB）复制到公共目录，同步做会卡住界面
+            IsRdpBusy = true;
+            RdpStatusText = "正在部署会话代理（首次会复制程序文件，稍等）…";
+            AppendLog("正在部署会话代理：把程序复制到所有用户都能访问的公共目录…");
+        });
 
         var bridge = RdpSettings.BridgePath;
         // 目标账户要带上：部署前要判断它那个常驻代理是不是正在跑任务（跑着就不能动）
         var targetUser = RdpSettings.TargetUser;
 
-        Task.Run(() =>
+        var (ok, message) = await Task.Run(() =>
         {
-            var ok = RdpSessionService.DeployAgent(out var message, bridge, targetUser);
-            return (Ok: ok, Message: message);
-        }).ContinueWith(task =>
+            var deployed = RdpSessionService.DeployAgent(out var text, bridge, targetUser);
+            return (Ok: deployed, Message: text);
+        });
+
+        await RunOnUiThreadAsync(() =>
         {
-            var (ok, message) = task.Result;
-            _dispatcher.TryEnqueue(() =>
+            if (ok)
             {
-                if (ok)
+                AppendLog($"会话代理：{Flatten(message)}");
+                RdpStatusText = NeedReloginAfterDeploy(message)
+                    ? "会话代理已部署（目标账户需注销重连才生效）"
+                    : "会话代理已部署";
+                if (showDialogs)
                 {
-                    AppendLog($"会话代理：{Flatten(message)}");
-                    RdpStatusText = ReportAgentDeployed(message)
-                        ? "会话代理已部署（目标账户需注销重连才生效）"
-                        : "会话代理已部署";
+                    ReportAgentDeployed(message);
                 }
-                else
+            }
+            else
+            {
+                // 失败原因可能是文件被占用 / PowerShell 报错 / 真的缺管理员权限。
+                // 不再替用户下"就是缺权限"的结论 —— message 里已经带了真实报错和判断依据。
+                AppendLog($"[远程桌面] 会话代理部署失败：{Flatten(message)}");
+                RdpStatusText = "会话代理部署失败";
+                if (showDialogs)
                 {
-                    // 失败原因可能是文件被占用 / PowerShell 报错 / 真的缺管理员权限。
-                    // 不再替用户下"就是缺权限"的结论 —— message 里已经带了真实报错和判断依据。
-                    AppendLog($"[远程桌面] 会话代理部署失败：{Flatten(message)}");
-                    RdpStatusText = "会话代理部署失败";
                     _ = DialogHelper.ShowMessageAsync("部署失败", message);
                 }
+            }
 
-                IsRdpBusy = false;
-                RefreshRdpReadiness();
-            });
+            IsRdpBusy = false;
+            RefreshRdpReadiness();
         });
+
+        return (ok, message);
     }
 
     /// <summary>把多行报文压成一行 —— 日志是按行写的，带换行的字符串会把日志切乱。</summary>
@@ -6020,6 +6188,16 @@ public sealed class MainViewModel : ObservableObject
         string.IsNullOrEmpty(text)
             ? string.Empty
             : text.Replace("\r\n", " ").Replace('\n', ' ').Replace('\r', ' ');
+
+    /// <summary>部署报文里是否带着「旧代理已被结束 / 需要注销重连」的信号。</summary>
+    private static bool NeedReloginAfterDeploy(string message)
+    {
+        var detail = Flatten(message);
+
+        // "已结束 N 个正在运行的旧会话代理" 和 "需注销目标账户后重新连接" 是同一个信号：
+        // 文件换了、旧进程没了，只有重新登录才会把新程序拉起来。
+        return detail.Contains("已结束") || detail.Contains("注销");
+    }
 
     /// <summary>
     /// 「部署会话代理」的成功回执。
@@ -6035,10 +6213,7 @@ public sealed class MainViewModel : ObservableObject
     private static bool ReportAgentDeployed(string message)
     {
         var detail = Flatten(message);
-
-        // "已结束 N 个正在运行的旧会话代理" 和 "需注销目标账户后重新连接" 是同一个信号：
-        // 文件换了、旧进程没了，只有重新登录才会把新程序拉起来。
-        var needRelogin = detail.Contains("已结束") || detail.Contains("注销");
+        var needRelogin = NeedReloginAfterDeploy(message);
 
         var body = "程序副本与公共启动项都已就位。\n\n"
             + (detail.Length > 0 ? detail : "（无附加说明）");
@@ -6327,6 +6502,9 @@ public sealed class MainViewModel : ObservableObject
     /// 它在整轮结束前一直是 true。</para>
     /// </summary>
     private volatile bool _runAbortRequested;
+
+    /// <summary>「开始执行前闸门」是否正在等待用户操作；防连点两次叠窗 / 重复部署。</summary>
+    private bool _agentGatePending;
 
     /// <summary>
     /// 可中止的等待（连接前等待用）。按 200ms 切片检查中止标志，返回 true = 被中止。

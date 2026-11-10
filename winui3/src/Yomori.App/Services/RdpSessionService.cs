@@ -1459,6 +1459,82 @@ public static class RdpSessionService
     }
 
     /// <summary>
+    /// 只补「登录自启」这一项：副本必须已就位，且已存在的 .lnk 一律不动。
+    ///
+    /// <para>与 <see cref="DeployAgent"/> 的分工：那个会把整套代理副本重铺一遍，
+    /// 而「副本在、只是自启项被删了」不该为此再搬运一次。这也是「开始执行前闸门」
+    /// 在只缺自启时给用户点的那个动作。</para>
+    ///
+    /// <para>⚠️ 不重写已有自启项：它的参数里带着用户配的 <c>--bridge:</c>，
+    /// 重写等于把桥目录改回默认值，远程通道会当场失效（与 <see cref="AutoDeployForInstall"/>
+    /// 同一条纪律）。</para>
+    /// </summary>
+    /// <param name="bridgePath">指令桥目录；写进自启项参数，通常为设置页里保存的值。</param>
+    /// <param name="message">结果说明（成功也可能带过程说明）。</param>
+    public static bool EnableAgentAutoStart(string? bridgePath, out string message)
+    {
+        message = string.Empty;
+
+        var exe = FindDeployedAgentExeIn(AgentPayloadRoot);
+        if (exe is null)
+        {
+            message = $"没有找到已部署的代理程序副本（{AgentPayloadRoot}）。\n"
+                + "请先点「部署会话代理」，把程序副本铺好后再开启登录自启。";
+            return false;
+        }
+
+        if (File.Exists(AgentShortcutPath))
+        {
+            message = $"登录自启项已存在，未改动：{AgentShortcutPath}";
+            return true;
+        }
+
+        if (!CreateStartupShortcut(exe, RdpTargets.BuildAgentArguments(bridgePath), out var error))
+        {
+            message = error;
+            return false;
+        }
+
+        message = $"已开启登录自启：{AgentShortcutPath}（程序副本：{Path.GetDirectoryName(exe)}）";
+        return true;
+    }
+
+    /// <summary>
+    /// 在副本候选槽里找已部署的代理主程序（只认新形态精简代理 Yomori.Agent.exe）。
+    /// 路径可注入，供冒烟用临时目录断言；生产传 <see cref="AgentPayloadRoot"/>。
+    /// </summary>
+    internal static string? FindDeployedAgentExeIn(string payloadRoot)
+    {
+        if (string.IsNullOrWhiteSpace(payloadRoot))
+        {
+            return null;
+        }
+
+        foreach (var slot in new[]
+                 {
+                     Path.Combine(payloadRoot, "agent"),
+                     Path.Combine(payloadRoot, "agent_b"),
+                 })
+        {
+            var exe = Path.Combine(slot, AgentExeName);
+            if (File.Exists(exe))
+            {
+                return exe;
+            }
+
+            // 没有随包 agent\ 时 DeployAgent 会回退成整目录复制的旧形态；
+            // 自启项参数（--rdp-agent）两种形态通用，别让「只缺自启」时判成没部署。
+            var legacy = Path.Combine(slot, LegacyAgentExeName);
+            if (File.Exists(legacy))
+            {
+                return legacy;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// 删掉改名前留下的旧自启项（见 <see cref="LegacyStartupShortcutNames"/>）。
     ///
     /// 单文件删除，全程吞异常：删不掉（被占用 / 权限不够）最多让登录时多空试一次，
