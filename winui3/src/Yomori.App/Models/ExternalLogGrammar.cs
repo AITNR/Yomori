@@ -402,3 +402,228 @@ public static class March7thGrammar
                text.StartsWith("✓", StringComparison.Ordinal);
     }
 }
+
+/// <summary>
+/// BetterGI（更好的原神）日志的文法常量。
+///
+/// <para>为什么单独一套：这个脚本的日志是 Serilog 风格的**三行一组** ——
+/// 头行只有时间、级别、上下文标签与模块类全名，中文正文在下一行，空行收尾。
+/// March7th 的「一行自带日期 + 级别 + 正文」与 MaaFramework 的内核行都不成立，
+/// 没有任何一条判据能复用。</para>
+///
+/// <para>每条规则都来自 `C:\Program Files\BetterGI\log\better-genshin-impact20261110.log`
+/// （BetterGI 0.66.0，固定前 9,726 行快照）与 11-08 / 11-09 / 10-21 交叉样本的真实行；
+/// 统计口径见《外部脚本实时日志深度适配计划书-BetterGI.md》§1.3。</para>
+/// </summary>
+public static class BetterGIGrammar
+{
+    /// <summary>头行的模块名前缀。内容探针靠它把本族与别的「方括号级别」日志分开。</summary>
+    public const string ModulePrefix = "BetterGenshinImpact.";
+
+    /// <summary>
+    /// 头行：`[11:54:39.123] [INF] [Primary:S2:P70396:T1794282807689] BetterGenshinImpact.Service.ScriptService`。
+    ///
+    /// <para>实测 3,242 行（33.3%），全部只有元数据、没有消息体。级别字段实测只有
+    /// `INF / DBG / WRN / ERR` 四种，这里仍用 `[A-Z]{3}` 兜住将来新增的级别。</para>
+    /// </summary>
+    public static readonly Regex HeaderLine = new(
+        @"^\[(?<hms>\d{2}:\d{2}:\d{2})\.(?<ms>\d{3})\]\s+\[(?<lvl>[A-Z]{3})\]\s+\[(?<ctx>[^\]]+)\]\s+(?<mod>\S+)\s*$",
+        RegexOptions.Compiled);
+
+    /// <summary>只由分隔符组成的正文行（`------------------------------` 27 行）。</summary>
+    public static readonly Regex SeparatorOnly = new(@"^[-=_*~\s]+$", RegexOptions.Compiled);
+
+    /// <summary>纯横线分隔（脚本在每个地图追踪任务前后各打一条）。</summary>
+    public static readonly Regex DashRule = new(@"^-{4,}\s*$", RegexOptions.Compiled);
+
+    /// <summary>等号小标题：`==== 不影响脚本正常运行 ====`（1 行）。</summary>
+    public static readonly Regex EqualsTitle = new(@"^=+\s*(?<title>.*?)\s*=+$", RegexOptions.Compiled);
+
+    /// <summary>`→ "任务启动！"` / `→ "任务结束"`（TaskRunner，全天 7 + 6 行）。</summary>
+    public static readonly Regex TaskRunnerStart = new(@"^→\s*""任务启动！""\s*$", RegexOptions.Compiled);
+    public static readonly Regex TaskRunnerDone = new(@"^→\s*""任务结束""\s*$", RegexOptions.Compiled);
+
+    /// <summary>`一条龙任务执行: 1/8` / `配置组任务执行: 1/4`。</summary>
+    public static readonly Regex OneDragonProgress = new(
+        @"^一条龙任务执行\s*[:：]\s*(?<cur>\d+)\s*/\s*(?<total>\d+)\s*$", RegexOptions.Compiled);
+    public static readonly Regex GroupProgress = new(
+        @"^配置组任务执行\s*[:：]\s*(?<cur>\d+)\s*/\s*(?<total>\d+)\s*$", RegexOptions.Compiled);
+
+    /// <summary>`配置组 "兑换码" 加载完成，共1个脚本，开始执行`。</summary>
+    public static readonly Regex GroupStart = new(
+        @"^配置组\s*""(?<name>.+?)""\s*加载完成[，,]\s*共\s*(?<count>\d+)\s*个脚本[，,]\s*开始执行\s*$",
+        RegexOptions.Compiled);
+
+    /// <summary>`配置组 "兑换码" 执行结束`。</summary>
+    public static readonly Regex GroupDone = new(
+        @"^配置组\s*""(?<name>.+?)""\s*执行结束\s*$", RegexOptions.Compiled);
+
+    /// <summary>`→ 开始执行JS脚本: "自动使用兑换码"`。</summary>
+    public static readonly Regex JsStart = new(
+        @"^→\s*开始执行JS脚本\s*[:：]\s*""(?<name>.+?)""\s*$", RegexOptions.Compiled);
+
+    /// <summary>`→ 开始执行地图追踪任务: "01-霜仙花-永凝冻土下方-5个.json"`。</summary>
+    public static readonly Regex MapStart = new(
+        @"^→\s*开始执行地图追踪任务\s*[:：]\s*""(?<name>.+?)""\s*$", RegexOptions.Compiled);
+
+    /// <summary>`→ 脚本执行结束: "自动使用兑换码", 耗时: 0分1.500秒`。</summary>
+    public static readonly Regex ScriptEnd = new(
+        @"^→\s*脚本执行结束\s*[:：]\s*""(?<name>.+?)""\s*[，,]\s*耗时\s*[:：]\s*(?<cost>.+?)\s*$",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// Windows 绝对路径（允许路径段里有空格）。ERR 正文里的资源路径在窄栏会折三行，压成文件名。
+    /// </summary>
+    public static readonly Regex WinPath = new(
+        @"[A-Za-z]:\\(?:[^\\/:*?""<>|\r\n]*\\)*(?<path>[^\\/:*?""<>|\r\n]*)",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 一次性启动期噪声：ONNX 初始化、GPU 探测、窗口与配置加载、JS 步骤处理器注册。
+    ///
+    /// <para>实测主样本 38 行；guide §11 的既有调研结论就是「丢一次性初始化行，任务行原样」。
+    /// WARNING / ERROR 级行**不在**本清单内（必出纪律优先）。</para>
+    /// </summary>
+    public static readonly string[] NoisePrefixes =
+    {
+        "[ONNX]", "[GpuAuto]", "已加载默认背景图片", "主窗体实例化", "实例 IPC v2 已启动",
+        "更好的原神", "遮罩窗口已启动", "启用一条龙配置", "启用任务总数量",
+        "启用一条龙任务的数量", "启用配置组任务的数量", "正在加载步骤处理器",
+        "发现 ", "注册步骤处理器", "创建了类型为", "当前版本为",
+    };
+
+    /// <summary>
+    /// 高频过程行的归类规则：按「包含」匹配（角色名会变，前缀不固定），
+    /// 命中即归入同一折叠类。实测过程行占正文 86%，全天 2,898 行。
+    /// </summary>
+    private static readonly (string Needle, string Label)[] ProcedureRules =
+    {
+        ("点按元素战技", "战技释放"),
+        ("到达路径点附近", "路径追踪"), ("粗略接近途经点", "路径追踪"),
+        ("精确接近目标点", "路径追踪"), ("已到达路径点", "路径追踪"),
+        ("打开编队界面检查战斗是否结束", "战斗结束检查"), ("派蒙头像可见", "战斗结束检查"),
+        ("识别到战斗结束", "战斗结束检查"), ("战斗超时结束", "战斗结束检查"),
+        ("Fetching:", "图像识别"), ("Using coord:", "图像识别"), ("OCR结果:", "图像识别"),
+        ("识别到的队伍角色", "队伍识别"), ("匹配到战斗脚本", "战斗脚本"),
+        ("执行 \"自动战斗\"", "自动战斗"), ("传送完成", "传送"), ("开始传送：", "传送"),
+        ("交互或拾取", "拾取"), ("超时或视野内没有可拾取物品", "拾取"),
+        ("点击候选列表", "界面点击"), ("点击委托界面", "界面点击"),
+        ("切换到区域", "区域切换"), ("区域选择动画等待", "区域切换"),
+        ("检测委托", "委托检测"), ("尝试使用FN快捷键", "委托界面"), ("已进入委托界面", "委托界面"),
+        ("视角转动到目标角度超时", "视角转动"), ("解除VK_", "按键释放"), ("动作：", "战斗动作"),
+        ("切换盾、回血角色", "战斗动作"), ("使用元素爆发", "战斗动作"),
+        ("记录恢复点位", "脱困"), ("已到达上次点位", "脱困"), ("疑似卡死", "脱困"),
+        ("卡死脱离结束", "脱困"), ("卡死脱困超时", "脱困"), ("此路线出现", "脱困"),
+        ("切换角色卡住", "脱困"), ("多次识别出战角色失败", "角色识别"),
+        ("使用新方法获取角色编号位置失败", "角色识别"),
+        ("当前获取焦点的窗口", "窗口焦点"), ("截图失败", "截图"),
+        ("领取邮件奖励异常", "领取奖励"), ("执行脚本时发生异常", "脚本异常"),
+        ("获取委托目标坐标时出错", "委托坐标"),
+    };
+
+    /// <summary>
+    /// 别的族混进同一份日志时的标记。注意 `ExternalLogGrammar.ForeignLine` 与本族头行同形，
+    /// 不能当排除项；March7th 的 `| INFO |` 标准行也不能排除（它是内容探针的另一族正例，
+    /// BetterGI 判定靠 `!hasStandard` 区分）。这里只列 MaaFramework 内核标记。
+    /// </summary>
+    private static readonly string[] ForeignMarkers =
+    {
+        "!!!OnEventNotify!!!", "[msg=", "MaaNS::",
+        "][INF][Px", "][TRC][Px", "][DBG][Px",
+    };
+
+    /// <summary>纯分隔符 / 等号小标题：绝不上屏。</summary>
+    public static bool IsSeparator(string line)
+    {
+        if (line.Length == 0) { return false; }
+        if (SeparatorOnly.IsMatch(line) || DashRule.IsMatch(line)) { return true; }
+        return EqualsTitle.IsMatch(line);
+    }
+
+    /// <summary>一次性启动期噪声（按前缀判定，前缀之后可能带参数）。</summary>
+    public static bool IsNoiseBody(string body)
+    {
+        if (body.Length == 0) { return false; }
+        foreach (var prefix in NoisePrefixes)
+        {
+            if (body.StartsWith(prefix, StringComparison.Ordinal)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>把正文归入一个折叠类；空串表示「不是过程行」。</summary>
+    public static string ProcedureClassOf(string body)
+    {
+        if (body.Length == 0) { return string.Empty; }
+        foreach (var rule in ProcedureRules)
+        {
+            if (body.IndexOf(rule.Needle, StringComparison.Ordinal) >= 0) { return rule.Label; }
+        }
+
+        return string.Empty;
+    }
+
+    /// <summary>这一行是不是别的脚本族的标记行。</summary>
+    public static bool IsForeignFamily(string line)
+    {
+        if (line.Length == 0) { return false; }
+        foreach (var marker in ForeignMarkers)
+        {
+            if (line.Contains(marker, StringComparison.Ordinal)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>头行的三字母级别 → Yomori 的级别枚举（供级别筛选器与归档闸使用）。</summary>
+    public static ExternalLogLevel LevelOf(string level) => level switch
+    {
+        "ERR" => ExternalLogLevel.Error,
+        "WRN" => ExternalLogLevel.Warn,
+        "DBG" => ExternalLogLevel.Debug,
+        "INF" => ExternalLogLevel.Info,
+        _ => ExternalLogLevel.Unknown,
+    };
+
+    /// <summary>WRN / ERR 必出，不参与任何去重与节流。</summary>
+    public static bool IsErrorOrWarn(string level) => level is "ERR" or "WRN";
+
+    /// <summary>
+    /// 已精简形态判定（幂等）。头行以 `[` 开头，天然不命中符号前缀；
+    /// 这里仍显式排除一次，避免将来头行形状变化时把元数据行误判成面板文本。
+    /// </summary>
+    public static bool LooksCompact(string line)
+    {
+        if (line.Length == 0) { return false; }
+        if (HeaderLine.IsMatch(line)) { return false; }
+        // 只认「恰好两空格 + 非空白字符」：异常堆栈的续行常以 3～4 个空格缩进
+        // （`   at Fischless...`），它们必须留在组内进归档，不能被当成已精简文本短路。
+        if (line.Length >= 3 && line[0] == ' ' && line[1] == ' ' && line[2] != ' ') { return true; }
+
+        var text = line.TrimStart();
+        if (text.Length == 0 || text.Length != line.Length) { return false; }
+        return text.StartsWith("▶", StringComparison.Ordinal) ||
+               text.StartsWith("✔", StringComparison.Ordinal) ||
+               text.StartsWith("✘", StringComparison.Ordinal) ||
+               text.StartsWith("■", StringComparison.Ordinal) ||
+               text.StartsWith("▸", StringComparison.Ordinal) ||
+               text.StartsWith("⚠", StringComparison.Ordinal) ||
+               text.StartsWith("✗", StringComparison.Ordinal) ||
+               text.StartsWith("⋯", StringComparison.Ordinal) ||
+               text.StartsWith("✓", StringComparison.Ordinal);
+    }
+
+    /// <summary>路径压成文件名（窄栏一条 `C:\Program Files\BetterGI\…\x.json` 要折三行）。</summary>
+    public static string CompressPaths(string body) =>
+        WinPath.Replace(body, match => FileNameOf(match.Groups["path"].Value));
+
+    /// <summary>取文件名（同时认 `\` 与 `/`）。</summary>
+    public static string FileNameOf(string path)
+    {
+        var text = path.Trim().Trim('"');
+        if (text.Length == 0) { return string.Empty; }
+        var cut = text.LastIndexOfAny(new[] { '\\', '/' });
+        return cut >= 0 ? text[(cut + 1)..].Trim() : text;
+    }
+}

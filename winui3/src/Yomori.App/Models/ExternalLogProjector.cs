@@ -41,8 +41,29 @@ public sealed class ExternalLogProjection
     /// </summary>
     public string SourceTime { get; private init; } = string.Empty;
 
+    /// <summary>
+    /// 适配器给出的真实级别（`null` = 沿用当前原始行的 `ExternalLogFilter.Classify` 结果）。
+    ///
+    /// <para>为什么需要：BetterGI 这类脚本把级别写在**头行**、正文在下一行。适配器跨行合成后，
+    /// 输出落在正文行上，而正文行 `Classify` 恒为 `Unknown`。没有这个字段，界面的
+    /// 「只看错误」筛选器与 TRACE/DEBUG 归档闸都会错配。仅已适配分支读取，
+    /// 既有静态工厂保持 `null`。</para>
+    /// </summary>
+    public ExternalLogLevel? Level { get; private init; }
+
+    /// <summary>
+    /// true = 这一行是脚本的结构 / 元数据行，其语义已并入紧随的业务行。
+    ///
+    /// <para>分派层在 `!Emit` 时跳过 Warn/Error 的强制原样放行，否则 BetterGI 的
+    /// 头行（只有类名、没有消息体）会以两行旧形态占掉一条。关键字命中行仍无条件放行。</para>
+    /// </summary>
+    public bool MetaOnly { get; private init; }
+
     /// <summary>丢弃一条（噪声、重复、中间层自检）。</summary>
     public static readonly ExternalLogProjection Drop = new() { Emit = false };
+
+    /// <summary>丢弃一条结构 / 元数据行：不让 Warn/Error 的强制放行把它推上屏。</summary>
+    public static readonly ExternalLogProjection MetaDrop = new() { Emit = false, MetaOnly = true };
 
     /// <summary>原样放行：格式不认识、解析失败、非 MaaFramework 族。</summary>
     public static readonly ExternalLogProjection Pass = new() { Emit = true, UseRaw = true };
@@ -69,7 +90,8 @@ public sealed class ExternalLogProjection
     /// <para>`Compact = true` 是界面切单行模板的唯一开关，所以只能由适配器路径产生；
     /// 其余静态工厂保持默认值，MaaFW 的输出因此逐像素不变。</para>
     /// </summary>
-    public static ExternalLogProjection CompactLine(string panel, string node, ExternalLogKind kind, string sourceTime) => new()
+    public static ExternalLogProjection CompactLine(string panel, string node, ExternalLogKind kind,
+        string sourceTime, ExternalLogLevel? level = null, bool metaOnly = false) => new()
     {
         Emit = true,
         PanelText = panel,
@@ -77,6 +99,8 @@ public sealed class ExternalLogProjection
         Kind = kind,
         Compact = true,
         SourceTime = sourceTime,
+        Level = level,
+        MetaOnly = metaOnly,
     };
 }
 

@@ -68,6 +68,9 @@ public static class ExternalLogAdapterRegistry
     /// <summary>March7thAssistant / March7th Launcher 的 id。</summary>
     public const string March7thId = "m7a";
 
+    /// <summary>BetterGI（更好的原神）的 id，与 `launch_presets.json` 的 `projects[id=bgi]` 对齐。</summary>
+    public const string BetterGIId = "bgi";
+
     /// <summary>两个入口同属一个项目，实测日志语法一致。</summary>
     private static readonly string[] March7thEntries =
     {
@@ -79,6 +82,12 @@ public static class ExternalLogAdapterRegistry
     private static readonly Regex March7thLogPattern = new(
         @"^20\?\?-\?\?-\?\?\.log$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+    /// <summary>BetterGI 只有一个入口（`projects[id=bgi].entries`）。</summary>
+    private static readonly string[] BetterGIEntries =
+    {
+        "BetterGI.exe",
+    };
+
     /// <summary>按线索选适配器；都不命中返回 null（调用方走粗略兜底）。</summary>
     public static IExternalLogAdapter? Select(ExternalLogAdapterHint? hint)
     {
@@ -87,14 +96,22 @@ public static class ExternalLogAdapterRegistry
         if (LooksLikeMarch7thPreset(hint.PresetId)) { return new March7thLogAdapter(); }
         if (LooksLikeMarch7thEntry(hint.EntryName)) { return new March7thLogAdapter(); }
         if (LooksLikeMarch7thLogPath(hint.LogPath, hint.LogPattern)) { return new March7thLogAdapter(); }
+
+        if (LooksLikeBetterGIPreset(hint.PresetId)) { return new BetterGILogAdapter(); }
+        if (LooksLikeBetterGIEntry(hint.EntryName)) { return new BetterGILogAdapter(); }
+        if (LooksLikeBetterGILogPath(hint.LogPath, hint.LogPattern)) { return new BetterGILogAdapter(); }
         return null;
     }
 
     /// <summary>
     /// 内容探针（文件刚建立、显式线索缺失时的兜底）。
     ///
-    /// <para>必须**同时**满足：至少一条 March7th 标准行 + 至少一条框线/框内标题/完成线，
+    /// <para>March7th 必须**同时**满足：至少一条标准行 + 至少一条框线/框内标题/完成线，
     /// 且整段里没有别的族的标记。单看标准行会把一堆 Python 脚本误判成 March7th。</para>
+    ///
+    /// <para>BetterGI 必须满足：至少两条带 `BetterGenshinImpact.` 模块名的头行 +
+    /// 至少一条非分隔的正文行，且没有 March7th 标准行。注意
+    /// `ExternalLogGrammar.ForeignLine` 与 BetterGI 头行同形，**不能**拿它当排除项。</para>
     /// </summary>
     public static IExternalLogAdapter? DetectByContent(IReadOnlyList<string> lines)
     {
@@ -102,10 +119,12 @@ public static class ExternalLogAdapterRegistry
 
         var hasStandard = false;
         var hasFrame = false;
+        var bgiHeaders = 0;
+        var bgiBodies = 0;
         foreach (var line in lines)
         {
             if (line is null) { continue; }
-            if (March7thGrammar.IsForeignFamily(line)) { return null; }
+            if (March7thGrammar.IsForeignFamily(line) || BetterGIGrammar.IsForeignFamily(line)) { return null; }
 
             if (!hasStandard && March7thGrammar.StandardLine.IsMatch(line)) { hasStandard = true; }
             if (!hasFrame &&
@@ -115,8 +134,21 @@ public static class ExternalLogAdapterRegistry
             {
                 hasFrame = true;
             }
+
+            var bgiHeader = BetterGIGrammar.HeaderLine.Match(line);
+            if (bgiHeader.Success &&
+                bgiHeader.Groups["mod"].Value.IndexOf(BetterGIGrammar.ModulePrefix,
+                    StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                bgiHeaders++;
+            }
+            else if (line.Trim().Length > 0 && !BetterGIGrammar.IsSeparator(line))
+            {
+                bgiBodies++;
+            }
         }
 
+        if (bgiHeaders >= 2 && bgiBodies >= 1 && !hasStandard) { return new BetterGILogAdapter(); }
         return hasStandard && hasFrame ? new March7thLogAdapter() : null;
     }
 
@@ -151,6 +183,42 @@ public static class ExternalLogAdapterRegistry
 
         var pattern = (logPattern ?? string.Empty).Trim();
         return pattern.Length == 0 || March7thLogPattern.IsMatch(pattern);
+    }
+
+    /// <summary>`bgi:oneDragon` / `bgi:start` / `bgi:groups` → 前段是 `bgi`。</summary>
+    private static bool LooksLikeBetterGIPreset(string? presetId)
+    {
+        var text = (presetId ?? string.Empty).Trim();
+        if (text.Length == 0) { return false; }
+        var head = text.Split(':')[0].Trim();
+        return string.Equals(head, BetterGIId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>`C:\Program Files\BetterGI\BetterGI.exe` → 只看文件名。</summary>
+    private static bool LooksLikeBetterGIEntry(string? entryName)
+    {
+        var name = FileNameOf((entryName ?? string.Empty).Trim());
+        if (name.Length == 0) { return false; }
+        foreach (var candidate in BetterGIEntries)
+        {
+            if (string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 日志路径带 `BetterGI` / `better-genshin-impact`，或文件模式就是
+    /// `better-genshin-impact*.log`（实测 `projects[id=bgi].log.pattern`）。
+    /// 任一命中即认定，不必全中 —— 用户可能把日志目录改到别处。
+    /// </summary>
+    private static bool LooksLikeBetterGILogPath(string? logPath, string? logPattern)
+    {
+        var path = (logPath ?? string.Empty).Trim();
+        var pattern = (logPattern ?? string.Empty).Trim();
+        return path.IndexOf("BetterGI", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               path.IndexOf("better-genshin-impact", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               pattern.IndexOf("better-genshin-impact", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     /// <summary>取文件名（同时认 `\` 与 `/`，远程日志路径是 Linux 风格时也不吃亏）。</summary>

@@ -665,7 +665,11 @@ public sealed class ExternalLogTail : IDisposable
         {
             // 关键字命中与警告/错误行**绝不吞**：适配器的降噪规则针对的是过程噪声，
             // 用户自己配的关键字与脚本自己打的告警必须照常出现，否则就是在藏问题。
-            if (line.KeywordHit || line.Level is ExternalLogLevel.Warn or ExternalLogLevel.Error)
+            // 例外：适配器明确标记 MetaOnly 的结构 / 元数据行（BetterGI 头行只有类名、
+            // 没有消息体），它的语义已并入紧随的业务行，按级别强制放行只会推上一条空壳行。
+            // 关键字命中仍无条件放行，保证用户配置的关键字一个都不丢。
+            if (line.KeywordHit ||
+                ((line.Level is ExternalLogLevel.Warn or ExternalLogLevel.Error) && !adapted.MetaOnly))
             {
                 result.Add(line);
             }
@@ -689,7 +693,10 @@ public sealed class ExternalLogTail : IDisposable
             NodeText = adapted.NodeText,
             Raw = raw,
             Kind = adapted.Kind,
-            Level = line.Level,
+            // BetterGI 这类脚本把级别写在头行、正文在下一行：适配器跨行合成后，
+            // 当前正文行的 Classify 恒为 Unknown。优先用适配器给出的真实级别，
+            // 否则界面的「只看错误」筛选器与 TRACE/DEBUG 归档闸都会错配。
+            Level = adapted.Level ?? line.Level,
             KeywordHit = line.KeywordHit,
             Compact = adapted.Compact,
             SourceTime = adapted.SourceTime,
@@ -725,7 +732,7 @@ public sealed class ExternalLogTail : IDisposable
                     Text = projection.PanelText,
                     NodeText = projection.NodeText,
                     Kind = projection.Kind,
-                    Level = ExternalLogLevel.Info,
+                    Level = projection.Level ?? ExternalLogLevel.Info,
                     Compact = true,
                     SourceTime = projection.SourceTime,
                 });
