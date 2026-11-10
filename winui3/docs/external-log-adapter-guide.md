@@ -5,6 +5,7 @@
 首个适配脚本：March7th Launcher / March7th Assistant（`m7a`，提交 `2d65404`）
 第二个适配脚本：BetterGI 更好的原神（`bgi`，2026-11-10）
 第三个适配脚本：MaaEnd（`maaend`，2026-11-10，MaaFW 内核日志专属适配）
+第四个适配脚本：MAA_bbb / 识宝小助手（`maabbb`，2026-11-10，MFW-PyQt6 前端 `gui.log`）
 
 ## 0. 必要条件（先读）
 
@@ -86,9 +87,14 @@ public static class ExternalLogAdapterRegistry
 {
     public const string March7thId = "m7a";
     public const string BetterGIId = "bgi";
+    public const string MaaEndId = "maaend";
+    public const string MaaBbbId = "maabbb";
     public static IExternalLogAdapter? Select(ExternalLogAdapterHint? hint);
     public static IExternalLogAdapter? DetectByContent(IReadOnlyList<string> lines);
 }
+
+// 可选能力：需要项目资源中文标签的适配器实现它（目前只有 MaaEndLogAdapter）。
+public interface IExternalLogLabelAware { void SetLabels(LogLabelMap labels); }
 ```
 
 `ExternalLogProjection` 既有成员保持默认：`Emit` / `UseRaw` / `PanelText` / `NodeText` / `Kind` / `Drop` / `Pass` / `New` / `PanelOnly` / `NodeOnly`。深度适配新增 `bool Compact`、`string SourceTime`，以及工厂 `CompactLine(panel, node, kind, sourceTime)`；`node` 传原始行，`sourceTime` 传脚本自带的 `HH:mm:ss`。
@@ -137,6 +143,15 @@ public static class ExternalLogAdapterRegistry
 | 5 | 以上都不成立 | 粗略兜底 |
 
 三条判定纪律：注册表只登记已适配脚本，未登记一律 `null`；适配器在 tail 实例构造时绑定一次，整份文件生命周期内不切换；内容探针只做加法，文件刚建立时不提前否定，切换前的行不回溯改写。
+
+第三期与第四期各有一类**跨项目同形**的日志，按纪律不接入内容探针：MaaFW 内核日志（MaaEnd）与 MFW-PyQt6 的 Python logger 行（MAA_bbb）在多个项目里格式完全一致，`gui.log` / `maafw.log` / `logoutput_widget.py` / `MFW.exe` 都是前端或框架的通用名字，命中即绑定会波及其它项目。两者只认显式线索：
+
+| 族 | 显式线索 | 内容探针 |
+|---|---|---|
+| `maaend` | `maaend:*` / `MaaEnd.exe` / 日志路径含 `MaaEnd` | 不启用 |
+| `maabbb` | `maabbb:*` / `mab.exe` / `Maa_bbb.exe` / 日志路径含 `Maa_bbb` | 不启用 |
+
+`maabbb` 命中后再按日志文件名分流：显式跟 `maafw.log` / `maa.log` 时复用 `MaaEndLogAdapter`（内核事件族），否则走 `MaaBbbLogAdapter`（`gui.log`）。线索全缺失时退回原投影器，属于可接受的 fail-open 降级。
 
 ## 5. 新脚本接入步骤
 
@@ -341,8 +356,9 @@ BetterGI 的日志是 Serilog 风格的**三行一组**：头行 `[11:54:39.123]
 | AUTO-MAS | `时间 \| 级别 \| 模块 \| 消息`，混 `POST /api/...`；丢 API 请求行，保留配置 / 进程 / 任务 |
 | MaaFramework 系（MaaEnd 除外） | 仍由 `ExternalLogProjector` + `LogLabelStore` 深度投影，保持两行旧形态 |
 | MaaEnd | **已单独适配（§12.1）**：`maaend` 族专属适配器，单行 Compact 形态；其它 MaaFW 项目不受影响 |
+| MAA_bbb / 识宝小助手 | **已单独适配（§12.2）**：`maabbb` 第四族（MFW-PyQt6 前端 `gui.log`），单行 Compact 形态；显式跟 `maafw.log` 时复用 §12.1 的内核事件族 |
 
-各族没有 `focus` 与 `label` 机制，面板档与节点档差异主要在「是否折叠连续点击 / 一次性初始化行」。
+除 MaaEnd 外，各族没有 `focus` 与 `label` 机制，面板档与节点档差异主要在「是否折叠连续点击 / 一次性初始化行」。
 
 ### 12.1 参考实现：MaaEnd（`maaend`，2026-11-10 第三期）
 
@@ -355,6 +371,21 @@ MaaEnd 是 MaaFramework 系里唯一走专属适配的项目：`debug\maafw.log`
 3. **专属改进**：`MaafwDetails.SingleFocus()` 补回「focus 是单键对象且键不等于当前事件」的中文提示；WRN 首条必出、同类每满 100 条再出一条，其余只进归档（用 `CompactLine("", 原文, …)` 而非 `Drop`，否则已适配分支会按 Warn 级别强制原样放行）；心跳与日志中断由适配器 `Tick` 自补。
 
 `ExternalLogProjector` 的投影逻辑、`ExternalLogFilter`、桥协议（仍为 1）与界面模板均未改动。完整规则表、前后对照与实测统计见 `整合/外部脚本实时日志深度适配计划书-MaaEnd.md`。
+
+### 12.2 参考实现：MAA_bbb（`maabbb`，2026-11-10 第四期）
+
+`projects[id=maabbb]`（`frontend: mfw`）没有项目级 `log` 段，采集目标取 `frontends[id=mfw].log`，即 `debug\gui.log`。该日志是第四类形态「MFW Python 侧混合单行族」：一行自带 `yyyy-MM-dd HH:mm:ss,mmm`、大写级别、源文件、行号、函数名与正文；业务正文集中在 `logoutput_widget.py`，再套一层 `[INFO] ` / `[WARNING] ` / `[ERROR] ` 前缀，本身已是中文短句；约 85% 的行是启动、配置、回调、GPU、更新与监控期的框架噪声。任务结束时 `notice.py` 会把整段 `[HH:mm:ss][信息|警报]…` 通知正文一次性写回文件，与前面的业务行逐条重复。
+
+四份 `gui.log` 快照合计 1,413 行：Python logger 标准行 1,281（90.7%）、通知正文块 132（9.3%）、无空行。语义全在中文正文里，不依赖 `[details={…}]` 与 `LogLabelMap`，故本族不实现 `IExternalLogLabelAware`。
+
+四个实现要点：
+
+1. **正文前缀级别优先**：`logoutput_widget.py` 的 Python 行级别恒为 `INFO`，而正文写 `[WARNING]` / `[ERROR]`；适配器从正文前缀借级别并用 `CompactLine(..., level)` 带出，保证「只看错误」筛选器与归档闸不错配。
+2. **通知块只进归档**：用 `CompactLine("", 原文, …)` 逐行交出（面板不上屏、原文进归档），不返回 `Drop`（已适配分支的 `Drop` 会按 Warn/Error 级别强制原样放行）。中文级别 `信息` / `警报` 不被 `ExternalLogFilter.Classify` 识别，适配器自行映射。
+3. **内容探针不启用**：MFW 前端的 Python logger 行、`gui.log` 与 `logoutput_widget.py` 跨项目同形；只认 `maabbb:*` / `mab.exe` / `Maa_bbb.exe` / 路径含 `Maa_bbb` 三类显式线索，`MFW.exe` 不作为独立信号。
+4. **按文件名分流**：同一项目显式跟 `maafw.log` / `maa.log` 时，日志属于 MaaFW 内核事件族，注册表直接返回 `MaaEndLogAdapter` 复用 §12.1 的实现，不另写一套规则；混合模式（`gui.log;maafw.log`）不算内核。
+
+去重只做「紧邻完全相同正文」（如连续两条 `设备连接成功`），不做跨轮次强节流，避免丢掉不同任务轮次里的同名提示。心跳与「日志中断」由适配器 `Tick` 自补。`ExternalLogProjector`、`ExternalLogFilter`、桥协议与界面模板均未改动。完整规则表、统计与前后对照见 `整合/外部脚本实时日志深度适配计划书-MAA_bbb.md`。
 
 ## 13. 检查清单（提交前逐项确认）
 
@@ -376,6 +407,10 @@ MaaEnd 是 MaaFramework 系里唯一走专属适配的项目：`debug\maafw.log`
 - [ ] 第三期：WRN 折叠用「面板为空、原文进归档」而非 `Drop`；心跳由适配器 `Tick` 自补
 - [ ] 第三期修复：已适配族过滤裸级别词关键字（`ERROR` 等），关键字命中产出单行 Compact 而非两行旧形态
 - [ ] 第三期修复：`$i18n` 词条键通过 `LogLabelMap.ResolveI18n` 解析（`locales/**/zh_cn.json` 顶层点分键）
+- [ ] 第四期：`maabbb` 未启用内容探针；`MFW.exe` / `gui.log` 单独不构成识别信号
+- [ ] 第四期：业务行级别从 `[WARNING]` / `[ERROR]` 正文前缀借用；通知块用「面板为空、原文进归档」而非 `Drop`
+- [ ] 第四期：`maafw.log` 分流复用内核事件族；混合文件名模式不误走内核族
+- [ ] 第四期：紧邻重复去重不吞跨轮次同名提示；心跳由适配器 `Tick` 自补
 - [ ] 编译、代理发布、冒烟结果已汇报，等待提交指示
 
 ## 附录 A：代码锚点（按方法名定位，不写行号）
@@ -386,7 +421,7 @@ MaaEnd 是 MaaFramework 系里唯一走专属适配的项目：`debug\maafw.log`
 | `Services/ExternalLogTail.cs::Tick` | 返回集合，排空适配器内部输出队列 |
 | `Services/ScriptRunner.cs::StartExternalLogTail` | 组装 `ExternalLogAdapterHint` |
 | `Models/ExternalLogAdapter.cs` | 接口、Hint、注册表 |
-| `Models/March7thLogAdapter.cs` / `Models/BetterGILogAdapter.cs` / `ExternalLogGrammar.cs` | 两个脚本适配器与各自文法 |
+| `Models/March7thLogAdapter.cs` / `Models/BetterGILogAdapter.cs` / `Models/MaaEndLogAdapter.cs` / `Models/MaaBbbLogAdapter.cs` / `ExternalLogGrammar.cs` | 四个脚本适配器与各自文法 |
 | `Models/ExternalLogProjector.cs`（顶部） | `ExternalLogProjection` 定义处 |
 | `Services/ExternalLogFilter.cs` / `ExternalLogModels.cs` | 粗略适配与数据结构 |
 | `Services/RdpAgentRunner.cs::OnExternalLogLine` / `ViewModels/MainViewModel.cs::DrainLocalLiveLogs` | 归档与上屏透传 |
@@ -400,6 +435,8 @@ MaaEnd 是 MaaFramework 系里唯一走专属适配的项目：`debug\maafw.log`
 |---|---|
 | 首期计划书 | `整合/外部脚本实时日志深度适配计划书-March7th.md`（仓库外） |
 | 第二期计划书 | `整合/外部脚本实时日志深度适配计划书-BetterGI.md`（仓库外） |
+| 第三期计划书 | `整合/外部脚本实时日志深度适配计划书-MaaEnd.md`（仓库外） |
+| 第四期计划书 | `整合/外部脚本实时日志深度适配计划书-MAA_bbb.md`（仓库外） |
 | 降噪计划书（含各族调研） | `整合/外部脚本实时日志降噪计划书.md`（仓库外） |
 | 用户向功能文档 | `repo/winui3/docs/live-script-logs.md` |
 | WorkBuddy 技能 | `~/.workbuddy/skills/yomori-external-log-adapter/`（SKILL.md、契约、踩坑、参考实现、代码模板、统计脚本） |

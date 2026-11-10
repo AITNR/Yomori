@@ -36,6 +36,7 @@
 | BetterGI | `C:\Program Files\BetterGI\log` | `better-genshin-impact*.log` |
 | March7thAssistant | `C:\Program Files\March7thAssistant_v2.7.0\logs` | `20??-??-??.log`（避免跟到 `config_diag.log`） |
 | MaaEnd | `D:\Program Files\MaaEnd\debug` | `maafw.log`（已做专属深度适配）；前端自身问题再看 `mxu-tauri.log` |
+| MAA_bbb / 识宝小助手 | `D:\Program Files\bh\MAA_bbb…\debug` | `gui.log`（默认，已做专属深度适配）；要看节点级识别改成 `maafw.log` |
 
 ## 显示视图
 
@@ -71,9 +72,11 @@ MaaFramework 系（MFAAvalonia / MXU / MFW / MaaPiCli，40 余个项目）默认
 - 节点名 30 秒内只出一条，避免同一节点反复触发刷屏；任务长时间没有输出时补一条心跳，
   日志出现 5 分钟以上空档时补一条「日志中断」。
 
-「逐脚本深度适配」按脚本逐个接入：三月七小助手 / March7th Launcher、BetterGI 把阶段框、正文自带的日期与级别、机制噪声压成「时间 + 一句话」的单行形态；BetterGI 还会把「元数据头行 + 中文正文 + 空行」的三行组合成一条。**MaaEnd 是 MaaFramework 系里唯一单独适配的项目**：它的 `debug` 目录下的 `maafw.log` 走专属适配器，同样每条一行，任务名与节点中文仍取自项目资源；其余 MaaFW 项目继续用上一节的通用投影（两行形态）。尚未适配的脚本仍走粗略适配，原样显示。识别不到已适配脚本时一律退回原样显示，不会丢行；归档与「原文」视图始终保留脚本写入的原始行。
+「逐脚本深度适配」按脚本逐个接入：三月七小助手 / March7th Launcher、BetterGI 把阶段框、正文自带的日期与级别、机制噪声压成「时间 + 一句话」的单行形态；BetterGI 还会把「元数据头行 + 中文正文 + 空行」的三行组合成一条。**MaaEnd 与 MAA_bbb 是两个单独适配的项目**：MaaEnd 的 `debug\maafw.log` 走 MaaFW 内核事件族专属适配器，任务名与节点中文仍取自项目资源；MAA_bbb（识宝小助手）的 `debug\gui.log` 走 MFW 前端混合单行族专属适配器，把 `logoutput_widget.py` 转发的中文业务短句压成单行、滤掉启动与回调期的框架噪声，任务结束时一次性写入的通知正文块不上面板、原文仍在「节点」与归档里可查。MAA_bbb 显式把模式改成 `maafw.log` 时复用 MaaEnd 的内核事件族适配器。其余 MaaFW 项目继续用上一节的通用投影（两行形态），尚未适配的脚本仍走粗略适配、原样显示；识别不到已适配脚本时一律退回原样显示，不会丢行；归档与「原文」视图始终保留脚本写入的原始行。
 
-MaaEnd 的专属识别只认三类显式线索（预设 `maaend:*`、入口 `MaaEnd.exe`、日志路径含 `MaaEnd`）：MaaFW 内核日志跨项目同形，不启用内容探针，避免把其它项目一起切到专属形态。若三个线索都缺失（例如手写日志路径），MaaEnd 会退回通用投影，显示仍正常、只是回到两行形态。中文任务名依赖安装目录里的 `interface.json`、`tasks/`、`locales/`、`resource/pipeline/`；缺了会退化成英文条目名，但不会丢行。接入方式、契约与检查清单见 `external-log-adapter-guide.md`。
+MaaEnd 的专属识别只认三类显式线索（预设 `maaend:*`、入口 `MaaEnd.exe`、日志路径含 `MaaEnd`）：MaaFW 内核日志跨项目同形，不启用内容探针，避免把其它项目一起切到专属形态。若三个线索都缺失（例如手写日志路径），MaaEnd 会退回通用投影，显示仍正常、只是回到两行形态。中文任务名依赖安装目录里的 `interface.json`、`tasks/`、`locales/`、`resource/pipeline/`；缺了会退化成英文条目名，但不会丢行。
+
+MAA_bbb 同样不启用内容探针：MFW 前端的 Python logger 行、`gui.log` 与 `logoutput_widget.py` 在所有 MFW 项目里格式一致，`MFW.exe` 也是通用入口。它只认预设 `maabbb:*`、入口 `mab.exe` / `Maa_bbb.exe`、日志路径含 `Maa_bbb` 三类显式线索；线索缺失时退回通用投影。本族的中文任务名与提示本就在日志正文里，不依赖项目资源文件。接入方式、契约与检查清单见 `external-log-adapter-guide.md`。
 
 「从文件末尾开始跟踪」开启时，为脚本启动前已存在的文件建立末尾基线；本次新建或轮转的文件从头读取。关闭时可读取已有内容。编码支持自动、UTF-8 和 GBK；无法确认编码时可显式选择。仅转发完整行，半行等待后续换行；单行按既有规则规整和截断。外部程序自身缓冲未写入磁盘的内容无法采集。
 

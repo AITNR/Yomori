@@ -711,3 +711,116 @@ public static class MaaEndGrammar
         return cut >= 0 ? text[(cut + 1)..].Trim() : text;
     }
 }
+
+/// <summary>
+/// MAA_bbb（识宝小助手，MFW-PyQt6 前端）<c>debug/gui.log</c> 的行文法 ——
+/// 第四族「MFW Python 侧混合单行族」（2026-11-10，见《外部脚本实时日志深度适配计划书-MAA_bbb.md》）。
+///
+/// <para>一条日志自带完整日期、毫秒、大写级别、源文件、行号、函数名与正文；
+/// 业务行集中在 <c>logoutput_widget.py</c>，正文再套一层 <c>[INFO] </c> / <c>[WARNING] </c>
+/// 前缀；任务结束时 <c>notice.py</c> 会把整段 <c>[HH:mm:ss][信息]…</c> 通知正文一次性写回文件，
+/// 与前面的业务行逐条重复。语义全在中文正文里，不依赖 payload JSON 与项目资源。</para>
+///
+/// <para>本类只放文法常量与前两期同形的工具方法，状态机在
+/// <see cref="MaaBbbLogAdapter"/>。与 <see cref="MaaEndGrammar"/> 分开：
+/// 内核事件族是另一套形状，按日志文件名分流，不共用规则。</para>
+/// </summary>
+public static class MaaBbbGrammar
+{
+    /// <summary>
+    /// Python logger 标准行：
+    /// <c>[2026-11-06 07:46:51,123][INFO][logoutput_widget.py][L1234][_append_log] | [INFO] 开始加载资源……</c>。
+    /// </summary>
+    public static readonly Regex PyLine = new(
+        @"^\[(?<date>\d{4}-\d{2}-\d{2}) (?<hms>\d{2}:\d{2}:\d{2}),(?<ms>\d{3})\]" +
+        @"\[(?<lvl>INFO|DEBUG|WARNING|ERROR|CRITICAL)\]\[(?<file>[^\]]+)\]\[L\d+\]\[(?<fn>[^\]]*)\]" +
+        @"\s*\|\s*(?<body>.*)$",
+        RegexOptions.Compiled);
+
+    /// <summary>
+    /// 任务完成通知的正文块：<c>[07:46:52][信息]执行任务: 登录方式选择接口</c>。
+    /// 中文级别不被 <c>ExternalLogFilter.Classify</c> 识别（恒 Unknown），适配器须自己借级别。
+    /// </summary>
+    public static readonly Regex NoticeBlockLine = new(
+        @"^\[(?<hms>\d{2}:\d{2}:\d{2})\]\[(?<lvl>信息|警报|警告|错误)\](?<body>.*)$",
+        RegexOptions.Compiled);
+
+    /// <summary><c>logoutput_widget.py</c> 转发的业务行前缀；正文里的级别优先于 Python 行的级别。</summary>
+    public static readonly Regex BusinessPrefix = new(
+        @"^\[(?<lvl>INFO|WARNING|ERROR|DEBUG)\]\s*(?<body>.*)$",
+        RegexOptions.Compiled);
+
+    /// <summary>任务边界：<c>执行任务: &lt;entry&gt;</c>。</summary>
+    public static readonly Regex TaskStart = new(@"^执行任务\s*[:：]\s*(?<name>.*)$", RegexOptions.Compiled);
+
+    /// <summary>全部任务结束。</summary>
+    public static readonly Regex AllDone = new(@"^所有任务都已完成", RegexOptions.Compiled);
+
+    /// <summary>停止任务。</summary>
+    public static readonly Regex Stopping = new(@"^停止任务中", RegexOptions.Compiled);
+
+    /// <summary>纯分隔线（<c>====</c> 一类），不能上面板。</summary>
+    public static readonly Regex PureSeparator = new(@"^[=\-_*~\s]+$", RegexOptions.Compiled);
+
+    /// <summary>截图帧噪声：<c>[LogImage] Got frame: 1280x720 …</c>。</summary>
+    public static readonly Regex LogImageFrame = new(@"^\[LogImage\]", RegexOptions.Compiled);
+
+    /// <summary>Windows 绝对路径（允许路径段里有空格），压成文件名避免窄栏折行。</summary>
+    public static readonly Regex WinPath = new(
+        @"[A-Za-z]:\\(?:[^\\/:*?""<>|\r\n]*\\)*(?<path>[^\\/:*?""<>|\r\n]*)",
+        RegexOptions.Compiled);
+
+    /// <summary>Python 大写级别 → Yomori 级别枚举（供「只看错误」筛选器与归档闸使用）。</summary>
+    public static ExternalLogLevel LevelOf(string level) => level switch
+    {
+        "ERROR" or "CRITICAL" => ExternalLogLevel.Error,
+        "WARNING" => ExternalLogLevel.Warn,
+        "INFO" => ExternalLogLevel.Info,
+        "DEBUG" => ExternalLogLevel.Debug,
+        _ => ExternalLogLevel.Unknown,
+    };
+
+    /// <summary>通知块的中文级别 → Yomori 级别枚举。</summary>
+    public static ExternalLogLevel NoticeLevelOf(string level) => level switch
+    {
+        "错误" => ExternalLogLevel.Error,
+        "警报" or "警告" => ExternalLogLevel.Warn,
+        _ => ExternalLogLevel.Info,
+    };
+
+    /// <summary>
+    /// 已精简形态判定（幂等）。收紧为「恰好两空格 + 第三字符非空白」，
+    /// 且显式排除本族两种原始行形状，防止原始行被短路成 <c>Pass</c>。
+    /// </summary>
+    public static bool LooksCompact(string line)
+    {
+        if (line.Length == 0) { return false; }
+        if (PyLine.IsMatch(line) || NoticeBlockLine.IsMatch(line)) { return false; }
+        if (line.Length >= 3 && line[0] == ' ' && line[1] == ' ' && line[2] != ' ') { return true; }
+
+        var text = line.TrimStart();
+        if (text.Length == 0 || text.Length != line.Length) { return false; }
+        return text.StartsWith("▶", StringComparison.Ordinal) ||
+               text.StartsWith("✔", StringComparison.Ordinal) ||
+               text.StartsWith("✘", StringComparison.Ordinal) ||
+               text.StartsWith("■", StringComparison.Ordinal) ||
+               text.StartsWith("▸", StringComparison.Ordinal) ||
+               text.StartsWith("⚠", StringComparison.Ordinal) ||
+               text.StartsWith("✗", StringComparison.Ordinal) ||
+               text.StartsWith("⋯", StringComparison.Ordinal) ||
+               text.StartsWith("✓", StringComparison.Ordinal);
+    }
+
+    /// <summary>路径压成文件名。</summary>
+    public static string CompressPaths(string body) =>
+        WinPath.Replace(body, match => FileNameOf(match.Groups["path"].Value));
+
+    /// <summary>取文件名（同时认 `\` 与 `/`）。</summary>
+    public static string FileNameOf(string path)
+    {
+        var text = path.Trim().Trim('"');
+        if (text.Length == 0) { return string.Empty; }
+        var cut = text.LastIndexOfAny(new[] { '\\', '/' });
+        return cut >= 0 ? text[(cut + 1)..].Trim() : text;
+    }
+}

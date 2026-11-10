@@ -88,6 +88,9 @@ public static class ExternalLogAdapterRegistry
     /// <summary>MaaEnd 的 id，与 `launch_presets.json` 的 `projects[id=maaend]` 对齐。</summary>
     public const string MaaEndId = "maaend";
 
+    /// <summary>MAA_bbb（识宝小助手）的 id，与 `launch_presets.json` 的 `projects[id=maabbb]` 对齐。</summary>
+    public const string MaaBbbId = "maabbb";
+
     /// <summary>两个入口同属一个项目，实测日志语法一致。</summary>
     private static readonly string[] March7thEntries =
     {
@@ -111,6 +114,13 @@ public static class ExternalLogAdapterRegistry
         "MaaEnd.exe",
     };
 
+    /// <summary>识宝小助手的两个入口（`projects[id=maabbb].entries`）。`MFW.exe` 是前端通用入口，不在此列。</summary>
+    private static readonly string[] MaaBbbEntries =
+    {
+        "mab.exe",
+        "Maa_bbb.exe",
+    };
+
     /// <summary>按线索选适配器；都不命中返回 null（调用方走粗略兜底）。</summary>
     public static IExternalLogAdapter? Select(ExternalLogAdapterHint? hint)
     {
@@ -127,6 +137,18 @@ public static class ExternalLogAdapterRegistry
         if (LooksLikeMaaEndPreset(hint.PresetId)) { return new MaaEndLogAdapter(); }
         if (LooksLikeMaaEndEntry(hint.EntryName)) { return new MaaEndLogAdapter(); }
         if (LooksLikeMaaEndLogPath(hint.LogPath)) { return new MaaEndLogAdapter(); }
+
+        // 识宝小助手：默认跟 mfw 前端的 debug/gui.log（第四族）；用户把模式改成
+        // maafw.log / maa.log 时，日志属于 MaaFW 内核事件族，复用第三期实现，不另写一套规则。
+        if (LooksLikeMaaBbbPreset(hint.PresetId) ||
+            LooksLikeMaaBbbEntry(hint.EntryName) ||
+            LooksLikeMaaBbbLogPath(hint.LogPath))
+        {
+            return PrefersMaafwKernel(hint.LogPath, hint.LogPattern)
+                ? new MaaEndLogAdapter()
+                : new MaaBbbLogAdapter();
+        }
+
         return null;
     }
 
@@ -145,6 +167,11 @@ public static class ExternalLogAdapterRegistry
     /// 其它 MaaFW 项目一起劫持到单行形态。它只靠三类显式线索（见
     /// 《外部脚本实时日志深度适配计划书-MaaEnd.md》§5.1）。探针里的 MaaFW 外族标记
     /// 已使内核日志天然不会命中前两族，这里保持白名单为加法，不新增分支。</para>
+    ///
+    /// <para>**MAA_bbb 同样不接入内容探针**：MFW-PyQt6 的 Python logger 行形状与
+    /// `logoutput_widget.py` 模块名是所有 MFW 项目共用的，没有项目专属标记；命中即绑定
+    /// 会把其它项目一起劫持。它只认 `maabbb:*` / `mab.exe` / `Maa_bbb.exe` / 路径含
+    /// `Maa_bbb` 三类显式线索（见《外部脚本实时日志深度适配计划书-MAA_bbb.md》§5.1）。</para>
     /// </summary>
     public static IExternalLogAdapter? DetectByContent(IReadOnlyList<string> lines)
     {
@@ -286,6 +313,67 @@ public static class ExternalLogAdapterRegistry
     {
         var path = (logPath ?? string.Empty).Trim();
         return path.Length > 0 && path.IndexOf("MaaEnd", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>`maabbb:direct` 一类 → 前段是 `maabbb`。</summary>
+    private static bool LooksLikeMaaBbbPreset(string? presetId)
+    {
+        var text = (presetId ?? string.Empty).Trim();
+        if (text.Length == 0) { return false; }
+        var head = text.Split(':')[0].Trim();
+        return string.Equals(head, MaaBbbId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>`mab.exe` / `Maa_bbb.exe` 命中；`MFW.exe` 是前端通用入口，不能当信号。</summary>
+    private static bool LooksLikeMaaBbbEntry(string? entryName)
+    {
+        var name = FileNameOf((entryName ?? string.Empty).Trim());
+        if (name.Length == 0) { return false; }
+        foreach (var candidate in MaaBbbEntries)
+        {
+            if (string.Equals(name, candidate, StringComparison.OrdinalIgnoreCase)) { return true; }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// 日志路径里带 `MAA_bbb` / `Maa_bbb`（实测 `D:\Program Files\bh\MAA_bbb（修改完成_1023_0301）\debug`）。
+    ///
+    /// <para>`gui.log` 与 `logoutput_widget.py` 都是 MFW-PyQt6 前端的通用名字，
+    /// 所有 MFW 项目同形，单独命中会把其它项目一起劫持；只在路径已含项目名时认定。</para>
+    /// </summary>
+    private static bool LooksLikeMaaBbbLogPath(string? logPath)
+    {
+        var path = (logPath ?? string.Empty).Trim();
+        return path.Length > 0 && path.IndexOf("Maa_bbb", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    /// <summary>
+    /// 按日志文件分流：显式指向 `maafw.log` / `maa.log` 时说明跟的是 MaaFW 内核日志，
+    /// 复用第三期内核事件族实现；否则是 mfw 前端的 `gui.log`，走第四族。
+    ///
+    /// <para>混合模式（例如 `gui.log;maafw.log`）不算内核，避免把 gui.log 的行喂给内核族。</para>
+    /// </summary>
+    private static bool PrefersMaafwKernel(string? logPath, string? logPattern)
+    {
+        var path = (logPath ?? string.Empty).Trim();
+        var pattern = (logPattern ?? string.Empty).Trim();
+
+        var file = FileNameOf(path);
+        if (string.Equals(file, "maafw.log", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(file, "maa.log", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (pattern.Length == 0 || pattern.IndexOf("gui.log", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            return false;
+        }
+
+        return pattern.IndexOf("maafw.log", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               pattern.IndexOf("maa.log", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     /// <summary>取文件名（同时认 `\` 与 `/`，远程日志路径是 Linux 风格时也不吃亏）。</summary>
