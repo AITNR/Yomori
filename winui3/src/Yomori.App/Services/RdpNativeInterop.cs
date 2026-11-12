@@ -111,6 +111,7 @@ namespace Yomori.Services
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_mouse(int session, uint flags, ushort x, ushort y);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_key(int session, int down, int extended, ushort scancode);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_keyboard_sync(int session, uint flags);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_suppress_output(int session, int allow);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_set_muted(int session, int muted);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_get_muted(int session);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_grab_frame(int session, out uint out_width, out uint out_height, out uint out_stride, out IntPtr out_data);

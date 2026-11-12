@@ -644,6 +644,20 @@ namespace Yomori.Services
             => _session > 0 && RdpNativeInterop.ycn_rdp_send_keyboard_sync(_session, state.ToWireFlags()) == 0;
 
         /// <summary>
+        /// 暂停/恢复服务端图形输出（MS-RDPBCGR 2.2.11.3 Client Suppress Output PDU）。
+        /// 供「只连接不渲染」的抓帧数据面使用：allow=false 时服务端停止发送图形更新，
+        /// 但连接、会话、输入与音频全部保活；allow=true 时原生层会补发一次全屏
+        /// RefreshRect 并强制下一帧整帧，避免恢复瞬间画面残缺。
+        ///
+        /// 只入队、由原生事件循环线程执行；未连接或非 RUNNING 态返回 false（不抛）。
+        /// </summary>
+        public bool SetDisplayUpdates(bool allow)
+            => _session > 0 && RdpNativeInterop.ycn_rdp_suppress_output(_session, allow ? 1 : 0) == 0;
+
+        /// <summary>回退到 RDP 帧流时调用：恢复图形输出并补一次全屏刷新。</summary>
+        public bool RequestFullRefresh() => SetDisplayUpdates(true);
+
+        /// <summary>
         /// 本机静音 / 取消静音（远端照常发声，只是本机不放）。
         /// 立即生效、不需要重连；原生侧对 rdpsnd 设备的 SetVolume 做了链式挂钩，
         /// 静音态下服务器下发的音量 PDU 也盖不掉。只影响**本会话**，不波及其他通道。

@@ -154,6 +154,9 @@ typedef struct
 	 * 置 pending_sync=1 让事件循环线程下一拍发 TS_SYNCHRONIZE（跨线程直发同 send_* 禁忌）。*/
 	uint32_t sync_flags;
 	int pending_sync;
+	/* 待处理的 Suppress Output 请求：-1=无, 0=暂停图形输出, 1=恢复+全屏刷新。
+	 * g_lock 保护；只入队、由事件循环线程执行（跨线程直调 update->SuppressOutput 会破坏协议流）。*/
+	int pending_suppress;
 
 	/* 连接参数副本（connect 时深拷贝，C# 侧内存随时可释放） */
 	char host[256];
@@ -3097,6 +3100,8 @@ static DWORD WINAPI event_loop(LPVOID arg)
 				int have_k = 0;
 				uint32_t sync_flags = 0;
 				int have_sync = 0;
+				int have_suppress = 0;
+				int suppress_allow = 0;
 				EnterCriticalSection(&g_lock);
 				if (s->mouse_head != s->mouse_tail)
 				{
@@ -3116,15 +3121,45 @@ static DWORD WINAPI event_loop(LPVOID arg)
 					s->pending_sync = 0;
 					have_sync = 1;
 				}
+				if (s->pending_suppress >= 0)
+				{
+					suppress_allow = s->pending_suppress;
+					s->pending_suppress = -1;
+					have_suppress = 1;
+				}
 				LeaveCriticalSection(&g_lock);
 				/* 同步必须排在键事件**之前**：它是服务器解释后续扫描码的基准，
 				 * 反过来（先按 NumLock 再同步）会让本拍按键仍按旧锁状态解释。 */
-				if (have_sync)
+			if (have_sync)
+			{
+				BOOL sent = freerdp_input_send_synchronize_event(instance->context->input, sync_flags);
+				WLog_DBG(TAG, "input drain: keyboard sync sent=%d flags=0x%08X", sent, sync_flags);
+			}
+			if (have_suppress)
+			{
+				rdpUpdate* update = instance->context->update;
+				rdpSettings* settings = instance->context->settings;
+				UINT16 desktop_w = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+				UINT16 desktop_h = (UINT16)freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+				RECTANGLE_16 full = { 0, 0, desktop_w, desktop_h };
+				BOOL sent = FALSE;
+
+				/* MS-RDPBCGR 2.2.11.3：allow=0 的 PDU 不含 desktopRect。
+				 * 这里仍传 &full 作防御 —— 正确的 FreeRDP 实现会按 allow 忽略 area，
+				 * 若上游内部对 area 做无条件解引用也不会踩空指针。 */
+				if (update && update->SuppressOutput)
+					sent = update->SuppressOutput(instance->context, suppress_allow ? 1 : 0, &full);
+				if (suppress_allow)
 				{
-					BOOL sent = freerdp_input_send_synchronize_event(instance->context->input, sync_flags);
-					WLog_DBG(TAG, "input drain: keyboard sync sent=%d flags=0x%08X", sent, sync_flags);
+					/* 恢复画面：补一次全屏 RefreshRect（RDP8+ 服务端单发可能只刷
+					 * (0,0) 一块），并强制下一帧整帧，避免画面残缺。 */
+					if (update && update->RefreshRect)
+						update->RefreshRect(instance->context, 1, &full);
+					InterlockedExchange(&s->dirty_force_full, 1);
 				}
-				if (have_m)
+				WLog_INFO(TAG, "suppress output: allow=%d sent=%d %ux%u", suppress_allow, sent, desktop_w, desktop_h);
+			}
+			if (have_m)
 				{
 					BOOL sent = freerdp_input_send_mouse_event(instance->context->input, m.flags, m.x, m.y);
 					WLog_DBG(TAG, "input drain: mouse sent=%d flags=0x%04X", sent, m.flags);
@@ -3137,8 +3172,8 @@ static DWORD WINAPI event_loop(LPVOID arg)
 					freerdp_input_send_keyboard_event_ex(instance->context->input,
 					                                     k.down ? TRUE : FALSE, TRUE, rdp_scancode);
 				}
-				if (!have_m && !have_k && !have_sync)
-					break;
+			if (!have_m && !have_k && !have_sync && !have_suppress)
+				break;
 			}
 
 			if (!freerdp_check_event_handles(instance->context))
@@ -3272,6 +3307,7 @@ teardown:
 	s->key_head = s->key_tail = 0;
 	s->sync_flags = 0;
 	s->pending_sync = 0;
+	s->pending_suppress = -1;
 	InterlockedExchange(&s->state, YCN_STATE_IDLE);
 	s->used = 0;
 	InterlockedIncrement(&g_total_released);
@@ -3417,6 +3453,7 @@ static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callback
 	s->key_tail = 0;
 	s->sync_flags = 0;
 	s->pending_sync = 0;
+	s->pending_suppress = -1;
 
 	instance = freerdp_new();
 	if (!instance)
@@ -3781,6 +3818,30 @@ YCN_API int ycn_rdp_send_keyboard_sync(int session, uint32_t flags)
 	}
 	s->sync_flags = flags;
 	s->pending_sync = 1;
+	LeaveCriticalSection(&g_lock);
+	return YCN_OK;
+}
+
+/* 暂停/恢复服务端图形输出（MS-RDPBCGR 2.2.11.3 Client Suppress Output PDU）。
+ * 只入队、由事件循环线程下一拍执行 —— 与 send_* / pending_sync 同一条纪律，
+ * 跨线程直调 update->SuppressOutput 会破坏协议流。
+ * allow=0 → SUPPRESS_DISPLAY_UPDATES；allow=1 → ALLOW_DISPLAY_UPDATES + 全屏 RefreshRect。 */
+YCN_API int ycn_rdp_suppress_output(int session, int allow)
+{
+	YcnSession* s;
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (!s)
+	{
+		LeaveCriticalSection(&g_lock);
+		return YCN_ERR_SESSION_NOT_FOUND;
+	}
+	if (InterlockedCompareExchange(&s->state, 0, 0) != YCN_STATE_RUNNING)
+	{
+		LeaveCriticalSection(&g_lock);
+		return YCN_ERR_NOT_CONNECTED;
+	}
+	s->pending_suppress = allow ? 1 : 0;
 	LeaveCriticalSection(&g_lock);
 	return YCN_OK;
 }

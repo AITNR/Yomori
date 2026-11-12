@@ -155,6 +155,14 @@ YCN_API uint32_t ycn_rdp_decode_capabilities(void);
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);
 
+/* 暂停/恢复服务端图形输出（MS-RDPBCGR 2.2.11.3 Client Suppress Output PDU）。
+ * allow=0 → SUPPRESS_DISPLAY_UPDATES（不带 desktopRect；服务端 MUST 停止发送图形更新）；
+ * allow=1 → ALLOW_DISPLAY_UPDATES（带全屏 rect，并在原生层补发一次 RefreshRect）。
+ * 该 PDU 不断会话、不断 socket；供「只连接不渲染」的抓帧数据面使用。
+ * 只入队，由事件循环线程执行；禁止在 on_frame_ready / on_connected 回调内调用。
+ * 返回 0 = 已入队；YCN_ERR_SESSION_NOT_FOUND / YCN_ERR_NOT_CONNECTED = 未入队。 */
+YCN_API int ycn_rdp_suppress_output(int session, int allow);
+
 /* 输入注入。flags = FreeRDP PTR_FLAGS_*（C# 侧定义同名常量） */
 YCN_API int ycn_rdp_send_mouse(int session, uint32_t flags, uint16_t x, uint16_t y);
 
