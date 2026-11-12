@@ -127,6 +127,124 @@
                 </StackPanel>
             </Border>
 
+            <!-- ===== 执行与通知（全局）：2026-11-12 从「通道管理」页整体迁入 =====
+                 连接方式 / 解码 / 渲染后端 / 通知开关都是全局设置，与某一条通道无关；
+                 放在设置页才不会让人以为「换条通道就要重配一遍」。 -->
+            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="执行与通知（全局）" FontWeight="SemiBold" />
+
+                    <ComboBox Header="连接方式"
+                              ItemsSource="{x:Bind VM.ClientModeItems}"
+                              DisplayMemberPath="Value"
+                              SelectedValuePath="Key"
+                              SelectedValue="{x:Bind VM.RdpSettings.ClientMode, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch" />
+
+                    <CheckBox Content="内嵌模式下在本机播放远端声音"
+                              IsChecked="{x:Bind VM.RdpSettings.AudioEnabled, Mode=TwoWay}" />
+
+                    <!-- 解码 / 渲染两个下拉的 ItemsSource 在构造函数里显式赋值，不用 x:Bind：
+                         x:Bind 的求值顺序会把 SelectedValue 排在 ItemsSource 之前，
+                         列表还空着时那次赋值被直接丢弃，之后再填选项也不会重新匹配 → 下拉框显示空白。
+                         Loaded 里再补一次选中值，保证每次进页面都看得见当前值。 -->
+                    <ComboBox x:Name="DecodeBackendCombo"
+                              Header="内嵌画面解码方式"
+                              DisplayMemberPath="Value"
+                              SelectedValuePath="Key"
+                              SelectedValue="{x:Bind VM.RdpSettings.DecodeBackend, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch"
+                              ToolTipService.ToolTip="自动会优先尝试硬件视频解码，失败后回退软件/非 AVC；软件强制禁用硬件视频解码。实际解码方式以会话日志诊断为准，连接刚开始时尚未判定为硬解。两种选择都在下次连接生效。--embed-nod3d 或 render_backend=software 会强制软件解码。" />
+
+                    <ComboBox x:Name="RenderBackendCombo"
+                              Header="内嵌画面渲染后端"
+                              DisplayMemberPath="Value"
+                              SelectedValuePath="Key"
+                              SelectedValue="{x:Bind VM.RdpSettings.RenderBackend, Mode=TwoWay}"
+                              HorizontalAlignment="Stretch"
+                              ToolTipService.ToolTip="D3D 在某些显卡 / 虚拟显示驱动组合下可能把整个窗口卡死（进程还活着但点不动）。碰到就切到软渲染，不用等新版本。改完下次连接生效。" />
+
+                    <CheckBox Content="GFX 图形管线（支持 H.264，需重连生效）"
+                              IsChecked="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
+                              ToolTipService.ToolTip="默认开启，H.264 硬解需要此管线。关闭后使用旧位图路径，仅用于性能与兼容性对照，CPU 是否降低需实测。" />
+
+                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                               Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />
+
+                    <NumberBox Header="等待目标会话建立的超时（秒）"
+                               Minimum="15"
+                               Maximum="600"
+                               SpinButtonPlacementMode="Compact"
+                               Value="{x:Bind VM.RdpSettings.ConnectTimeoutSeconds, Mode=TwoWay}" />
+
+                    <ToggleSwitch Header="每完成一个任务都发通知（仅本机主控端）"
+                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnTaskDone, Mode=TwoWay}"
+                                  ToolTipService.ToolTip="每个任务跑完在你正在看的桌面上弹一条「任务已完成（i/n）」。目标会话里不再弹任何通知。" />
+                    <ToggleSwitch Header="每条会话通道跑完都发通知（仅本机主控端）"
+                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnChannelDone, Mode=TwoWay}"
+                                  ToolTipService.ToolTip="某条通道整条跑完（含失联）时弹一条「Yomori：通道「x」任务结束」。" />
+                    <ToggleSwitch Header="全部通道跑完后发汇总通知（仅本机主控端）"
+                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnAllDone, Mode=TwoWay}"
+                                  ToolTipService.ToolTip="整轮结束发一条汇总（多块才发）。" />
+                    <ToggleSwitch Header="本地（非远程会话）执行时也发通知"
+                                  IsOn="{x:Bind VM.RdpSettings.NotifyLocalTaskDone, Mode=TwoWay}" />
+                </StackPanel>
+            </Border>
+
+            <!-- ===== 通道预检：2026-11-12 从「通道管理」页整体迁入 =====
+                 检查对象由页内下拉选取，与通道管理页共用同一份 VM.SelectedChannel；
+                 下拉的 ItemsSource / SelectedItem 全在 SettingsPage.xaml.cs 里管，
+                 避开 ComboBox 的 x:Bind 求值顺序坑（选中项排在列表之前，TwoWay 还可能回写空值）。 -->
+            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                <StackPanel Spacing="12">
+                    <TextBlock Text="通道预检" FontWeight="SemiBold" />
+
+                    <ComboBox x:Name="ReadinessChannelCombo"
+                              Header="检查通道"
+                              DisplayMemberPath="DisplayName"
+                              HorizontalAlignment="Stretch"
+                              SelectionChanged="OnReadinessChannelChanged" />
+
+                    <InfoBar x:Name="ChannelReadinessBar"
+                             IsOpen="True"
+                             IsClosable="False"
+                             Severity="Informational"
+                             Title="检查结果"
+                             Message="{x:Bind VM.ChannelReadinessText, Mode=OneWay}" />
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="120" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="目标会话：" Opacity="0.7" />
+                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelSessionSummary, Mode=OneWay}" TextWrapping="Wrap" />
+                    </Grid>
+
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="120" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="代理状态：" Opacity="0.7" />
+                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelAgentStatusText, Mode=OneWay}" TextWrapping="Wrap" />
+                    </Grid>
+
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="部署会话代理" Click="OnDeployChannelAgent"
+                                ToolTipService.ToolTip="把代理放进所有用户共享的启动目录，目标账户登录后自动接管任务（整机共用一份）" />
+                        <Button Content="移除代理" Click="OnRemoveAgent" />
+                        <Button Content="重新检查" Click="OnRefreshChannelReadiness" />
+                    </StackPanel>
+
+                    <!-- 这几个按钮的即时结果原先只落在 RdpStatusText 上，而通道管理页从不显示它 ——
+                         点了「部署会话代理」页面纹丝不动。现在结果显示在本卡里。 -->
+                    <TextBlock Text="{x:Bind VM.RdpStatusText, Mode=OneWay}"
+                               TextWrapping="Wrap"
+                               Opacity="0.75" />
+                </StackPanel>
+            </Border>
+
             <!-- 远程桌面解锁（RDP 多用户）。
                  本版（计划书 M1）只做只读检测：读注册表值、服务状态、会话枚举、文件版本与 INI，
                  不写任何键、不下载、不装组件。三个修改按钮因此保持禁用并说明原因 ——

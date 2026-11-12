@@ -1,6 +1,7 @@
 // -*- coding: utf-8 -*-
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
@@ -60,6 +61,12 @@ public sealed partial class SettingsPage : Page
     /// </summary>
     private bool _rdpAutoDetectDone;
 
+    /// <summary>通道预检下拉正在程序性同步选中项，避免 SelectionChanged 回写造成循环。</summary>
+    private bool _syncingReadinessChannel;
+
+    /// <summary>预检结果只在本页首次加载时刷一次（改主题会让 Loaded 重来）。</summary>
+    private bool _readinessRefreshed;
+
     /// <summary>
     /// 「重新观看开始引导」：一次性重播，不写配置、不改首次启动标记。
     /// 放在设置页是为了让跳过引导的用户有回头路。
@@ -78,9 +85,27 @@ public sealed partial class SettingsPage : Page
         {
             _unloaded = true;
             _themeHintCts?.Cancel();
+            // 单例 VM：页面切换时解绑，别把本页的控件留在订阅链上
+            VM.PropertyChanged -= OnReadinessPropertyChanged;
         };
 
         Loaded += OnPageLoaded;
+
+        // 2026-11-12：执行与通知 / 通道预检从通道管理页迁入。
+        // 两个下拉的 ItemsSource 必须早于 SelectedValue 生效（x:Bind 求值顺序坑），
+        // 所以在构造函数里显式赋值；Loaded 再补一次选中值。
+        RenderBackendCombo.ItemsSource = RenderBackends.Items;
+        SyncRenderBackendSelection();
+        DecodeBackendCombo.ItemsSource = DecodeBackends.Items;
+        SyncDecodeBackendSelection();
+
+        // 预检的通道下拉完全在代码里管：绑 TwoWay 会在列表还是空的时候把
+        // SelectedItem 的赋值丢掉，甚至把 null 回写进 VM.SelectedChannel。
+        ReadinessChannelCombo.ItemsSource = VM.Channels;
+        SyncReadinessChannelSelection();
+
+        Loaded += OnReadinessSectionLoaded;
+        VM.PropertyChanged += OnReadinessPropertyChanged;
 
         _syncing = true;
         try
@@ -1134,6 +1159,143 @@ public sealed partial class SettingsPage : Page
         // 令牌状态在构造时读不出来（PasswordBox 还没进树），放在首次加载
         RunOnUi(DispatcherQueue, RefreshGitHubTokenState);
         await RefreshRdpSectionAsync(announce: false);
+    }
+
+    // ---------------- 执行与通知 / 通道预检（2026-11-12 从通道管理页迁入） ----------------
+
+    /// <summary>
+    /// 把渲染后端下拉框拉回配置里的当前值。x:Bind 求值顺序是 SelectedValue 先、
+    /// ItemsSource 后，Items 还空着时那次赋值会被丢弃；构造函数和 Loaded 各补一次。
+    /// 空配置一律归一成 auto（D3D11），所以不会出现"没有选中项"的状态。
+    /// </summary>
+    private void SyncRenderBackendSelection()
+    {
+        var key = RenderBackends.Normalize(VM.RdpSettings.RenderBackend);
+        if (!string.Equals(RenderBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
+        {
+            RenderBackendCombo.SelectedValue = key;
+        }
+    }
+
+    /// <summary>解码方式下拉框与渲染后端一样受 x:Bind 求值顺序影响，ctor 和 Loaded 都补一次。</summary>
+    private void SyncDecodeBackendSelection()
+    {
+        var key = DecodeBackends.Normalize(VM.RdpSettings.DecodeBackend);
+        if (!string.Equals(DecodeBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
+        {
+            DecodeBackendCombo.SelectedValue = key;
+        }
+    }
+
+    /// <summary>把预检下拉的选中项拉回 VM 当前选中的通道（同一份全局状态，两页共用）。</summary>
+    private void SyncReadinessChannelSelection()
+    {
+        _syncingReadinessChannel = true;
+        try
+        {
+            if (!ReferenceEquals(ReadinessChannelCombo.SelectedItem, VM.SelectedChannel))
+            {
+                ReadinessChannelCombo.SelectedItem = VM.SelectedChannel;
+            }
+        }
+        finally
+        {
+            _syncingReadinessChannel = false;
+        }
+    }
+
+    /// <summary>用户在预检卡里换通道：回写 VM，setter 会顺带刷新该通道的预检结论。</summary>
+    private void OnReadinessChannelChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingReadinessChannel)
+        {
+            return;
+        }
+
+        if (ReadinessChannelCombo.SelectedItem is RdpChannel channel
+            && !ReferenceEquals(channel, VM.SelectedChannel))
+        {
+            VM.SelectedChannel = channel;
+        }
+    }
+
+    /// <summary>预检结论变了就换 InfoBar 颜色（就绪=绿，否则=黄）。</summary>
+    private void SyncReadinessChrome()
+    {
+        ChannelReadinessBar.Severity = VM.ChannelReadinessText.Contains("就绪")
+            ? InfoBarSeverity.Success
+            : InfoBarSeverity.Warning;
+    }
+
+    /// <summary>
+    /// 页面加载时把迁入的两块界面摆好。与 RDP 检测的 OnPageLoaded 分开 ——
+    /// 那个有 _rdpAutoDetectDone 早退，主题切换导致 Loaded 再来一次时不该跳过这里的同步。
+    /// </summary>
+    private void OnReadinessSectionLoaded(object sender, RoutedEventArgs e)
+    {
+        SyncRenderBackendSelection();
+        SyncDecodeBackendSelection();
+        SyncReadinessChannelSelection();
+
+        if (!_readinessRefreshed)
+        {
+            _readinessRefreshed = true;
+            // 启动后直接进设置页时，SelectedChannel 的预检文本还没算过（Initialize 里
+            // ReloadChannels(refreshReadiness:false) 故意不跑），这里补一次。
+            VM.RefreshChannelReadiness();
+        }
+
+        SyncReadinessChrome();
+    }
+
+    /// <summary>
+    /// VM 里的预检 / 选中通道变了，同步本页的显示。
+    /// 统一调度到 UI 线程：这些属性也可能由后台任务写，直接碰控件会踩跨线程 COM 异常。
+    /// Unloaded 时解绑，避免单例 VM 订阅泄漏。
+    /// </summary>
+    private void OnReadinessPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
+        {
+            case nameof(MainViewModel.ChannelReadinessText):
+            case nameof(MainViewModel.RdpStatusText):
+                RunOnUi(DispatcherQueue, () =>
+                {
+                    if (!_unloaded)
+                    {
+                        SyncReadinessChrome();
+                    }
+                });
+                break;
+            case nameof(MainViewModel.SelectedChannel):
+            case nameof(MainViewModel.Channels):
+                RunOnUi(DispatcherQueue, () =>
+                {
+                    if (!_unloaded)
+                    {
+                        SyncReadinessChannelSelection();
+                    }
+                });
+                break;
+        }
+    }
+
+    private void OnRefreshChannelReadiness(object sender, RoutedEventArgs e)
+    {
+        VM.RefreshChannelReadiness();
+        SyncReadinessChrome();
+    }
+
+    private void OnDeployChannelAgent(object sender, RoutedEventArgs e)
+    {
+        VM.DeployChannelAgentCommand.Execute(null);
+        SyncReadinessChrome();
+    }
+
+    private void OnRemoveAgent(object sender, RoutedEventArgs e)
+    {
+        VM.RemoveAgentCommand.Execute(null);
+        SyncReadinessChrome();
     }
 
     /// <summary>把「令牌配没配」写到界面上。只显示掩码，绝不回显整串。</summary>

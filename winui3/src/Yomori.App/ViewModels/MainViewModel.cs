@@ -5053,10 +5053,10 @@ public sealed class MainViewModel : ObservableObject
     /// <summary>连接方式下拉框数据源。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> ClientModeItems => ClientModes.Items;
 
-    /// <summary>内嵌画面解码方式选项（绑到通道管理页的下拉框）。</summary>
+    /// <summary>内嵌画面解码方式选项（绑到设置页的下拉框）。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> DecodeBackendItems => DecodeBackends.Items;
 
-    /// <summary>内嵌画面渲染后端选项（绑到通道管理页的下拉框）。</summary>
+    /// <summary>内嵌画面渲染后端选项（绑到设置页的下拉框）。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> RenderBackendItems => RenderBackends.Items;
 
     /// <summary>当前是否为内嵌连接模式（client_mode = embedded）。</summary>

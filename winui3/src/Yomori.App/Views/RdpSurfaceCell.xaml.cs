@@ -176,7 +176,7 @@ public sealed partial class RdpSurfaceCell : UserControl
         {
             PlaceholderText.Text =
                 "当前客户端模式是「独立窗口（mstsc）」，画面在系统自带的远程桌面窗口里，应用内不显示。\n" +
-                "想在这里看到内嵌画面，请到「通道管理…」把客户端模式改为「内嵌」。";
+                "想在这里看到内嵌画面，请到「设置 → 执行与通知」把连接方式改为「内嵌」。";
         }
         else if (VM.SurfaceEndReason(_channelId) is { Length: > 0 } endReason)
         {

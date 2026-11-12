@@ -143,7 +143,7 @@ public sealed partial class MainWindow : Window
         //   父项本身        = 只负责展开/收起子菜单，点击**不导航**（否则和子项重复）；
         //   子项「多画面」  = 多画面页（全部通道的网格），唯一的菜单入口；
         //   子项「通道名」  = 该通道单独的画面页；
-        //   子项「通道管理…」= 配置 / 凭据 / 部署代理 / 预检。
+        //   子项「通道管理…」= 通道配置（增删改 / 凭据 / 桥目录 / 分辨率）；部署代理与预检在设置页。
         // 子项按「配置里启用的通道 + 本轮在跑的通道」重建，配置一改就跟着变。
         //
         // ⚠️ 三条信号缺一不可：
@@ -1444,7 +1444,7 @@ public sealed partial class MainWindow : Window
     private const string ChannelTagPrefix = "ch:";
 
     /// <summary>
-    /// 「通道管理…」子项 tag —— 配置 / 凭据 / 部署代理 / 预检（<see cref="Views.ChannelsPage"/>）。
+    /// 「通道管理…」子项 tag —— 通道配置（增删改 / 凭据 / 桥目录 / 分辨率，<see cref="Views.ChannelsPage"/>）。部署代理与环境预检在设置页。
     /// 刻意不再叫 "channels"：那个 tag 现在只是「会话通道」父项的标识，
     /// 导航语义已让给「多画面」子项（<see cref="MultiViewTag"/>）。
     /// </summary>

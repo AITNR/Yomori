@@ -11,12 +11,13 @@ using Yomori.ViewModels;
 namespace Yomori.Views;
 
 /// <summary>
-/// 通道管理 · 配置 / 预检页（计划书 §8.3 / D4；菜单位置见 docs/channel-menu-multiview-plan.md，
+/// 通道管理 · 配置页（计划书 §8.3 / D4；菜单位置见 docs/channel-menu-multiview-plan.md，
 /// 由原 <c>RdpPage</c> 改造）。
 ///
-/// 本页负责<b>配</b>：通道增删改、凭据、部署代理、环境预检、全局执行与通知设置；
-/// 每条通道的<b>画面</b>在多画面页（<see cref="RdpMultiViewPage"/>）与各通道子页
-/// （<see cref="RdpChannelPage"/>）里。
+/// 本页负责<b>配</b>：左边选通道（增删改），右边编辑该通道的名称 / 主机 / 账户 /
+/// 桥目录 / 凭据 / 分辨率。2026-11-12 起「通道预检」与「全局执行与通知设置」整体迁到
+/// <see cref="SettingsPage"/>；每条通道的<b>画面</b>在多画面页
+/// （<see cref="RdpMultiViewPage"/>）与各通道子页（<see cref="RdpChannelPage"/>）里。
 ///
 /// 画面控件仍然留在这里（折叠状态）：一是自检模式 <c>--embed-vm</c> 要用，
 /// 二是全屏 / 键盘接管那套逻辑与它绑在一起。
@@ -34,16 +35,9 @@ public sealed partial class ChannelsPage : Page
 
         _selfCheckEmbed = Program.EmbedVmArgs is not null;
 
-        // 渲染后端下拉框的数据源与选中值都在这里先摆好，早于 x:Bind 的求值。
-        // 走 x:Bind 时它们的相对顺序是 SelectedValue 在前、ItemsSource 在后 ——
-        // ComboBox 在列表还空着的时候赋 SelectedValue 会被丢弃，之后再填选项也不会重新匹配，
-        // 结果就是下拉框永远空白（"连接方式"没这毛病：它的 ItemsSource 恰好排在前面）。
-        RenderBackendCombo.ItemsSource = RenderBackends.Items;
-        SyncRenderBackendSelection();
-        DecodeBackendCombo.ItemsSource = DecodeBackends.Items;
-        SyncDecodeBackendSelection();
-
         // 会话处理（收尾动作）已迁到任务的收尾行 —— 本页不再有那个下拉框（见《任务类型与收尾计划书》§6.6）。
+        // 渲染后端 / 解码方式两个下拉连同「执行与通知」卡一起迁到设置页（SettingsPage），
+        // 它们的 ItemsSource 初始化与选中值同步也在那边，本页不再碰。
 
         // 画面控件诊断直接进运行日志（便于无人值守验收）
         EmbedView.DiagnosticLog = VM.AppendLog;
@@ -64,14 +58,8 @@ public sealed partial class ChannelsPage : Page
     {
         VM.PropertyChanged += OnViewModelPropertyChanged;
 
-        // x:Bind 的求值顺序是 RdpSettings（→ SelectedValue）排在 RenderBackendItems（→ ItemsSource）之前。
-        // ComboBox 在 Items 还是空的时候赋 SelectedValue 会被直接丢弃，之后填 Items 也不会重新匹配，
-        // 于是下拉框永远显示空白（"连接方式"没这毛病：它的 ItemsSource 恰好排在前面）。
-        // Loaded 在 x:Bind 全部 Loading 之后触发，在这里补一次即可保证每次进页面都看得见当前值。
-        SyncRenderBackendSelection();
-        SyncDecodeBackendSelection();
-
-        VM.RefreshRdpReadiness();
+        // 全局预检（RefreshRdpReadiness）与执行 / 通知设置已迁到设置页。
+        // 这里只刷「每通道预检」—— 编辑卡里的凭据 / 授权状态也由它带出来。
         VM.RefreshChannelReadiness();
         SyncChannelChrome();
 
@@ -106,23 +94,21 @@ public sealed partial class ChannelsPage : Page
         _embedStatsTimer?.Stop();
     }
 
-    /// <summary>VM 里的通道 / 预检状态变了就同步一次界面装饰（下拉选中、空列表提示、预检颜色）。</summary>
+    /// <summary>VM 里的通道状态变了就同步一次界面装饰（空列表提示、编辑卡可用态）。</summary>
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         switch (e.PropertyName)
         {
             case nameof(MainViewModel.SelectedChannel):
             case nameof(MainViewModel.Channels):
-            case nameof(MainViewModel.ChannelReadinessText):
             case nameof(MainViewModel.ChannelCredentialText):
             case nameof(MainViewModel.ActiveSession):
-            case nameof(MainViewModel.RdpStatusText):
                 SyncChannelChrome();
                 break;
         }
     }
 
-    /// <summary>把选中通道、空列表提示、预检颜色这些"装饰性"状态刷一遍。</summary>
+    /// <summary>把空列表提示、编辑卡可用态这些"装饰性"状态刷一遍。预检结果归设置页。</summary>
     private void SyncChannelChrome()
     {
         var selected = VM.SelectedChannel;
@@ -136,36 +122,6 @@ public sealed partial class ChannelsPage : Page
         ChannelEditorHint.Text = selected is null
             ? "未选择通道"
             : $"正在编辑：{selected.DisplayName}";
-
-        ChannelReadinessBar.Severity = VM.ChannelReadinessText.Contains("就绪")
-            ? InfoBarSeverity.Success
-            : InfoBarSeverity.Warning;
-    }
-
-    /// <summary>
-    /// 把渲染后端下拉框拉回配置里的当前值（见 <see cref="OnLoaded"/> 里关于求值顺序的说明）。
-    /// 空配置一律归一成 auto（D3D11），所以不会出现"没有选中项"的状态。
-    /// </summary>
-    private void SyncRenderBackendSelection()
-    {
-        var key = RenderBackends.Normalize(VM.RdpSettings.RenderBackend);
-        if (!string.Equals(RenderBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
-        {
-            RenderBackendCombo.SelectedValue = key;
-        }
-    }
-
-    /// <summary>
-    /// 解码方式下拉框与渲染后端一样受 x:Bind 求值顺序影响：SelectedValue 可能先于
-    /// ItemsSource 赋值而被空列表丢弃。ctor 和 Loaded 都补一次，保证进页面不会空白。
-    /// </summary>
-    private void SyncDecodeBackendSelection()
-    {
-        var key = DecodeBackends.Normalize(VM.RdpSettings.DecodeBackend);
-        if (!string.Equals(DecodeBackendCombo.SelectedValue as string, key, StringComparison.Ordinal))
-        {
-            DecodeBackendCombo.SelectedValue = key;
-        }
     }
 
     /// <summary>自检模式：折叠本页除画面卡以外的全部内容，让画面直接进视口。</summary>
@@ -205,12 +161,6 @@ public sealed partial class ChannelsPage : Page
     private void OnRemoveChannel(object sender, RoutedEventArgs e)
     {
         VM.RemoveChannelCommand.Execute(VM.SelectedChannel);
-        SyncChannelChrome();
-    }
-
-    private void OnRefreshChannelReadiness(object sender, RoutedEventArgs e)
-    {
-        VM.RefreshChannelReadiness();
         SyncChannelChrome();
     }
 
@@ -261,18 +211,6 @@ public sealed partial class ChannelsPage : Page
     private void OnClearChannelCredential(object sender, RoutedEventArgs e)
     {
         VM.ClearChannelCredential();
-        SyncChannelChrome();
-    }
-
-    private void OnDeployChannelAgent(object sender, RoutedEventArgs e)
-    {
-        VM.DeployChannelAgentCommand.Execute(null);
-        SyncChannelChrome();
-    }
-
-    private void OnRemoveAgent(object sender, RoutedEventArgs e)
-    {
-        VM.RemoveAgentCommand.Execute(null);
         SyncChannelChrome();
     }
 

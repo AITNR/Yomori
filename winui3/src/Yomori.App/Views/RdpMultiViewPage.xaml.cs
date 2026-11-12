@@ -204,7 +204,7 @@ public sealed partial class RdpMultiViewPage : Page
 
         MultiViewHintText.Text = VM.IsEmbeddedMode
             ? "这里并列显示全部通道的画面；每格右上角可把它弹成独立窗口，想单独放大请看左侧菜单里它自己的那一项。"
-            : "当前客户端模式是「独立窗口（mstsc）」，画面在系统自带的远程桌面窗口里；要在这里并排看画面，请到「通道管理…」把连接方式改成「内嵌」。";
+            : "当前客户端模式是「独立窗口（mstsc）」，画面在系统自带的远程桌面窗口里；要在这里并排看画面，请到「设置 → 执行与通知」把连接方式改成「内嵌」。";
     }
 
     /// <summary>把第 index 格放进 2×2 网格里合适的位置（1 / 2 / 3 格时自动跨行列）。</summary>

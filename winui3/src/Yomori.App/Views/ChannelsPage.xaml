@@ -1,11 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 通道管理 · 配置 / 预检页（计划书 §8.3 / D4；菜单位置见 docs/channel-menu-multiview-plan.md）。
+<!-- 通道管理 · 配置页（计划书 §8.3 / D4；菜单位置见 docs/channel-menu-multiview-plan.md）。
 
-     职能分家：
-       本页     = 通道配置（增删改）+ 凭据 + 部署代理 + 环境预检 + 全局执行/通知设置；
+     职能分家（2026-11-12 重构）：
+       本页     = 通道配置：左边选通道（增删改），右边编辑该通道的名称/主机/账户/桥目录/凭据/分辨率；
+       设置页   = 通道预检（部署代理、环境检查）+ 全局执行与通知设置（连接方式、解码、渲染、通知开关）；
        多画面页 = 左侧菜单「会话通道」父项：全部通道的网格（RdpMultiViewPage）；
        通道页   = 该通道的画面、进度、心跳、事件（父项下每条通道一个子项）。
-     所以内嵌画面卡在这里是【折叠保留】的 —— 画面归多画面页与通道页，本页只在自检模式下自己挂一下。 -->
+
+     布局对齐「任务执行」页：左侧固定 264 的选择列，右侧随窗口伸缩的详情列。
+     内嵌画面卡在这里是【折叠保留】的 —— 画面归多画面页与通道页，本页只在自检模式下自己挂一下。
+     ⚠️ EmbedCard 必须是根 Grid 的直接子元素：自检模式 CollapseNonEmbedSections() 会遍历
+        根 Panel 的 Children，把除它以外的兄弟全部折叠，然后单独把它显示出来。 -->
 <Page
     x:Class="Yomori.Views.ChannelsPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -13,351 +18,215 @@
     xmlns:models="using:Yomori.Models"
     xmlns:views="using:Yomori.Views">
 
-    <ScrollViewer VerticalScrollBarVisibility="Auto">
-        <StackPanel Padding="16,12" Spacing="12">
+    <Grid Padding="16,12" ColumnSpacing="12">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="264" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
 
-            <!-- 标题与总开关 -->
-            <StackPanel Spacing="4">
-                <TextBlock Text="通道管理" Style="{StaticResource SubtitleTextBlockStyle}" />
-                <TextBlock TextWrapping="Wrap" Opacity="0.7"
-                           Text="一条通道 = 一个目标账户 + 它自己的凭据和指令桥目录。任务在「任务执行」页**按通道编排**（先选通道，再往这条通道里加任务）；开始执行后通道之间并行，通道内部仍按顺序跑。没分配通道的任务归「本地执行」，在主控端当前会话里跑。" />
+        <!-- ===== 左：选择通道 ===== -->
+        <Grid Grid.Column="0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
 
-                <Button HorizontalAlignment="Left"
-                        Content="去任务页编排任务"
+            <TextBlock Grid.Row="0"
+                       Text="通道"
+                       Style="{StaticResource SubtitleTextBlockStyle}"
+                       Margin="0,0,0,8" />
+
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="6" Margin="0,0,0,8">
+                <!-- x:Name 供首次启动引导第 6 步挖洞定位（OnboardingPlan.TargetAddChannel），别改。 -->
+                <Button x:Name="AddChannelButton" Content="新建通道" Click="OnAddChannel"
+                        ToolTipService.ToolTip="加一条通道：填目标主机与账户，然后保存凭据" />
+                <Button Content="复制" Click="OnDuplicateChannel"
+                        ToolTipService.ToolTip="按当前选中的通道复制一条（凭据需要重新保存）" />
+                <Button Content="删除" Click="OnRemoveChannel" />
+            </StackPanel>
+
+            <Border Grid.Row="2"
+                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                    BorderThickness="1"
+                    CornerRadius="8"
+                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+                <ListView x:Name="ChannelList"
+                          ItemsSource="{x:Bind VM.Channels, Mode=OneWay}"
+                          SelectedItem="{x:Bind VM.SelectedChannel, Mode=TwoWay}"
+                          SelectionMode="Single">
+                    <ListView.ItemTemplate>
+                        <DataTemplate x:DataType="models:RdpChannel">
+                            <StackPanel Padding="4,6" Spacing="2">
+                                <TextBlock Text="{x:Bind Name, Mode=OneWay}" />
+                                <TextBlock Text="{x:Bind ListSubtitle, Mode=OneWay}"
+                                           Opacity="0.65" FontSize="12"
+                                           TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListView.ItemTemplate>
+                </ListView>
+            </Border>
+
+            <StackPanel Grid.Row="3" Spacing="8" Margin="0,8,0,0">
+                <InfoBar x:Name="ChannelEmptyBar"
+                         IsOpen="False"
+                         IsClosable="False"
+                         Severity="Informational"
+                         Title="还没有配置通道"
+                         Message="点「新建通道」加一条，填上目标主机与账户，再保存凭据。只想在本机当前账户跑任务的话，不配通道也可以 —— 那属于「本地执行」。" />
+
+                <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                           Text="一条通道 = 一个目标账户 + 它自己的凭据和指令桥目录。任务在「任务执行」页按通道编排（先选通道，再往这条通道里加任务）；开始执行后通道之间并行，通道内部仍按顺序跑。没分配通道的任务归「本地执行」。" />
+
+                <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                           Text="同一台机器上的多条通道请配不同账户 —— 同一个账户开两条通道会抢同一个会话。有通道就按通道下发，没配通道的任务在主控端当前会话里跑（通道功能恒为开启，没有总开关）。多条通道能否同时跑取决于系统是否允许多个交互式会话并存；普通 Windows 客户端版同一台机器只允许一个交互式会话，第二条通道会顶掉前一个桌面，这种情况请把通道分到不同机器。" />
+
+                <Button Content="去任务页编排任务"
+                        HorizontalAlignment="Stretch"
                         Click="OnOpenTasks">
                     <ToolTipService.ToolTip>
                         <ToolTip Content="打开「任务执行」页：左边选通道，中间给这条通道排任务。" />
                     </ToolTipService.ToolTip>
                 </Button>
             </StackPanel>
+        </Grid>
 
-            <!-- 总开关已移除（2026-10-26）：有通道就按通道下发，没配通道的任务照旧跑本地。
-                 这条卡片只留多会话说明 —— 它是用户排「第二条通道顶掉前一个桌面」时最需要的一句话。 -->
-            <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    Padding="14">
-                <StackPanel Spacing="8">
-                    <TextBlock Text="多条通道同时执行" FontWeight="SemiBold" FontSize="13" />
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="有通道就按通道下发，没配通道的任务在主控端当前会话里跑（通道功能恒为开启，没有总开关）。多条通道能否同时跑，取决于系统是否允许多个交互式会话并存：系统允许多会话时各通道互不影响；普通 Windows 客户端版同一台机器只允许一个交互式会话，第二条通道会顶掉前一个桌面，这种情况请把通道分到不同机器。" />
-                </StackPanel>
-            </Border>
+        <!-- ===== 右：通道设置 ===== -->
+        <ScrollViewer Grid.Column="1" Padding="4,0,8,0"
+                      VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="10">
+                <TextBlock Text="通道设置" Style="{StaticResource SubtitleTextBlockStyle}" />
+                <TextBlock x:Name="ChannelEditorHint"
+                           Opacity="0.6" FontSize="12" TextWrapping="Wrap" />
 
-            <!-- ===== 通道列表 ===== -->
-            <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    Padding="14">
-                <StackPanel Spacing="10">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-
-                        <TextBlock Grid.Column="0" Text="通道" FontWeight="SemiBold" VerticalAlignment="Center" />
-
-                        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8">
-                            <Button x:Name="AddChannelButton" Content="新建通道" Click="OnAddChannel"
-                                    ToolTipService.ToolTip="加一条通道：填目标主机与账户，然后保存凭据" />
-                            <Button Content="复制" Click="OnDuplicateChannel"
-                                    ToolTipService.ToolTip="按当前选中的通道复制一条（凭据需要重新保存）" />
-                            <Button Content="删除" Click="OnRemoveChannel" />
-                            <Button Content="重新预检" Click="OnRefreshChannelReadiness" />
-                        </StackPanel>
-                    </Grid>
-
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="同一台机器上的多条通道请配不同账户 —— 同一个账户开两条通道没有意义（它们会抢同一个会话）。" />
-
-                    <Border Height="200"
-                            BorderBrush="{ThemeResource DividerStrokeColorDefaultBrush}"
-                            BorderThickness="1"
-                            CornerRadius="6">
-                        <ListView x:Name="ChannelList"
-                                  ItemsSource="{x:Bind VM.Channels, Mode=OneWay}"
-                                  SelectedItem="{x:Bind VM.SelectedChannel, Mode=TwoWay}"
-                                  SelectionMode="Single">
-                            <ListView.ItemTemplate>
-                                <DataTemplate x:DataType="models:RdpChannel">
-                                    <StackPanel Padding="4,6" Spacing="2">
-                                        <TextBlock Text="{x:Bind Name, Mode=OneWay}" />
-                                        <TextBlock Text="{x:Bind ListSubtitle, Mode=OneWay}"
-                                                   Opacity="0.65" FontSize="12"
-                                                   TextTrimming="CharacterEllipsis" />
-                                    </StackPanel>
-                                </DataTemplate>
-                            </ListView.ItemTemplate>
-                        </ListView>
-                    </Border>
-
-                    <InfoBar x:Name="ChannelEmptyBar"
-                             IsOpen="False"
-                             IsClosable="False"
-                             Severity="Informational"
-                             Title="还没有配置通道"
-                             Message="点「新建通道」加一条，填上目标主机与账户，再保存凭据。只想在本机当前账户跑任务的话，不配通道也可以 —— 那属于「本地执行」。" />
-                </StackPanel>
-            </Border>
-
-            <!-- ===== 通道编辑 ===== -->
-            <Border x:Name="ChannelEditorCard"
-                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    Padding="14">
-                <StackPanel Spacing="10">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="通道设置" FontWeight="SemiBold" VerticalAlignment="Center" />
-                        <TextBlock Grid.Column="1" x:Name="ChannelEditorHint"
-                                   Opacity="0.6" FontSize="12" VerticalAlignment="Center" />
-                    </Grid>
-
-                    <TextBox Header="通道名称"
-                             PlaceholderText="例如 1 号机 · Player2（留空会按账户名自动起一个）"
-                             Text="{x:Bind VM.SelectedChannel.Name, Mode=TwoWay}"
-                             LostFocus="OnChannelFieldLostFocus" />
-
-                    <Grid ColumnSpacing="8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBox Grid.Column="0"
-                                 Header="目标主机"
-                                 PlaceholderText="127.0.0.1（可填 IP、主机名，或带端口如 192.168.1.20:3390）"
-                                 Text="{x:Bind VM.SelectedChannel.Host, Mode=TwoWay}"
+                <Border x:Name="ChannelEditorCard" Padding="16" Style="{StaticResource YomoriCardStyle}">
+                    <StackPanel Spacing="10">
+                        <TextBox Header="通道名称"
+                                 PlaceholderText="例如 1 号机 · Player2（留空会按账户名自动起一个）"
+                                 Text="{x:Bind VM.SelectedChannel.Name, Mode=TwoWay}"
                                  LostFocus="OnChannelFieldLostFocus" />
-                        <Button Grid.Column="1" Content="用本机" VerticalAlignment="Bottom"
-                                Click="OnUseLocalHost"
-                                ToolTipService.ToolTip="填回 127.0.0.1，切本机另一个账户" />
-                    </Grid>
 
-                    <TextBox Header="目标账户"
-                             PlaceholderText="例如 Player2 或 机器名\Player2"
-                             Text="{x:Bind VM.SelectedChannel.User, Mode=TwoWay}"
-                             LostFocus="OnChannelFieldLostFocus" />
+                        <Grid ColumnSpacing="8">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBox Grid.Column="0"
+                                     Header="目标主机"
+                                     PlaceholderText="127.0.0.1（可填 IP、主机名，或带端口如 192.168.1.20:3390）"
+                                     Text="{x:Bind VM.SelectedChannel.Host, Mode=TwoWay}"
+                                     LostFocus="OnChannelFieldLostFocus" />
+                            <Button Grid.Column="1" Content="用本机" VerticalAlignment="Bottom"
+                                    Click="OnUseLocalHost"
+                                    ToolTipService.ToolTip="填回 127.0.0.1，切本机另一个账户" />
+                        </Grid>
 
-                    <TextBox Header="指令桥目录（仅远程主机需要）"
-                             PlaceholderText="留空＝本机 ProgramData 下的默认位置（按账户名自动分目录）"
-                             Text="{x:Bind VM.SelectedChannel.BridgePath, Mode=TwoWay}"
-                             LostFocus="OnChannelFieldLostFocus" />
+                        <TextBox Header="目标账户"
+                                 PlaceholderText="例如 Player2 或 机器名\Player2"
+                                 Text="{x:Bind VM.SelectedChannel.User, Mode=TwoWay}"
+                                 LostFocus="OnChannelFieldLostFocus" />
 
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="实际桥目录：" Opacity="0.7" VerticalAlignment="Center" />
-                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelBridgeDir, Mode=OneWay}"
-                                   TextTrimming="CharacterEllipsis" FontSize="12" Opacity="0.8"
-                                   VerticalAlignment="Center" Margin="6,0" />
-                        <Button Grid.Column="2" Content="打开" Click="OnOpenChannelBridgeFolder" />
-                    </Grid>
+                        <TextBox Header="指令桥目录（仅远程主机需要）"
+                                 PlaceholderText="留空＝本机 ProgramData 下的默认位置（按账户名自动分目录）"
+                                 Text="{x:Bind VM.SelectedChannel.BridgePath, Mode=TwoWay}"
+                                 LostFocus="OnChannelFieldLostFocus" />
 
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="桥目录是主控端与目标会话里的代理互相传指令/状态的地方，留空时按「账户名」自动分目录（每条通道一个），所以本机多账户不用手动区分。目标是别的机器时，对方读不到本机文件，必须填一个双方都能读写的共享位置。" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="实际桥目录：" Opacity="0.7" VerticalAlignment="Center" />
+                            <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelBridgeDir, Mode=OneWay}"
+                                       TextTrimming="CharacterEllipsis" FontSize="12" Opacity="0.8"
+                                       VerticalAlignment="Center" Margin="6,0" />
+                            <Button Grid.Column="2" Content="打开" Click="OnOpenChannelBridgeFolder" />
+                        </Grid>
 
-                    <PasswordBox x:Name="ChannelPasswordInput"
-                                 Header="登录密码"
-                                 PlaceholderText="仅用于存入 Windows 凭据管理器"
-                                 PasswordChar="●" />
+                        <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                                   Text="桥目录是主控端与目标会话里的代理互相传指令/状态的地方，留空时按「账户名」自动分目录（每条通道一个），所以本机多账户不用手动区分。目标是别的机器时，对方读不到本机文件，必须填一个双方都能读写的共享位置。" />
 
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="保存凭据" Click="OnSaveChannelCredential" />
-                        <Button Content="清除已保存凭据" Click="OnClearChannelCredential" />
-                        <TextBlock VerticalAlignment="Center" Opacity="0.7" FontSize="12">
-                            <Run Text="凭据：" />
-                            <Run Text="{x:Bind VM.ChannelCredentialText, Mode=OneWay}" />
+                        <PasswordBox x:Name="ChannelPasswordInput"
+                                     Header="登录密码"
+                                     PlaceholderText="仅用于存入 Windows 凭据管理器"
+                                     PasswordChar="●" />
+
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="保存凭据" Click="OnSaveChannelCredential" />
+                            <Button Content="清除已保存凭据" Click="OnClearChannelCredential" />
+                            <TextBlock VerticalAlignment="Center" Opacity="0.7" FontSize="12">
+                                <Run Text="凭据：" />
+                                <Run Text="{x:Bind VM.ChannelCredentialText, Mode=OneWay}" />
+                            </TextBlock>
+                        </StackPanel>
+
+                        <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                                   Text="密码只进 Windows 凭据管理器（按「主机 + 账户」各存一条，通道之间互不覆盖），不会写进 config.json。目标账户必须设置过登录密码。" />
+
+                        <TextBlock TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                                   Text="保存凭据后会自动检查该账户是不是本机管理员：已是管理员则不做任何修改；不是管理员时先征求确认，确认后把该账户加入本机 Administrators 组，即授予本机管理员权限。原有组成员关系（Users、Remote Desktop Users 等）全部保持不变。远程主机的通道不受影响 —— 那些账户要在目标计算机上设置。" />
+
+                        <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.85">
+                            <Run Text="管理员授权：" />
+                            <Run Text="{x:Bind VM.ChannelGrantText, Mode=OneWay}" />
                         </TextBlock>
+
+                        <ComboBox Header="远程桌面窗口尺寸"
+                                  ItemsSource="{x:Bind VM.ResolutionItems}"
+                                  DisplayMemberPath="Value"
+                                  SelectedValuePath="Key"
+                                  SelectedValue="{x:Bind VM.ChannelResolutionKey, Mode=TwoWay}"
+                                  HorizontalAlignment="Stretch" />
+
+                        <!-- 「该通道任务全部结束后的会话处理」与「启用该通道」已移除：
+                             收尾动作迁到任务的收尾行（任务执行页最后一行），
+                             通道启停改由任务执行页左栏每行的开关承担 —— 那是唯一入口。 -->
+
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <Button Content="保存通道设置" Click="OnSaveChannelEdits"
+                                    Style="{StaticResource AccentButtonStyle}" />
+                        </StackPanel>
+
+                        <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                                   Text="文本框失焦时会自动落盘，按钮只是让你能确认一次。通道要不要参与本轮执行，在「任务执行」页左栏每行的开关上设置；跑完之后的收尾动作（注销 / 断开）在任务列表最后那条收尾任务里选。环境预检与全局执行/通知设置已移到「设置」页。" />
                     </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
 
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="密码只进 Windows 凭据管理器（按「主机 + 账户」各存一条，通道之间互不覆盖），不会写进 config.json。目标账户必须设置过登录密码。" />
-
-                    <TextBlock TextWrapping="Wrap" Opacity="0.7" FontSize="12"
-                               Text="保存凭据后会自动检查该账户是不是本机管理员：已是管理员则不做任何修改；不是管理员时先征求确认，确认后把该账户加入本机 Administrators 组，即授予本机管理员权限。原有组成员关系（Users、Remote Desktop Users 等）全部保持不变。远程主机的通道不受影响 —— 那些账户要在目标计算机上设置。" />
-
-                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.85">
-                        <Run Text="管理员授权：" />
-                        <Run Text="{x:Bind VM.ChannelGrantText, Mode=OneWay}" />
-                    </TextBlock>
-
-                    <ComboBox Header="远程桌面窗口尺寸"
-                              ItemsSource="{x:Bind VM.ResolutionItems}"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.ChannelResolutionKey, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch" />
-
-                    <!-- 「该通道任务全部结束后的会话处理」与「启用该通道」已移除：
-                         收尾动作迁到任务的收尾行（任务执行页最后一行），
-                         通道启停改由任务执行页左栏每行的开关承担 —— 那是唯一入口。 -->
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="保存通道设置" Click="OnSaveChannelEdits"
-                                Style="{StaticResource AccentButtonStyle}" />
-                    </StackPanel>
-
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="文本框失焦时会自动落盘，按钮只是让你能确认一次。通道要不要参与本轮执行，在「任务执行」页左栏每行的开关上设置；跑完之后的收尾动作（注销 / 断开）在任务列表最后那条收尾任务里选。" />
+        <!-- 内嵌画面宿主：正常模式下折叠（画面归通道页），只有自检模式（embed-vm 参数）才自己挂上来。
+             输入转发 / 全屏 / 黑白屏自愈那套代码保留在这里，M6 多画面时统一收口。
+             ⚠️ Grid.ColumnSpan 让它跨满两列；自检时左右两栏被 CollapseNonEmbedSections 折叠。 -->
+        <Border x:Name="EmbedCard"
+                Grid.Column="0" Grid.ColumnSpan="2"
+                Visibility="Collapsed"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="1"
+                CornerRadius="8"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                Padding="14">
+            <StackPanel Spacing="10">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <TextBlock x:Name="EmbedCardTitle" Text="内嵌画面" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock Text="连接方式选「内嵌」时，画面显示在多画面页与各通道子页里；这里只在自检模式下使用。"
+                               Opacity="0.6" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap" />
                 </StackPanel>
-            </Border>
-
-            <!-- ===== 该通道预检 ===== -->
-            <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    Padding="14">
-                <StackPanel Spacing="10">
-                    <TextBlock Text="通道预检" FontWeight="SemiBold" />
-
-                    <InfoBar x:Name="ChannelReadinessBar"
-                             IsOpen="True"
-                             IsClosable="False"
-                             Severity="Informational"
-                             Title="检查结果"
-                             Message="{x:Bind VM.ChannelReadinessText, Mode=OneWay}" />
-
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="120" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="目标会话：" Opacity="0.7" />
-                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelSessionSummary, Mode=OneWay}" TextWrapping="Wrap" />
-                    </Grid>
-
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="120" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="代理状态：" Opacity="0.7" />
-                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelAgentStatusText, Mode=OneWay}" TextWrapping="Wrap" />
-                    </Grid>
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="部署会话代理" Click="OnDeployChannelAgent"
-                                ToolTipService.ToolTip="把代理放进所有用户共享的启动目录，目标账户登录后自动接管任务（整机共用一份）" />
-                        <Button Content="移除代理" Click="OnRemoveAgent" />
-                        <Button Content="重新检查" Click="OnRefreshChannelReadiness" />
-                    </StackPanel>
-
-                    <!-- 这几个按钮的即时结果原先只落在 RdpStatusText 上，而本页从不显示它 ——
-                         点了「部署会话代理」页面纹丝不动，只能靠弹窗或日志才看得出成没成。 -->
-                    <TextBlock Text="{x:Bind VM.RdpStatusText, Mode=OneWay}"
-                               TextWrapping="Wrap"
-                               Opacity="0.75" />
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button x:Name="EmbedConnectButton" Content="连接预览" Click="OnEmbedConnect" Style="{StaticResource AccentButtonStyle}" />
+                    <Button x:Name="EmbedDisconnectButton" Content="断开" Click="OnEmbedDisconnect" IsEnabled="False" />
+                    <Button x:Name="EmbedFullScreenButton" Content="全屏" Click="OnEmbedFullScreenToggle" IsEnabled="False" />
+                    <CheckBox x:Name="EmbedAudioCheck" Content="播放远端声音" IsChecked="True" VerticalAlignment="Center" />
+                    <TextBlock x:Name="EmbedStatusText" VerticalAlignment="Center" Opacity="0.7" FontSize="12" />
                 </StackPanel>
-            </Border>
-
-            <!-- ===== 全局执行与通知设置 ===== -->
-            <Border BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    Padding="14">
-                <StackPanel Spacing="10">
-                    <TextBlock Text="执行与通知（全局）" FontWeight="SemiBold" />
-
-                    <ComboBox Header="连接方式"
-                              ItemsSource="{x:Bind VM.ClientModeItems}"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.RdpSettings.ClientMode, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch" />
-
-                    <CheckBox Content="内嵌模式下在本机播放远端声音"
-                              IsChecked="{x:Bind VM.RdpSettings.AudioEnabled, Mode=TwoWay}" />
-
-                    <ComboBox x:Name="DecodeBackendCombo"
-                              Header="内嵌画面解码方式"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.RdpSettings.DecodeBackend, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch"
-                              ToolTipService.ToolTip="自动会优先尝试硬件视频解码，失败后回退软件/非 AVC；软件强制禁用硬件视频解码。实际解码方式以会话日志诊断为准，连接刚开始时尚未判定为硬解。两种选择都在下次连接生效。--embed-nod3d 或 render_backend=software 会强制软件解码。" />
-
-                    <!-- ItemsSource 在代码里（构造函数）显式赋值，不用 x:Bind：
-                         x:Bind 的求值顺序会把 SelectedValue 排在 ItemsSource 之前，
-                         列表还空着时那次赋值被直接丢弃，之后再填选项也不会重新匹配 → 下拉框显示空白。 -->
-                    <ComboBox x:Name="RenderBackendCombo"
-                              Header="内嵌画面渲染后端"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.RdpSettings.RenderBackend, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch"
-                              ToolTipService.ToolTip="D3D 在某些显卡 / 虚拟显示驱动组合下可能把整个窗口卡死（进程还活着但点不动）。碰到就切到软渲染，不用等新版本。改完下次连接生效。" />
-                    <CheckBox Content="GFX 图形管线（支持 H.264，需重连生效）"
-                              IsChecked="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
-                              ToolTipService.ToolTip="默认开启，H.264 硬解需要此管线。关闭后使用旧位图路径，仅用于性能与兼容性对照，CPU 是否降低需实测。"
-                              />
-
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />
-
-                    <NumberBox Header="等待目标会话建立的超时（秒）"
-                               Minimum="15"
-                               Maximum="600"
-                               SpinButtonPlacementMode="Compact"
-                               Value="{x:Bind VM.RdpSettings.ConnectTimeoutSeconds, Mode=TwoWay}" />
-
-                    <ToggleSwitch Header="每完成一个任务都发通知（仅本机主控端）"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnTaskDone, Mode=TwoWay}"
-                                  ToolTipService.ToolTip="每个任务跑完在你正在看的桌面上弹一条「任务已完成（i/n）」。目标会话里不再弹任何通知。" />
-                    <ToggleSwitch Header="每条会话通道跑完都发通知（仅本机主控端）"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnChannelDone, Mode=TwoWay}"
-                                  ToolTipService.ToolTip="某条通道整条跑完（含失联）时弹一条「Yomori：通道「x」任务结束」。" />
-                    <ToggleSwitch Header="全部通道跑完后发汇总通知（仅本机主控端）"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnAllDone, Mode=TwoWay}"
-                                  ToolTipService.ToolTip="整轮结束发一条汇总（多块才发）。" />
-                    <ToggleSwitch Header="本地（非远程会话）执行时也发通知"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyLocalTaskDone, Mode=TwoWay}" />
-
-                </StackPanel>
-            </Border>
-
-            <!-- 内嵌画面宿主：正常模式下折叠（画面归通道页），只有自检模式（embed-vm 参数）才自己挂上来。
-                 输入转发 / 全屏 / 黑白屏自愈那套代码保留在这里，M6 多画面时统一收口。 -->
-            <Border x:Name="EmbedCard"
-                    Visibility="Collapsed"
-                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
-                    BorderThickness="1"
-                    CornerRadius="8"
-                    Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                    Padding="14">
-                <StackPanel Spacing="10">
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <TextBlock x:Name="EmbedCardTitle" Text="内嵌画面" FontWeight="SemiBold" VerticalAlignment="Center" />
-                        <TextBlock Text="连接方式选「内嵌」时，画面显示在多画面页与各通道子页里；这里只在自检模式下使用。"
-                                   Opacity="0.6" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap" />
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button x:Name="EmbedConnectButton" Content="连接预览" Click="OnEmbedConnect" Style="{StaticResource AccentButtonStyle}" />
-                        <Button x:Name="EmbedDisconnectButton" Content="断开" Click="OnEmbedDisconnect" IsEnabled="False" />
-                        <Button x:Name="EmbedFullScreenButton" Content="全屏" Click="OnEmbedFullScreenToggle" IsEnabled="False" />
-                        <CheckBox x:Name="EmbedAudioCheck" Content="播放远端声音" IsChecked="True" VerticalAlignment="Center" />
-                        <TextBlock x:Name="EmbedStatusText" VerticalAlignment="Center" Opacity="0.7" FontSize="12" />
-                    </StackPanel>
-                    <TextBlock FontSize="12" Opacity="0.6" TextWrapping="Wrap"
-                               Text="输入提示：点击画面获得焦点后，鼠标与键盘直接作用于远端。全屏时 Win 键、Alt+Tab 等系统组合键全部转投远端（F11 退出全屏）；Ctrl+Alt+Del 是系统安全序列任何客户端都无法转发，远端任务管理器请用 Ctrl+Shift+Esc。" />
-                    <Border x:Name="EmbedHostBorder" Height="360">
-                        <views:RdpView x:Name="EmbedView" />
-                    </Border>
-                </StackPanel>
-            </Border>
-
-        </StackPanel>
-    </ScrollViewer>
+                <TextBlock FontSize="12" Opacity="0.6" TextWrapping="Wrap"
+                           Text="输入提示：点击画面获得焦点后，鼠标与键盘直接作用于远端。全屏时 Win 键、Alt+Tab 等系统组合键全部转投远端（F11 退出全屏）；Ctrl+Alt+Del 是系统安全序列任何客户端都无法转发，远端任务管理器请用 Ctrl+Shift+Esc。" />
+                <Border x:Name="EmbedHostBorder" Height="360">
+                    <views:RdpView x:Name="EmbedView" />
+                </Border>
+            </StackPanel>
+        </Border>
+    </Grid>
 </Page>
