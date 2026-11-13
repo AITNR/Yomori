@@ -34,6 +34,7 @@ namespace Yomori.Services
         private long _currentTotalBytes;
         // 累计统计：RunAsync 结束会释放 relay，但排障/验收仍要能读到「这一生发过多少帧」。
         private ulong _publishedTotal;
+        private ulong _heartbeatCount;
         private string _lastMapName = string.Empty;
         private bool _disposed;
 
@@ -42,6 +43,8 @@ namespace Yomori.Services
         public bool Enabled => _relay?.Enabled ?? false;
         /// <summary>累计已发布帧数（含已释放的上一代 Relay）。</summary>
         public ulong PublishedCount => _publishedTotal + (_relay?.PublishedCount ?? 0);
+        /// <summary>累计心跳次数：静态桌面一帧不发时也应持续增长。</summary>
+        public ulong HeartbeatCount => _heartbeatCount;
         /// <summary>当前或最后一次使用的映射名。</summary>
         public string MapName => _relay?.MapName ?? _lastMapName;
 
@@ -95,7 +98,12 @@ namespace Yomori.Services
                     int ticks = Math.Max(1, _pollIntervalMs / _frameIntervalMs);
                     for (int i = 0; i < ticks && !ct.IsCancellationRequested; i++)
                     {
-                        _relay.Tick(Environment.TickCount64);
+                        long now = Environment.TickCount64;
+                        _relay.Tick(now);
+                        // 心跳与帧发布解耦：静态桌面一帧都发不出去时，消费端仍能看到
+                        // 采集端在线，从而保持 Suppress Output 而不是误回退 RDP（S1-9）。
+                        // 低频（每 10 拍）整头读-改-写，S2 连续帧流需补跨进程互斥体。
+                        if (i % 10 == 0) { _relay.Heartbeat(now); _heartbeatCount++; }
                         await Task.Delay(_frameIntervalMs, ct).ConfigureAwait(false);
                     }
                 }

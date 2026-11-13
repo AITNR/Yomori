@@ -19,6 +19,18 @@ namespace Yomori.Services
     {
         bool TryReadLatest(out FrameHeader header, out byte[] pixels, out ulong seq);
         void Acknowledge(ulong seq);
+
+        /// <summary>
+        /// 采集端是否仍在线（全局头合法 + <c>ProducerOnline</c> + 生产端心跳未超时）。
+        /// <para><b>默认 false 是刻意的保守值</b>：无法判断时按「采集端不可用」处理，
+        /// 沿用旧的连续无帧回退语义，避免测试用 fake 意外跳过安全网。真实 reader
+        /// （<see cref="DeferredCaptureFrameReader"/> / <see cref="CaptureFrameChannel"/>）
+        /// 必须重写为基于环状态与心跳的判据。</para>
+        /// <para>用途：静态桌面下 DXGI <c>AcquireNextFrame</c> 超时是正常现象，
+        /// 「环在线但没有新帧」不该被当成采集故障，否则会无谓撤销 Suppress Output
+        /// 并在 DD / RDP 之间抖动（4.3.3「超时保持上一完整帧」）。</para>
+        /// </summary>
+        bool IsHealthy(long nowMs) => false;
     }
 
     /// <summary>控制面契约：false = 停 RDP 图形输出，true = 复原并补全屏刷新。</summary>
@@ -100,8 +112,19 @@ namespace Yomori.Services
             if (!_reader.TryReadLatest(out FrameHeader header, out byte[] pixels, out ulong seq)
                 || pixels.Length == 0)
             {
+                // S1-9：区分「静态桌面没有新帧」与「采集端真的掉线」。
+                // 前者全局头仍合法、生产端心跳仍在刷新 → 保持 Suppress Output 和屏幕上的
+                // 最后一帧，不累计无帧、不回退。OnPresentTick 会因 RDP 侧 seq 未变而早退，
+                // 自然实现 4.3.3「超时保持上一完整帧」。若误在这里回退，静态桌面就会
+                // 每隔几十拍撤销一次 suppress、再走一遍双源闸门预热，造成 DD / RDP 抖动。
+                if (_reader.IsHealthy(nowMs))
+                {
+                    _noFrameStreak = 0;
+                    return UseRdp();
+                }
                 _noFrameStreak++;
-                // 已经停了 RDP 帧流却迟迟没有抓帧：必须复原，否则画面永久静止。
+                // 采集端真掉线（映射消失 / 全局头失效 / 心跳超时）：复原 RDP 帧流，
+                // 否则画面会永久静止。
                 if (_suppressed && _noFrameStreak >= _maxNoFrameStreak) ForceFallback(nowMs);
                 return UseRdp();
             }

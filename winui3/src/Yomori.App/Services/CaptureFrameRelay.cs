@@ -49,6 +49,12 @@ namespace Yomori.Services
         /// <summary>由采集端常驻循环按节拍调用；返回本拍是否发布了帧。</summary>
         public ProducerTickResult Tick(long nowMs) => _producer.Tick(nowMs);
 
+        /// <summary>
+        /// 生产端心跳：静态桌面下一帧都发布不了时也要让消费端知道「我还活着」。
+        /// 由采集循环每轮（约 1 Hz）调用一次，不推进 seq。
+        /// </summary>
+        public void Heartbeat(long nowMs) => _channel.WriteHeartbeat(nowMs);
+
         public void Dispose()
         {
             if (_disposed) return;

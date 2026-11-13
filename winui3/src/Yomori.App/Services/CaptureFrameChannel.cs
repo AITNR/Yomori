@@ -137,6 +137,41 @@ namespace Yomori.Services
         // 接口契约为 void；公开方法保留返回值供现有断言与调用方使用。
         void ICaptureFrameReader.Acknowledge(ulong seq) => Acknowledge(seq);
 
+        /// <summary>生产端心跳超过这个毫秒数未更新，即判定采集端掉线。</summary>
+        public const long DefaultHeartbeatTimeoutMs = 5000;
+
+        /// <summary>
+        /// 生产端心跳：<b>不推进 NextSeq</b>，只刷新 ProducerTickMs 与 ProducerOnline。
+        /// <para>静态桌面下 DXGI 会一直超时、一帧都不发布；消费端需要靠这个心跳区分
+        /// 「采集端活着但画面没变」与「采集端真挂了」。整头读-改-写由生产端单线程串行执行，
+        /// 频率控制在采集循环每轮一次（约 1 Hz），避免与消费端 Acknowledge 高频竞争。</para>
+        /// </summary>
+        public void WriteHeartbeat(long nowMs)
+        {
+            if (!TryReadRingHeader(out FrameRingHeader ring))
+                ring = FrameRingHeader.Create(_layout.Width, _layout.Height, _layout.Stride,
+                                              _layout.SlotCount, nextSeq: 1);
+            ring.ProducerTickMs = nowMs;
+            ring.Flags |= FrameRingHeader.ProducerOnline;
+            WriteRingHeader(ring);
+        }
+
+        /// <summary>环合法 + 生产端在线 + 心跳未超时（实现 ICaptureFrameReader）。</summary>
+        public bool IsHealthy(long nowMs) => IsHealthy(nowMs, DefaultHeartbeatTimeoutMs);
+
+        /// <summary>同上，可自定义超时（测试与真机标定用）。</summary>
+        public bool IsHealthy(long nowMs, long timeoutMs)
+        {
+            try
+            {
+                if (!TryReadRingHeader(out FrameRingHeader ring)) return false;
+                if ((ring.Flags & FrameRingHeader.ProducerOnline) == 0) return false;
+                long age = nowMs - ring.ProducerTickMs;
+                return age >= 0 && age <= timeoutMs;
+            }
+            catch { return false; }
+        }
+
         /// <summary>
         /// 写一帧到指定槽：帧头 → 矩形表 → BGRA32 像素。
         /// pixels 长度必须等于 header.PayloadBytes，rects 数量必须等于 header.RectCount。

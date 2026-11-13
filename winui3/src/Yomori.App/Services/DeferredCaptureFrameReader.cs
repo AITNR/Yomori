@@ -23,6 +23,7 @@ namespace Yomori.Services
     {
         private readonly object _gate = new();
         private readonly long _retryIntervalMs;
+        private readonly long _heartbeatTimeoutMs;
         private string _mapName = string.Empty;
         private SharedFrameRingLayout? _layout;
         private CaptureFrameChannel? _channel;
@@ -33,10 +34,38 @@ namespace Yomori.Services
         public string MapName { get { lock (_gate) { return _mapName; } } }
         public string? LastError { get; private set; }
 
-        public DeferredCaptureFrameReader(long retryIntervalMs = 1000)
+        public DeferredCaptureFrameReader(long retryIntervalMs = 1000,
+                                         long heartbeatTimeoutMs = 5000)
         {
             if (retryIntervalMs < 0) throw new ArgumentOutOfRangeException(nameof(retryIntervalMs));
+            if (heartbeatTimeoutMs < 1) throw new ArgumentOutOfRangeException(nameof(heartbeatTimeoutMs));
             _retryIntervalMs = retryIntervalMs;
+            _heartbeatTimeoutMs = heartbeatTimeoutMs;
+        }
+
+        /// <summary>
+        /// 采集端是否在线：映射打得开 + 全局头合法 + <c>ProducerOnline</c> + 心跳未超时。
+        /// <para>与 <c>TryReadLatest</c> 的区别：后者在「环在线但没有新帧」时也返回 false
+        /// （静态桌面），本方法用来把这种情况与「采集端真掉线」区分开，避免误撤销 suppress。</para>
+        /// </summary>
+        public bool IsHealthy(long nowMs)
+        {
+            lock (_gate)
+            {
+                if (_disposed || !EnsureOpenLocked(nowMs)) return false;
+                try
+                {
+                    if (!_channel!.TryReadRingHeader(out FrameRingHeader ring)) return false;
+                    if ((ring.Flags & FrameRingHeader.ProducerOnline) == 0) return false;
+                    long age = nowMs - ring.ProducerTickMs;
+                    return age >= 0 && age <= _heartbeatTimeoutMs;
+                }
+                catch
+                {
+                    CloseChannelLocked();
+                    return false;
+                }
+            }
         }
 
         /// <summary>设定/切换目标映射。name 或 layout 变化都会丢弃旧句柄。</summary>
