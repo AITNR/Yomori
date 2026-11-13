@@ -138,6 +138,80 @@ public readonly struct FrameHeader
 }
 
 /// <summary>
+/// 共享内存 offset 0 的全局头，固定 64 字节（正好占满 SharedFrameRingLayout.GlobalHeaderBytes）。
+/// 生产端维护 NextSeq、消费端维护 LastAckedSeq，两端据此定位「最新已发布帧」，
+/// 避免消费端盲目扫槽或读到被环形覆盖的旧帧。
+///
+/// ⚠️ 跨进程并发：本结构只定义布局与校验，读写由 CaptureFrameChannel 串行执行；
+///    S1 是单生产者 / 单消费者低频路径，暂不加互斥体。S2 上连续帧流时必须补命名互斥体
+///    或对 NextSeq / LastAckedSeq 做跨进程原子操作。
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
+public struct FrameRingHeader
+{
+    public const uint Magic = 0x59435247u; // "YCRG"
+    public const uint Version = 1u;
+    public const int Size = 64;
+    public const uint ProducerOnline = 1u << 0;
+    private const uint KnownFlagsMask = ProducerOnline;
+
+    public uint MagicValue;
+    public uint VersionValue;
+    public uint HeaderSize;
+    public uint SlotCount;
+    public ulong NextSeq;
+    public ulong LastAckedSeq;
+    public uint Width;
+    public uint Height;
+    public uint Stride;
+    public uint Flags;
+    public long ProducerTickMs;
+    public uint Reserved0;
+    public uint Reserved1;
+
+    public static FrameRingHeader Create(uint width, uint height, uint stride,
+                                         int slotCount, ulong nextSeq = 1,
+                                         long producerTickMs = 0)
+        => new()
+        {
+            MagicValue = Magic,
+            VersionValue = Version,
+            HeaderSize = (uint)Size,
+            SlotCount = (uint)slotCount,
+            NextSeq = nextSeq,
+            LastAckedSeq = 0,
+            Width = width,
+            Height = height,
+            Stride = stride,
+            Flags = ProducerOnline,
+            ProducerTickMs = producerTickMs,
+            Reserved0 = 0,
+            Reserved1 = 0,
+        };
+
+    public bool IsValid(out string reason)
+    {
+        if (MagicValue != Magic) { reason = "全局头 Magic 不匹配"; return false; }
+        if (VersionValue != Version) { reason = "全局头版本不匹配"; return false; }
+        if (HeaderSize != Size) { reason = "全局头 HeaderSize 与布局不符"; return false; }
+        if (SlotCount < 1 || SlotCount > SharedFrameRingLayout.MaxSlotCount)
+        { reason = "全局头槽数超出上限"; return false; }
+        if (NextSeq == 0) { reason = "NextSeq 从 1 开始"; return false; }
+        if (LastAckedSeq >= NextSeq) { reason = "LastAckedSeq 不得追上或超过 NextSeq"; return false; }
+        if (Width == 0 || Height == 0) { reason = "全局头尺寸为 0"; return false; }
+        if (Stride < (ulong)Width * 4) { reason = "全局头 Stride 小于 Width*4"; return false; }
+        if ((Flags & ~KnownFlagsMask) != 0) { reason = "全局头未知标志位"; return false; }
+        reason = "";
+        return true;
+    }
+
+    public void Validate()
+    {
+        if (!IsValid(out string reason)) throw new InvalidOperationException(reason);
+    }
+}
+
+/// <summary>
 /// 一段共享内存的布局：全局头 + N 个等长槽；每槽 = 帧头 + 矩形表 + BGRA32 像素。
 /// 全部按 64 字节对齐，槽偏移为纯算术（真正的 CreateFileMapping / ACL 属 S1 后续真机工作）。
 /// </summary>

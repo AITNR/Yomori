@@ -15,7 +15,7 @@ using Yomori.Models;
 namespace Yomori.Services
 {
     /// <summary>一段共享内存环形缓冲的读写端。线程不安全，调用方自行串行化。</summary>
-    public sealed class CaptureFrameChannel : IDisposable
+    public sealed class CaptureFrameChannel : IDisposable, ICaptureFrameReader
     {
         private readonly MemoryMappedFile _mmf;
         private readonly MemoryMappedViewStream _stream;
@@ -54,6 +54,88 @@ namespace Yomori.Services
             MemoryMappedFile mmf = MemoryMappedFile.OpenExisting(mapName, MemoryMappedFileRights.ReadWrite);
             return new CaptureFrameChannel(mmf, layout, mapName, ownsMmf: true);
         }
+
+        /// <summary>写共享内存 offset 0 的全局头（生产端初始化 / 每次发布时更新）。</summary>
+        public void WriteRingHeader(in FrameRingHeader header)
+        {
+            header.Validate();
+            Span<byte> buf = stackalloc byte[FrameRingHeader.Size];
+            MemoryMarshal.Write(buf, in header);
+            _stream.Position = 0;
+            _stream.Write(buf);
+        }
+
+        /// <summary>读全局头；未初始化或错位时返回 false。</summary>
+        public bool TryReadRingHeader(out FrameRingHeader header)
+        {
+            Span<byte> buf = stackalloc byte[FrameRingHeader.Size];
+            _stream.Position = 0;
+            _stream.ReadExactly(buf);
+            header = MemoryMarshal.Read<FrameRingHeader>(buf);
+            return header.IsValid(out _);
+        }
+
+        /// <summary>
+        /// 生产端发布一帧：按 seq 选槽写入，并推进全局头 NextSeq = seq + 1。
+        /// 全局头尚未初始化时按当前布局自动创建。返回新的 NextSeq。
+        /// </summary>
+        public ulong PublishFrame(in FrameHeader frame, ReadOnlySpan<FrameRect> rects,
+                                  ReadOnlySpan<byte> pixels, long producerTickMs = 0)
+        {
+            frame.Validate();
+            int slot = FrameFlowPolicy.SlotForSeq(frame.Seq, _layout.SlotCount);
+            WriteFrame(slot, frame, rects, pixels);
+
+            if (!TryReadRingHeader(out FrameRingHeader ring))
+                ring = FrameRingHeader.Create(_layout.Width, _layout.Height, _layout.Stride,
+                                              _layout.SlotCount, nextSeq: 1);
+            ring.NextSeq = frame.Seq + 1;
+            ring.ProducerTickMs = producerTickMs;
+            ring.Flags |= FrameRingHeader.ProducerOnline;
+            WriteRingHeader(ring);
+            return ring.NextSeq;
+        }
+
+        /// <summary>
+        /// 消费端读最新已发布且未确认的帧：依据全局头 NextSeq-1 定位槽，
+        /// 并核对帧头 Seq 与之一致（槽若已被更新的帧覆盖则拒绝，不显示旧画面）。
+        /// </summary>
+        public bool TryReadLatest(out FrameHeader frame, out byte[] pixels, out ulong seq)
+        {
+            frame = default;
+            pixels = Array.Empty<byte>();
+            seq = 0;
+            if (!TryReadRingHeader(out FrameRingHeader ring)) return false;
+            if (ring.SlotCount != _layout.SlotCount ||
+                ring.Width != _layout.Width || ring.Height != _layout.Height ||
+                ring.Stride != _layout.Stride)
+                return false;
+            if (!FrameFlowPolicy.TryLatestReadable(ring.NextSeq, ring.LastAckedSeq, out ulong latest))
+                return false;
+            int slot = FrameFlowPolicy.SlotForSeq(latest, _layout.SlotCount);
+            if (!TryReadFrame(slot, out FrameHeader got, out byte[] gotPixels)) return false;
+            if (got.Seq != latest) return false;
+            frame = got;
+            pixels = gotPixels;
+            seq = latest;
+            return true;
+        }
+
+        /// <summary>消费端确认已呈现的帧；返回更新后的 LastAckedSeq。</summary>
+        public ulong Acknowledge(ulong seq)
+        {
+            if (!TryReadRingHeader(out FrameRingHeader ring))
+                throw new InvalidOperationException("全局头未初始化或非法");
+            if (seq <= ring.LastAckedSeq || seq >= ring.NextSeq)
+                throw new ArgumentOutOfRangeException(nameof(seq),
+                    "seq 必须在 (LastAckedSeq, NextSeq) 区间内");
+            ring.LastAckedSeq = seq;
+            WriteRingHeader(ring);
+            return seq;
+        }
+
+        // 接口契约为 void；公开方法保留返回值供现有断言与调用方使用。
+        void ICaptureFrameReader.Acknowledge(ulong seq) => Acknowledge(seq);
 
         /// <summary>
         /// 写一帧到指定槽：帧头 → 矩形表 → BGRA32 像素。

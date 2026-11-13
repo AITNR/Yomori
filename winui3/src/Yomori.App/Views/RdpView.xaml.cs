@@ -289,6 +289,12 @@ namespace Yomori.Views
         }
 
         /// <summary>接管外部 client（全屏窗口复用同一会话时用）。</summary>
+        /// <summary>
+        /// S1 抓帧通路的帧源选择器，由外部（设置页开关 / MainViewModel）注入。
+        /// 为 null 或内部未启用时，OnPresentTick 完全走原有 RDP 帧路径。
+        /// </summary>
+        public Yomori.Services.CaptureViewPort? CaptureViewPort { get; set; }
+
         public void AttachClient(RdpEmbeddedClient client)
         {
             // DetachClient 会顺带复位 _renderSuspended / _occlusionLogged，
@@ -869,6 +875,33 @@ namespace Yomori.Views
             var tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
+                // S1 抓帧通路：默认关闭。只有 ViewPort 明确给出共享内存帧、且 Present 成功，
+                // 才替代本拍的 RDP 帧源；未启用 / 无帧 / 回退 / 呈现失败一律落到下面的
+                // 原有路径，绝不出现「RDP 帧已停但没有替代帧」的空窗（4.7 禁止先切后验）。
+                if (CaptureViewPort is { } viewPort)
+                {
+                    // rdpSample 传 default（非黑）：RDP 帧此刻仍在正常供画面，
+                    // 双源闸门主要用来挡住 DD 侧的全 0 前导帧 / 黑帧故障。
+                    var decision = viewPort.Tick(System.Environment.TickCount64,
+                                                 default(Yomori.Models.FrameSample));
+                    var capPixels = decision.Pixels;
+                    if (decision.UseCapture && capPixels is { Length: > 0 })
+                    {
+                        if (_renderer is not { Initialized: true })
+                            EnsureRendererOnUi(decision.Width, decision.Height);
+                        if (_renderer is { Initialized: true } captureRenderer &&
+                            captureRenderer.Present(capPixels, decision.Width, decision.Height, decision.Stride))
+                        {
+                            viewPort.Acknowledge(decision.Seq);
+                            _presentedSeq = seq;
+                            _pendingFirstFrame = false;
+                            FramesRendered++;
+                            ClearEndingOverlay();
+                            return;
+                        }
+                    }
+                }
+
                 if (!_d3dFailed && !RdpD3DRenderer.ShouldUseSoftware && client.SupportsDirtyFrameCopy)
                 {
                     if (_renderer is not { Initialized: true })

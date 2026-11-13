@@ -247,6 +247,15 @@ public sealed class AppConfig : ObservableObject
     public bool LocalExecutionEnabled { get; set; } = true;
 
     /// <summary>
+    /// 抓帧推送通路（S1）：勾选后 RdpView 在双源比对通过、预热完成且
+    /// Suppress Output 真的成功时，用共享内存帧替代 RDP 帧流。
+    /// <para>默认 false。无采集端 / 黑帧 / 连续无帧 / 逃生时自动保持 RDP 帧流，
+    /// 不会黑屏；取消勾选强制复原 RDP 帧流。</para>
+    /// </summary>
+    [JsonPropertyName("enable_capture_frame_path")]
+    public bool EnableCaptureFramePath { get; set; } = false;
+
+    /// <summary>
     /// <b>只有导出文件里才有</b>：这次导出了哪些内容类别、密码是不是明文。
     ///
     /// 正常 config.json 不写它（<see cref="Models.ExportOptions"/> 默认值不写就是 null）。
