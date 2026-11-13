@@ -46,18 +46,47 @@ namespace Yomori.Views
         /// 系统没法把专用工作集裁下去（实测：窗口正常时专用工作集约 730 MiB，
         /// 没人碰的时候能掉到 238 MiB）。停掉呈现后，页面自然变冷，裁剪才有意义。</para>
         ///
-        /// <para>会话、网络与解码**完全不受影响** —— 只停"把最后一帧画到屏幕上"。</para>
+        /// <para>会话与网络不受影响；<b>解码也一并暂停</b>：H.264 解码才是每帧 4–5 ms 的大头，
+        /// 只停呈现能省下的不到两成。不可见时整帧丢弃（见 SuspendAllForHiddenWindow）。</para>
         /// </summary>
         private static volatile bool s_windowOccluded;
 
         /// <summary>本实例上次 tick 时是否被窗口可见性挡住；恢复后要补一帧。</summary>
         private bool _resumeNeedsFirstFrame;
 
-        /// <summary>主窗口隐藏/最小化：暂停所有画面的抓帧与呈现。</summary>
-        public static void SuspendAllForHiddenWindow() => s_windowOccluded = true;
+        /// <summary>主窗口隐藏/最小化：暂停所有画面的抓帧、呈现与解码。</summary>
+        public static void SuspendAllForHiddenWindow()
+        {
+            s_windowOccluded = true;
+            SetDecodePaused(true);
+        }
 
-        /// <summary>主窗口恢复可见：允许各画面继续呈现（下一拍自行补首帧）。</summary>
-        public static void ResumeAllForHiddenWindow() => s_windowOccluded = false;
+        /// <summary>主窗口恢复可见：恢复解码并允许各画面继续呈现（下一拍自行补首帧）。</summary>
+        public static void ResumeAllForHiddenWindow()
+        {
+            s_windowOccluded = false;
+            SetDecodePaused(false);
+        }
+
+        /// <summary>
+        /// 把「不可见就停解码」交给原生层。
+        ///
+        /// <para>解码发生在 freerdp3.dll 内部，托管侧碰不到，只能经 ycn_rdp.dll 写进程环境
+        /// 变量转达。开关是**进程级**的，所以前提必须是「整个窗口都不可见」——这正是
+        /// Suspend/Resume 的语义。</para>
+        ///
+        /// <para>旧版本 dll 没有这个导出；调用失败只意味着"照旧解码"，不影响可见性逻辑，
+        /// 因此静默吞掉查找/加载异常，避免升级错配时把整个页面拖崩。</para>
+        /// </summary>
+        private static void SetDecodePaused(bool paused)
+        {
+            try
+            {
+                RdpNativeInterop.ycn_rdp_set_decode_paused(paused ? 1 : 0);
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
 
         /// <summary>
         /// 渲染世代号。每次 DetachClient / Disconnect 自增；
@@ -818,8 +847,8 @@ namespace Yomori.Views
             {
                 _occlusionLogged = occluded;
                 DiagnosticLog?.Invoke(occluded
-                    ? "[embed] 呈现已暂停：窗口隐藏闸门生效，帧与解码继续"
-                    : "[embed] 呈现已恢复：窗口隐藏闸门解除，补抓首帧");
+                    ? "[embed] 已暂停：窗口隐藏闸门生效，呈现与解码一并停止（服务端仍在推帧，带宽不变）"
+                    : "[embed] 已恢复：窗口隐藏闸门解除，恢复解码并请求一次全帧刷新");
             }
 
             if (_renderSuspended)

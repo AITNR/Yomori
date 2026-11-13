@@ -155,6 +155,13 @@ YCN_API uint32_t ycn_rdp_decode_capabilities(void);
 /* 断开会话（语义 = mstsc「断开连接」：会话保留、进程存活）。幂等；未知 session 静默返回 */
 YCN_API void ycn_rdp_disconnect(int session);
 
+/* 窗口不可见时暂停解码：paused != 0 丢弃整帧（不解码、不合成、不通知上层），
+ * 为 0 恢复并请求一次全帧刷新（暂停期间丢掉的 P 帧会让参考帧断裂）。
+ *
+ * 进程级 —— 影响本进程所有会话。托管侧只应在「整个窗口都不可见」时置 1，
+ * 否则可见那路的画面会一起冻住。服务端仍会继续推帧，带宽不变。 */
+YCN_API void ycn_rdp_set_decode_paused(int paused);
+
 /* 输入注入。flags = FreeRDP PTR_FLAGS_*（C# 侧定义同名常量） */
 YCN_API int ycn_rdp_send_mouse(int session, uint32_t flags, uint16_t x, uint16_t y);
 

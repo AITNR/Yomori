@@ -1,0 +1,68 @@
+--- a/libfreerdp/gdi/gfx.c
++++ b/libfreerdp/gdi/gfx.c
+@@ -26,6 +26,7 @@
+ #include <winpr/assert.h>
+ #include <winpr/cast.h>
+ #include <winpr/platform.h>
++#include <winpr/environment.h>
+ 
+ #include <freerdp/api.h>
+ #include <freerdp/log.h>
+@@ -885,6 +886,30 @@
+  *
+  * @return 0 on success, otherwise a Win32 error code
+  */
++/* Yomori: pause H.264 decoding while the window is invisible.
++ *
++ * When nothing on screen can show the frame (minimized, hidden, fully occluded)
++ * the whole command is dropped: no decode, no chroma work, and crucially no
++ * invalidRegion / UpdateSurfaceArea, so the presenter never wakes up either.
++ * The server keeps sending (bandwidth unchanged), but local CPU drops to almost
++ * nothing -- exactly the trade a "leave it running" monitor wants.
++ *
++ * State comes from ycn_rdp.dll via ycn_rdp_set_decode_paused(), written into
++ * this process' environment block, so winpr's process-env API sees it. Read on
++ * every frame on purpose: no caching, the flag flips at runtime.
++ */
++static BOOL ycn_decode_paused(void)
++{
++	char buf[8] = { 0 };
++	const DWORD n = GetEnvironmentVariableA("YOMORI_DECODE_PAUSED", buf, sizeof(buf));
++	return ((n > 0) && (n < sizeof(buf)) && (buf[0] != '0')) ? TRUE : FALSE;
++}
++
++/* Set while frames are being dropped; the first frame after resuming triggers a
++ * full refresh, because the P frames skipped during the pause left the H.264
++ * reference chain broken. */
++static BOOL ycn_was_paused = FALSE;
++
+ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+                                       const RDPGFX_SURFACE_COMMAND* cmd)
+ {
+@@ -901,6 +926,13 @@
+ 	WINPR_ASSERT(context);
+ 	WINPR_ASSERT(cmd);
+ 
++	/* Yomori: drop the whole frame while invisible -- no decode, no notification. */
++	if (ycn_decode_paused())
++	{
++		ycn_was_paused = TRUE;
++		return CHANNEL_RC_OK;
++	}
++
+ 	WINPR_ASSERT(context->GetSurfaceData);
+ 	surface =
+ 	    (gdiGfxSurface*)context->GetSurfaceData(context, (UINT16)MIN(UINT16_MAX, cmd->surfaceId));
+@@ -911,6 +943,12 @@
+ 		return ERROR_NOT_FOUND;
+ 	}
+ 
++	if (ycn_was_paused)
++	{
++		ycn_was_paused = FALSE;
++		ycn_gdi_request_full_refresh(gdi, surface);
++	}
++
+ 	if (!surface->h264)
+ 	{
+ 		const UINT32 decodePolicy = ycn_gdi_thread_h264_policy();
