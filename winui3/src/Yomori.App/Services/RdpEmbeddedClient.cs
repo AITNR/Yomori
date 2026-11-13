@@ -597,8 +597,27 @@ namespace Yomori.Services
                        $", decode_caps=0x{_decodeCapabilities:X}" +
                        $", hw_compiled={(hwCompiled ? "yes" : "no")}" +
                        $", hw_diagnostics={(hwDiagnostics ? "yes" : "no")}" +
+                       $", avc444_aux_drop={Avc444AuxDropFlag()}" +
                        $", entry={entry}";
             }
+        }
+
+        /// <summary>
+        /// 诊断用：AVC444 辅助流是否被丢弃。
+        ///
+        /// 开关由原生层的 <c>ycn_apply_gfx_config</c> 从命令行
+        /// <c>--embed-drop-avc444-aux</c> 解析后写进<b>本进程</b>的环境变量
+        /// <c>YOMORI_AVC444_DROP_AUX</c>；freerdp3.dll 里的 <c>avc444_decompress</c>
+        /// 用同一个进程环境块读取它。两者同进程，所以这里读到的值就是原生侧实际生效的值。
+        ///
+        /// 只用于把"参数有没有解析到"和"解析到了但没收益"区分开——这两者在别处
+        /// 完全看不出差别（日志原本没有任何标记）。每次现场读、不缓存：一次连接内不会变，
+        /// 但要能立刻发现"用户其实没带参数"这种情况。
+        /// </summary>
+        private static string Avc444AuxDropFlag()
+        {
+            var v = System.Environment.GetEnvironmentVariable("YOMORI_AVC444_DROP_AUX");
+            return string.IsNullOrEmpty(v) || v == "0" ? "0" : "1";
         }
 
         /// <summary>原生通道加载诊断（一行文本：load_addins 返回值 / 通道计数 / GFX 状态 / 通道名）。</summary>
