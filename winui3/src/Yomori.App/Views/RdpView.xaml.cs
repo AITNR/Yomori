@@ -308,6 +308,9 @@ namespace Yomori.Views
             PrepareRenderSurface();
 
             _client = client;
+            // ViewPort 挂在 client 上：弹出窗口 / 全屏接管同一会话时自动沿用同一个帧源，
+            // 不会因为换了 RdpView 实例就丢掉抓帧通路（S1 第八批）。
+            CaptureViewPort = client.ViewPort;
             HookClient(_client);
 
             _dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();

@@ -102,7 +102,35 @@ public static class AgentHost
         // 代理侧一颗通知都不发；而代理跑在目标账户里，真去注册也只会在别人的
         // 用户配置里塞一条本程序的通知身份，纯属污染。它内部还要 DispatcherQueue，
         // 碰它就等于把 WinRT 那套重新拉进代理进程。
+        // S1 第八批：抓帧采集端是**可选增强**，与指令循环并列、互不阻塞。
+        // 指令循环执行任务时会 await 在 runner.RunAsync 上，若把抓帧塞进那条循环，
+        // 任务一跑画面就断。开关由桥目录 capture-enable.json 驱动，默认关闭时
+        // 这里连 D3D 设备都不创建，空闲代理的内存/CPU 不变。
+        // 构造与运行中的任何异常都由 CaptureAgentLoop 自行收敛，绝不掀常驻代理。
+        CaptureAgentLoop? captureLoop = null;
+        try
+        {
+            var captureBridge = RdpBridge.Agent;
+            captureLoop = new CaptureAgentLoop(
+                captureBridge.ChannelTag,
+                captureBridge.BridgeDir,
+                () => new DxgiFrameSource(),
+                // NC3 实测：代理是 asInvoker 非提升进程，token 里没有
+                // SeCreateGlobalPrivilege，创建 Global\ 对象必被拒（Win32=5）。
+                // 映射由提升运行的主控端创建并设 Everyone ACE，这里只 OpenExisting。
+                CaptureSharedMemoryAcl.OpenExistingFactory,
+                global: true);
+        }
+        catch
+        {
+            // 可选增强初始化失败：忽略即可，代理继续跑指令桥，画面走原有 RDP 帧流。
+        }
+
         var loop = Task.Run(RunAgentLoopAsync);
+        if (captureLoop is not null)
+        {
+            _ = Task.Run(() => captureLoop.RunAsync(CancellationToken.None));
+        }
 
         // 主线程就是"让进程活着"的那根钉子：同步等循环结束。
         // 循环是 while(true)，正常不返回；返回了说明桥目录废了。

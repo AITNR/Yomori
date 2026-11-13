@@ -4799,6 +4799,23 @@ public sealed class MainViewModel : ObservableObject
         /// <summary>用户在这格画面上点了「静音」：本机不放远端声音（每通道独立，运行时不落盘）。</summary>
         public bool LocalMuted { get; set; }
 
+        // ---- S1 第八批：抓帧通路（按通道隔离，默认关闭）----
+        /// <summary>这条通道的指令桥目录；开关文件 capture-enable.json 写在这里。</summary>
+        public string CaptureBridgeDir { get; set; } = string.Empty;
+        /// <summary>桥目录末段，两端算出的同一个标识（RdpBridge.ChannelTag），用作映射名 token。</summary>
+        public string CaptureChannelTag { get; set; } = string.Empty;
+        /// <summary>延迟打开的共享内存读帧端；映射不存在时保持 RDP 帧流，不黑屏。</summary>
+        public DeferredCaptureFrameReader? CaptureConsumer { get; set; }
+        /// <summary>帧源选择器；同时挂在 client 上供 RdpView.AttachClient 读取。</summary>
+        public CaptureViewPort? ViewPort { get; set; }
+        /// <summary>
+        /// 由**提升运行的主控端**创建并保活的 Global\ 映射句柄（NC3）。
+        /// 代理是 asInvoker、没有 SeCreateGlobalPrivilege，只能 OpenExisting；
+        /// 因此这个句柄必须由主控端持有，否则最后一个句柄关闭后映射即销毁。
+        /// </summary>
+        public System.IO.MemoryMappedFiles.MemoryMappedFile? CaptureSharedMemory { get; set; }
+        public string CaptureMapName { get; set; } = string.Empty;
+
         // 事件处理器引用（闭包捕获本对象）——解绑时必须用同一批委托实例
         public EventHandler<(int Session, uint Width, uint Height)>? OnConnected;
         public EventHandler<RdpFrameEventArgs>? OnFrameArrived;
@@ -5163,6 +5180,9 @@ public sealed class MainViewModel : ObservableObject
         // 事件处理器闭包捕获 conn 本身 —— 多通道并存时才知道回调属于哪条通道。
         // 引用存在 conn 上，释放时用同一批委托实例解绑。
         var client = new RdpEmbeddedClient();
+        // 抓帧帧源属于 client 而不是某个 RdpView：弹出/全屏会换 View 接管同一 client。
+        // 默认关闭，AttachCaptureViewPort 内部只对已启用配置做 retarget，不会动 RDP 帧流。
+        AttachCaptureViewPort(key, client, conn);
         conn.OnConnected = (_, e) => OnEmbedConnected(conn, e);
         conn.OnFrameArrived = (_, e) => OnEmbedFrameArrived(conn, e);
         conn.OnDisconnected = (_, e) => Post(() =>
@@ -5254,6 +5274,145 @@ public sealed class MainViewModel : ObservableObject
         var created = new EmbedConnection { Key = key };
         _embeds[key] = created;
         return created;
+    }
+
+    // ---------------- S1 第八批：抓帧通路的设置页开关与按通道接线 ----------------
+
+    /// <summary>
+    /// 为一条新建的 RDP 连接装配帧源选择器。
+    /// <para>ViewPort 挂在 client 上（不是 RdpView），弹出窗口 / 全屏接管同一会话时自动沿用。
+    /// 全程 try/catch：抓帧初始化失败只记日志，画面继续走原有 RDP 帧流，绝不黑屏。</para>
+    /// </summary>
+    private void AttachCaptureViewPort(string key, RdpEmbeddedClient client, EmbedConnection conn)
+    {
+        try
+        {
+            // 映射名 token 用桥目录末段：RdpBridge.ChannelTag 在两端算出同一个值
+            // （桥目录本身按账户派生），无需改部署参数或新增协议字段。
+            var channel = SurfaceChannelPreference(key);
+            var bridge = channel is not null
+                ? RdpBridge.ForChannel(channel)
+                : RdpBridge.For(RdpChannelPaths.Resolve(RdpSettings.BridgePath, RdpSettings.TargetUser));
+            conn.CaptureBridgeDir = bridge.BridgeDir;
+            conn.CaptureChannelTag = bridge.ChannelTag;
+
+            var consumer = new DeferredCaptureFrameReader();
+            var viewPort = new CaptureViewPort(key, consumer, new RdpControlPlane(client));
+            conn.CaptureConsumer = consumer;
+            conn.ViewPort = viewPort;
+            client.ViewPort = viewPort;
+
+            // 配置里已经启用（上次勾选过）→ 新连接直接接上，不必再去设置页拨一次。
+            if (Config.EnableCaptureFramePath)
+                ApplyCaptureFramePathTo(conn, true, Environment.TickCount64);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"[抓帧] 通道 {key} 初始化失败（保持 RDP 帧流）：{ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// 设置页开关的入口：把开关状态同步到所有已建立的通道。
+    /// 同时写桥目录里的 capture-enable.json（Agent 侧据此启动/停止 DD 采集）。
+    /// 必须在 UI 线程调用 —— SetEnabled(false) 会经 RdpControlPlane 复原 RDP 帧流。
+    /// </summary>
+    public void ApplyCaptureFramePath()
+    {
+        bool on = Config.EnableCaptureFramePath;
+        long now = Environment.TickCount64;
+        int applied = 0;
+        foreach (var conn in _embeds.Values)
+        {
+            try
+            {
+                if (conn.ViewPort is null) continue;
+                ApplyCaptureFramePathTo(conn, on, now);
+                applied++;
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[抓帧] 通道 {conn.Key} 应用开关失败：{ex.Message}");
+            }
+        }
+        AppendLog($"[抓帧] 开关{(on ? "启用" : "关闭")}：已同步 {applied} 条通道" +
+                  (on ? "（共享内存无帧时自动保持 RDP 帧流）" : "（全部复原 RDP 帧流）"));
+    }
+
+    private void ApplyCaptureFramePathTo(EmbedConnection conn, bool on, long nowMs)
+    {
+        if (conn.CaptureBridgeDir.Length == 0) return;
+
+        uint width = conn.Width > 0 ? (uint)conn.Width : 1920;
+        uint height = conn.Height > 0 ? (uint)conn.Height : 1080;
+        int slots = SharedFrameRingLayout.DefaultSlotCount;
+
+        // 两端从同一个文件取布局参数，TryReadLatest 的尺寸逐项校验才不会失败。
+        var flag = new CaptureEnableFlag
+        {
+            Enabled = on,
+            Width = width,
+            Height = height,
+            Slots = slots,
+            ChannelTag = conn.CaptureChannelTag,
+            WrittenAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        };
+        if (!CaptureEnableFlag.TryWrite(conn.CaptureBridgeDir, flag, out var writeError))
+            AppendLog($"[抓帧] 通道 {conn.Key} 写开关失败：{writeError}");
+
+        if (on && conn.CaptureConsumer is { } consumer)
+        {
+            try
+            {
+                var layout = new SharedFrameRingLayout(width, height, slots);
+                string mapName = CaptureChannelNaming.ForChannelSized(
+                    conn.CaptureChannelTag, width, height, global: true);
+
+                // NC3：创建 Global\ 对象需要 SeCreateGlobalPrivilege，只有**提升运行的
+                // 主控端**有；目标会话里 asInvoker 的 Agent 只能 OpenExisting。
+                // 因此映射由这里创建、设 Everyone ACE，并把句柄挂在 conn 上保活 ——
+                // 最后一个句柄关闭后内核对象即销毁，Agent 就再也打不开了。
+                if (conn.CaptureSharedMemory is null ||
+                    !string.Equals(conn.CaptureMapName, mapName, StringComparison.Ordinal))
+                {
+                    conn.CaptureSharedMemory?.Dispose();
+                    conn.CaptureSharedMemory = null;
+                    if (!CaptureSharedMemoryAcl.TryCreateOrOpen(
+                            mapName, layout.TotalBytes, out var mmf, out var createError))
+                    {
+                        AppendLog($"[抓帧] 通道 {conn.Key} 创建共享内存失败（保持 RDP 帧流）：{createError}");
+                        conn.CaptureSharedMemory = null;
+                        conn.CaptureMapName = string.Empty;
+                        conn.ViewPort?.SetEnabled(false, nowMs);
+                        // 让 Agent 别空转：改回关闭。
+                        CaptureEnableFlag.TryWrite(conn.CaptureBridgeDir,
+                            new CaptureEnableFlag { Enabled = false, Width = width, Height = height,
+                                                    Slots = slots, ChannelTag = conn.CaptureChannelTag }, out _);
+                        return;
+                    }
+                    conn.CaptureSharedMemory = mmf;
+                    conn.CaptureMapName = mapName;
+                }
+                // 即使映射已存在（重复启用 / 关闭后又开），也要把消费端重新指向它。
+                consumer.Retarget(mapName, layout);
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"[抓帧] 通道 {conn.Key} 布局失败（保持 RDP 帧流）：{ex.Message}");
+                conn.ViewPort?.SetEnabled(false, nowMs);
+                return;
+            }
+        }
+
+        // 关闭时强制复原 RDP 帧流，并释放共享内存句柄（保活结束，内核对象随 Agent 句柄释放而回收）。
+        conn.ViewPort?.SetEnabled(on, nowMs);
+        if (!on)
+        {
+            conn.CaptureConsumer?.Clear();
+            conn.CaptureSharedMemory?.Dispose();
+            conn.CaptureSharedMemory = null;
+            conn.CaptureMapName = string.Empty;
+        }
     }
 
     private void OnEmbedFrameArrived(EmbedConnection conn, RdpFrameEventArgs e)

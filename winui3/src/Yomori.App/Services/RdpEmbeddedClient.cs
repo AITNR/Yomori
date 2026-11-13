@@ -84,6 +84,13 @@ namespace Yomori.Services
         private System.Threading.Tasks.TaskCompletionSource _completion = CompletedSource();
         public System.Threading.Tasks.Task Completion { get { lock (_gate) { return _completion.Task; } } }
 
+        /// <summary>
+        /// S1 第八批：这条会话的抓帧帧源选择器。属于 **client 而不是 RdpView** ——
+        /// 弹出窗口 / 全屏会用新的 RdpView 接管同一个 client，ViewPort 必须跟着 client 走，
+        /// 否则接管后帧源就丢了。由 MainViewModel 创建连接时注入，默认 null。
+        /// </summary>
+        public CaptureViewPort? ViewPort { get; set; }
+
         private static System.Threading.Tasks.TaskCompletionSource CompletedSource()
         {
             var source = new System.Threading.Tasks.TaskCompletionSource(System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously);

@@ -36,6 +36,14 @@ namespace Yomori.Services
             return name;
         }
 
+        /// <summary>
+        /// 带尺寸后缀的映射名（S1 第八批）。分辨率变更 = 换一段新映射，
+        /// 不必删除/扩缩已存在的映射（MemoryMappedFile 容量创建后不可改）。
+        /// 两端都从桥目录的 capture-enable.json 取同一组 width/height，保证一致。
+        /// </summary>
+        public static string ForChannelSized(string channelId, uint width, uint height, bool global = true)
+            => ForChannel($"{channelId}_{width}x{height}", global);
+
         public static bool IsValidMapName(string name)
         {
             if (string.IsNullOrEmpty(name) || name.Length > MaxNameLength) return false;

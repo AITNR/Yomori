@@ -287,6 +287,29 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
+    /// S1 抓帧通路开关（实验性）。
+    ///
+    /// <para>与自动切回主控会话同一套路：<c>OneWay</c> + 手动写回 + 立刻落盘。
+    /// <c>TwoWay</c> 下 <c>Toggled</c> 早于绑定写回，那个「值没变」的判断会永远不成立。</para>
+    ///
+    /// <para>写回之后必须调 <see cref="MainViewModel.ApplyCaptureFramePath"/>：它把开关同步到
+    /// 已建立的每条通道（启用/停用 ViewPort）并写桥目录的 capture-enable.json，
+    /// 会话代理据此启动或停止 DXGI 采集。关闭时 ViewPort 会强制复原 RDP 帧流。</para>
+    /// </summary>
+    private void OnCapturePathToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncing) return;
+        if (sender is not ToggleSwitch toggle) return;
+
+        var on = toggle.IsOn;
+        if (VM.Config.EnableCaptureFramePath == on) return;
+
+        VM.Config.EnableCaptureFramePath = on;
+        VM.SaveConfig();
+        VM.ApplyCaptureFramePath();
+    }
+
+    /// <summary>
     /// 自动切回主控会话开关。
     ///
     /// <para>与开发者模式同一套路：<c>OneWay</c> 绑定 + 手动写回 + 立刻落盘。

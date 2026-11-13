@@ -20,13 +20,25 @@ namespace Yomori.Services
         public bool Enabled => _producer.Enabled;
         public ulong PublishedCount => _producer.PublishedCount;
 
+        /// <summary>
+        /// NC5：构造后默认关闭，必须显式启用。
+        /// <para>S1 第八批新增：mapFactory 供 Agent 侧注入带 ACL 的 Global\ 映射创建
+        /// （CaptureSharedMemoryAcl.TryCreateOrOpen）；mapNameOverride 供「尺寸后缀」映射名
+        /// 绕过默认的 ForChannel 命名。两者都不传时行为与第七批完全一致（_smoke 回环用）。</para>
+        /// </summary>
         public CaptureFrameRelay(string channelId, SharedFrameRingLayout layout,
-                                 ICaptureFrameSource source, bool global = true)
+                                 ICaptureFrameSource source, bool global = true,
+                                 Func<string, long, MemoryMappedFile?>? mapFactory = null,
+                                 string? mapNameOverride = null)
         {
             ChannelId = channelId ?? throw new ArgumentNullException(nameof(channelId));
             Layout = layout ?? throw new ArgumentNullException(nameof(layout));
-            MapName = CaptureChannelNaming.ForChannel(channelId, global);
-            _mmf = MemoryMappedFile.CreateOrOpen(MapName, layout.TotalBytes);
+            MapName = mapNameOverride ?? CaptureChannelNaming.ForChannel(channelId, global);
+            MemoryMappedFile mmf = mapFactory is not null
+                ? mapFactory(MapName, layout.TotalBytes)
+                  ?? throw new IOException("创建/打开共享内存映射失败：" + MapName)
+                : MemoryMappedFile.CreateOrOpen(MapName, layout.TotalBytes);
+            _mmf = mmf;
             _channel = new CaptureFrameChannel(_mmf, layout, MapName);
             _producer = new CaptureFrameProducer(_channel, source);
         }

@@ -84,6 +84,22 @@
 
                     <!-- 通道账户密码永不过期：默认勾选，只作用于已添加进 Yomori 的通道账户。
                          按约定本开关不带说明文字；执行结果只写运行日志，失败时把开关拨回。 -->
+                    <!-- S1 抓帧通路（实验性）：用目标会话内的 DXGI 抓帧替代 RDP 图形帧流。
+                         默认关闭；共享内存无帧 / 黑帧 / 采集端未上线时自动保持 RDP 画面，不会黑屏。
+                         OneWay + Toggled 手动写回：TwoWay 下 Toggled 早于绑定写回，
+                         在回调里读配置会读到旧值（项目既有纪律）。
+                         注意：本块必须排在「通道账户密码永不过期」之前 —— 那个开关按约定
+                         下方不带说明文字，冒烟有断言盯着，别把 TextBlock 挪到它后面。 -->
+                    <ToggleSwitch x:Name="CapturePathSwitch"
+                                  Header="使用代理抓帧替代 RDP 画面（实验性）"
+                                  IsOn="{x:Bind VM.Config.EnableCaptureFramePath, Mode=OneWay}"
+                                  Toggled="OnCapturePathToggled" />
+
+                    <TextBlock Text="目标会话内的代理用 DXGI 抓帧，经共享内存送回主控端显示；RDP 连接保留为控制面。共享内存无帧或检出黑帧时按通道自动回退 RDP 画面，不中断任务。需更新到含抓帧通路的代理版本后才会生效。"
+                               TextWrapping="Wrap"
+                               Opacity="0.7"
+                               FontSize="12" />
+
                     <ToggleSwitch x:Name="ChannelPasswordPolicySwitch"
                                   Header="通道账户密码永不过期"
                                   IsOn="{x:Bind VM.RdpSettings.ChannelPasswordNeverExpires, Mode=OneWay}"
