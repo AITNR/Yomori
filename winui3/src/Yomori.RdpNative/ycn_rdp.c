@@ -463,11 +463,67 @@ static BOOL ycn_avc420_only_requested(void)
 	return v ? TRUE : FALSE;
 }
 
+/* 监控模式：命令行含 --embed-drop-avc444-aux 时，让 FreeRDP 层丢弃 AVC444
+ * 辅助流（只解主流，画面停在 4:2:0，等同 AVC420 的观感）。
+ *
+ * 开关本身在 libfreerdp/codec/h264.c（补丁 freerdp-3.32.0-ycnz-drop-avc444-aux），
+ * 那里读的是进程环境变量 YOMORI_AVC444_DROP_AUX —— 因为 h264.c 属于 freerdp3.dll，
+ * 不能直接读本进程的命令行。两边用 Win32 环境块对接，跨 DLL 才可靠。
+ *
+ * 不改 config、不改导出 ABI；不传参数时行为与上游完全一致，便于 A/B 对照。 */
+static BOOL ycn_drop_avc444_aux_requested(void)
+{
+	static volatile LONG cached = -1;
+	LONG v = InterlockedCompareExchange(&cached, 0, 0);
+	const wchar_t token[] = L"--embed-drop-avc444-aux";
+	const wchar_t* cmd;
+
+	if (v >= 0)
+		return v ? TRUE : FALSE;
+	v = 0;
+	cmd = GetCommandLineW();
+	if (cmd)
+	{
+		const wchar_t* p = cmd;
+		while (*p)
+		{
+			const wchar_t* start;
+			size_t len;
+			BOOL quoted = FALSE;
+			while (*p == L' ' || *p == 9)
+				p++;
+			if (*p == L'"')
+			{
+				quoted = TRUE;
+				p++;
+			}
+			start = p;
+			while (*p && (quoted ? *p != L'"' : (*p != L' ' && *p != 9)))
+				p++;
+			len = (size_t)(p - start);
+			if (len == (sizeof(token) / sizeof(token[0]) - 1) &&
+			    _wcsnicmp(start, token, len) == 0)
+			{
+				v = 1;
+				break;
+			}
+			if (quoted && *p == L'"')
+				p++;
+		}
+	}
+	InterlockedExchange(&cached, v ? 1 : 0);
+	return v ? TRUE : FALSE;
+}
+
 static void ycn_apply_gfx_config(rdpSettings* settings, const YcnGfxConfig* cfg)
 {
 	BOOL avc444;
 	if (!settings || !cfg)
 		return;
+	/* 丢弃辅助流的开关要送到 freerdp3.dll 里的 avc444_decompress（它读进程环境块）。
+	 * 放在这里是因为每次建立 GFX 配置都必然经过；写同一对键值幂等。 */
+	if (ycn_drop_avc444_aux_requested())
+		SetEnvironmentVariableW(L"YOMORI_AVC444_DROP_AUX", L"1");
 	avc444 = (cfg->avc444 && !ycn_avc420_only_requested()) ? TRUE : FALSE;
 	freerdp_settings_set_bool(settings, FreeRDP_SupportGraphicsPipeline,
 	                          cfg->support_graphics_pipeline ? TRUE : FALSE);
