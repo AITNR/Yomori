@@ -860,6 +860,38 @@ namespace Yomori.Views
 
             var seq = System.Threading.Volatile.Read(ref _frameSeq);
 
+            // S1 抓帧通路：默认关闭。只有 ViewPort 明确给出共享内存帧、且 Present 成功，
+            // 才替代本拍的 RDP 帧源；未启用 / 无帧 / 回退 / 呈现失败一律落到下面的
+            // 原有路径，绝不出现「RDP 帧已停但没有替代帧」的空窗（4.7 禁止先切后验）。
+            //
+            // ⚠️ 必须放在下面「RDP 无新帧早退」之前：Suppress Output 生效后服务端停止推帧，
+            // _frameSeq 不再变化，早退会每拍命中；若把本分支放在早退之后，
+            // CaptureViewPort.Tick 永远不会被调用，共享内存里哪怕有新帧也上不了屏
+            // —— 这是 2026-11-13 真机「画面定格在最后一帧」的直接原因。
+            if (CaptureViewPort is { } viewPort)
+            {
+                // rdpSample 传 default（非黑）：RDP 帧此刻仍在正常供画面，
+                // 双源闸门主要用来挡住 DD 侧的全 0 前导帧 / 黑帧故障。
+                var decision = viewPort.Tick(System.Environment.TickCount64,
+                                             default(Yomori.Models.FrameSample));
+                var capPixels = decision.Pixels;
+                if (decision.UseCapture && capPixels is { Length: > 0 })
+                {
+                    if (_renderer is not { Initialized: true })
+                        EnsureRendererOnUi(decision.Width, decision.Height);
+                    if (_renderer is { Initialized: true } captureRenderer &&
+                        captureRenderer.Present(capPixels, decision.Width, decision.Height, decision.Stride))
+                    {
+                        viewPort.Acknowledge(decision.Seq);
+                        _presentedSeq = seq;
+                        _pendingFirstFrame = false;
+                        FramesRendered++;
+                        ClearEndingOverlay();
+                        return;
+                    }
+                }
+            }
+
             // 「还没呈现过第一帧」时不受 _frameSeq 约束：远端静止的桌面永远不会触发
             // FrameArrived（原生只在 end_paint 回调），光等新帧就是永久黑屏。
             // 原生缓存里始终有最后一帧，抓它即可。
@@ -878,33 +910,6 @@ namespace Yomori.Views
             var tickStart = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                // S1 抓帧通路：默认关闭。只有 ViewPort 明确给出共享内存帧、且 Present 成功，
-                // 才替代本拍的 RDP 帧源；未启用 / 无帧 / 回退 / 呈现失败一律落到下面的
-                // 原有路径，绝不出现「RDP 帧已停但没有替代帧」的空窗（4.7 禁止先切后验）。
-                if (CaptureViewPort is { } viewPort)
-                {
-                    // rdpSample 传 default（非黑）：RDP 帧此刻仍在正常供画面，
-                    // 双源闸门主要用来挡住 DD 侧的全 0 前导帧 / 黑帧故障。
-                    var decision = viewPort.Tick(System.Environment.TickCount64,
-                                                 default(Yomori.Models.FrameSample));
-                    var capPixels = decision.Pixels;
-                    if (decision.UseCapture && capPixels is { Length: > 0 })
-                    {
-                        if (_renderer is not { Initialized: true })
-                            EnsureRendererOnUi(decision.Width, decision.Height);
-                        if (_renderer is { Initialized: true } captureRenderer &&
-                            captureRenderer.Present(capPixels, decision.Width, decision.Height, decision.Stride))
-                        {
-                            viewPort.Acknowledge(decision.Seq);
-                            _presentedSeq = seq;
-                            _pendingFirstFrame = false;
-                            FramesRendered++;
-                            ClearEndingOverlay();
-                            return;
-                        }
-                    }
-                }
-
                 if (!_d3dFailed && !RdpD3DRenderer.ShouldUseSoftware && client.SupportsDirtyFrameCopy)
                 {
                     if (_renderer is not { Initialized: true })

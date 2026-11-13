@@ -29,9 +29,15 @@ namespace Yomori.Services
         private IDXGIOutputDuplication? _dup;
         private byte[]? _prev;
         private bool _disposed;
+        private int _consecutiveTimeouts;
+
+        /// <summary>连续超时达到这个次数就整套重建 duplication（约 9 秒 @100ms 超时）。</summary>
+        private const int TimeoutRebuildThreshold = 90;
 
         public string? LastError { get; private set; }
         public int AccessLostCount { get; private set; }
+        /// <summary>连续超时计数（排障用；成功取帧或重建后清零）。</summary>
+        public int ConsecutiveTimeouts => _consecutiveTimeouts;
 
         public DxgiFrameSource(int adapterIndex = 0, int outputIndex = 0, int timeoutMs = 100)
         {
@@ -48,6 +54,7 @@ namespace Yomori.Services
             if (!EnsureInitialized()) return false;
 
             IDXGIResource? resource = null;
+            bool acquired = false;
             try
             {
                 var rr = _dup!.AcquireNextFrame((uint)_timeoutMs, out _, out resource);
@@ -56,10 +63,27 @@ namespace Yomori.Services
                     if ((uint)rr.Code == DxgiErrorAccessLost)
                     {
                         AccessLostCount++;
+                        _consecutiveTimeouts = 0;
                         ReleaseDuplication(); // 整套重建，下一拍重新 DuplicateOutput
+                    }
+                    else
+                    {
+                        // 静态桌面本来就会超时，但 duplication 长期持有后可能卡在
+                        // 「一直超时」的坏状态（只有 ACCESS_LOST 才重建会漏掉这种）。
+                        // 累计到阈值就强制重建，让 DD 自己恢复产帧能力。
+                        _consecutiveTimeouts++;
+                        if (_consecutiveTimeouts >= TimeoutRebuildThreshold)
+                        {
+                            _consecutiveTimeouts = 0;
+                            LastError = "连续超时达到阈值，重建 Desktop Duplication";
+                            ReleaseDuplication();
+                        }
                     }
                     return false; // 超时 / ACCESS_LOST 都只是本拍无帧
                 }
+                acquired = true;
+                _consecutiveTimeouts = 0;
+                LastError = null;
 
                 using var tex = resource!.QueryInterface<ID3D11Texture2D>();
                 var td = tex.Description;
@@ -115,7 +139,12 @@ namespace Yomori.Services
             finally
             {
                 resource?.Dispose();
-                try { _dup?.ReleaseFrame(); } catch { /* 已重建 / 已释放则忽略 */ }
+                // DXGI 约定：只有 AcquireNextFrame 成功后才能调 ReleaseFrame；
+                // 超时 / 失败时调用是未定义行为，长期常驻可能把 duplication 卡死。
+                if (acquired)
+                {
+                    try { _dup?.ReleaseFrame(); } catch { /* 已重建 / 已释放则忽略 */ }
+                }
             }
         }
 
