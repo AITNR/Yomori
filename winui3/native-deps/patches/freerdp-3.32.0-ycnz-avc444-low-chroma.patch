@@ -14,7 +14,7 @@ index 97874a8..f9cf2c5 100644
  
  	/* Yomori bridge extension: versioned, append-only diagnostics.
 diff --git a/libfreerdp/codec/h264.c b/libfreerdp/codec/h264.c
-index 07eae72..81697b2 100644
+index 07eae72..8cca6a1 100644
 --- a/libfreerdp/codec/h264.c
 +++ b/libfreerdp/codec/h264.c
 @@ -754,6 +754,41 @@ static double avg(UINT64* count, double old, double size)
@@ -59,7 +59,7 @@ index 07eae72..81697b2 100644
  INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionRects,
                          UINT32 numRegionRects, const BYTE* pSrcData, UINT32 SrcSize,
                          const RECTANGLE_16* auxRegionRects, UINT32 numAuxRegionRect,
-@@ -772,6 +807,40 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
+@@ -772,6 +807,43 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
  		ycn_h264_diag_frame_failure(h264, -1013, "avc444-region-main");
  		return -1013;
  	}
@@ -93,14 +93,17 @@ index 07eae72..81697b2 100644
 +			return -1017;
 +		}
 +
++		/* 与上游 avc444_decompress 的成功返回保持一致：成功是 0，只有负值才
++		 * 表示失败（gfx.c 只判 rc < 0）。这里返回正数会让按上游契约写的
++		 * 调用方/测试把成功当异常。 */
 +		ycn_h264_diag_frame_success(h264);
-+		return 1;
++		return 0;
 +	}
 +
  	if (!areRectsValid(h264->log, nDstWidth, nDstHeight, auxRegionRects, numAuxRegionRect))
  	{
  		ycn_h264_diag_frame_failure(h264, -1014, "avc444-region-aux");
-@@ -1091,6 +1160,9 @@ BOOL h264_context_set_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option, UIN
+@@ -1091,6 +1163,9 @@ BOOL h264_context_set_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option, UIN
  			else if (value == YCN_H264_DECODE_POLICY_AUTO_HW)
  				h264->hwAccel = 1;
  			return TRUE;
@@ -110,7 +113,7 @@ index 07eae72..81697b2 100644
  		default:
  			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
  			           option);
-@@ -1117,6 +1189,8 @@ UINT32 h264_context_get_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option)
+@@ -1117,6 +1192,8 @@ UINT32 h264_context_get_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option)
  			return h264->hwAccel;
  		case H264_CONTEXT_OPTION_YCN_DECODE_POLICY:
  			return h264->ycnDecodePolicy;

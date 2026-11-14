@@ -414,15 +414,6 @@ public sealed partial class SettingsPage : Page
     }
 
     /// <summary>
-    /// 「通道账户密码永不过期」开关：默认勾选，只作用于已添加进 Yomori 的本机本地通道账户。
-    ///
-    /// <para>刻意用 OneWay + Toggled：必须**先执行成功再落配置**。执行失败或被拒绝还原时
-    /// 把开关拨回原位，不留下「看着是开的、其实没做」的状态。</para>
-    ///
-    /// <para>取消勾选会还原 Windows 账户的标志位；若某个账户的密码年龄已达系统策略上限，
-    /// 服务整批拒绝还原 —— 那种情况下清掉标志位会让密码立刻过期、通道当场断连。</para>
-    /// </summary>
-    /// <summary>
     /// AVC444 低色度模式开关。
     ///
     /// <para>与开发者模式同一套路：<c>OneWay</c> 绑定 + 手动写回 + 立刻落盘。
@@ -468,6 +459,15 @@ public sealed partial class SettingsPage : Page
             : "已关闭 AVC444 低色度模式（下次连接生效）：恢复完整 AVC444 4:4:4 解码。");
     }
 
+    /// <summary>
+    /// 「通道账户密码永不过期」开关：默认勾选，只作用于已添加进 Yomori 的本机本地通道账户。
+    ///
+    /// <para>刻意用 OneWay + Toggled：必须**先执行成功再落配置**。执行失败或被拒绝还原时
+    /// 把开关拨回原位，不留下「看着是开的、其实没做」的状态。</para>
+    ///
+    /// <para>取消勾选会还原 Windows 账户的标志位；若某个账户的密码年龄已达系统策略上限，
+    /// 服务整批拒绝还原 —— 那种情况下清掉标志位会让密码立刻过期、通道当场断连。</para>
+    /// </summary>
     private async void OnChannelPasswordPolicyToggled(object sender, RoutedEventArgs e)
     {
         if (_syncing)

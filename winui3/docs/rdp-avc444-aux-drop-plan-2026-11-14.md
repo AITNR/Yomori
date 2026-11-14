@@ -223,11 +223,15 @@ RDPGFX SurfaceCommand codec 14 / 15
 
 | 批次 | 时间 | 产出 | 自测 | 状态 |
 |---|---|---|---|---|
-| W1 上游补丁 | 2026-11-14 12:20 | 新增 `native-deps/patches/freerdp-3.32.0-ycnz-avc444-low-chroma.patch`：`H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA`（0x59434E02）+ 私有 `ycnAvc444LowChroma`；`avc444_decompress` 在低色度模式下 op0/1 走主流 YUV420→BGRA、op2 只解码不输出；`gfx.c` 加每 `rdpContext` 开关（`ycn_gdi_set/get/release_avc444_low_chroma`）、跳过 aux rect 的 dirty/UpdateSurfaceArea、op2 不做区域更新 | 纯净 3.32.0 tarball 上按序应用 msvc-hw-label → diagnostics → 本补丁 → decode-pause 全部干净应用（pause 有 54 行偏移，仍成功）；`h264.c`、`gfx.c` 用 MSVC 14.44 `/c` 单独编译 0 error | 已完成（补丁级验证）；未进 DLL |
-| W2 桥接 ABI | 2026-11-14 12:25 | `ycn_rdp.h`：`YCN_DECODE_CAP_AVC444_LOW_CHROMA`(0x8)、`YCN_GFX_OPTION_LOW_CHROMA_AVC444`(0x1)、`ycn_rdp_connect_ex2`；`ycn_rdp.c`：会话 `gfx_options`、ex2 未知位拒绝、`gdi_init` 后设置、teardown/abandon 释放登记 | `ycn_rdp.c` 直接 `cl /c` 编译通过（仅既有的无害 C4081）；`_smoke` 编译通过 | 已完成（编译级验证） |
+| W1 上游补丁 | 2026-11-14 12:20 | 新增 `native-deps/patches/freerdp-3.32.0-ycnz-avc444-low-chroma.patch`：`H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA`（0x59434E02）+ 私有 `ycnAvc444LowChroma`；`avc444_decompress` 在低色度模式下 op0/1 走主流 YUV420→BGRA、op2 只解码不输出；`gfx.c` 加每 `rdpContext` 开关（`ycn_gdi_set/get/release_avc444_low_chroma`）、跳过 aux rect 的 dirty/UpdateSurfaceArea、op2 不做区域更新 | 按 vcpkg 的实际打补丁方式（`git apply --ignore-whitespace --whitespace=nowarn`）在纯净 3.32.0 tarball 上按 sorted 顺序应用 7 个上游 port 补丁 + 4 个 ycn 补丁，全部 OK；CI run 43556540733 用该补丁重建 freerdp3.dll 成功 | 已完成（已进 DLL） |
+| W2 桥接 ABI | 2026-11-14 12:25 | `ycn_rdp.h`：`YCN_DECODE_CAP_AVC444_LOW_CHROMA`(0x8)、`YCN_GFX_OPTION_LOW_CHROMA_AVC444`(0x1)、`ycn_rdp_connect_ex2`；`ycn_rdp.c`：会话 `gfx_options`、ex2 未知位拒绝、`gdi_init` 后设置、teardown/abandon 释放登记 | CI 步骤「校验原生层」PASS：能力位与 ex2 存在性互约束通过、未知 graphics option 被拒；打包校验脚本要求的新导出也在产物里 | 已完成（已进 DLL） |
 | W2 配置/UI | 2026-11-14 12:28 | `RdpConfig.LowChromaAvc444`（`low_chroma_avc444`，默认 false）、`RdpConnectInfo.LowChromaAvc444`、`MainViewModel` 透传、`RdpEmbeddedClient` 能力位判断 + ex2 调用 + 诊断字段 `avc444_low_chroma`、设置页 ToggleSwitch + 保存失败回拨 | `_smoke` 新增 5 条断言全 PASS（默认关、键名往返、Clone、旧配置缺键、Sanitize 不重置）；整体 2410 PASS / 1 FAIL（失败项为既有的 `[遮挡闸门] 节拍器…`，依赖未提交的 occlusion 工作，与本改动无关） | 已完成 |
-| W3 离线测试 | 2026-11-14 12:30 | `avc444_decode_probe.py`：`--low-chroma` 走 `h264_context_set_option`；`--full` 增加「低色度 op0 输出必须与 op1 主流单解逐字节相同」的等价断言 | 未跑（需带补丁的 DLL） | 待运行时验证 |
-| W3 ABI 测试 | 2026-11-14 12:30 | `native_decode_checks.py`：已知能力位加入 0x8；能力位与 `ycn_rdp_connect_ex2` 存在性互相约束；未知 graphics option 必须被拒 | 未跑（需带补丁的 DLL） | 待运行时验证 |
-| W4 A/B | — | 真实会话 CPU/画质对照 | 未开始 | 待构建完成后执行 |
+| W3 离线测试 | 2026-11-14 13:10 | `avc444_decode_probe.py`：`--low-chroma` 走 `h264_context_set_option`；`--full` 增加「低色度 op0 输出必须与 op1 主流单解逐字节相同」的等价断言 | 用 CI 产物实跑：op1 4 项 PASS；op0 双流 4 项 PASS（PSNR 40.444 / 40.802，MAE 1.843 / 1.738）；低色度 4 项 `equivalent=True`（两侧 sha 完全相同 `be11d250…`）但整体判 FAIL，原因是分支返回 `1` 而上游成功约定为 `0` → 已改为 `return 0` 并与上游对齐 | 等价性已实测通过；返回值偏差已修，待 CI 重建复核 |
+| W3 ABI 测试 | 2026-11-14 13:10 | `native_decode_checks.py`：已知能力位加入 0x8；能力位与 `ycn_rdp_connect_ex2` 存在性互相约束；未知 graphics option 必须被拒 | CI run 43556540733 步骤「校验原生层」PASS（含本项）；另用 pefile 之外的方式直接读产物：`ycn_rdp_decode_capabilities()` 返回 `0xF`，`ycn_gdi_set/get/release_avc444_low_chroma` 与 `ycn_rdp_connect_ex2` 均已导出 | 已完成 |
+| W4 A/B | — | 真实会话 CPU/画质对照 | 未开始 | 待最终 DLL 装配后可执行 |
 
-**当前闸门**：本机沙箱的黑名单拦截 `reg.exe`，vcpkg 在 `pkgconf` 步骤即失败（`PROGRAM BLOCKED BY SECURITY POLICY`），所以**无法在本沙箱内重建带补丁的 freerdp3.dll**，`ycn_rdp.dll` 也因缺少新导出而无法链接。已验证到「补丁干净应用 + 三个 .c 用 MSVC 单独编译 0 error」，下一步必须在 CI（或用户本机非沙箱环境）完成：vcpkg overlay 重建 → native CMake Release x64 → `avc444_decode_probe.py --full` → `native_decode_checks.py` → 主工程 build。真实会话 A/B 与 CPU 收益结论仍未取得，当前不得声称「降低 CPU」。
+**当前闸门**：本机沙箱的黑名单拦截 `reg.exe`，vcpkg 在 `pkgconf` 步骤即失败（`PROGRAM BLOCKED BY SECURITY POLICY`），所以**无法在本沙箱内重建带补丁的 freerdp3.dll**。因此构建一律交给 CI：`43556540733`（提交 `3b897a2`）已用本补丁完整重建并跑通原生层校验与能力校验。
+
+离线等价性用 CI 产物在本机实跑，结论成立；过程中确认了一个**本机环境坑**（与产品无关）：本机 Python 自带的 `libcrypto-3-x64.dll` 与 Yomori 用的 vcpkg OpenSSL 同名，`import hashlib` 会把它先载入进程，之后加载 `freerdp3.dll` 得到 `WinError 127`。绕法是启动时先预载同目录的 OpenSSL；CI 的 runner 上没有此冲突。另有依赖不全的问题：只放 CI 的 13 个 DLL 会缺 `avformat-63`/`avfilter-12` 等，需与既有构建目录的 DLL 合并后再跑探针。
+
+真实会话 A/B 与 CPU 收益结论仍未取得，当前不得声称「降低 CPU」。
