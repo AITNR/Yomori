@@ -227,7 +227,7 @@ public sealed partial class MainWindow : Window
     internal string CurrentPageTag => _currentTag;
 
     /// <summary>引导专用导航入口：复用统一的 NavigateTo，不另起一套选中态逻辑。</summary>
-    internal void NavigateForOnboarding(string tag) => NavigateTo(tag);
+    internal void NavigateForOnboarding(string tag) => NavigateTo(tag, animate: false);
 
     /// <summary>
     /// 在当前页面里按 x:Name 找引导目标。目标都是页面的直接具名元素、不在 DataTemplate 里；
@@ -1811,7 +1811,17 @@ public sealed partial class MainWindow : Window
         NavigateTo(tag);
     }
 
-    private void NavigateTo(string tag)
+    /// <summary>通道页面入场动画挂字段保活（Storyboard 不自持引用）。</summary>
+    private Storyboard? _channelPageEntranceBoard;
+
+    /// <summary>正在播入场动画的页面；收尾要摘掉它身上动画专用的 RenderTransform。</summary>
+    private FrameworkElement? _channelPageEntranceTarget;
+
+    /// <summary>
+    /// 引导换页时传 animate:false：入场位移会让引导的 TransformToVisual 量偏坐标。
+    /// 其它导航维持原样，只给「会话通道」子菜单的三个目标页面加过渡。
+    /// </summary>
+    private void NavigateTo(string tag, bool animate = true)
     {
         // 旧 tag "channels"（原「会话通道」父项入口，ChannelsPage「打开多画面」还在用）
         // 统一落到「多画面」子项：父项不再作为导航目标，选中态也要落在子项上。
@@ -1833,8 +1843,16 @@ public sealed partial class MainWindow : Window
             ContentFrame.Navigate(typeof(Views.RdpChannelPage), tag[ChannelTagPrefix.Length..]);
             ChannelsNavItem.IsExpanded = true;
             SyncNavigationSelection(tag);
+            if (animate)
+            {
+                PlayChannelPageEntrance();
+            }
+
             return;
         }
+
+        var channelPage = string.Equals(tag, MultiViewTag, StringComparison.Ordinal)
+                          || string.Equals(tag, ChannelMgmtTag, StringComparison.Ordinal);
 
         switch (tag)
         {
@@ -1863,7 +1881,119 @@ public sealed partial class MainWindow : Window
         }
 
         SyncNavigationSelection(tag);
+
+        if (animate && channelPage)
+        {
+            PlayChannelPageEntrance();
+        }
     }
+
+    /// <summary>
+    /// 通道相关页面切换后给新页面播入场动画（淡入 + 轻微上移，220ms）。
+    /// 写法照 PlayChannelMenuEntrance / SettingsPage 的分类入场动画。
+    /// </summary>
+    private void PlayChannelPageEntrance()
+    {
+        CancelChannelPageEntrance();
+
+        if (ContentFrame.Content is not FrameworkElement page)
+        {
+            return;
+        }
+
+        _channelPageEntranceTarget = page;
+
+        // Frame.Navigate 刚返回时新页面可能还没上屏，Storyboard.Begin 拿不到 XamlRoot。
+        // 等一次 Loaded 再播；切页时由 CancelChannelPageEntrance 解掉未触发的订阅。
+        if (!page.IsLoaded)
+        {
+            page.Loaded += OnChannelPageEntranceLoaded;
+            return;
+        }
+
+        StartChannelPageEntrance(page);
+    }
+
+    private void OnChannelPageEntranceLoaded(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement page)
+        {
+            page.Loaded -= OnChannelPageEntranceLoaded;
+            StartChannelPageEntrance(page);
+        }
+    }
+
+    /// <summary>真正播动画前复核页面还是当前内容（可能已经又切走了）。</summary>
+    private void StartChannelPageEntrance(FrameworkElement page)
+    {
+        if (!ReferenceEquals(ContentFrame.Content, page))
+        {
+            CancelChannelPageEntrance();
+            return;
+        }
+
+        var duration = new Duration(TimeSpan.FromMilliseconds(220));
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        var transform = new CompositeTransform { TranslateY = 12 };
+        page.RenderTransform = transform;
+        page.Opacity = 0;
+
+        var board = new Storyboard();
+
+        var fade = new DoubleAnimation
+        {
+            To = 1,
+            Duration = duration,
+            EasingFunction = ease,
+        };
+        Storyboard.SetTarget(fade, page);
+        Storyboard.SetTargetProperty(fade, "Opacity");
+
+        var slide = new DoubleAnimation
+        {
+            To = 0,
+            Duration = duration,
+            EasingFunction = ease,
+            EnableDependentAnimation = true,
+        };
+        Storyboard.SetTarget(slide, transform);
+        Storyboard.SetTargetProperty(slide, "TranslateY");
+
+        board.Children.Add(fade);
+        board.Children.Add(slide);
+        board.Completed += OnChannelPageEntranceCompleted;
+
+        // 挂字段保活：Storyboard 不自持引用。
+        _channelPageEntranceBoard = board;
+        _channelPageEntranceTarget = page;
+        board.Begin();
+    }
+
+    /// <summary>停掉页面入场动画并复原：撤 HoldEnd、摘掉动画专用的 RenderTransform。</summary>
+    private void CancelChannelPageEntrance()
+    {
+        if (_channelPageEntranceBoard is Storyboard board)
+        {
+            board.Completed -= OnChannelPageEntranceCompleted;
+            board.Stop();
+            _channelPageEntranceBoard = null;
+        }
+
+        if (_channelPageEntranceTarget is FrameworkElement page)
+        {
+            page.Loaded -= OnChannelPageEntranceLoaded;
+            if (page.IsLoaded)
+            {
+                page.Opacity = 1;
+                page.RenderTransform = null;
+            }
+        }
+
+        _channelPageEntranceTarget = null;
+    }
+
+    private void OnChannelPageEntranceCompleted(object? sender, object e) => CancelChannelPageEntrance();
 
     private void SyncNavigationSelection(string tag)
     {

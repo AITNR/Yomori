@@ -5,6 +5,8 @@ using System.Linq;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Navigation;
 using Yomori.ViewModels;
 
@@ -39,6 +41,12 @@ public sealed partial class RdpMultiViewPage : Page
 
     /// <summary>分页页码（0 起）。</summary>
     private int _gridPage;
+
+    /// <summary>翻页时才给网格播入场动画；1Hz 重排不播（否则每秒闪一次）。</summary>
+    private bool _animateNextLayout;
+
+    /// <summary>网格入场动画挂字段保活（Storyboard 不自持引用）。</summary>
+    private Storyboard? _surfaceLayoutBoard;
 
     public RdpMultiViewPage()
     {
@@ -99,6 +107,9 @@ public sealed partial class RdpMultiViewPage : Page
     protected override void OnNavigatedFrom(NavigationEventArgs e)
     {
         _pageAlive = false;
+        _animateNextLayout = false;
+        // 页面卸载后动画回调不能再碰控件
+        CancelSurfaceLayoutAnimation();
         _refreshTimer?.Stop();
         _refreshTimer = null;
         VM.SurfaceRefreshRequested -= OnSurfaceRefreshRequested;
@@ -205,6 +216,13 @@ public sealed partial class RdpMultiViewPage : Page
         MultiViewHintText.Text = VM.IsEmbeddedMode
             ? "这里并列显示全部通道的画面；每格右上角可把它弹成独立窗口，想单独放大请看左侧菜单里它自己的那一项。"
             : "当前客户端模式是「独立窗口（mstsc）」，画面在系统自带的远程桌面窗口里；要在这里并排看画面，请到「设置 → 执行与通知」把连接方式改成「内嵌」。";
+
+        // 只在翻页那一拍播入场动画；1Hz 的常规重排不播，否则每秒闪一次。
+        if (_animateNextLayout)
+        {
+            _animateNextLayout = false;
+            PlaySurfaceLayoutEntrance();
+        }
     }
 
     /// <summary>把第 index 格放进 2×2 网格里合适的位置（1 / 2 / 3 格时自动跨行列）。</summary>
@@ -256,14 +274,84 @@ public sealed partial class RdpMultiViewPage : Page
     private void OnPrevPageClicked(object sender, RoutedEventArgs e)
     {
         _gridPage = Math.Max(0, _gridPage - 1);
+        _animateNextLayout = true;
         LayoutSurfaces();
     }
 
     private void OnNextPageClicked(object sender, RoutedEventArgs e)
     {
         _gridPage++;
+        _animateNextLayout = true;
         LayoutSurfaces();
     }
+
+    /// <summary>
+    /// 翻页后给整个画面网格播入场动画（淡入 + 轻微上移，200ms）。
+    /// 只在翻页时播：LayoutSurfaces 每 1Hz 也会跑，那次不播，否则每秒闪一次。
+    /// </summary>
+    private void PlaySurfaceLayoutEntrance()
+    {
+        CancelSurfaceLayoutAnimation();
+
+        if (!_pageAlive || !SurfaceLayout.IsLoaded)
+        {
+            return;
+        }
+
+        var duration = new Duration(TimeSpan.FromMilliseconds(200));
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        var transform = new CompositeTransform { TranslateY = 10 };
+        SurfaceLayout.RenderTransform = transform;
+        SurfaceLayout.Opacity = 0;
+
+        var board = new Storyboard();
+
+        var fade = new DoubleAnimation
+        {
+            To = 1,
+            Duration = duration,
+            EasingFunction = ease,
+        };
+        Storyboard.SetTarget(fade, SurfaceLayout);
+        Storyboard.SetTargetProperty(fade, "Opacity");
+
+        var slide = new DoubleAnimation
+        {
+            To = 0,
+            Duration = duration,
+            EasingFunction = ease,
+            EnableDependentAnimation = true,
+        };
+        Storyboard.SetTarget(slide, transform);
+        Storyboard.SetTargetProperty(slide, "TranslateY");
+
+        board.Children.Add(fade);
+        board.Children.Add(slide);
+        board.Completed += OnSurfaceLayoutAnimationCompleted;
+
+        _surfaceLayoutBoard = board;
+        board.Begin();
+    }
+
+    /// <summary>停掉网格动画并复原：撤 HoldEnd、摘掉动画专用的 RenderTransform。</summary>
+    private void CancelSurfaceLayoutAnimation()
+    {
+        if (_surfaceLayoutBoard is Storyboard board)
+        {
+            board.Completed -= OnSurfaceLayoutAnimationCompleted;
+            board.Stop();
+            _surfaceLayoutBoard = null;
+        }
+
+        if (SurfaceLayout.IsLoaded)
+        {
+            SurfaceLayout.Opacity = 1;
+            SurfaceLayout.RenderTransform = null;
+        }
+    }
+
+    private void OnSurfaceLayoutAnimationCompleted(object? sender, object e) => CancelSurfaceLayoutAnimation();
 
     private void OnOpenChannelManagerClicked(object sender, RoutedEventArgs e) => VM.Navigate("channel-mgmt");
 

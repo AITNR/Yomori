@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Windows.UI;
 using Yomori.Helpers;
 using Yomori.Models;
@@ -86,6 +87,15 @@ public sealed partial class SettingsPage : Page
     private bool _syncingSection;
 
     /// <summary>
+    /// 分类入场动画必须挂字段保活。Storyboard 不自持引用，Begin() 返回后没人引用
+    /// 就会被 GC，动画静默不播（MainWindow 的菜单入场动画踩过同一个坑）。
+    /// </summary>
+    private Storyboard? _sectionEntranceBoard;
+
+    /// <summary>正在播入场动画的分类面板。收尾要摘掉它身上动画专用的 RenderTransform。</summary>
+    private FrameworkElement? _sectionEntrancePanel;
+
+    /// <summary>
     /// 用户点左侧分类：只切 Visibility，不重建任何集合。
     /// 动态 Clear() 再 Add 会撞上树进入期的 stowed exception。
     /// </summary>
@@ -104,15 +114,25 @@ public sealed partial class SettingsPage : Page
         }
     }
 
-    /// <summary>切到指定分类：显示对应面板、更新页眉、同步导航选中态、滚动回顶部。</summary>
-    private void ShowSection(string key, bool resetScroll = true)
+    /// <summary>
+    /// 切到指定分类：显示对应面板、更新页眉、同步导航选中态、滚动回顶部，
+    /// 并给新面板播一段入场动画。
+    /// </summary>
+    /// <param name="animate">引导定位 / 主题重建恢复分类时传 false：
+    /// 位移会让 TransformToVisual 量到的坐标偏十几像素，高亮框会套歪。</param>
+    private void ShowSection(string key, bool resetScroll = true, bool animate = true)
     {
         if (Array.IndexOf(SectionKeys, key) < 0 || _unloaded)
         {
             return;
         }
 
+        // 连点分类时先收掉上一次动画，不能让两个 Storyboard 同时压着同一批属性。
+        CancelSectionAnimation();
+
         _currentSection = key;
+
+        FrameworkElement? entering = null;
 
         // 一律用 FindName 取控件：主题切换会重建内容树，生成字段可能指向失效元素。
         _syncingSection = true;
@@ -122,7 +142,12 @@ public sealed partial class SettingsPage : Page
             {
                 if (FindName("Section_" + k) is FrameworkElement panel)
                 {
-                    panel.Visibility = k == key ? Visibility.Visible : Visibility.Collapsed;
+                    var visible = k == key;
+                    panel.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+                    if (visible)
+                    {
+                        entering = panel;
+                    }
                 }
             }
 
@@ -156,7 +181,82 @@ public sealed partial class SettingsPage : Page
         {
             scroll.ChangeView(null, 0, null, true);
         }
+
+        if (animate && entering is not null)
+        {
+            StartSectionEntranceAnimation(entering);
+        }
     }
+
+    /// <summary>
+    /// 停掉入场动画并复原状态。打断了要调，自然播完了也要调。
+    /// HoldEnd 会长期压住 Opacity / TranslateY，不 Stop 掉之后谁再改都不生效。
+    /// </summary>
+    private void CancelSectionAnimation()
+    {
+        if (_sectionEntranceBoard is Storyboard board)
+        {
+            board.Completed -= OnSectionEntranceCompleted;
+            board.Stop();
+            _sectionEntranceBoard = null;
+        }
+
+        if (_sectionEntrancePanel is FrameworkElement panel && panel.IsLoaded)
+        {
+            panel.Opacity = 1;
+            // 铁律：动画专用的变换必须摘掉。留着的话命中测试算局部变换时
+            // 会摸到失效对象（GetLocalTransform 崩溃，2026-10-27 两次同签名）。
+            panel.RenderTransform = null;
+        }
+
+        _sectionEntrancePanel = null;
+    }
+
+    /// <summary>
+    /// 新分类入场：淡入 + 轻微上移，220ms。写法照 MainWindow 的菜单入场动画
+    /// （CompositeTransform.TranslateY 是依赖动画，必须 EnableDependentAnimation）。
+    /// </summary>
+    private void StartSectionEntranceAnimation(FrameworkElement panel)
+    {
+        var duration = new Duration(TimeSpan.FromMilliseconds(220));
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        var transform = new CompositeTransform { TranslateY = 12 };
+        panel.RenderTransform = transform;
+        panel.Opacity = 0;
+
+        var board = new Storyboard();
+
+        var fade = new DoubleAnimation
+        {
+            To = 1,
+            Duration = duration,
+            EasingFunction = ease,
+        };
+        Storyboard.SetTarget(fade, panel);
+        Storyboard.SetTargetProperty(fade, "Opacity");
+
+        var slide = new DoubleAnimation
+        {
+            To = 0,
+            Duration = duration,
+            EasingFunction = ease,
+            EnableDependentAnimation = true,
+        };
+        Storyboard.SetTarget(slide, transform);
+        Storyboard.SetTargetProperty(slide, "TranslateY");
+
+        board.Children.Add(fade);
+        board.Children.Add(slide);
+        board.Completed += OnSectionEntranceCompleted;
+
+        // 挂字段保活：Storyboard 不自持引用。
+        _sectionEntranceBoard = board;
+        _sectionEntrancePanel = panel;
+        board.Begin();
+    }
+
+    private void OnSectionEntranceCompleted(object? sender, object e) => CancelSectionAnimation();
 
     /// <summary>
     /// 引导等外部定位：把目标控件所在的分类展开，并强制同步布局。
@@ -177,7 +277,7 @@ public sealed partial class SettingsPage : Page
                 && fe.Tag is string key
                 && Array.IndexOf(SectionKeys, key) >= 0)
             {
-                ShowSection(key, resetScroll: false);
+                ShowSection(key, resetScroll: false, animate: false);
                 // Visibility 改变只是标记布局失效，这里强制跑完一趟，
                 // 后面紧接着的 TransformToVisual 才能量到展开后的尺寸。
                 if (FindName("SettingsScroll") is ScrollViewer scroll)
@@ -236,6 +336,8 @@ public sealed partial class SettingsPage : Page
         Unloaded += (_, __) =>
         {
             _unloaded = true;
+            // 页面卸载后不能再往控件上写：动画回调里会碰 Opacity / RenderTransform。
+            CancelSectionAnimation();
             _themeHintCts?.Cancel();
             // 单例 VM：页面切换时解绑，别把本页的控件留在订阅链上
             VM.PropertyChanged -= OnReadinessPropertyChanged;
@@ -1355,7 +1457,7 @@ public sealed partial class SettingsPage : Page
         {
             // 改主题会让根元素 RequestedTheme 变化、内容树重建，Loaded 再来一次。
             // 这时把当前分类补回去，否则用户正在看的分类会莫名跳回「常规」。
-            ShowSection(_currentSection, resetScroll: false);
+            ShowSection(_currentSection, resetScroll: false, animate: false);
             return;
         }
 

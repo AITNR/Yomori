@@ -3,6 +3,8 @@ using System;
 using System.ComponentModel;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Media.Animation;
 using Yomori.Helpers;
 using Yomori.Models;
 using Yomori.Services;
@@ -84,6 +86,9 @@ public sealed partial class ChannelsPage : Page
 
     private void OnUnloaded(object sender, RoutedEventArgs e)
     {
+        // 页面卸载后动画回调不能再碰控件
+        CancelChannelEditorAnimation();
+
         // 页面切换（Frame.Navigate 每次新建实例）：解除订阅。
         // 内嵌连接归 VM 持有，不受页面生命周期影响。
         VM.PropertyChanged -= OnViewModelPropertyChanged;
@@ -94,12 +99,19 @@ public sealed partial class ChannelsPage : Page
         _embedStatsTimer?.Stop();
     }
 
+    /// <summary>通道编辑卡入场动画挂字段保活（Storyboard 不自持引用）。</summary>
+    private Storyboard? _channelEditorBoard;
+
     /// <summary>VM 里的通道状态变了就同步一次界面装饰（空列表提示、编辑卡可用态）。</summary>
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         switch (e.PropertyName)
         {
             case nameof(MainViewModel.SelectedChannel):
+                SyncChannelChrome();
+                // 只有真正换选中通道才播；Channels / ActiveSession 那些 1Hz 刷新别反复闪
+                PlayChannelEditorEntrance();
+                break;
             case nameof(MainViewModel.Channels):
             case nameof(MainViewModel.ChannelCredentialText):
             case nameof(MainViewModel.ActiveSession):
@@ -107,6 +119,75 @@ public sealed partial class ChannelsPage : Page
                 break;
         }
     }
+
+    /// <summary>
+    /// 切换通道后给右侧编辑卡播入场动画（淡入 + 轻微上移，200ms）。
+    /// Opacity 终值沿用 SyncChannelChrome 的语义：没选中通道时是 0.5（变灰），不是 1。
+    /// </summary>
+    private void PlayChannelEditorEntrance()
+    {
+        CancelChannelEditorAnimation();
+
+        if (!ChannelEditorCard.IsLoaded)
+        {
+            return;
+        }
+
+        var targetOpacity = VM.SelectedChannel is null ? 0.5 : 1.0;
+        var duration = new Duration(TimeSpan.FromMilliseconds(200));
+        var ease = new CubicEase { EasingMode = EasingMode.EaseOut };
+
+        var transform = new CompositeTransform { TranslateY = 10 };
+        ChannelEditorCard.RenderTransform = transform;
+        ChannelEditorCard.Opacity = 0;
+
+        var board = new Storyboard();
+
+        var fade = new DoubleAnimation
+        {
+            To = targetOpacity,
+            Duration = duration,
+            EasingFunction = ease,
+        };
+        Storyboard.SetTarget(fade, ChannelEditorCard);
+        Storyboard.SetTargetProperty(fade, "Opacity");
+
+        var slide = new DoubleAnimation
+        {
+            To = 0,
+            Duration = duration,
+            EasingFunction = ease,
+            EnableDependentAnimation = true,
+        };
+        Storyboard.SetTarget(slide, transform);
+        Storyboard.SetTargetProperty(slide, "TranslateY");
+
+        board.Children.Add(fade);
+        board.Children.Add(slide);
+        board.Completed += OnChannelEditorAnimationCompleted;
+
+        _channelEditorBoard = board;
+        board.Begin();
+    }
+
+    /// <summary>停掉编辑卡动画并复原：撤 HoldEnd、摘掉动画专用的 RenderTransform。</summary>
+    private void CancelChannelEditorAnimation()
+    {
+        if (_channelEditorBoard is Storyboard board)
+        {
+            board.Completed -= OnChannelEditorAnimationCompleted;
+            board.Stop();
+            _channelEditorBoard = null;
+        }
+
+        if (ChannelEditorCard.IsLoaded)
+        {
+            ChannelEditorCard.Opacity = VM.SelectedChannel is null ? 0.5 : 1.0;
+            ChannelEditorCard.RenderTransform = null;
+        }
+    }
+
+    private void OnChannelEditorAnimationCompleted(object? sender, object e) => CancelChannelEditorAnimation();
 
     /// <summary>把空列表提示、编辑卡可用态这些"装饰性"状态刷一遍。预检结果归设置页。</summary>
     private void SyncChannelChrome()
