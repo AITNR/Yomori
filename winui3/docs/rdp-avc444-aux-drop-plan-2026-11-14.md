@@ -228,7 +228,7 @@ RDPGFX SurfaceCommand codec 14 / 15
 | W2 配置/UI | 2026-11-14 12:28 | `RdpConfig.LowChromaAvc444`（`low_chroma_avc444`，默认 false）、`RdpConnectInfo.LowChromaAvc444`、`MainViewModel` 透传、`RdpEmbeddedClient` 能力位判断 + ex2 调用 + 诊断字段 `avc444_low_chroma`、设置页 ToggleSwitch + 保存失败回拨 | `_smoke` 新增 5 条断言全 PASS（默认关、键名往返、Clone、旧配置缺键、Sanitize 不重置）；整体 2410 PASS / 1 FAIL（失败项为既有的 `[遮挡闸门] 节拍器…`，依赖未提交的 occlusion 工作，与本改动无关） | 已完成 |
 | W3 离线测试 | 2026-11-14 13:49 | `avc444_decode_probe.py`：`--low-chroma` 走 `h264_context_set_option`；`--full` 增加「低色度 op0 输出必须与 op1 主流单解逐字节相同」的等价断言 | 用 CI 产物实跑：op1 4 项 PASS；op0 双流 4 项 PASS（PSNR 40.444 / 40.802，MAE 1.843 / 1.738）；低色度 4 项 `equivalent=True`（两侧 sha 完全相同）。首轮因分支返回 `1` 而上游成功约定为 `0` 被判 FAIL，改 `return 0` 后 **`FINAL: op1(PASS) full(PASS)` 12/12 全绿** | 已完成 |
 | W3 ABI 测试 | 2026-11-14 13:10 | `native_decode_checks.py`：已知能力位加入 0x8；能力位与 `ycn_rdp_connect_ex2` 存在性互相约束；未知 graphics option 必须被拒 | CI run 43556540733 步骤「校验原生层」PASS（含本项）；另用 pefile 之外的方式直接读产物：`ycn_rdp_decode_capabilities()` 返回 `0xF`，`ycn_gdi_set/get/release_avc444_low_chroma` 与 `ycn_rdp_connect_ex2` 均已导出 | 已完成 |
-| W4 A/B | — | 真实会话 CPU/画质对照 | 未开始 | 待最终 DLL 装配后可执行 |
+| W4 A/B | 2026-11-14 15:05 | 交替采样实测（`_probe/ab-lowchroma-2026-11-14/result.md`）：同一时间段内 on/off 快速交替，按日志模式标记分组 | codec 路径 **3.345 → 3.544 ms/surface（−5.6%，四分位不重叠）**，即约 0.68% 单核；进程 CPU 因噪声不可判；**GPU 视频解码/3D 引擎无差异**（`hw_frames/surface` 两模式都是 1.000）；显存无差异 | 已完成，**结论：无可感知收益**，不作性能卖点 |
 
 **当前闸门**：本机沙箱的黑名单拦截 `reg.exe`，vcpkg 在 `pkgconf` 步骤即失败（`PROGRAM BLOCKED BY SECURITY POLICY`），所以**无法在本沙箱内重建带补丁的 freerdp3.dll**。构建一律交给 CI，两轮均已通过：`43556540733`（`3b897a2`）首次用本补丁重建并跑通原生层/能力校验；`43560648588`（`042e192`）在返回值修正后重建同样通过。
 
