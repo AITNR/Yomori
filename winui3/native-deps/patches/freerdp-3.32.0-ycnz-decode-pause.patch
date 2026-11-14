@@ -1,6 +1,24 @@
 --- a/libfreerdp/gdi/gfx.c
 +++ b/libfreerdp/gdi/gfx.c
-@@ -880,6 +880,86 @@
+@@ -26,6 +26,7 @@
+ #include <winpr/assert.h>
+ #include <winpr/cast.h>
+ #include <winpr/platform.h>
++#include <winpr/environment.h>
+ 
+ #include <freerdp/api.h>
+ #include <freerdp/log.h>
+@@ -34,6 +35,9 @@
+ #include <freerdp/utils/gfx.h>
+ #include <math.h>
+ 
++/* libfreerdp/codec/h264.c 中的恢复闸门（同 DLL 内部符号，无需导出）。 */
++void ycn_h264_set_wait_keyframe(H264_CONTEXT* h264, BOOL wait);
++
+ #define TAG FREERDP_TAG("gdi")
+ 
+ /* Yomori AVC444 low chroma mode: per-rdpContext opt-in. Defined at the end of
+@@ -826,6 +830,87 @@
  #endif
  }
  
@@ -15,7 +33,8 @@
 + * 丢帧连 invalidRegion / UpdateSurfaceArea 都不走, 所以呈现节拍器也不会被唤醒。
 + * 服务端照旧推帧(带宽不变), 帧确认照常发送, 会话不会因为"客户端不收"而降级或断开。
 + *
-+ * 恢复后必须请求一次全帧刷新: 暂停期间丢掉的 P 帧已让参考链断裂。
++ * 恢复后必须请求一次全帧刷新, 并让解码器等到关键帧: 暂停期间丢掉的 P 帧已让
++ * 参考链断裂, 直接解下一张 P 帧会出成片错误块。
 + */
 +#define YCN_PAUSE_SLOTS 16
 +
@@ -87,15 +106,13 @@
  /**
   * Function description
   *
-@@ -893,6 +973,7 @@
- 	UINT status = CHANNEL_RC_OK;
- 	gdiGfxSurface* surface = nullptr;
- 	RDPGFX_AVC444_BITMAP_STREAM* bs = nullptr;
-+	YCN_PAUSE_ENTRY* pauseEntry = nullptr;
- 	RDPGFX_AVC420_BITMAP_STREAM* avc1 = nullptr;
+@@ -843,10 +928,21 @@
  	RDPGFX_H264_METABLOCK* meta1 = nullptr;
  	RDPGFX_AVC420_BITMAP_STREAM* avc2 = nullptr;
-@@ -901,6 +982,15 @@
+ 	RDPGFX_H264_METABLOCK* meta2 = nullptr;
++	YCN_PAUSE_ENTRY* pauseEntry = nullptr;
++	BOOL resumeNeedsKeyframe = FALSE;
+ 	WINPR_ASSERT(gdi);
  	WINPR_ASSERT(context);
  	WINPR_ASSERT(cmd);
  
@@ -111,13 +128,28 @@
  	WINPR_ASSERT(context->GetSurfaceData);
  	surface =
  	    (gdiGfxSurface*)context->GetSurfaceData(context, (UINT16)MIN(UINT16_MAX, cmd->surfaceId));
-@@ -911,6 +1001,9 @@
+@@ -857,6 +953,12 @@
  		return ERROR_NOT_FOUND;
  	}
  
 +	if (pauseEntry && (InterlockedExchange(&pauseEntry->needs_refresh, 0) != 0))
++	{
 +		ycn_gdi_request_full_refresh(gdi, surface);
++		resumeNeedsKeyframe = TRUE;
++	}
 +
  	if (!surface->h264)
  	{
  		const UINT32 decodePolicy = ycn_gdi_thread_h264_policy();
+@@ -884,6 +986,11 @@
+ 	if (!surface->h264)
+ 		return ERROR_NOT_SUPPORTED;
+ 
++	/* Yomori: 刚从"不可见"恢复。先等主码流的关键帧，期间表面停在暂停前
++	 * 那张好图上 —— 否则用缺失参考帧解出来的错误块会先覆盖它。 */
++	if (resumeNeedsKeyframe)
++		ycn_h264_set_wait_keyframe(surface->h264, TRUE);
++
+ 	if (!is_within_surface(surface, cmd))
+ 		return ERROR_INVALID_DATA;
+ 

@@ -1,0 +1,137 @@
+--- a/libfreerdp/codec/h264.h
++++ b/libfreerdp/codec/h264.h
+@@ -74,6 +74,10 @@
+ 		UINT32 ycnRecoveryAttempts;
+ 		UINT32 ycnRecoveryPending;
+ 		UINT32 ycnFrameWasHardware;
++		/* Yomori: 恢复解码后等首个关键帧，期间只"喂"不"出"。 */
++		UINT32 ycnWaitKeyframe;
++		UINT32 ycnWaitKeyframeFrames;
++		UINT32 ycnFrameIsKeyframe;
+ 		/* Yomori AVC444 low chroma mode: decode the main stream only and
+ 		 * convert YUV420 straight to the destination surface. */
+ 		UINT32 ycnAvc444LowChroma;
+@@ -115,6 +119,8 @@
+ 	                                        UINT32 height);
+ 
+ 	FREERDP_LOCAL void ycn_h264_diag_begin_frame(H264_CONTEXT* h264);
++	/* 置位后，在拿到主码流第一个 I 帧之前不把解码结果写进表面。 */
++	FREERDP_LOCAL void ycn_h264_set_wait_keyframe(H264_CONTEXT* h264, BOOL wait);
+ 	FREERDP_LOCAL void ycn_h264_diag_mark_frame(H264_CONTEXT* h264, BOOL hardware,
+ 	                                             const char* backendName);
+ 	FREERDP_LOCAL void ycn_h264_diag_frame_success(H264_CONTEXT* h264);
+--- a/libfreerdp/codec/h264.c
++++ b/libfreerdp/codec/h264.c
+@@ -171,7 +171,10 @@
+ void ycn_h264_diag_begin_frame(H264_CONTEXT* h264)
+ {
+ 	if (h264)
++	{
+ 		h264->ycnFrameWasHardware = FALSE;
++		h264->ycnFrameIsKeyframe = 0;
++	}
+ }
+ 
+ void ycn_h264_diag_mark_frame(H264_CONTEXT* h264, BOOL hardware, const char* backendName)
+@@ -278,6 +281,51 @@
+ 	return status;
+ }
+ 
++/* Yomori: 恢复解码时先等关键帧。
++ *
++ * 暂停期间整帧被丢弃，解码器的 DPB 里就缺了这些参考帧。恢复后先到的 P 帧会解出
++ * 成片错误块（实测是整屏彩色斜纹），而且它又成为后续帧的参考，画面会一直烂到
++ * 下一个 IDR 才恢复。所以恢复后先只"喂"不"出"：码流照常送进解码器保持连续，
++ * 但在拿到主码流的第一个 I 帧之前，不把结果写进表面 —— 表面因此停在暂停前最后
++ * 一张好图上。
++ *
++ * 兜底：万一服务端迟迟不发 IDR（RefreshRect 不保证一定触发），丢掉
++ * YCN_WAIT_KEYFRAME_MAX_FRAMES 帧后放行。宁可短暂有块，也不能永久定格。
++ */
++#define YCN_WAIT_KEYFRAME_MAX_FRAMES 90
++
++void ycn_h264_set_wait_keyframe(H264_CONTEXT* h264, BOOL wait)
++{
++	if (!h264)
++		return;
++
++	h264->ycnWaitKeyframe = wait ? 1u : 0u;
++	h264->ycnWaitKeyframeFrames = 0;
++}
++
++static BOOL ycn_h264_skip_non_keyframe(H264_CONTEXT* h264, BOOL mainStream)
++{
++	if (!h264 || (h264->ycnWaitKeyframe == 0))
++		return FALSE;
++
++	/* 只有主码流的 I 帧才算恢复点：辅助流的 I 帧不代表主流参考链已重建。 */
++	if (mainStream && h264->ycnFrameIsKeyframe)
++	{
++		h264->ycnWaitKeyframe = 0;
++		h264->ycnWaitKeyframeFrames = 0;
++		return FALSE;
++	}
++
++	if (++h264->ycnWaitKeyframeFrames > YCN_WAIT_KEYFRAME_MAX_FRAMES)
++	{
++		h264->ycnWaitKeyframe = 0;
++		h264->ycnWaitKeyframeFrames = 0;
++		return FALSE;
++	}
++
++	return TRUE;
++}
++
+ INT32 avc420_decompress(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize, BYTE* pDstData,
+                         DWORD DstFormat, UINT32 nDstStep, WINPR_ATTR_UNUSED UINT32 nDstWidth,
+                         WINPR_ATTR_UNUSED UINT32 nDstHeight, const RECTANGLE_16* regionRects,
+@@ -306,6 +354,9 @@
+ 		return status;
+ 	}
+ 
++	if (ycn_h264_skip_non_keyframe(h264, TRUE))
++		return 1;
++
+ 	pYUVData[0] = h264->pYUVData[0];
+ 	pYUVData[1] = h264->pYUVData[1];
+ 	pYUVData[2] = h264->pYUVData[2];
+@@ -724,6 +775,9 @@
+ 	if (log_decompress(h264, pSrcData, SrcSize, rects, nrRects) < 0)
+ 		return FALSE;
+ 
++	if (ycn_h264_skip_non_keyframe(h264, type == AVC444_LUMA))
++		return TRUE;
++
+ 	pYUVData[0] = h264->pYUVData[0];
+ 	pYUVData[1] = h264->pYUVData[1];
+ 	pYUVData[2] = h264->pYUVData[2];
+@@ -778,6 +832,8 @@
+ 		return FALSE;
+ 	if (status == 0)
+ 		return TRUE; /* no new frame produced, nothing to present */
++	if (ycn_h264_skip_non_keyframe(h264, TRUE))
++		return TRUE;
+ 	if (decodeOnly)
+ 		return TRUE;
+ 
+--- a/libfreerdp/codec/h264_ffmpeg.c
++++ b/libfreerdp/codec/h264_ffmpeg.c
+@@ -704,6 +704,18 @@
+ 		goto fail;
+ 	}
+ 
++	if (gotFrame)
++	{
++		/* Yomori: 记录本帧是否 I 帧，供恢复后的关键帧闸门判断。 */
++		const AVFrame* keySrc = sys->videoFrame;
++#if defined(WITH_FFMPEG_HWACCEL)
++		if (sys->useHwDecoder && sys->hwctx && sys->hwVideoFrame)
++			keySrc = sys->hwVideoFrame;
++#endif
++		h264->ycnFrameIsKeyframe =
++		    (keySrc && (keySrc->pict_type == AV_PICTURE_TYPE_I)) ? 1u : 0u;
++	}
++
+ #if defined(WITH_FFMPEG_HWACCEL)
+ 
+ 	if (sys->hwctx)
