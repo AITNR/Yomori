@@ -1,67 +1,122 @@
 --- a/libfreerdp/gdi/gfx.c
 +++ b/libfreerdp/gdi/gfx.c
-@@ -26,6 +26,7 @@
- #include <winpr/assert.h>
- #include <winpr/cast.h>
- #include <winpr/platform.h>
-+#include <winpr/environment.h>
+@@ -880,6 +880,86 @@
+ #endif
+ }
  
- #include <freerdp/api.h>
- #include <freerdp/log.h>
-@@ -885,6 +886,30 @@
-  *
-  * @return 0 on success, otherwise a Win32 error code
-  */
-+/* Yomori: pause H.264 decoding while the window is invisible.
++/* Yomori: 不可见就整帧丢弃。
 + *
-+ * When nothing on screen can show the frame (minimized, hidden, fully occluded)
-+ * the whole command is dropped: no decode, no chroma work, and crucially no
-+ * invalidRegion / UpdateSurfaceArea, so the presenter never wakes up either.
-+ * The server keeps sending (bandwidth unchanged), but local CPU drops to almost
-+ * nothing -- exactly the trade a "leave it running" monitor wants.
++ * 两种触发, 都在解码之前生效:
++ *   1) 进程级 -- 整个窗口不可见(最小化/收进托盘)。托管侧 ycn_rdp_set_decode_paused()
++ *      写进程环境变量 YOMORI_DECODE_PAUSED, 这里读。
++ *   2) 会话级 -- 该通道没有画面消费者(切走页面、画面被摘掉)。由 ycn_rdp.dll 的
++ *      ycn_rdp_set_session_decode_paused() 经 ycn_gdi_set_session_paused() 设置。
 + *
-+ * State comes from ycn_rdp.dll via ycn_rdp_set_decode_paused(), written into
-+ * this process' environment block, so winpr's process-env API sees it. Read on
-+ * every frame on purpose: no caching, the flag flips at runtime.
++ * 丢帧连 invalidRegion / UpdateSurfaceArea 都不走, 所以呈现节拍器也不会被唤醒。
++ * 服务端照旧推帧(带宽不变), 帧确认照常发送, 会话不会因为"客户端不收"而降级或断开。
++ *
++ * 恢复后必须请求一次全帧刷新: 暂停期间丢掉的 P 帧已让参考链断裂。
 + */
-+static BOOL ycn_decode_paused(void)
++#define YCN_PAUSE_SLOTS 16
++
++typedef struct
++{
++	const rdpContext* ctx;
++	volatile LONG paused;        /* 会话级: 没有消费者 */
++	volatile LONG needs_refresh; /* 丢过帧, 恢复后要补一帧 */
++} YCN_PAUSE_ENTRY;
++
++static YCN_PAUSE_ENTRY g_ycn_pause[YCN_PAUSE_SLOTS];
++static SRWLOCK g_ycn_pause_lock = SRWLOCK_INIT;
++
++WINPR_ATTR_UNUSED static YCN_PAUSE_ENTRY* ycn_pause_entry(const rdpContext* ctx)
++{
++	size_t i;
++	YCN_PAUSE_ENTRY* slot = nullptr;
++
++	if (!ctx)
++		return nullptr;
++
++	AcquireSRWLockExclusive(&g_ycn_pause_lock);
++	for (i = 0; i < YCN_PAUSE_SLOTS; i++)
++	{
++		if (g_ycn_pause[i].ctx == ctx)
++		{
++			slot = &g_ycn_pause[i];
++			break;
++		}
++		if (!g_ycn_pause[i].ctx && !slot)
++			slot = &g_ycn_pause[i];
++	}
++	if (slot && !slot->ctx)
++	{
++		slot->ctx = ctx;
++		InterlockedExchange(&slot->paused, 0);
++		InterlockedExchange(&slot->needs_refresh, 0);
++	}
++	ReleaseSRWLockExclusive(&g_ycn_pause_lock);
++	return slot;
++}
++
++/* 整个窗口不可见: 进程级开关, 托管侧经环境变量转达。 */
++WINPR_ATTR_UNUSED static BOOL ycn_pause_global(void)
 +{
 +	char buf[8] = { 0 };
 +	const DWORD n = GetEnvironmentVariableA("YOMORI_DECODE_PAUSED", buf, sizeof(buf));
 +	return ((n > 0) && (n < sizeof(buf)) && (buf[0] != '0')) ? TRUE : FALSE;
 +}
 +
-+/* Set while frames are being dropped; the first frame after resuming triggers a
-+ * full refresh, because the P frames skipped during the pause left the H.264
-+ * reference chain broken. */
-+static BOOL ycn_was_paused = FALSE;
++WINPR_ATTR_UNUSED static BOOL ycn_pause_should_drop(YCN_PAUSE_ENTRY* entry)
++{
++	if (ycn_pause_global())
++		return TRUE;
++	if (!entry)
++		return FALSE;
++	return (InterlockedCompareExchange(&entry->paused, 0, 0) != 0) ? TRUE : FALSE;
++}
 +
- static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
-                                       const RDPGFX_SURFACE_COMMAND* cmd)
- {
-@@ -901,6 +926,13 @@
++/* ycn_rdp.dll 调用: 该会话当前有没有画面消费者。 */
++FREERDP_API void ycn_gdi_set_session_paused(rdpContext* context, BOOL paused)
++{
++	YCN_PAUSE_ENTRY* entry = ycn_pause_entry(context);
++
++	if (entry)
++		InterlockedExchange(&entry->paused, paused ? 1 : 0);
++}
++
+ /**
+  * Function description
+  *
+@@ -893,6 +973,7 @@
+ 	UINT status = CHANNEL_RC_OK;
+ 	gdiGfxSurface* surface = nullptr;
+ 	RDPGFX_AVC444_BITMAP_STREAM* bs = nullptr;
++	YCN_PAUSE_ENTRY* pauseEntry = nullptr;
+ 	RDPGFX_AVC420_BITMAP_STREAM* avc1 = nullptr;
+ 	RDPGFX_H264_METABLOCK* meta1 = nullptr;
+ 	RDPGFX_AVC420_BITMAP_STREAM* avc2 = nullptr;
+@@ -901,6 +982,15 @@
  	WINPR_ASSERT(context);
  	WINPR_ASSERT(cmd);
  
-+	/* Yomori: drop the whole frame while invisible -- no decode, no notification. */
-+	if (ycn_decode_paused())
++	/* Yomori: 不可见就整帧丢弃 -- 不解码、不合成、不通知上层呈现。 */
++	pauseEntry = ycn_pause_entry(gdi->context);
++	if (ycn_pause_should_drop(pauseEntry))
 +	{
-+		ycn_was_paused = TRUE;
++		if (pauseEntry)
++			InterlockedExchange(&pauseEntry->needs_refresh, 1);
 +		return CHANNEL_RC_OK;
 +	}
 +
  	WINPR_ASSERT(context->GetSurfaceData);
  	surface =
  	    (gdiGfxSurface*)context->GetSurfaceData(context, (UINT16)MIN(UINT16_MAX, cmd->surfaceId));
-@@ -911,6 +943,12 @@
+@@ -911,6 +1001,9 @@
  		return ERROR_NOT_FOUND;
  	}
  
-+	if (ycn_was_paused)
-+	{
-+		ycn_was_paused = FALSE;
++	if (pauseEntry && (InterlockedExchange(&pauseEntry->needs_refresh, 0) != 0))
 +		ycn_gdi_request_full_refresh(gdi, surface);
-+	}
 +
  	if (!surface->h264)
  	{

@@ -189,6 +189,10 @@ namespace Yomori.Services
                     _state = RdpClientStateMachine.Transition(_state, RdpClientEvent.NativeConnected);
                 }
 
+                // 建连前挂上的消费者要在这里补一次：_session 为 0 时原生侧无从定位连接，
+                // 那时的暂停/恢复只记在托管侧。补发是幂等的。
+                ApplyDecodePause();
+
                 // 补发「建连之前」就记下的静音意图。
                 //
                 // 为什么必须有这一步（2026-10-22 用户报「首次启动任务时按钮显示已静音、实际仍有声，
@@ -598,22 +602,29 @@ namespace Yomori.Services
                        $", hw_compiled={(hwCompiled ? "yes" : "no")}" +
                        $", hw_diagnostics={(hwDiagnostics ? "yes" : "no")}" +
                        $", decode_paused={DecodePausedFlag()}" +
+                       $", consumers={System.Threading.Volatile.Read(ref _frameConsumers)}" +
                        $", entry={entry}";
             }
         }
 
         /// <summary>
-        /// 诊断用：当前是否处于「不可见即停解码」状态（0/1）。
+        /// 诊断用：本会话解码是否被暂停（0/1）。
         ///
-        /// 状态由托管侧的 SuspendAllForHiddenWindow / ResumeAllForHiddenWindow 经
-        /// ycn_rdp.dll 写进本进程环境变量 YOMORI_DECODE_PAUSED，freerdp3.dll 的
-        /// gdi_SurfaceCommand_AVC444 每帧读同一个变量决定是否丢帧。同进程，值一致。
+        /// 两个来源都会让原生层丢帧：本会话没有画面消费者（切走页面 / 摘掉画面，
+        /// 由 <see cref="AddFrameConsumer"/> / <see cref="RemoveFrameConsumer"/> 维护），
+        /// 或整个窗口不可见（进程级环境变量 YOMORI_DECODE_PAUSED）。
+        /// 这里合成成一个值，正好是原生层实际的判据。
         ///
-        /// 注意：暂停期间窗口不可见，这一行日志本来就不会打；所以它主要用来确认
-        /// 「恢复后确实回到 0」，以及排查"以为暂停了其实没有"。
+        /// 暂停期间没有帧呈现，这一行本来就不会打；它主要用来确认「恢复后确实回到 0」，
+        /// 以及排查"以为暂停了其实没有"。
         /// </summary>
-        private static string DecodePausedFlag()
+        private string DecodePausedFlag()
         {
+            if (_decodePaused)
+            {
+                return "1";
+            }
+
             var v = System.Environment.GetEnvironmentVariable("YOMORI_DECODE_PAUSED");
             return string.IsNullOrEmpty(v) || v == "0" ? "0" : "1";
         }
@@ -711,6 +722,78 @@ namespace Yomori.Services
             var buf = new byte[512];
             RdpNativeInterop.ycn_rdp_last_error(session, buf, (UIntPtr)buf.Length);
             return System.Text.Encoding.UTF8.GetString(buf).TrimEnd('\0');
+        }
+
+        // ---------------- 画面消费者引用计数（不可见即停解码） ----------------
+
+        /// <summary>
+        /// 当前挂着本会话画面的视图数。0 表示没有任何地方需要这些帧。
+        ///
+        /// <para>为什么按引用计数：同一会话会在页面、全屏窗口、弹出窗口之间交接。
+        /// 交接顺序不确定（新视图先挂上、旧视图后摘下，或反之），只有计数能避免
+        /// 中间那一瞬被误判成「没人看」而白停一次。</para>
+        /// </summary>
+        private int _frameConsumers;
+
+        /// <summary>最近一次下发给原生层的暂停状态（诊断用）。</summary>
+        private volatile bool _decodePaused;
+
+        /// <summary>本会话是否已因「无消费者」而暂停解码（诊断用）。</summary>
+        public bool DecodePaused => _decodePaused;
+
+        /// <summary>
+        /// 有一个视图开始使用本会话的画面。第一个消费者出现时恢复解码。
+        ///
+        /// <para>恢复由原生层在下一帧到达时请求全帧刷新 —— 暂停期间丢掉的 P 帧
+        /// 已经让参考链断裂，不刷新会花屏。</para>
+        /// </summary>
+        public void AddFrameConsumer()
+        {
+            if (System.Threading.Interlocked.Increment(ref _frameConsumers) != 1)
+            {
+                return;
+            }
+
+            ApplyDecodePause();
+        }
+
+        /// <summary>一个视图不再使用本会话的画面。最后一个消费者离开时暂停解码。</summary>
+        public void RemoveFrameConsumer()
+        {
+            if (System.Threading.Interlocked.Decrement(ref _frameConsumers) != 0)
+            {
+                return;
+            }
+
+            ApplyDecodePause();
+        }
+
+        /// <summary>
+        /// 把「有没有消费者」应用到原生层。
+        ///
+        /// <para>会话还没建起来时只记状态：<c>_session == 0</c> 时原生侧无从定位连接，
+        /// 建连回调里会再调一次本方法。</para>
+        ///
+        /// <para>旧版本 dll 没有这个导出，调用失败只意味着「照旧解码」，不影响可见性，
+        /// 所以静默吞掉查找异常，避免升级错配时把整条会话拖崩。</para>
+        /// </summary>
+        private void ApplyDecodePause()
+        {
+            var paused = System.Threading.Volatile.Read(ref _frameConsumers) == 0;
+            _decodePaused = paused;
+
+            var session = System.Threading.Volatile.Read(ref _session);
+            if (session == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                RdpNativeInterop.ycn_rdp_set_session_decode_paused(session, paused ? 1 : 0);
+            }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
         }
 
         public void Dispose()

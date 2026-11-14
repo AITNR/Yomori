@@ -55,6 +55,11 @@
 
 EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
+/* freerdp3.dll 导出的会话级解码暂停开关（补丁 freerdp-3.32.0-ycnz-decode-pause
+ * 在 libfreerdp/gdi/gfx.c 里定义）。按 rdpContext 记录，所以只影响这一路连接。
+ * 不加 FREERDP_API 也能链接：导入库会生成跳板，这里只需普通声明。 */
+void ycn_gdi_set_session_paused(rdpContext* context, BOOL paused);
+
 /* ---------------- 常量 ---------------- */
 
 /* 并发内嵌会话上限。
@@ -3608,6 +3613,17 @@ YCN_API uint32_t ycn_rdp_decode_capabilities(void)
 YCN_API void ycn_rdp_set_decode_paused(int paused)
 {
 	SetEnvironmentVariableW(L"YOMORI_DECODE_PAUSED", paused ? L"1" : L"0");
+}
+
+YCN_API void ycn_rdp_set_session_decode_paused(int session, int paused)
+{
+	YcnSession* s;
+
+	EnterCriticalSection(&g_lock);
+	s = find_session(session);
+	if (s && s->instance && s->instance->context)
+		ycn_gdi_set_session_paused(s->instance->context, paused ? TRUE : FALSE);
+	LeaveCriticalSection(&g_lock);
 }
 
 YCN_API void ycn_rdp_disconnect(int session)

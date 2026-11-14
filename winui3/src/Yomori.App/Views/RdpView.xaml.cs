@@ -302,6 +302,7 @@ namespace Yomori.Views
             _dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
             _client = new RdpEmbeddedClient();
             HookClient(_client);
+            _client.AddFrameConsumer();
             MarkPendingFirstFrame();
             StartPresentTimer();
 
@@ -332,6 +333,13 @@ namespace Yomori.Views
 
             _client = client;
             HookClient(_client);
+            // 挂上即恢复解码（若之前因「没人看」被暂停，原生层会在下一帧请求全帧刷新）。
+            var wasPaused = client.DecodePaused;
+            _client.AddFrameConsumer();
+            if (wasPaused && !client.DecodePaused)
+            {
+                DiagnosticLog?.Invoke("[embed] 已挂上画面：本通道恢复解码（首帧请求全帧刷新）");
+            }
 
             _dispatcher = Microsoft.UI.Dispatching.DispatcherQueue.GetForCurrentThread();
             // 切页回来 / 全屏接管：远端可能自始至终没画过任何东西（静止桌面），
@@ -391,6 +399,12 @@ namespace Yomori.Views
                 oldClient.FrameArrived -= OnFrameArrived;
                 oldClient.DesktopResized -= OnDesktopResized;
                 oldClient.Disconnected -= OnClientDisconnected;
+                // 本视图不再消费画面。若这是最后一个消费者，原生层会把该会话的帧整帧丢弃。
+                oldClient.RemoveFrameConsumer();
+                if (oldClient.DecodePaused)
+                {
+                    DiagnosticLog?.Invoke("[embed] 已摘除画面：本通道无消费者，暂停解码（服务端仍推帧，带宽不变）");
+                }
                 _client = null;
             }
             // 推进世代号：让已在飞的软渲染任务在下一个检查点自行退出

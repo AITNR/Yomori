@@ -5307,6 +5307,13 @@ public sealed class MainViewModel : ObservableObject
                 return; // 仍在连接中，下一拍再看
             }
 
+            // 没人看画面时解码被暂停（切走页面 / 摘掉画面），此时抓到的只会是上一帧旧快照，
+            // 拿它判黑屏会误触发自动重连。跳过这一拍，恢复后再判。
+            if (client.DecodePaused)
+            {
+                return;
+            }
+
             // At most one outstanding sample per connection, even if native grab stalls.
             if (System.Threading.Interlocked.CompareExchange(ref sampling, 1, 0) != 0) { return; }
             _ = Task.Run(() =>

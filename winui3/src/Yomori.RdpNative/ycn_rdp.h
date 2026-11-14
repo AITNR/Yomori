@@ -162,6 +162,14 @@ YCN_API void ycn_rdp_disconnect(int session);
  * 否则可见那路的画面会一起冻住。服务端仍会继续推帧，带宽不变。 */
 YCN_API void ycn_rdp_set_decode_paused(int paused);
 
+/* 按会话暂停解码：paused != 0 时该会话的 AVC444 帧整帧丢弃（不解码、不合成、
+ * 不通知上层呈现），为 0 时恢复并在下一个到达帧上请求一次全帧刷新。
+ *
+ * 语义是「这个会话当前有没有画面消费者」：托管侧在画面挂上/摘下的引用计数
+ * 归零时切换。切走页面、摘掉画面各格都会走到这里，因此只影响这一路，
+ * 其余可见通道照常。未知 session 静默返回。 */
+YCN_API void ycn_rdp_set_session_decode_paused(int session, int paused);
+
 /* 输入注入。flags = FreeRDP PTR_FLAGS_*（C# 侧定义同名常量） */
 YCN_API int ycn_rdp_send_mouse(int session, uint32_t flags, uint16_t x, uint16_t y);
 
