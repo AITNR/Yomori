@@ -552,7 +552,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private string _clientMode = ClientModes.Embedded;
     private bool _audioEnabled = true;
     private bool _gfxEnabled = true;
-    private bool _lowChromaAvc444;
+    private bool _lowChromaAvc444 = true;
     private string _decodeBackend = DecodeBackends.Auto;
     private string _renderBackend = RenderBackends.Auto;
     private int _desktopWidth = RdpResolutions.DefaultWidth;
@@ -762,14 +762,17 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     }
 
     /// <summary>
-    /// AVC444 低色度模式（low_chroma_avc444，默认关闭）。
+    /// AVC444 低色度模式（low_chroma_avc444，默认<b>开启</b>）。
     ///
     /// <para>协商仍是 AVC444/AVC444v2（服务端实际发 codec 14/15），只是客户端解码时
     /// 只解主流、跳过 aux 与逐像素色度重建，画面停在 4:2:0。服务端照旧推 aux，
     /// 所以<b>网络带宽不会下降</b>；色度-only 更新的区域会保留旧颜色。</para>
     ///
-    /// <para>只影响新建连接；已在跑的会话沿用建立时锁定的模式。旧配置没有这个键时
-    /// 反序列化后保持关闭，不需要在 Sanitize 里额外迁移。</para>
+    /// <para>只影响新建连接；已在跑的会话沿用建立时锁定的模式。旧配置没有这个键时按默认
+    /// 开启处理（字段初值即 true），显式存过 <c>false</c> 的用户保持关闭，不需要额外迁移。</para>
+    ///
+    /// <para>默认开启的依据是交替采样实测：解码耗时 3.544 → 3.345 ms/surface（−5.6%），
+    /// 约 0.68% 单核；GPU 与显存无差异。收益很小但确实存在，代价是彩色细边变软。</para>
     /// </summary>
     [JsonPropertyName("low_chroma_avc444")]
     public bool LowChromaAvc444

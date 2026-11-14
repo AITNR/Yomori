@@ -26,7 +26,7 @@ namespace Yomori.Services
         public bool AllowSelfsigned { get; init; } = true;
         public bool EnableAudio { get; init; } = true;
         public bool UseGfx { get; init; }
-        /// <summary>AVC444 低色度模式（只解主流、跳过 aux 与色度重建）。默认关闭。</summary>
+        /// <summary>AVC444 低色度模式（只解主流、跳过 aux 与色度重建）。默认开启，可关。</summary>
         public bool LowChromaAvc444 { get; init; }
         public string DecodeBackend { get; init; } = DecodeBackends.Auto;
         public string RenderBackend { get; init; } = RenderBackends.Auto;
@@ -288,10 +288,10 @@ namespace Yomori.Services
                 var useVersionedEntry = RdpNativeInterop.TryProbeDecodeApi(
                     out var decodeApiVersion, out var decodeCapabilities);
 
-                // AVC444 低色度只在能力位确认且用户显式开启时请求。
-                // 未确认时一律当作关闭：不静默忽略选项继续按「已开启」跑原路径。
-                // 低色度模式只作用于 GFX/AVC444 路径：关掉 GFX 时即使勾选也不下发，
-                // 否则诊断会显示「on」而实际根本没有 AVC 命令流。
+                // AVC444 低色度默认开启；仍要过两道闸：能力位确认、以及 GFX 管线真的开着。
+                // 能力位没确认时一律当作关闭——不静默忽略选项却按「已开启」跑原路径。
+                // 关掉 GFX 时即使配置为开启也不下发，否则诊断会显示「on」而实际根本没有
+                // AVC 命令流。
                 var wantLowChroma = info.UseGfx
                                     && info.LowChromaAvc444
                                     && (decodeCapabilities

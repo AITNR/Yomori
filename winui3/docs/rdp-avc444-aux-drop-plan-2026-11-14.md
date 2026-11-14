@@ -7,6 +7,10 @@
 - 目标：在保留 AVC444/AVC444v2 协商、RDP GDI / BGRA / WinUI 显示链和会话语义的前提下，完成一个默认关闭、每会话生效、可诊断可回退的低色度模式；首阶段交付完整代码与自动化验证，达到可提交候选
 - 非目标：修改远端服务器策略、强制协商 AVC420、重写 GPU 表面合成或改变 RDP 输入/音频/会话收尾行为
 
+> **默认值已变更（2026-11-14 15:35，W5）**：实测 codec 路径 −5.6% 后，按用户决定把
+> `low_chroma_avc444` 改为**默认开启**。下文凡是「默认关闭」的表述，记录的是该批次当时的
+> 设计与验收状态，不是当前行为；当前行为以第 9 章 W5 与设置页文案为准。
+
 ## 1. 结论摘要
 
 | 设想 | 可行性 | 结论 |
@@ -228,10 +232,11 @@ RDPGFX SurfaceCommand codec 14 / 15
 | W2 配置/UI | 2026-11-14 12:28 | `RdpConfig.LowChromaAvc444`（`low_chroma_avc444`，默认 false）、`RdpConnectInfo.LowChromaAvc444`、`MainViewModel` 透传、`RdpEmbeddedClient` 能力位判断 + ex2 调用 + 诊断字段 `avc444_low_chroma`、设置页 ToggleSwitch + 保存失败回拨 | `_smoke` 新增 5 条断言全 PASS（默认关、键名往返、Clone、旧配置缺键、Sanitize 不重置）；整体 2410 PASS / 1 FAIL（失败项为既有的 `[遮挡闸门] 节拍器…`，依赖未提交的 occlusion 工作，与本改动无关） | 已完成 |
 | W3 离线测试 | 2026-11-14 13:49 | `avc444_decode_probe.py`：`--low-chroma` 走 `h264_context_set_option`；`--full` 增加「低色度 op0 输出必须与 op1 主流单解逐字节相同」的等价断言 | 用 CI 产物实跑：op1 4 项 PASS；op0 双流 4 项 PASS（PSNR 40.444 / 40.802，MAE 1.843 / 1.738）；低色度 4 项 `equivalent=True`（两侧 sha 完全相同）。首轮因分支返回 `1` 而上游成功约定为 `0` 被判 FAIL，改 `return 0` 后 **`FINAL: op1(PASS) full(PASS)` 12/12 全绿** | 已完成 |
 | W3 ABI 测试 | 2026-11-14 13:10 | `native_decode_checks.py`：已知能力位加入 0x8；能力位与 `ycn_rdp_connect_ex2` 存在性互相约束；未知 graphics option 必须被拒 | CI run 43556540733 步骤「校验原生层」PASS（含本项）；另用 pefile 之外的方式直接读产物：`ycn_rdp_decode_capabilities()` 返回 `0xF`，`ycn_gdi_set/get/release_avc444_low_chroma` 与 `ycn_rdp_connect_ex2` 均已导出 | 已完成 |
-| W4 A/B | 2026-11-14 15:05 | 交替采样实测（`_probe/ab-lowchroma-2026-11-14/result.md`）：同一时间段内 on/off 快速交替，按日志模式标记分组 | codec 路径 **3.345 → 3.544 ms/surface（−5.6%，四分位不重叠）**，即约 0.68% 单核；进程 CPU 因噪声不可判；**GPU 视频解码/3D 引擎无差异**（`hw_frames/surface` 两模式都是 1.000）；显存无差异 | 已完成，**结论：无可感知收益**，不作性能卖点 |
+| W4 A/B | 2026-11-14 15:05 | 交替采样实测（`_probe/ab-lowchroma-2026-11-14/result.md`）：同一时间段内 on/off 快速交替，按日志模式标记分组 | codec 路径 **3.345 → 3.544 ms/surface（−5.6%，四分位不重叠）**，即约 0.68% 单核；进程 CPU 因噪声不可判；**GPU 视频解码/3D 引擎无差异**（`hw_frames/surface` 两模式都是 1.000）；显存无差异 | 已完成，量小但确实存在；GPU/显存无收益 |
+| W5 默认启用 | 2026-11-14 15:35 | 按用户决定把 `low_chroma_avc444` 改为**默认开启**：`RdpConfig` 字段初值 true、设置页文案改为「默认开启，可关」、代码注释与文档同步；显式存过 `false` 的配置保持关闭（不得被 `Sanitize` 或反序列化洗回 true） | `_smoke` 6 条断言全 PASS（默认开启、键名往返、Clone、旧配置缺键按默认开启、**显式关闭存活往返**、Sanitize 不重置关闭）；整体 2411 PASS / 1 FAIL（仍为既有的 `[遮挡闸门] 节拍器…`） | 已完成 |
 
 **当前闸门**：本机沙箱的黑名单拦截 `reg.exe`，vcpkg 在 `pkgconf` 步骤即失败（`PROGRAM BLOCKED BY SECURITY POLICY`），所以**无法在本沙箱内重建带补丁的 freerdp3.dll**。构建一律交给 CI，两轮均已通过：`43556540733`（`3b897a2`）首次用本补丁重建并跑通原生层/能力校验；`43560648588`（`042e192`）在返回值修正后重建同样通过。
 
 离线等价性用 CI 产物在本机实跑，结论成立；过程中确认了一个**本机环境坑**（与产品无关）：本机 Python 自带的 `libcrypto-3-x64.dll` 与 Yomori 用的 vcpkg OpenSSL 同名，`import hashlib` 会把它先载入进程，之后加载 `freerdp3.dll` 得到 `WinError 127`。绕法是启动时先预载同目录的 OpenSSL；CI 的 runner 上没有此冲突。另有依赖不全的问题：只放 CI 的 13 个 DLL 会缺 `avformat-63`/`avfilter-12` 等，需与既有构建目录的 DLL 合并后再跑探针。
 
-真实会话 A/B 与 CPU 收益结论仍未取得，当前不得声称「降低 CPU」。
+真实会话 A/B 已取得结论：codec 路径 −5.6%（约 0.68% 单核），GPU 与显存无差异。按该结论该收益属于「小但真实」，**不构成整机 CPU 降低的卖点**；默认开启是产品选择（用户 2026-11-14 决定），文档与设置页都写明代价是彩色细边变软。
