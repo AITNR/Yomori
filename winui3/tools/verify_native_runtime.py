@@ -431,6 +431,10 @@ exports = [
     "ycn_h264_context_new_ex",
     "ycn_h264_context_recover_software",
     "ycn_h264_get_diagnostics",
+    # AVC444 low chroma patch: the per-session switch consumed by
+    # gdi_SurfaceCommand_AVC444. Its presence proves the patch is compiled in.
+    "ycn_gdi_set_avc444_low_chroma",
+    "ycn_gdi_set_session_paused",
 ]
 info = {"exports": [], "decode_api_version": None, "decode_capabilities": None}
 try:
@@ -612,6 +616,7 @@ def verify(
                     "ycn_h264_context_new_ex",
                     "ycn_h264_context_recover_software",
                     "ycn_h264_get_diagnostics",
+                    "ycn_gdi_set_avc444_low_chroma",
                 }
                 actual_exports = set(load_info.get("exports") or [])
                 missing_exports = sorted(expected_exports - actual_exports)

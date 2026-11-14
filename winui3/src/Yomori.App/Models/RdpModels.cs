@@ -552,6 +552,7 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     private string _clientMode = ClientModes.Embedded;
     private bool _audioEnabled = true;
     private bool _gfxEnabled = true;
+    private bool _lowChromaAvc444;
     private string _decodeBackend = DecodeBackends.Auto;
     private string _renderBackend = RenderBackends.Auto;
     private int _desktopWidth = RdpResolutions.DefaultWidth;
@@ -758,6 +759,23 @@ public sealed class RdpConfig : ObservableObject, ICloneable
     {
         get => _gfxEnabled;
         set => SetProperty(ref _gfxEnabled, value);
+    }
+
+    /// <summary>
+    /// AVC444 低色度模式（low_chroma_avc444，默认关闭）。
+    ///
+    /// <para>协商仍是 AVC444/AVC444v2（服务端实际发 codec 14/15），只是客户端解码时
+    /// 只解主流、跳过 aux 与逐像素色度重建，画面停在 4:2:0。服务端照旧推 aux，
+    /// 所以<b>网络带宽不会下降</b>；色度-only 更新的区域会保留旧颜色。</para>
+    ///
+    /// <para>只影响新建连接；已在跑的会话沿用建立时锁定的模式。旧配置没有这个键时
+    /// 反序列化后保持关闭，不需要在 Sanitize 里额外迁移。</para>
+    /// </summary>
+    [JsonPropertyName("low_chroma_avc444")]
+    public bool LowChromaAvc444
+    {
+        get => _lowChromaAvc444;
+        set => SetProperty(ref _lowChromaAvc444, value);
     }
 
     /// <summary>

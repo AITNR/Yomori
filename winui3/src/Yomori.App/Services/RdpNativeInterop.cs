@@ -80,6 +80,16 @@ namespace Yomori.Services
         public const uint SoftwareAvc = 2;
     }
 
+    /// <summary>ycn_rdp_connect_ex2 的 graphics_options 位（与 ycn_rdp.h 同值）。</summary>
+    internal static class YcnGfxOptions
+    {
+        public const uint None = 0;
+
+        /// <summary>AVC444 低色度：只解主流并直接 YUV420→BGRA，跳过 aux 与色度重建。
+        /// 协议仍是 AVC444，带宽不降；色度-only 更新的区域保留旧颜色。</summary>
+        public const uint LowChromaAvc444 = 1u << 0;
+    }
+
     /// <summary>ycn_rdp_decode_capabilities 的位定义。</summary>
     [Flags]
     internal enum YcnDecodeCapabilities : uint
@@ -88,6 +98,8 @@ namespace Yomori.Services
         AvcDecode = 1u << 0,
         HardwareDiagnostics = 1u << 1,
         HardwareCompiled = 1u << 2,
+        /// <summary>上游补丁已编入：支持 AVC444 低色度模式（connect_ex2）。</summary>
+        Avc444LowChroma = 1u << 3,
     }
 
     /// <summary>P/Invoke 入口（签名与 ycn_rdp.h 冻结版一致，勿单独改动）。</summary>
@@ -102,6 +114,11 @@ namespace Yomori.Services
         // 上面的 ycn_rdp_connect 仍是完整、可用的回退入口；不能给旧参数结构追加字段。
         [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_connect_ex")]
         internal static extern int ycn_rdp_connect_ex(ref YcnRdpParams parameters, ref YcnRdpCallbacks callbacks, IntPtr user, uint decodePolicy);
+
+        // 带 graphics 选项的入口。只有能力位确认后才调用；不支持时必须当作「未启用」，
+        // 不能静默忽略选项继续按已开启处理。
+        [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_connect_ex2")]
+        internal static extern int ycn_rdp_connect_ex2(ref YcnRdpParams parameters, ref YcnRdpCallbacks callbacks, IntPtr user, uint decodePolicy, uint gfxOptions);
         [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_decode_api_version")]
         private static extern uint ycn_rdp_decode_api_version();
         [DllImport(Lib, CallingConvention = CC, EntryPoint = "ycn_rdp_decode_capabilities")]

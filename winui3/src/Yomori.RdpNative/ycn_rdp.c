@@ -60,6 +60,12 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
  * 不加 FREERDP_API 也能链接：导入库会生成跳板，这里只需普通声明。 */
 void ycn_gdi_set_session_paused(rdpContext* context, BOOL paused);
 
+/* freerdp3.dll 导出的每会话 AVC444 低色度开关（补丁 freerdp-3.32.0-ycnz-avc444-low-chroma
+ * 在 libfreerdp/gdi/gfx.c 里定义）。按 rdpContext 记录；默认不注册 = 原始 4:4:4 路径。
+ * 必须在 gdi_init 之后、首个 GFX SurfaceCommand 之前设置。 */
+void ycn_gdi_set_avc444_low_chroma(rdpContext* context, BOOL enabled);
+void ycn_gdi_release_avc444_low_chroma(const rdpContext* context);
+
 /* ---------------- 常量 ---------------- */
 
 /* 并发内嵌会话上限。
@@ -251,6 +257,8 @@ typedef struct
 	/* 解码策略与真实诊断（g_lock 保护；稳定路径零 I/O）。 */
 	uint32_t decode_request_policy;
 	uint32_t decode_effective_policy;
+	/* ycn_rdp_connect_ex2 的 graphics 选项（按会话保存，建连前锁定）。 */
+	uint32_t gfx_options;
 	uint32_t decode_hw_compiled;
 	uint32_t decode_last_codec;
 	uint32_t decode_backend;
@@ -597,7 +605,12 @@ static void ycn_abandon_connect(YcnSession* s, freerdp* instance, HANDLE stop_ev
 	if (instance)
 	{
 		if (instance->context)
+		{
+			/* 释放本会话的 AVC444 低色度登记，避免 rdpContext 指针被复用后
+			 * 下一路会话继承上一路的模式。 */
+			ycn_gdi_release_avc444_low_chroma(instance->context);
 			freerdp_context_free(instance);
+		}
 		freerdp_free(instance);
 	}
 	EnterCriticalSection(&g_lock);
@@ -2914,6 +2927,12 @@ static BOOL ycn_post_connect(freerdp* instance)
 		return FALSE;
 	}
 
+	/* AVC444 低色度模式：必须在首个 GFX SurfaceCommand 之前锁定到本会话的
+	 * rdpContext 上；模式只影响这一路，且建连后不再改变（改设置需重连）。 */
+	ycn_gdi_set_avc444_low_chroma(instance->context,
+	                              (s->gfx_options & YCN_GFX_OPTION_LOW_CHROMA_AVC444) ? TRUE
+	                                                                                 : FALSE);
+
 	/* 挂 EndPaint 铩：gdi 实现在 gdi_init 时已注册，存原实现先调再拷帧（per-session） */
 	s->orig_end_paint = instance->context->update->EndPaint;
 	instance->context->update->EndPaint = ycn_end_paint;
@@ -3243,6 +3262,9 @@ teardown:
 	InterlockedExchange(&s->teardown_stage, 4);
 	if (instance->context)
 	{
+		/* AVC444 低色度登记按 rdpContext 索引；context 释放前必须先摘掉，
+		 * 否则同一地址被下一路会话复用时会把旧模式带过去。 */
+		ycn_gdi_release_avc444_low_chroma(instance->context);
 		gdi_free(instance);
 		freerdp_context_free(instance);
 	}
@@ -3296,7 +3318,7 @@ teardown:
 /* ---------------- 导出实现 ---------------- */
 
 static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
-                            void* user, uint32_t requested_decode_policy)
+                            void* user, uint32_t requested_decode_policy, uint32_t gfx_options)
 {
 	int slot = -1;
 	int id;
@@ -3378,6 +3400,7 @@ static int ycn_connect_impl(const ycn_rdp_params* params, const ycn_rdp_callback
 	s->use_gfx = params->use_gfx;
 	s->decode_request_policy = requested_decode_policy;
 	s->decode_effective_policy = effective_decode_policy;
+	s->gfx_options = gfx_options;
 	s->decode_hw_compiled = (probe->capabilities & YCN_DECODE_CAP_HW_COMPILED) ? 1u : 0u;
 	s->decode_backend = 0;
 	s->decode_fallback = 0;
@@ -3571,7 +3594,7 @@ YCN_API int ycn_rdp_graphics_settings_probe(uint32_t use_gfx, uint32_t decode_po
 YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
                             void* user)
 {
-	return ycn_connect_impl(params, callbacks, user, YCN_DECODE_POLICY_LEGACY);
+	return ycn_connect_impl(params, callbacks, user, YCN_DECODE_POLICY_LEGACY, 0u);
 }
 
 YCN_API int ycn_rdp_connect_ex(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
@@ -3582,7 +3605,23 @@ YCN_API int ycn_rdp_connect_ex(const ycn_rdp_params* params, const ycn_rdp_callb
 		set_global_error("invalid decode_policy: %u", (unsigned)decode_policy);
 		return YCN_ERR_INVALID_ARG;
 	}
-	return ycn_connect_impl(params, callbacks, user, decode_policy);
+	return ycn_connect_impl(params, callbacks, user, decode_policy, 0u);
+}
+
+YCN_API int ycn_rdp_connect_ex2(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
+                                void* user, uint32_t decode_policy, uint32_t gfx_options)
+{
+	if (decode_policy > YCN_DECODE_POLICY_SOFTWARE)
+	{
+		set_global_error("invalid decode_policy: %u", (unsigned)decode_policy);
+		return YCN_ERR_INVALID_ARG;
+	}
+	if ((gfx_options & ~(uint32_t)YCN_GFX_OPTION_LOW_CHROMA_AVC444) != 0u)
+	{
+		set_global_error("unknown graphics option: 0x%08X", (unsigned)gfx_options);
+		return YCN_ERR_INVALID_ARG;
+	}
+	return ycn_connect_impl(params, callbacks, user, decode_policy, gfx_options);
 }
 
 YCN_API uint32_t ycn_rdp_decode_api_version(void)
@@ -3595,8 +3634,11 @@ YCN_API uint32_t ycn_rdp_decode_capabilities(void)
 	const YcnFreeRdpDecodeProbe* probe = decode_probe();
 	if (!probe->ready)
 		return 0u;
-	return probe->capabilities & (YCN_DECODE_CAP_AVC | YCN_DECODE_CAP_DIAGNOSTICS |
-	                              YCN_DECODE_CAP_HW_COMPILED);
+	/* LOW_CHROMA 由本 DLL 的链接期保证：补丁缺失时 ycn_gdi_set_avc444_low_chroma
+	 * 无法链接，构建就失败，所以这里可以无条件报告。 */
+	return (probe->capabilities & (YCN_DECODE_CAP_AVC | YCN_DECODE_CAP_DIAGNOSTICS |
+	                               YCN_DECODE_CAP_HW_COMPILED)) |
+	       YCN_DECODE_CAP_AVC444_LOW_CHROMA;
 }
 
 /* 窗口不可见时暂停解码：paused != 0 时丢弃整帧（不解码、不合成、不通知上层），

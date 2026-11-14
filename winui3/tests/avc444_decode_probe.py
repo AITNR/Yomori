@@ -114,6 +114,21 @@ def compare_bgra(actual: bytes, expected: bytes) -> dict[str, Any]:
     }
 
 
+YCN_H264_OPTION_AVC444_LOW_CHROMA = 0x59434E02
+
+
+def enable_low_chroma(api: dict[str, Any], ctx: int) -> int:
+    """Switch the decoder context into Yomori AVC444 low chroma mode.
+
+    The mode is a per-context option (H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA)
+    so the probe exercises exactly the code path the production bridge arms.
+    """
+    fn = api["lib"].h264_context_set_option
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_uint32]
+    fn.restype = ctypes.c_int32
+    return int(fn(ctx, YCN_H264_OPTION_AVC444_LOW_CHROMA, 1))
+
+
 def bind_avc444(api: dict[str, Any]) -> None:
     rect = api["Rect"]
     fn = api["lib"].avc444_decompress
@@ -193,6 +208,10 @@ def worker_main(args: argparse.Namespace) -> int:
         output["reset"] = int(api["reset"](ctx, args.width, args.height))
         if not output["reset"]:
             raise RuntimeError("h264_context_reset failed")
+        if args.low_chroma:
+            output["lowChromaOption"] = enable_low_chroma(api, ctx)
+            if output["lowChromaOption"] != 1:
+                raise RuntimeError("low chroma option was rejected by the decoder")
         before = output["diagBefore"] = base.get_diag(api, ctx)
         decoded = output["decoded"] = []
         last_raw = b""
@@ -229,11 +248,14 @@ def extract(text: str) -> dict[str, Any] | None:
 
 
 def launch(dll: Path, main: Path, aux: Path | None, width: int, height: int, policy: int,
-           codec_id: int, op: int, label: str, output_bgra: Path | None = None) -> dict[str, Any]:
+           codec_id: int, op: int, label: str, output_bgra: Path | None = None,
+           low_chroma: bool = False) -> dict[str, Any]:
     argv = [sys.executable, str(Path(__file__).resolve()), "--_worker", "--dll", str(dll),
             "--main", str(main), "--width", str(width), "--height", str(height),
             "--policy", str(policy), "--codec-id", str(codec_id), "--op", str(op),
             "--frames", "2"]
+    if low_chroma:
+        argv.append("--low-chroma")
     if aux is not None:
         argv.extend(["--aux", str(aux)])
     if output_bgra is not None:
@@ -402,9 +424,11 @@ def encode_h264(ffmpeg: Path, yuv: bytes, width: int, height: int, path: Path) -
 
 
 def run_case(dll: Path, main: Path, aux: Path | None, width: int, height: int, policy: int,
-             codec_id: int, op: int, label: str, expected: bytes | None = None) -> dict[str, Any]:
+             codec_id: int, op: int, label: str, expected: bytes | None = None,
+             low_chroma: bool = False) -> dict[str, Any]:
     output_path = ROOT / f"{label}-decoded.bgra" if expected is not None else None
-    record = launch(dll, main, aux, width, height, policy, codec_id, op, label, output_path)
+    record = launch(dll, main, aux, width, height, policy, codec_id, op, label, output_path,
+                    low_chroma)
     result = classify(record, policy)
     if expected is not None:
         compare = {"match": False, "error": "decoded BGRA was not exported"}
@@ -468,6 +492,7 @@ def parser() -> argparse.ArgumentParser:
                    help=argparse.SUPPRESS)
     p.add_argument("--op", type=int, choices=(0, 1, 2), default=1, help=argparse.SUPPRESS)
     p.add_argument("--frames", type=int, default=2, help=argparse.SUPPRESS)
+    p.add_argument("--low-chroma", action="store_true", help=argparse.SUPPRESS)
     return p
 
 
@@ -523,6 +548,7 @@ def main() -> int:
                     full["generated"] = generated
                     source = Path(generated["source"]).read_bytes()
                     full_runs = []
+                    low_runs = []
                     for fixture in generated["fixtures"]:
                         for policy in (POLICY_SW, POLICY_HW):
                             policy_name = "software-p2" if policy == POLICY_SW else "dxva2-p1"
@@ -535,8 +561,36 @@ def main() -> int:
                             record["fixture"] = fixture
                             full_runs.append(record)
 
+                            # Low chroma equivalence: with the mode on, op=0 must
+                            # produce exactly the same pixels as decoding the main
+                            # stream alone (op=1), i.e. the aux stream is really
+                            # skipped and the 4:2:0 output is complete.
+                            ref_label = f"op1ref-{CODECS[fixture['codecId']]}-{policy_name}"
+                            reference = run_case(dll, Path(fixture["main"]["path"]), None,
+                                                 args.width, args.height, policy,
+                                                 fixture["codecId"], 1, ref_label)
+                            low_label = f"low-{CODECS[fixture['codecId']]}-{policy_name}"
+                            low = run_case(dll, Path(fixture["main"]["path"]),
+                                           Path(fixture["aux"]["path"]), args.width,
+                                           args.height, policy, fixture["codecId"], 0,
+                                           low_label, low_chroma=True)
+                            low_worker = low.get("worker") or {}
+                            ref_worker = reference.get("worker") or {}
+                            low_sha = ((low_worker.get("decoded") or [{}])[0]).get("sha256")
+                            ref_sha = ((ref_worker.get("decoded") or [{}])[0]).get("sha256")
+                            low["label"] = low_label
+                            low["reference"] = ref_label
+                            low["referenceSha256"] = ref_sha
+                            low["lowChromaSha256"] = low_sha
+                            low["lowChromaOption"] = low_worker.get("lowChromaOption")
+                            low["equivalent"] = bool(low_sha is not None and low_sha == ref_sha)
+                            low["ok"] = bool(low["cls"]["ok"] and low["equivalent"])
+                            low_runs.append(low)
+
                     full["runs"] = full_runs
-                    full["pass"] = bool(full_runs) and all(item["cls"]["ok"] for item in full_runs)
+                    full["lowChromaRuns"] = low_runs
+                    full["pass"] = (bool(full_runs) and all(item["cls"]["ok"] for item in full_runs)
+                                    and bool(low_runs) and all(item["ok"] for item in low_runs))
                 except Exception as exc:
                     full["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -549,6 +603,14 @@ def main() -> int:
                       f"colors={first.get('colors')} sha={str(first.get('sha256'))[:16]}")
                 print(f"  compare: {json.dumps(item.get('compare', {}), sort_keys=True)}")
                 print(f"  diag: {json.dumps(cls.get('checks', {}), sort_keys=True)}")
+                print(f"  log: {item['log']}")
+            for item in full.get("lowChromaRuns", []):
+                state = "PASS" if item.get("ok") else "FAIL"
+                print(f"[{item['label']}] {state}: low_chroma_option={item.get('lowChromaOption')} "
+                      f"equivalent={item.get('equivalent')}")
+                print(f"  low={str(item.get('lowChromaSha256'))[:16]} "
+                      f"ref={str(item.get('referenceSha256'))[:16]} "
+                      f"reason={item['cls']['reason']}")
                 print(f"  log: {item['log']}")
             if full.get("error"):
                 print(f"[full op0] SKIP/FAIL: {full['error']}")

@@ -422,6 +422,52 @@ public sealed partial class SettingsPage : Page
     /// <para>取消勾选会还原 Windows 账户的标志位；若某个账户的密码年龄已达系统策略上限，
     /// 服务整批拒绝还原 —— 那种情况下清掉标志位会让密码立刻过期、通道当场断连。</para>
     /// </summary>
+    /// <summary>
+    /// AVC444 低色度模式开关。
+    ///
+    /// <para>与开发者模式同一套路：<c>OneWay</c> 绑定 + 手动写回 + 立刻落盘。
+    /// <c>TwoWay</c> 下 <c>Toggled</c> 早于绑定写回，回调里读配置会读到旧值。</para>
+    ///
+    /// <para>落盘失败必须把开关拨回：留下「看着是开的、其实没存」的状态，
+    /// 下次启动就静默恢复成关闭。</para>
+    /// </summary>
+    private void OnAvc444LowChromaToggled(object sender, RoutedEventArgs e)
+    {
+        if (_syncing)
+        {
+            return;
+        }
+
+        if (sender is not ToggleSwitch toggle)
+        {
+            return;
+        }
+
+        var on = toggle.IsOn;
+        if (VM.RdpSettings.LowChromaAvc444 == on)
+        {
+            return;
+        }
+
+        VM.RdpSettings.LowChromaAvc444 = on;
+        try
+        {
+            VM.SaveConfig();
+        }
+        catch (Exception ex)
+        {
+            VM.RdpSettings.LowChromaAvc444 = !on;
+            toggle.IsOn = !on;
+            var detail = ex.Message.Length == 0 ? ex.GetType().Name : ex.Message;
+            VM.AppendLog("AVC444 低色度模式保存失败，已恢复原状：" + detail);
+            return;
+        }
+
+        VM.AppendLog(on
+            ? "已打开 AVC444 低色度模式（下次连接生效）：客户端只解主流并直接转 BGRA，彩色细边可能变软。"
+            : "已关闭 AVC444 低色度模式（下次连接生效）：恢复完整 AVC444 4:4:4 解码。");
+    }
+
     private async void OnChannelPasswordPolicyToggled(object sender, RoutedEventArgs e)
     {
         if (_syncing)

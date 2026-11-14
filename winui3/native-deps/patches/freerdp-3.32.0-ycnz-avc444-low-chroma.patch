@@ -1,0 +1,296 @@
+diff --git a/include/freerdp/codec/h264.h b/include/freerdp/codec/h264.h
+index 97874a8..f9cf2c5 100644
+--- a/include/freerdp/codec/h264.h
++++ b/include/freerdp/codec/h264.h
+@@ -64,6 +64,10 @@ extern "C"
+ 		H264_CONTEXT_OPTION_HW_ACCEL,  /** set to request hw accel, get to check if hw accel is on,
+ 		                                  @since version 3.11.0 */
+ 		H264_CONTEXT_OPTION_YCN_DECODE_POLICY = 0x59434E01, /** Yomori per-context decode policy */
++		H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA = 0x59434E02, /** Yomori AVC444 low chroma mode:
++		                                                         decode the main stream only and
++		                                                         convert YUV420 directly; the
++		                                                         auxiliary chroma stream is skipped */
+ 	} H264_CONTEXT_OPTION;
+ 
+ 	/* Yomori bridge extension: versioned, append-only diagnostics.
+diff --git a/libfreerdp/codec/h264.c b/libfreerdp/codec/h264.c
+index 07eae72..81697b2 100644
+--- a/libfreerdp/codec/h264.c
++++ b/libfreerdp/codec/h264.c
+@@ -754,6 +754,41 @@ static double avg(UINT64* count, double old, double size)
+ }
+ #endif
+ 
++/* Yomori AVC444 low chroma mode.
++ *
++ * The main bitstream of an AVC444 surface command already is a complete YUV420
++ * image; the auxiliary stream only restores 4:4:4 chroma. In low chroma mode we
++ * therefore decode the main stream and convert its 4:2:0 planes straight into
++ * the destination surface -- the same primitives the AVC420 path uses -- instead
++ * of expanding to YUV444 and converting. The auxiliary stream is never submitted
++ * to the decoder.
++ *
++ * decodeOnly != 0 (op == 2, chroma-only update) still feeds the main stream to
++ * the decoder so the reference chain stays intact, but writes no pixels: the
++ * region keeps its previous colour until a later op 0/1 update covers it.
++ */
++static BOOL ycn_avc444_low_chroma_rects(H264_CONTEXT* h264, const BYTE* pSrcData, UINT32 SrcSize,
++                                       BYTE* pDstData, DWORD DstFormat, UINT32 nDstStep,
++                                       const RECTANGLE_16* rects, UINT32 nrRects, BOOL decodeOnly)
++{
++	const BYTE* pYUVData[3];
++	const INT32 status = log_decompress(h264, pSrcData, SrcSize, rects, nrRects);
++
++	if (status < 0)
++		return FALSE;
++	if (status == 0)
++		return TRUE; /* no new frame produced, nothing to present */
++	if (decodeOnly)
++		return TRUE;
++
++	pYUVData[0] = h264->pYUVData[0];
++	pYUVData[1] = h264->pYUVData[1];
++	pYUVData[2] = h264->pYUVData[2];
++	return yuv420_context_decode(h264->yuv, pYUVData, h264->iStride, h264->YUVHeight, DstFormat,
++	                             pDstData, nDstStep, rects, nrRects);
++}
++
++
+ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionRects,
+                         UINT32 numRegionRects, const BYTE* pSrcData, UINT32 SrcSize,
+                         const RECTANGLE_16* auxRegionRects, UINT32 numAuxRegionRect,
+@@ -772,6 +807,40 @@ INT32 avc444_decompress(H264_CONTEXT* h264, BYTE op, const RECTANGLE_16* regionR
+ 		ycn_h264_diag_frame_failure(h264, -1013, "avc444-region-main");
+ 		return -1013;
+ 	}
++
++	/* Yomori low chroma mode: the auxiliary stream is not consumed, so its
++	 * rectangles are neither validated nor applied. */
++	if (h264->ycnAvc444LowChroma != 0)
++	{
++		BOOL decoded = FALSE;
++
++		switch (op)
++		{
++			case 0: /* main luma + chroma420, aux chroma ignored */
++			case 1: /* main luma update */
++				decoded = ycn_avc444_low_chroma_rects(h264, pSrcData, SrcSize, pDstData,
++				                                      DstFormat, nDstStep, regionRects,
++				                                      numRegionRects, FALSE);
++				break;
++			case 2: /* chroma-only update in the main stream */
++				decoded = ycn_avc444_low_chroma_rects(h264, pSrcData, SrcSize, pDstData,
++				                                      DstFormat, nDstStep, regionRects,
++				                                      numRegionRects, TRUE);
++				break;
++			default:
++				break;
++		}
++
++		if (!decoded)
++		{
++			ycn_h264_diag_frame_failure(h264, -1017, "avc444-low-chroma");
++			return -1017;
++		}
++
++		ycn_h264_diag_frame_success(h264);
++		return 1;
++	}
++
+ 	if (!areRectsValid(h264->log, nDstWidth, nDstHeight, auxRegionRects, numAuxRegionRect))
+ 	{
+ 		ycn_h264_diag_frame_failure(h264, -1014, "avc444-region-aux");
+@@ -1091,6 +1160,9 @@ BOOL h264_context_set_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option, UIN
+ 			else if (value == YCN_H264_DECODE_POLICY_AUTO_HW)
+ 				h264->hwAccel = 1;
+ 			return TRUE;
++		case H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA:
++			h264->ycnAvc444LowChroma = value ? 1u : 0u;
++			return TRUE;
+ 		default:
+ 			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
+ 			           option);
+@@ -1117,6 +1189,8 @@ UINT32 h264_context_get_option(H264_CONTEXT* h264, H264_CONTEXT_OPTION option)
+ 			return h264->hwAccel;
+ 		case H264_CONTEXT_OPTION_YCN_DECODE_POLICY:
+ 			return h264->ycnDecodePolicy;
++		case H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA:
++			return h264->ycnAvc444LowChroma;
+ 		default:
+ 			WLog_Print(h264->log, WLOG_WARN, "Unknown H264_CONTEXT_OPTION[0x%08" PRIx32 "]",
+ 			           option);
+diff --git a/libfreerdp/codec/h264.h b/libfreerdp/codec/h264.h
+index 874d14f..9d9a78e 100644
+--- a/libfreerdp/codec/h264.h
++++ b/libfreerdp/codec/h264.h
+@@ -74,6 +74,9 @@ extern "C"
+ 		UINT32 ycnRecoveryAttempts;
+ 		UINT32 ycnRecoveryPending;
+ 		UINT32 ycnFrameWasHardware;
++		/* Yomori AVC444 low chroma mode: decode the main stream only and
++		 * convert YUV420 straight to the destination surface. */
++		UINT32 ycnAvc444LowChroma;
+ 		UINT64 ycnSuccessfulFrames;
+ 		UINT64 ycnSuccessfulHardwareFrames;
+ 		UINT64 ycnSuccessfulSoftwareFrames;
+diff --git a/libfreerdp/gdi/gfx.c b/libfreerdp/gdi/gfx.c
+index ea0d0d9..5f5e5d9 100644
+--- a/libfreerdp/gdi/gfx.c
++++ b/libfreerdp/gdi/gfx.c
+@@ -36,6 +36,12 @@
+ 
+ #define TAG FREERDP_TAG("gdi")
+ 
++/* Yomori AVC444 low chroma mode: per-rdpContext opt-in. Defined at the end of
++ * this file. The default (no session registered / not enabled) keeps the
++ * upstream 4:4:4 behaviour unchanged. */
++FREERDP_API void ycn_gdi_set_avc444_low_chroma(rdpContext* context, BOOL enabled);
++FREERDP_API BOOL ycn_gdi_get_avc444_low_chroma(const rdpContext* context);
++
+ /* The bridge invokes this from the GFX callback on the same thread before the
+  * GDI SurfaceCommand. This is session-local because each FreeRDP session owns
+  * its event-loop thread, and avoids a process-global rdpGdi lookup table. */
+@@ -881,6 +887,14 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+ 	if (!is_within_surface(surface, cmd))
+ 		return ERROR_INVALID_DATA;
+ 
++	/* Yomori low chroma: arm the per-surface H.264 context before decoding.
++	 * Re-applied on every command so that a surface recreated on resize keeps the
++	 * mode; the value itself comes from the per-session switch. */
++	const BOOL ycnLowChroma = ycn_gdi_get_avc444_low_chroma(gdi->context);
++	if (!h264_context_set_option(surface->h264, H264_CONTEXT_OPTION_YCN_AVC444_LOW_CHROMA,
++	                             ycnLowChroma ? 1u : 0u))
++		return ERROR_INTERNAL_ERROR;
++
+ 	bs = (RDPGFX_AVC444_BITMAP_STREAM*)cmd->extra;
+ 
+ 	if (!bs)
+@@ -903,6 +917,12 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+ 		return ERROR_INTERNAL_ERROR;
+ 	}
+ 
++	/* Yomori low chroma, op == 2: chroma-only update. The main stream was still
++	 * decoded to keep the reference chain intact, but no pixel changed, so no
++	 * region is marked dirty and nothing is copied to the output surface. */
++	if (ycnLowChroma && (bs->LC == 2))
++		return gdi_interFrameUpdate(gdi, context);
++
+ 	for (UINT32 i = 0; i < meta1->numRegionRects; i++)
+ 	{
+ 		if (!region16_union_rect(&(surface->invalidRegion), &(surface->invalidRegion),
+@@ -916,18 +936,24 @@ static UINT gdi_SurfaceCommand_AVC444(rdpGdi* gdi, RdpgfxClientContext* context,
+ 	if (status != CHANNEL_RC_OK)
+ 		goto fail;
+ 
+-	for (UINT32 i = 0; i < meta2->numRegionRects; i++)
++	/* Yomori low chroma: the auxiliary stream was never decoded, so its
++	 * rectangles carry no new pixels. Marking them dirty would copy stale
++	 * surface content into the output, so they are skipped entirely. */
++	if (!ycnLowChroma)
+ 	{
+-		if (!region16_union_rect(&(surface->invalidRegion), &(surface->invalidRegion),
+-		                         &(meta2->regionRects[i])))
+-			goto fail;
+-	}
++		for (UINT32 i = 0; i < meta2->numRegionRects; i++)
++		{
++			if (!region16_union_rect(&(surface->invalidRegion), &(surface->invalidRegion),
++			                         &(meta2->regionRects[i])))
++				goto fail;
++		}
+ 
+-	status = IFCALLRESULT(CHANNEL_RC_OK, context->UpdateSurfaceArea, context, surface->surfaceId,
+-	                      meta2->numRegionRects, meta2->regionRects);
++		status = IFCALLRESULT(CHANNEL_RC_OK, context->UpdateSurfaceArea, context,
++		                      surface->surfaceId, meta2->numRegionRects, meta2->regionRects);
+ 
+-	if (status != CHANNEL_RC_OK)
+-		goto fail;
++		if (status != CHANNEL_RC_OK)
++			goto fail;
++	}
+ 
+ 	status = gdi_interFrameUpdate(gdi, context);
+ 
+@@ -2173,3 +2199,81 @@ BOOL ycn_gdi_get_h264_diagnostics(rdpGdi* gdi, UINT16 surfaceId,
+ 	LeaveCriticalSection(&gdi->gfx->mux);
+ 	return rc;
+ }
++
++/* ---- Yomori AVC444 low chroma mode ---------------------------------------
++ *
++ * Per-rdpContext opt-in switch consumed by gdi_SurfaceCommand_AVC444(). It is
++ * intentionally independent of the GDI/GFX structures so the default build has
++ * no behavioural change: without a registered entry the getter returns FALSE
++ * and the upstream 4:4:4 path runs unchanged.
++ */
++
++#define YCN_AVC444_SLOTS 16
++
++typedef struct
++{
++	const rdpContext* context;
++	BOOL enabled;
++} YCN_AVC444_ENTRY;
++
++static YCN_AVC444_ENTRY g_ycnAvc444[YCN_AVC444_SLOTS];
++static SRWLOCK g_ycnAvc444Lock = SRWLOCK_INIT;
++
++static YCN_AVC444_ENTRY* ycn_avc444_entry(const rdpContext* context, BOOL create)
++{
++	YCN_AVC444_ENTRY* slot = nullptr;
++	size_t i;
++
++	if (!context)
++		return nullptr;
++
++	AcquireSRWLockExclusive(&g_ycnAvc444Lock);
++	for (i = 0; i < YCN_AVC444_SLOTS; i++)
++	{
++		if (g_ycnAvc444[i].context == context)
++		{
++			slot = &g_ycnAvc444[i];
++			break;
++		}
++		if (!g_ycnAvc444[i].context && !slot)
++			slot = &g_ycnAvc444[i];
++	}
++	if (slot && !slot->context && create)
++	{
++		slot->context = context;
++		slot->enabled = FALSE;
++	}
++	if (slot && !slot->context)
++		slot = nullptr;
++	ReleaseSRWLockExclusive(&g_ycnAvc444Lock);
++	return slot;
++}
++
++FREERDP_API void ycn_gdi_set_avc444_low_chroma(rdpContext* context, BOOL enabled)
++{
++	YCN_AVC444_ENTRY* entry = ycn_avc444_entry(context, TRUE);
++
++	if (entry)
++		entry->enabled = enabled ? TRUE : FALSE;
++}
++
++FREERDP_API BOOL ycn_gdi_get_avc444_low_chroma(const rdpContext* context)
++{
++	const YCN_AVC444_ENTRY* entry = ycn_avc444_entry(context, FALSE);
++	return (entry && entry->enabled) ? TRUE : FALSE;
++}
++
++/* Called on session teardown so a recycled context pointer cannot inherit a
++ * previous session's mode. Safe to call with an unregistered context. */
++FREERDP_API void ycn_gdi_release_avc444_low_chroma(const rdpContext* context)
++{
++	YCN_AVC444_ENTRY* entry = ycn_avc444_entry(context, FALSE);
++
++	if (entry)
++	{
++		AcquireSRWLockExclusive(&g_ycnAvc444Lock);
++		entry->context = nullptr;
++		entry->enabled = FALSE;
++		ReleaseSRWLockExclusive(&g_ycnAvc444Lock);
++	}
++}

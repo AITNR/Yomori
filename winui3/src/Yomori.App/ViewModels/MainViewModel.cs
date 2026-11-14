@@ -5196,6 +5196,7 @@ public sealed class MainViewModel : ObservableObject
             AllowSelfsigned = true,
             EnableAudio = RdpSettings.AudioEnabled,
             UseGfx = RdpSettings.GfxEnabled,
+            LowChromaAvc444 = RdpSettings.LowChromaAvc444,
             DecodeBackend = RdpSettings.DecodeBackend,
             RenderBackend = RdpSettings.RenderBackend,
         });

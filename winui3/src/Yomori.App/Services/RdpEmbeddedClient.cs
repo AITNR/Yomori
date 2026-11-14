@@ -26,6 +26,8 @@ namespace Yomori.Services
         public bool AllowSelfsigned { get; init; } = true;
         public bool EnableAudio { get; init; } = true;
         public bool UseGfx { get; init; }
+        /// <summary>AVC444 低色度模式（只解主流、跳过 aux 与色度重建）。默认关闭。</summary>
+        public bool LowChromaAvc444 { get; init; }
         public string DecodeBackend { get; init; } = DecodeBackends.Auto;
         public string RenderBackend { get; init; } = RenderBackends.Auto;
     }
@@ -72,6 +74,9 @@ namespace Yomori.Services
         private uint _decodeApiVersion;
         private uint _decodeCapabilities;
         private bool _usedVersionedDecodeEntry;
+        // AVC444 低色度：requested = 用户配置；active = 能力确认后真正下发的模式。
+        private bool _lowChromaAvc444Requested;
+        private bool _lowChromaAvc444Active;
         private static readonly bool s_forceSoftwareFromCommandLine = Array.Exists(
             Environment.GetCommandLineArgs(), a => a == "--embed-nod3d");
         // 最近一次「静音意图」。原生 ycn_rdp_set_muted 在会话不是 RUNNING 时**直接拒绝**，
@@ -282,6 +287,17 @@ namespace Yomori.Services
                     info.DecodeBackend, info.RenderBackend, s_forceSoftwareFromCommandLine);
                 var useVersionedEntry = RdpNativeInterop.TryProbeDecodeApi(
                     out var decodeApiVersion, out var decodeCapabilities);
+
+                // AVC444 低色度只在能力位确认且用户显式开启时请求。
+                // 未确认时一律当作关闭：不静默忽略选项继续按「已开启」跑原路径。
+                // 低色度模式只作用于 GFX/AVC444 路径：关掉 GFX 时即使勾选也不下发，
+                // 否则诊断会显示「on」而实际根本没有 AVC 命令流。
+                var wantLowChroma = info.UseGfx
+                                    && info.LowChromaAvc444
+                                    && (decodeCapabilities
+                                        & (uint)YcnDecodeCapabilities.Avc444LowChroma) != 0;
+                var gfxOptions = wantLowChroma ? YcnGfxOptions.LowChromaAvc444 : YcnGfxOptions.None;
+
                 lock (_gate)
                 {
                     _decodeBackend = DecodeBackends.Normalize(info.DecodeBackend);
@@ -290,20 +306,29 @@ namespace Yomori.Services
                     _decodeApiVersion = decodeApiVersion;
                     _decodeCapabilities = decodeCapabilities;
                     _usedVersionedDecodeEntry = useVersionedEntry;
+                    _lowChromaAvc444Requested = info.LowChromaAvc444;
+                    _lowChromaAvc444Active = wantLowChroma;
                 }
 
                 if (useVersionedEntry)
                 {
                     try
                     {
-                        session = RdpNativeInterop.ycn_rdp_connect_ex(
-                            ref p, ref cb, IntPtr.Zero, requestedPolicy);
+                        session = gfxOptions != YcnGfxOptions.None
+                            ? RdpNativeInterop.ycn_rdp_connect_ex2(
+                                ref p, ref cb, IntPtr.Zero, requestedPolicy, gfxOptions)
+                            : RdpNativeInterop.ycn_rdp_connect_ex(
+                                ref p, ref cb, IntPtr.Zero, requestedPolicy);
                     }
                     catch (EntryPointNotFoundException)
                     {
                         // 极端情况下探测通过但调用时导出消失/被替换：完整退回旧入口，
                         // 不把失败当成连接失败，也不给旧结构追加任何字段。
-                        lock (_gate) { _usedVersionedDecodeEntry = false; }
+                        lock (_gate)
+                        {
+                            _usedVersionedDecodeEntry = false;
+                            _lowChromaAvc444Active = false;
+                        }
                         session = RdpNativeInterop.ycn_rdp_connect(ref p, ref cb, IntPtr.Zero);
                     }
                 }
@@ -601,6 +626,7 @@ namespace Yomori.Services
                        $", decode_caps=0x{_decodeCapabilities:X}" +
                        $", hw_compiled={(hwCompiled ? "yes" : "no")}" +
                        $", hw_diagnostics={(hwDiagnostics ? "yes" : "no")}" +
+                       $", avc444_low_chroma={(_lowChromaAvc444Requested ? (_lowChromaAvc444Active ? "on" : "unsupported") : "off")}" +
                        $", decode_paused={DecodePausedFlag()}" +
                        $", consumers={System.Threading.Volatile.Read(ref _frameConsumers)}" +
                        $", entry={entry}";

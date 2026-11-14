@@ -168,6 +168,16 @@
                               IsChecked="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
                               ToolTipService.ToolTip="默认开启，H.264 硬解需要此管线。关闭后使用旧位图路径，仅用于性能与兼容性对照，CPU 是否降低需实测。" />
 
+                    <!-- AVC444 低色度：只解主流并直接 YUV420→BGRA，跳过辅助流与逐像素
+                         色度重建。协议仍是 AVC444、带宽不降；色度-only 更新的区域会保留
+                         旧颜色。默认关闭，只对新连接生效。 -->
+                    <ToggleSwitch x:Name="Avc444LowChromaSwitch"
+                                  Header="AVC444 低色度模式（降低颜色精度）"
+                                  IsOn="{x:Bind VM.RdpSettings.LowChromaAvc444, Mode=OneWay}"
+                                  Toggled="OnAvc444LowChromaToggled" />
+                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                               Text="只影响新建的内嵌连接：协商仍是 AVC444，客户端跳过辅助色度流，彩色细边可能变软，网络流量不变。默认关闭；关闭即回到完整 4:4:4。改完下次连接生效。" />
+
                     <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
                                Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />
 

@@ -96,6 +96,15 @@ typedef struct ycn_rdp_callbacks
 #define YCN_DECODE_CAP_AVC             0x00000001u
 #define YCN_DECODE_CAP_DIAGNOSTICS     0x00000002u
 #define YCN_DECODE_CAP_HW_COMPILED     0x00000004u
+/* 上游补丁 freerdp-3.32.0-ycnz-avc444-low-chroma 已编入：AVC444 可只解主流并
+ * 直接 YUV420→BGRA（低色度模式）。旧 DLL 不会报告这一位。 */
+#define YCN_DECODE_CAP_AVC444_LOW_CHROMA 0x00000008u
+
+/* ---- ycn_rdp_connect_ex2 的 graphics_options 位 ---- */
+/* 低色度 AVC444：协商仍是 AVC444/AVC444v2（codec 14/15），只是客户端解码时
+ * 只解主流、跳过 aux 与逐像素色度重建，画面停在 4:2:0。服务端照旧推 aux，
+ * 所以带宽不会下降；色度-only 更新的区域会保留旧颜色。默认关闭。 */
+#define YCN_GFX_OPTION_LOW_CHROMA_AVC444 0x00000001u
 
 /* 建立会话：立即返回，连接在后台线程进行；成功返回 session id(>0)，失败返回负错误码。
  * 旧入口保持 non-AVC 行为；新代码用 connect_ex 选择解码策略。 */
@@ -105,6 +114,14 @@ YCN_API int ycn_rdp_connect(const ycn_rdp_params* params, const ycn_rdp_callback
  * 也保守回退到旧 non-AVC 路径，绝不误报硬解，也不假装已禁用 HW。 */
 YCN_API int ycn_rdp_connect_ex(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
                                void* user, uint32_t decode_policy);
+
+/* 带 graphics 选项的版本化入口。gfx_options 见 YCN_GFX_OPTION_*；未知位会被
+ * 拒绝（返回 YCN_ERR_INVALID_ARG），避免旧 DLL 静默忽略「以为已开启」的模式。
+ * 选项按会话保存：只影响这一路连接，改变后需重新连接才生效。
+ * 低色度模式要求 YCN_DECODE_CAP_AVC444_LOW_CHROMA；不支持时返回
+ * YCN_ERR_INVALID_ARG，调用方必须当作「未启用」而不是继续按开启处理。 */
+YCN_API int ycn_rdp_connect_ex2(const ycn_rdp_params* params, const ycn_rdp_callbacks* callbacks,
+                                void* user, uint32_t decode_policy, uint32_t gfx_options);
 
 /* 图形/AVC 设置自检（纯函数，不建立会话、不改 FreeRDP 全局状态）。
  * 只返回本实现将写入 rdpSettings 的值，供 native_decode_checks.py 用

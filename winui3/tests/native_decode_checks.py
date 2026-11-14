@@ -20,7 +20,9 @@ import sys
 YCN_DECODE_CAP_AVC = 0x1
 YCN_DECODE_CAP_DIAGNOSTICS = 0x2
 YCN_DECODE_CAP_HW_COMPILED = 0x4
-YCN_KNOWN_CAPS = YCN_DECODE_CAP_AVC | YCN_DECODE_CAP_DIAGNOSTICS | YCN_DECODE_CAP_HW_COMPILED
+YCN_DECODE_CAP_AVC444_LOW_CHROMA = 0x8
+YCN_KNOWN_CAPS = (YCN_DECODE_CAP_AVC | YCN_DECODE_CAP_DIAGNOSTICS |
+                  YCN_DECODE_CAP_HW_COMPILED | YCN_DECODE_CAP_AVC444_LOW_CHROMA)
 
 YCN_H264_DIAGNOSTICS_VERSION = 1
 YCN_GRAPHICS_SETTINGS_PROBE_VERSION = 1
@@ -250,6 +252,19 @@ def check_bridge_abi(lib: ctypes.CDLL) -> dict[str, object]:
         capabilities & YCN_DECODE_CAP_AVC
     ):
         raise AssertionError("diagnostics reported without AVC support")
+
+    # connect_ex2 must exist whenever the low chroma capability is advertised,
+    # and unknown graphics options must be rejected instead of silently ignored.
+    if capabilities & YCN_DECODE_CAP_AVC444_LOW_CHROMA:
+        connect_ex2 = getattr(lib, "ycn_rdp_connect_ex2", None)
+        if connect_ex2 is None:
+            raise AssertionError("low chroma capability advertised without ycn_rdp_connect_ex2")
+        _configure(connect_ex2, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32)
+        rc = int(connect_ex2(None, None, None, 1, 0x80000000))
+        if rc >= 0:
+            raise AssertionError(f"connect_ex2 accepted an unknown graphics option: rc={rc}")
+
     return {"api_version": api_version, "capabilities": capabilities}
 
 
