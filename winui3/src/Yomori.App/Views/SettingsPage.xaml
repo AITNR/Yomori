@@ -5,577 +5,713 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:models="using:Yomori.Models">
 
-    <!-- 横向必须 Stretch：ScrollViewer 默认不给内容无限宽，StackPanel 若再带
-         HorizontalAlignment="Left" 就会按内容期望宽度收缩，卡片宽度不随窗口变。 -->
-    <ScrollViewer x:Name="SettingsScroll"
-                  Padding="16,12"
-                  HorizontalScrollBarVisibility="Disabled"
-                  HorizontalScrollMode="Disabled"
-                  HorizontalContentAlignment="Stretch"
-                  VerticalScrollBarVisibility="Auto">
-        <StackPanel Spacing="12"
-                    HorizontalAlignment="Stretch">
+    <!--
+      设置页信息架构（2026-11-14 重构）
+      ============================================================
+      原来 10 张卡片全部平铺在一个 ScrollViewer 里，配置开关与运维操作面板混排，
+      且有三处语义错配：「任务完成后」塞了远程会话开关、「执行与通知」把连接参数
+      和通知开关混在一张卡、「关于」里藏了一整套更新设置。
 
-            <TextBlock Text="全局设置" Style="{StaticResource SubtitleTextBlockStyle}" />
+      现在左侧是静态分类导航，右侧一次只显示一个分类。8 个分类按用途分配：
+        常规 / 连接与显示 / 通知 / 环境检查 / 更新 / 数据与日志 / 开发者 / 关于
 
-            <!-- 行为 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="任务完成后" FontWeight="SemiBold" />
+      两条硬约束（改动时别破）：
+      1. 所有 x:Name、事件处理器名、x:Bind 表达式保持原样。冒烟有多处按名字锚定的
+         断言，首次启动引导也靠 FindName("RdpUnlockCard") 与
+         FindName("SettingsScroll") 定位整张 RDP 卡片。
+      2. 分类切换只改 Visibility，不重建集合。动态 Clear() 再 Add 会撞上树进入期
+         的 stowed exception，所以导航项全部静态写在 XAML 里。
+    -->
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="196" />
+            <ColumnDefinition Width="*" />
+        </Grid.ColumnDefinitions>
 
-                    <ToggleSwitch Header="所有任务完成后自动关机"
-                                  IsOn="{x:Bind VM.Config.ShutdownAfterDone, Mode=TwoWay}" />
+        <!-- ================= 左列：分类导航 ================= -->
+        <Border Grid.Column="0"
+                Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                BorderThickness="0,0,1,0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
 
-                    <NumberBox x:Name="ShutdownDelayBox"
-                               Header="关机倒计时（秒）"
-                               Minimum="0" Maximum="86400"
-                               SpinButtonPlacementMode="Compact"
-                               ValueChanged="OnShutdownDelayChanged" />
-
-                    <ToggleSwitch Header="所有任务完成后自动退出程序"
-                                  IsOn="{x:Bind VM.Config.AutoExitAfterDone, Mode=TwoWay}" />
-
-                    <ToggleSwitch Header="程序启动后自动开始执行任务"
-                                  IsOn="{x:Bind VM.Config.AutoStartTasks, Mode=TwoWay}" />
-
-                    <ToggleSwitch Header="超时处理时保存前后截图"
-                                  IsOn="{x:Bind VM.Config.EnableTimeoutScreenshot, Mode=TwoWay}" />
-
-                    <!-- 连接建立后空闲时回收一次工作集：把"连接期一次性提交、之后不再访问"的
-                         冷页放掉，降低任务管理器里的常驻占用。只动常驻页，提交量不变。 -->
-                    <ToggleSwitch Header="空闲时自动回收内存"
-                                  OnContent="已启用"
-                                  OffContent="已禁用"
-                                  IsOn="{x:Bind VM.Config.TrimWorkingSetOnIdle, Mode=TwoWay}" />
-
-                    <ToggleSwitch Header="Windows 开机自启动本程序"
-                                  IsOn="{x:Bind VM.Config.WindowsStartup, Mode=TwoWay}" />
-
-                    <!-- 自动切回主控会话：目标固定为主控进程自己的 Windows 会话。
-                         只在「本机通道连上」之后执行，一次连接批次最多切一次。 -->
-                    <ToggleSwitch x:Name="AutoReturnSwitch"
-                                  Header="连接本机通道后自动切回主控会话"
-                                  IsOn="{x:Bind VM.RdpSettings.AutoReturnToControllerSession, Mode=OneWay}"
-                                  Toggled="OnAutoReturnToggled" />
-
-                    <TextBlock Text="本机内嵌通道连上后，把桌面切回本程序所在会话。切换时占着桌面的会话会断开（进程保留）。不随配置导入导出。"
-                               TextWrapping="Wrap"
-                               Opacity="0.7"
-                               FontSize="12" />
-
-                    <!-- UU 远程修复：某些环境下 UU 会连到通道账户的桌面。
-                         根因是本机 wtsapi32 缺 WTSGetActiveConsoleSessionId，UU 取不到控制台身份。
-                         这里修正它对会话的判定，不修改 UU 的任何文件。
-                         不落配置：修复只在本进程生命周期内有效，持久化会出现「显示已开但实际失效」。 -->
-                    <ToggleSwitch x:Name="UuFixSwitch"
-                                  Header="UU 远程修复"
-                                  IsOn="{x:Bind VM.RdpSettings.UuSessionFixEnabled, Mode=OneWay}"
-                                  Toggled="OnUuFixToggled" />
-
-                    <TextBlock Text="让 UU 远程连到本程序所在桌面。连接或开始执行后 18 秒自动应用；应用时 UU 投屏进程会重启一次（远控短暂中断）。关闭不撤销已生效的修正。"
-                               TextWrapping="Wrap"
-                               Opacity="0.7"
-                               FontSize="12" />
-
-                    <TextBlock x:Name="UuFixStatusText"
-                               TextWrapping="Wrap"
-                               Visibility="Collapsed"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-
-                    <!-- 通道账户密码永不过期：默认勾选，只作用于已添加进 Yomori 的通道账户。
-                         按约定本开关不带说明文字；执行结果只写运行日志，失败时把开关拨回。 -->
-                    <ToggleSwitch x:Name="ChannelPasswordPolicySwitch"
-                                  Header="通道账户密码永不过期"
-                                  IsOn="{x:Bind VM.RdpSettings.ChannelPasswordNeverExpires, Mode=OneWay}"
-                                  Toggled="OnChannelPasswordPolicyToggled" />
+                <StackPanel Grid.Row="0" Padding="16,16,12,10" Spacing="2">
+                    <TextBlock Text="全局设置" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock Text="按类别查找选项" FontSize="12" Opacity="0.6" TextWrapping="Wrap" />
                 </StackPanel>
-            </Border>
 
-            <!-- 外观 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="外观" FontWeight="SemiBold" />
-                    <ComboBox x:Name="ThemeBox"
-                              Header="主题"
-                              MinWidth="220"
-                              ItemsSource="{x:Bind VM.ThemeItems, Mode=OneWay}"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectionChanged="OnThemeChanged" />
-                    <!-- 切换反馈走页内文字，不用 ContentDialog：改根部 RequestedTheme 会重建 XamlRoot
-                         的内容树，和正在显示的对话框抢输入层（详见 SettingsPage.xaml.cs 的注释） -->
-                    <TextBlock x:Name="ThemeHintText"
-                               Visibility="Collapsed"
-                               TextWrapping="Wrap"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                <!-- 静态 8 项：Tag 即分类键，SettingsPage.xaml.cs 的 ShowSection 按它切面板。
+                     引导定位折叠分类里的 RdpUnlockCard 时，也会走同一个 ShowSection。 -->
+                <ListView x:Name="SectionNav" Grid.Row="1"
+                          Padding="8,4,8,12"
+                          SelectionMode="Single"
+                          SelectionChanged="OnSectionNavSelectionChanged"
+                          HorizontalAlignment="Stretch">
+                    <ListViewItem Tag="general" IsSelected="True">
+                        <TextBlock Text="常规" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="connection">
+                        <TextBlock Text="连接与显示" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="notifications">
+                        <TextBlock Text="通知" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="environment">
+                        <TextBlock Text="环境检查" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="updates">
+                        <TextBlock Text="更新" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="data">
+                        <TextBlock Text="数据与日志" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="developer">
+                        <TextBlock Text="开发者" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                    <ListViewItem Tag="about">
+                        <TextBlock Text="关于" FontSize="14" Margin="0,2" />
+                    </ListViewItem>
+                </ListView>
+            </Grid>
+        </Border>
 
-                    <!-- 关闭按钮行为：与 window.close_action 一一对应。
-                         放在这里是为了让"记住我的选择"有回头路 —— 只在弹窗里记、没有地方改，
-                         用户勾了之后就永远改不回来了。 -->
-                    <ComboBox x:Name="CloseActionBox"
-                              Header="关闭按钮"
-                              MinWidth="220"
-                              ItemsSource="{x:Bind VM.CloseActionItems, Mode=OneWay}"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectionChanged="OnCloseActionChanged" />
+        <!-- ================= 右列：当前分类内容 ================= -->
+        <!-- 横向必须 Stretch：ScrollViewer 默认不给内容无限宽，StackPanel 若再带
+             HorizontalAlignment="Left" 就会按内容期望宽度收缩，卡片宽度不随窗口变。 -->
+        <ScrollViewer x:Name="SettingsScroll" Grid.Column="1"
+                      Padding="16,12"
+                      HorizontalScrollBarVisibility="Disabled"
+                      HorizontalScrollMode="Disabled"
+                      HorizontalContentAlignment="Stretch"
+                      VerticalScrollBarVisibility="Auto">
+            <StackPanel Spacing="12"
+                        HorizontalAlignment="Stretch">
 
-                    <TextBlock Text="收进状态栏后，双击托盘里的Yomori图标可以回到主界面。"
-                               TextWrapping="Wrap"
-                               Opacity="0.7"
-                               FontSize="12" />
+                <StackPanel Spacing="2">
+                    <TextBlock x:Name="SectionTitle" Text="常规" Style="{StaticResource SubtitleTextBlockStyle}" />
+                    <TextBlock x:Name="SectionSubtitle"
+                               Text="程序启动、收尾与界面相关的常用设置。"
+                               FontSize="12" Opacity="0.65" TextWrapping="Wrap" />
                 </StackPanel>
-            </Border>
 
-            <!-- ===== 执行与通知（全局）：2026-11-12 从「通道管理」页整体迁入 =====
-                 连接方式 / 解码 / 渲染后端 / 通知开关都是全局设置，与某一条通道无关；
-                 放在设置页才不会让人以为「换条通道就要重配一遍」。 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="执行与通知（全局）" FontWeight="SemiBold" />
+                <!-- ==================== 分类 1：常规 ==================== -->
+                <StackPanel x:Name="Section_general" Tag="general" Spacing="12" Visibility="Visible">
 
-                    <ComboBox Header="连接方式"
-                              ItemsSource="{x:Bind VM.ClientModeItems}"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.RdpSettings.ClientMode, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch" />
+                    <!-- 启动与收尾 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="启动与收尾" FontWeight="SemiBold" />
 
-                    <CheckBox Content="内嵌模式下在本机播放远端声音"
-                              IsChecked="{x:Bind VM.RdpSettings.AudioEnabled, Mode=TwoWay}" />
+                            <ToggleSwitch Header="程序启动后自动开始执行任务"
+                                          IsOn="{x:Bind VM.Config.AutoStartTasks, Mode=TwoWay}" />
 
-                    <!-- 解码 / 渲染两个下拉的 ItemsSource 在构造函数里显式赋值，不用 x:Bind：
-                         x:Bind 的求值顺序会把 SelectedValue 排在 ItemsSource 之前，
-                         列表还空着时那次赋值被直接丢弃，之后再填选项也不会重新匹配 → 下拉框显示空白。
-                         Loaded 里再补一次选中值，保证每次进页面都看得见当前值。 -->
-                    <ComboBox x:Name="DecodeBackendCombo"
-                              Header="内嵌画面解码方式"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.RdpSettings.DecodeBackend, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch"
-                              ToolTipService.ToolTip="自动会优先尝试硬件视频解码，失败后回退软件/非 AVC；软件强制禁用硬件视频解码。实际解码方式以会话日志诊断为准，连接刚开始时尚未判定为硬解。两种选择都在下次连接生效。--embed-nod3d 或 render_backend=software 会强制软件解码。" />
+                            <ToggleSwitch Header="Windows 开机自启动本程序"
+                                          IsOn="{x:Bind VM.Config.WindowsStartup, Mode=TwoWay}" />
 
-                    <ComboBox x:Name="RenderBackendCombo"
-                              Header="内嵌画面渲染后端"
-                              DisplayMemberPath="Value"
-                              SelectedValuePath="Key"
-                              SelectedValue="{x:Bind VM.RdpSettings.RenderBackend, Mode=TwoWay}"
-                              HorizontalAlignment="Stretch"
-                              ToolTipService.ToolTip="D3D 在某些显卡 / 虚拟显示驱动组合下可能把整个窗口卡死（进程还活着但点不动）。碰到就切到软渲染，不用等新版本。改完下次连接生效。" />
+                            <ToggleSwitch Header="所有任务完成后自动关机"
+                                          IsOn="{x:Bind VM.Config.ShutdownAfterDone, Mode=TwoWay}" />
 
-                    <CheckBox Content="GFX 图形管线（支持 H.264，需重连生效）"
-                              IsChecked="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
-                              ToolTipService.ToolTip="默认开启，H.264 硬解需要此管线。关闭后使用旧位图路径，仅用于性能与兼容性对照，CPU 是否降低需实测。" />
+                            <NumberBox x:Name="ShutdownDelayBox"
+                                       Header="关机倒计时（秒）"
+                                       Minimum="0" Maximum="86400"
+                                       SpinButtonPlacementMode="Compact"
+                                       ValueChanged="OnShutdownDelayChanged" />
 
-                    <!-- AVC444 低色度：只解主流并直接 YUV420→BGRA，跳过辅助流与逐像素
-                         色度重建。协议仍是 AVC444、带宽不降；色度-only 更新的区域会保留
-                         旧颜色。默认开启，只对新连接生效。 -->
-                    <ToggleSwitch x:Name="Avc444LowChromaSwitch"
-                                  Header="AVC444 低色度模式（默认开启，降低颜色精度）"
-                                  IsOn="{x:Bind VM.RdpSettings.LowChromaAvc444, Mode=OneWay}"
-                                  Toggled="OnAvc444LowChromaToggled" />
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="只影响新建的内嵌连接：协商仍是 AVC444，客户端跳过辅助色度流，彩色细边可能变软，网络流量不变。实测解码耗时约降 5%（整机不可感知）；关掉即回到完整 4:4:4。改完下次连接生效。" />
+                            <ToggleSwitch Header="所有任务完成后自动退出程序"
+                                          IsOn="{x:Bind VM.Config.AutoExitAfterDone, Mode=TwoWay}" />
 
-                    <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
-                               Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />
+                            <ToggleSwitch Header="超时处理时保存前后截图"
+                                          IsOn="{x:Bind VM.Config.EnableTimeoutScreenshot, Mode=TwoWay}" />
 
-                    <NumberBox Header="等待目标会话建立的超时（秒）"
-                               Minimum="15"
-                               Maximum="600"
-                               SpinButtonPlacementMode="Compact"
-                               Value="{x:Bind VM.RdpSettings.ConnectTimeoutSeconds, Mode=TwoWay}" />
-
-                    <ToggleSwitch Header="每完成一个任务都发通知（仅本机主控端）"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnTaskDone, Mode=TwoWay}"
-                                  ToolTipService.ToolTip="每个任务跑完在你正在看的桌面上弹一条「任务已完成（i/n）」。目标会话里不再弹任何通知。" />
-                    <ToggleSwitch Header="每条会话通道跑完都发通知（仅本机主控端）"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnChannelDone, Mode=TwoWay}"
-                                  ToolTipService.ToolTip="某条通道整条跑完（含失联）时弹一条「Yomori：通道「x」任务结束」。" />
-                    <ToggleSwitch Header="全部通道跑完后发汇总通知（仅本机主控端）"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyOnAllDone, Mode=TwoWay}"
-                                  ToolTipService.ToolTip="整轮结束发一条汇总（多块才发）。" />
-                    <ToggleSwitch Header="本地（非远程会话）执行时也发通知"
-                                  IsOn="{x:Bind VM.RdpSettings.NotifyLocalTaskDone, Mode=TwoWay}" />
-                </StackPanel>
-            </Border>
-
-            <!-- ===== 通道预检：2026-11-12 从「通道管理」页整体迁入 =====
-                 检查对象由页内下拉选取，与通道管理页共用同一份 VM.SelectedChannel；
-                 下拉的 ItemsSource / SelectedItem 全在 SettingsPage.xaml.cs 里管，
-                 避开 ComboBox 的 x:Bind 求值顺序坑（选中项排在列表之前，TwoWay 还可能回写空值）。 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="通道预检" FontWeight="SemiBold" />
-
-                    <ComboBox x:Name="ReadinessChannelCombo"
-                              Header="检查通道"
-                              DisplayMemberPath="DisplayName"
-                              HorizontalAlignment="Stretch"
-                              SelectionChanged="OnReadinessChannelChanged" />
-
-                    <InfoBar x:Name="ChannelReadinessBar"
-                             IsOpen="True"
-                             IsClosable="False"
-                             Severity="Informational"
-                             Title="检查结果"
-                             Message="{x:Bind VM.ChannelReadinessText, Mode=OneWay}" />
-
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="120" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="目标会话：" Opacity="0.7" />
-                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelSessionSummary, Mode=OneWay}" TextWrapping="Wrap" />
-                    </Grid>
-
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="120" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Grid.Column="0" Text="代理状态：" Opacity="0.7" />
-                        <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelAgentStatusText, Mode=OneWay}" TextWrapping="Wrap" />
-                    </Grid>
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="部署会话代理" Click="OnDeployChannelAgent"
-                                ToolTipService.ToolTip="把代理放进所有用户共享的启动目录，目标账户登录后自动接管任务（整机共用一份）" />
-                        <Button Content="移除代理" Click="OnRemoveAgent" />
-                        <Button Content="重新检查" Click="OnRefreshChannelReadiness" />
-                    </StackPanel>
-
-                    <!-- 这几个按钮的即时结果原先只落在 RdpStatusText 上，而通道管理页从不显示它 ——
-                         点了「部署会话代理」页面纹丝不动。现在结果显示在本卡里。 -->
-                    <TextBlock Text="{x:Bind VM.RdpStatusText, Mode=OneWay}"
-                               TextWrapping="Wrap"
-                               Opacity="0.75" />
-                </StackPanel>
-            </Border>
-
-            <!-- 远程桌面解锁（RDP 多用户）。
-                 本版（计划书 M1）只做只读检测：读注册表值、服务状态、会话枚举、文件版本与 INI，
-                 不写任何键、不下载、不装组件。三个修改按钮因此保持禁用并说明原因 ——
-                 宁可明确摆出「还没接」，也不要留一个点了没反应的按钮。 -->
-            <!-- x:Name 供首次启动引导定位整张卡片（见 OnboardingPlan.TargetRdpUnlockCard）。 -->
-            <Border x:Name="RdpUnlockCard" Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="远程桌面解锁（RDP）" FontWeight="SemiBold" />
-                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.7"
-                               Text="让本机支持多账户同时远程连接。当前仅只读检测：服务配置、会话、termsrv.dll 版本与 rdpwrap.ini，不改系统、不下载文件。" />
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button x:Name="RdpUnlockButton" Content="解锁 RDP" Click="OnRdpUnlock" />
-                        <Button x:Name="RdpUninstallButton" Content="卸载 RDP 解锁" Click="OnRdpUninstall" IsEnabled="False" />
-                        <Button x:Name="RdpRestoreRegistryButton" Content="还原注册表" Click="OnRdpRestoreRegistry" IsEnabled="False" />
-                    </StackPanel>
-
-                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                               Text="解锁＝装组件并改配置；还原注册表＝只回滚本功能改过的键值；卸载＝调用官方卸载器。三者不能同时运行。" />
-
-                    <!-- 来源与许可说明（计划书 §9：外部下载资产不随包分发，但仍要交代来源与风险） -->
-                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                               Text="组件来自 sebaxakerhtc/rdpwrap（Apache-2.0）。不随包分发载荷、不改 termsrv.dll、不做注入；安装器按需从官方 Releases 下载并校验。可能被安全软件误报，不做规避。" />
-
-                    <InfoBar x:Name="RdpResultBar" IsOpen="False" IsClosable="True" />
-
-                    <!-- 执行步骤：跑完点开看，每一行对应计划书 3.3 的一步 -->
-                    <StackPanel x:Name="RdpStepsPanel" Spacing="4" Visibility="Collapsed">
-                        <TextBlock x:Name="RdpStepsTitle" FontSize="12" FontWeight="SemiBold" />
-                        <ScrollViewer MaxHeight="220"
-                                      VerticalScrollBarVisibility="Auto"
-                                      HorizontalScrollBarVisibility="Disabled">
-                            <StackPanel x:Name="RdpStepsLines" Spacing="2" />
-                        </ScrollViewer>
-                    </StackPanel>
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button x:Name="RdpRedetectButton" Content="重新检测" Click="OnRdpRedetect" />
-                        <Button x:Name="RdpDiagnoseButton" Content="查看诊断" Click="OnRdpDiagnose" IsEnabled="False" />
-                        <Button Content="打开排查教程" Click="OnRdpTutorial"
-                                ToolTipService.ToolTip="一键解锁反复失败时的手动兜底方案：第三方 RDP Wrapper 手动安装教程" />
-                        <Button x:Name="RdpBackupButton" Content="历史备份" Click="OnRdpBackups" />
-                        <Button x:Name="RdpPickInstallerButton" Content="指定安装包" Click="OnRdpPickInstaller"
-                                ToolTipService.ToolTip="网络拿不到 GitHub 附件时，用浏览器手动下载 RDPW_Installer.exe 后在这里选中它" />
-                        <Button x:Name="RdpPickIniButton" Content="指定 INI" Click="OnRdpPickIni"
-                                ToolTipService.ToolTip="粘贴 rdpwrap issues 里针对本机系统版本的补丁段；程序按段名合并写入 rdpwrap.ini，版本对得上才重启服务" />
-                    </StackPanel>
-
-                    <!-- 四行检测结果由 SettingsPage.xaml.cs 直接填入 StackPanel：
-                         行内容随检测结果变化，用 DataTemplate + x:Bind 反而要多写一套 ViewModel。 -->
-                    <StackPanel x:Name="RdpProbeRows" Spacing="6" />
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <ProgressRing x:Name="RdpProbeProgress" Width="16" Height="16"
-                                      IsActive="False" Visibility="Collapsed" />
-                        <TextBlock x:Name="RdpProbeSummaryText" VerticalAlignment="Center"
-                                   TextWrapping="Wrap" Text="尚未检测。" />
-                    </StackPanel>
-
-                    <TextBlock x:Name="RdpProbeDetailText"
-                               TextWrapping="Wrap" FontSize="12" Opacity="0.65"
-                               IsTextSelectionEnabled="True" />
-
-                    <!-- 操作反馈（复制诊断、检测完成等）留在这里，别只往运行日志页写 -->
-                    <TextBlock x:Name="RdpProbeActionText"
-                               Visibility="Collapsed"
-                               TextWrapping="Wrap" FontSize="12"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                </StackPanel>
-            </Border>
-
-            <!-- 开发者 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="开发者" FontWeight="SemiBold" />
-
-                    <!-- ⚠️ OneWay + Toggled 里落盘，**不能**写成 TwoWay：
-                         TwoWay 下 x:Bind 会自己把值写回 Config，"用户拨动"和"绑定回写"
-                         哪个先到没有保证，处理函数里那句"值没变就当程序性赋值"就会被
-                         概率性地跳过 —— 表现是偶尔不落盘 / 重复提示。
-                         OneWay 时 Config 只由 OnDeveloperModeToggled 写，顺序确定。 -->
-                    <ToggleSwitch x:Name="DeveloperModeSwitch"
-                                  Header="开发者模式"
-                                  IsOn="{x:Bind VM.Config.DeveloperMode, Mode=OneWay}"
-                                  Toggled="OnDeveloperModeToggled" />
-
-                    <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.6"
-                               Text="开启后运行日志页显示 [embed] 诊断行。关闭只影响页面显示，日志文件始终完整保留。" />
-
-                    <!-- GitHub 访问令牌：从「远程桌面解锁」区挪到这里（2026-10-26）——
-                         它只影响访问 GitHub 接口的配额，跟某个功能是一对一关系，不是 RDP 专属，
-                         放在开发者工具区才不会让人以为"不解锁 RDP 就不用管它"。
-                         令牌只进 Windows 凭据管理器，不进 config.json：
-                         匿名接口每小时 60 次，配令牌后 5000 次 —— 这是绕过限流的正路。 -->
-                    <StackPanel Spacing="6">
-                        <TextBlock Text="GitHub 访问令牌（可选）" FontSize="13" FontWeight="SemiBold" />
-                        <StackPanel Orientation="Horizontal" Spacing="8">
-                            <PasswordBox x:Name="GitHubTokenBox"
-                                         Width="320"
-                                         PlaceholderText="ghp_… 或 github_pat_…"
-                                         PasswordRevealMode="Hidden" />
-                            <Button x:Name="GitHubTokenSaveButton" Content="保存并验证" Click="OnSaveGitHubToken" />
-                            <Button x:Name="GitHubTokenClearButton" Content="清除" Click="OnClearGitHubToken" />
+                            <!-- 连接建立后空闲时回收一次工作集：把"连接期一次性提交、之后不再访问"的
+                                 冷页放掉，降低任务管理器里的常驻占用。只动常驻页，提交量不变。 -->
+                            <ToggleSwitch Header="空闲时自动回收内存"
+                                          OnContent="已启用"
+                                          OffContent="已禁用"
+                                          IsOn="{x:Bind VM.Config.TrimWorkingSetOnIdle, Mode=TwoWay}" />
                         </StackPanel>
-                        <TextBlock x:Name="GitHubTokenState" FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
-                        <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
-                                   Text="提高 GitHub 接口配额（60 → 5000 次/小时）。检查更新（含每次启动时的自动检查）与远程桌面解锁都会带上它；只需公开仓库只读权限，令牌存凭据管理器，界面只显示首尾各 4 位。" />
-                    </StackPanel>
+                    </Border>
+
+                    <!-- 界面 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="界面" FontWeight="SemiBold" />
+                            <ComboBox x:Name="ThemeBox"
+                                      Header="主题"
+                                      MinWidth="220"
+                                      ItemsSource="{x:Bind VM.ThemeItems, Mode=OneWay}"
+                                      DisplayMemberPath="Value"
+                                      SelectedValuePath="Key"
+                                      SelectionChanged="OnThemeChanged" />
+                            <!-- 切换反馈走页内文字，不用 ContentDialog：改根部 RequestedTheme 会重建 XamlRoot
+                                 的内容树，和正在显示的对话框抢输入层（详见 SettingsPage.xaml.cs 的注释） -->
+                            <TextBlock x:Name="ThemeHintText"
+                                       Visibility="Collapsed"
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                            <!-- 关闭按钮行为：与 window.close_action 一一对应。
+                                 放在这里是为了让"记住我的选择"有回头路 —— 只在弹窗里记、没有地方改，
+                                 用户勾了之后就永远改不回来了。 -->
+                            <ComboBox x:Name="CloseActionBox"
+                                      Header="关闭按钮"
+                                      MinWidth="220"
+                                      ItemsSource="{x:Bind VM.CloseActionItems, Mode=OneWay}"
+                                      DisplayMemberPath="Value"
+                                      SelectedValuePath="Key"
+                                      SelectionChanged="OnCloseActionChanged" />
+
+                            <TextBlock Text="收进状态栏后，双击托盘里的Yomori图标可以回到主界面。"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.7"
+                                       FontSize="12" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
-            </Border>
 
-            <!-- 配置 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="配置" FontWeight="SemiBold" />
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="导出配置" Click="OnExport" />
-                        <Button Content="导入配置" Click="OnImport" />
-                    </StackPanel>
-                    <TextBlock Text="导入只会覆盖任务列表；自动关机、开机自启动、截图开关等本机设置保持不变。"
-                               FontSize="12" Opacity="0.6" TextWrapping="Wrap" />
+                <!-- ==================== 分类 2：连接与显示 ==================== -->
+                <StackPanel x:Name="Section_connection" Tag="connection" Spacing="12" Visibility="Collapsed">
+
+                    <!-- 连接方式 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="连接方式" FontWeight="SemiBold" />
+
+                            <ComboBox Header="连接方式"
+                                      ItemsSource="{x:Bind VM.ClientModeItems}"
+                                      DisplayMemberPath="Value"
+                                      SelectedValuePath="Key"
+                                      SelectedValue="{x:Bind VM.RdpSettings.ClientMode, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch" />
+
+                            <ToggleSwitch Header="内嵌模式下在本机播放远端声音"
+                                          IsOn="{x:Bind VM.RdpSettings.AudioEnabled, Mode=TwoWay}" />
+
+                            <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                                       Text="选「内嵌」时画面显示在「会话通道」的多画面页与各通道子页里，鼠标键盘可直接操作；选「独立窗口」时用系统 mstsc 开窗口（稳定，永久可用）。改连接方式后下次连接生效。" />
+
+                            <NumberBox Header="等待目标会话建立的超时（秒）"
+                                       Minimum="15"
+                                       Maximum="600"
+                                       SpinButtonPlacementMode="Compact"
+                                       Value="{x:Bind VM.RdpSettings.ConnectTimeoutSeconds, Mode=TwoWay}" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 画面与解码 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="画面与解码" FontWeight="SemiBold" />
+
+                            <!-- 解码 / 渲染两个下拉的 ItemsSource 在构造函数里显式赋值，不用 x:Bind：
+                                 x:Bind 的求值顺序会把 SelectedValue 排在 ItemsSource 之前，
+                                 列表还空着时那次赋值被直接丢弃，之后再填选项也不会重新匹配 → 下拉框显示空白。
+                                 Loaded 里再补一次选中值，保证每次进页面都看得见当前值。 -->
+                            <ComboBox x:Name="DecodeBackendCombo"
+                                      Header="内嵌画面解码方式"
+                                      DisplayMemberPath="Value"
+                                      SelectedValuePath="Key"
+                                      SelectedValue="{x:Bind VM.RdpSettings.DecodeBackend, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch"
+                                      ToolTipService.ToolTip="自动会优先尝试硬件视频解码，失败后回退软件/非 AVC；软件强制禁用硬件视频解码。实际解码方式以会话日志诊断为准，连接刚开始时尚未判定为硬解。两种选择都在下次连接生效。--embed-nod3d 或 render_backend=software 会强制软件解码。" />
+
+                            <ComboBox x:Name="RenderBackendCombo"
+                                      Header="内嵌画面渲染后端"
+                                      DisplayMemberPath="Value"
+                                      SelectedValuePath="Key"
+                                      SelectedValue="{x:Bind VM.RdpSettings.RenderBackend, Mode=TwoWay}"
+                                      HorizontalAlignment="Stretch"
+                                      ToolTipService.ToolTip="D3D 在某些显卡 / 虚拟显示驱动组合下可能把整个窗口卡死（进程还活着但点不动）。碰到就切到软渲染，不用等新版本。改完下次连接生效。" />
+
+                            <ToggleSwitch Header="GFX 图形管线（支持 H.264，需重连生效）"
+                                          IsOn="{x:Bind VM.RdpSettings.GfxEnabled, Mode=TwoWay}"
+                                          ToolTipService.ToolTip="默认开启，H.264 硬解需要此管线。关闭后使用旧位图路径，仅用于性能与兼容性对照，CPU 是否降低需实测。" />
+
+                            <!-- AVC444 低色度：只解主流并直接 YUV420→BGRA，跳过辅助流与逐像素
+                                 色度重建。协议仍是 AVC444、带宽不降；色度-only 更新的区域会保留
+                                 旧颜色。默认开启，只对新连接生效。 -->
+                            <ToggleSwitch x:Name="Avc444LowChromaSwitch"
+                                          Header="AVC444 低色度模式（默认开启，降低颜色精度）"
+                                          IsOn="{x:Bind VM.RdpSettings.LowChromaAvc444, Mode=OneWay}"
+                                          Toggled="OnAvc444LowChromaToggled" />
+                            <TextBlock TextWrapping="Wrap" Opacity="0.65" FontSize="12"
+                                       Text="只影响新建的内嵌连接：协商仍是 AVC444，客户端跳过辅助色度流，彩色细边可能变软，网络流量不变。实测解码耗时约降 5%（整机不可感知）；关掉即回到完整 4:4:4。改完下次连接生效。" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 会话与账户：这三项原先混在「任务完成后」里，都是远程会话相关，挪回本分类 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="会话与账户" FontWeight="SemiBold" />
+
+                            <!-- 自动切回主控会话：目标固定为主控进程自己的 Windows 会话。
+                                 只在「本机通道连上」之后执行，一次连接批次最多切一次。 -->
+                            <ToggleSwitch x:Name="AutoReturnSwitch"
+                                          Header="连接本机通道后自动切回主控会话"
+                                          IsOn="{x:Bind VM.RdpSettings.AutoReturnToControllerSession, Mode=OneWay}"
+                                          Toggled="OnAutoReturnToggled" />
+
+                            <TextBlock Text="本机内嵌通道连上后，把桌面切回本程序所在会话。切换时占着桌面的会话会断开（进程保留）。不随配置导入导出。"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.7"
+                                       FontSize="12" />
+
+                            <!-- UU 远程修复：某些环境下 UU 会连到通道账户的桌面。
+                                 根因是本机 wtsapi32 缺 WTSGetActiveConsoleSessionId，UU 取不到控制台身份。
+                                 这里修正它对会话的判定，不修改 UU 的任何文件。
+                                 不落配置：修复只在本进程生命周期内有效，持久化会出现「显示已开但实际失效」。 -->
+                            <ToggleSwitch x:Name="UuFixSwitch"
+                                          Header="UU 远程修复"
+                                          IsOn="{x:Bind VM.RdpSettings.UuSessionFixEnabled, Mode=OneWay}"
+                                          Toggled="OnUuFixToggled" />
+
+                            <TextBlock Text="让 UU 远程连到本程序所在桌面。连接或开始执行后 18 秒自动应用；应用时 UU 投屏进程会重启一次（远控短暂中断）。关闭不撤销已生效的修正。"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.7"
+                                       FontSize="12" />
+
+                            <TextBlock x:Name="UuFixStatusText"
+                                       TextWrapping="Wrap"
+                                       Visibility="Collapsed"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                            <!-- 通道账户密码永不过期：默认勾选，只作用于已添加进 Yomori 的通道账户。
+                                 按约定本开关不带说明文字；执行结果只写运行日志，失败时把开关拨回。 -->
+                            <ToggleSwitch x:Name="ChannelPasswordPolicySwitch"
+                                          Header="通道账户密码永不过期"
+                                          IsOn="{x:Bind VM.RdpSettings.ChannelPasswordNeverExpires, Mode=OneWay}"
+                                          Toggled="OnChannelPasswordPolicyToggled" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
-            </Border>
 
-            <!-- 外部脚本日志：每个通道每天一个文件，超过份数自动清理 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="外部脚本日志" FontWeight="SemiBold" />
-                    <TextBlock Text="脚本自身输出的日志，按通道分目录、每天一份。目标会话写在 %ProgramData%\Yomori\agent\external_logs，本地写在程序目录 external_logs。"
-                               TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
-                    <TextBlock Text="只归档 INFO 及以上，TRACE/DEBUG 不入文件（体积约减四分之三）。需要完整明细时设 YOMORI_EXTERNAL_LOG_VERBOSE=1。"
-                               TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
+                <!-- ==================== 分类 3：通知 ==================== -->
+                <StackPanel x:Name="Section_notifications" Tag="notifications" Spacing="12" Visibility="Collapsed">
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="通知" FontWeight="SemiBold" />
+                            <TextBlock Text="通知由本机主控端发出，目标会话里不弹任何通知。"
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
 
-                    <Grid ColumnSpacing="12">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-
-                        <TextBlock Grid.Column="0" Text="最多保留（份）：" VerticalAlignment="Center" />
-                        <NumberBox x:Name="ExternalLogKeepBox" Grid.Column="1"
-                                   Minimum="1" Maximum="365"
-                                   SpinButtonPlacementMode="Compact"
-                                   ValueChanged="OnExternalLogKeepChanged" />
-                    </Grid>
-
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="查看占用" Click="OnExternalLogUsage" />
-                        <Button Content="清理超出的" Click="OnExternalLogPrune" />
-                        <Button Content="打开日志目录" Click="OnOpenExternalLogFolder" />
-                    </StackPanel>
-
-                    <TextBlock x:Name="ExternalLogInfoText"
-                               TextWrapping="Wrap" FontSize="12" Opacity="0.65" />
-
-                    <!-- 操作反馈必须留在本页。
-                         原来「查看占用」「清理超出的」只往「运行日志」页追加一行，
-                         用户站在设置页看不到任何变化，会当成按钮坏了。
-                         这段文字专门显示上一次操作的结果（含时间戳，重复点也能看出刷新了）。 -->
-                    <TextBlock x:Name="ExternalLogActionText"
-                               Visibility="Collapsed"
-                               TextWrapping="Wrap" FontSize="12"
-                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-
-                    <!-- 明细列表：点「查看占用」才展开，默认收起免得占版面。
-                         行由 SettingsPage.xaml.cs 直接塞进 StackPanel，不用 DataTemplate + x:Bind。 -->
-                    <StackPanel x:Name="ExternalLogUsagePanel" Spacing="6" Visibility="Collapsed">
-                        <TextBlock x:Name="ExternalLogUsageTitle" FontSize="12" FontWeight="SemiBold" />
-                        <ScrollViewer MaxHeight="220"
-                                      VerticalScrollBarVisibility="Auto"
-                                      HorizontalScrollBarVisibility="Disabled">
-                            <StackPanel x:Name="ExternalLogUsageLines" Spacing="2" />
-                        </ScrollViewer>
-                    </StackPanel>
+                            <ToggleSwitch Header="每完成一个任务都发通知（仅本机主控端）"
+                                          IsOn="{x:Bind VM.RdpSettings.NotifyOnTaskDone, Mode=TwoWay}"
+                                          ToolTipService.ToolTip="每个任务跑完在你正在看的桌面上弹一条「任务已完成（i/n）」。目标会话里不再弹任何通知。" />
+                            <ToggleSwitch Header="每条会话通道跑完都发通知（仅本机主控端）"
+                                          IsOn="{x:Bind VM.RdpSettings.NotifyOnChannelDone, Mode=TwoWay}"
+                                          ToolTipService.ToolTip="某条通道整条跑完（含失联）时弹一条「Yomori：通道「x」任务结束」。" />
+                            <ToggleSwitch Header="全部通道跑完后发汇总通知（仅本机主控端）"
+                                          IsOn="{x:Bind VM.RdpSettings.NotifyOnAllDone, Mode=TwoWay}"
+                                          ToolTipService.ToolTip="整轮结束发一条汇总（多块才发）。" />
+                            <ToggleSwitch Header="本地（非远程会话）执行时也发通知"
+                                          IsOn="{x:Bind VM.RdpSettings.NotifyLocalTaskDone, Mode=TwoWay}" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
-            </Border>
 
-            <!-- 目录 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="目录" FontWeight="SemiBold" />
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Content="打开配置目录" Click="OnOpenConfigFolder" />
-                        <Button Content="打开日志目录" Click="OnOpenLogFolder" />
-                        <Button Content="打开统计目录" Click="OnOpenStatsFolder" />
-                    </StackPanel>
+                <!-- ==================== 分类 4：环境检查 ==================== -->
+                <StackPanel x:Name="Section_environment" Tag="environment" Spacing="12" Visibility="Collapsed">
+
+                    <!-- ===== 通道预检：2026-11-12 从「通道管理」页整体迁入 =====
+                         检查对象由页内下拉选取，与通道管理页共用同一份 VM.SelectedChannel；
+                         下拉的 ItemsSource / SelectedItem 全在 SettingsPage.xaml.cs 里管，
+                         避开 ComboBox 的 x:Bind 求值顺序坑（选中项排在列表之前，TwoWay 还可能回写空值）。 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="通道预检" FontWeight="SemiBold" />
+
+                            <ComboBox x:Name="ReadinessChannelCombo"
+                                      Header="检查通道"
+                                      DisplayMemberPath="DisplayName"
+                                      HorizontalAlignment="Stretch"
+                                      SelectionChanged="OnReadinessChannelChanged" />
+
+                            <InfoBar x:Name="ChannelReadinessBar"
+                                     IsOpen="True"
+                                     IsClosable="False"
+                                     Severity="Informational"
+                                     Title="检查结果"
+                                     Message="{x:Bind VM.ChannelReadinessText, Mode=OneWay}" />
+
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="120" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="目标会话：" Opacity="0.7" />
+                                <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelSessionSummary, Mode=OneWay}" TextWrapping="Wrap" />
+                            </Grid>
+
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="120" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="代理状态：" Opacity="0.7" />
+                                <TextBlock Grid.Column="1" Text="{x:Bind VM.ChannelAgentStatusText, Mode=OneWay}" TextWrapping="Wrap" />
+                            </Grid>
+
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="部署会话代理" Click="OnDeployChannelAgent"
+                                        ToolTipService.ToolTip="把代理放进所有用户共享的启动目录，目标账户登录后自动接管任务（整机共用一份）" />
+                                <Button Content="移除代理" Click="OnRemoveAgent" />
+                                <Button Content="重新检查" Click="OnRefreshChannelReadiness" />
+                            </StackPanel>
+
+                            <!-- 这几个按钮的即时结果原先只落在 RdpStatusText 上，而通道管理页从不显示它 ——
+                                 点了「部署会话代理」页面纹丝不动。现在结果显示在本卡里。 -->
+                            <TextBlock Text="{x:Bind VM.RdpStatusText, Mode=OneWay}"
+                                       TextWrapping="Wrap"
+                                       Opacity="0.75" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 远程桌面解锁（RDP 多用户）。
+                         本版（计划书 M1）只做只读检测：读注册表值、服务状态、会话枚举、文件版本与 INI，
+                         不写任何键、不下载、不装组件。三个修改按钮因此保持禁用并说明原因 ——
+                         宁可明确摆出「还没接」，也不要留一个点了没反应的按钮。 -->
+                    <!-- x:Name 供首次启动引导定位整张卡片（见 OnboardingPlan.TargetRdpUnlockCard）。
+                         这张卡位于「环境检查」分类里，引导会先调 EnsureSectionOfTargetVisible
+                         把分类展开，否则 TransformToVisual 量不到折叠元素的坐标。 -->
+                    <Border x:Name="RdpUnlockCard" Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="远程桌面解锁（RDP）" FontWeight="SemiBold" />
+                            <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.7"
+                                       Text="让本机支持多账户同时远程连接。当前仅只读检测：服务配置、会话、termsrv.dll 版本与 rdpwrap.ini，不改系统、不下载文件。" />
+
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="RdpUnlockButton" Content="解锁 RDP" Click="OnRdpUnlock" />
+                                <Button x:Name="RdpUninstallButton" Content="卸载 RDP 解锁" Click="OnRdpUninstall" IsEnabled="False" />
+                                <Button x:Name="RdpRestoreRegistryButton" Content="还原注册表" Click="OnRdpRestoreRegistry" IsEnabled="False" />
+                            </StackPanel>
+
+                            <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
+                                       Text="解锁＝装组件并改配置；还原注册表＝只回滚本功能改过的键值；卸载＝调用官方卸载器。三者不能同时运行。" />
+
+                            <!-- 来源与许可说明（计划书 §9：外部下载资产不随包分发，但仍要交代来源与风险） -->
+                            <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
+                                       Text="组件来自 sebaxakerhtc/rdpwrap（Apache-2.0）。不随包分发载荷、不改 termsrv.dll、不做注入；安装器按需从官方 Releases 下载并校验。可能被安全软件误报，不做规避。" />
+
+                            <InfoBar x:Name="RdpResultBar" IsOpen="False" IsClosable="True" />
+
+                            <!-- 执行步骤：跑完点开看，每一行对应计划书 3.3 的一步 -->
+                            <StackPanel x:Name="RdpStepsPanel" Spacing="4" Visibility="Collapsed">
+                                <TextBlock x:Name="RdpStepsTitle" FontSize="12" FontWeight="SemiBold" />
+                                <ScrollViewer MaxHeight="220"
+                                              VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled">
+                                    <StackPanel x:Name="RdpStepsLines" Spacing="2" />
+                                </ScrollViewer>
+                            </StackPanel>
+
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button x:Name="RdpRedetectButton" Content="重新检测" Click="OnRdpRedetect" />
+                                <Button x:Name="RdpDiagnoseButton" Content="查看诊断" Click="OnRdpDiagnose" IsEnabled="False" />
+                                <Button Content="打开排查教程" Click="OnRdpTutorial"
+                                        ToolTipService.ToolTip="一键解锁反复失败时的手动兜底方案：第三方 RDP Wrapper 手动安装教程" />
+                                <Button x:Name="RdpBackupButton" Content="历史备份" Click="OnRdpBackups" />
+                                <Button x:Name="RdpPickInstallerButton" Content="指定安装包" Click="OnRdpPickInstaller"
+                                        ToolTipService.ToolTip="网络拿不到 GitHub 附件时，用浏览器手动下载 RDPW_Installer.exe 后在这里选中它" />
+                                <Button x:Name="RdpPickIniButton" Content="指定 INI" Click="OnRdpPickIni"
+                                        ToolTipService.ToolTip="粘贴 rdpwrap issues 里针对本机系统版本的补丁段；程序按段名合并写入 rdpwrap.ini，版本对得上才重启服务" />
+                            </StackPanel>
+
+                            <!-- 四行检测结果由 SettingsPage.xaml.cs 直接填入 StackPanel：
+                                 行内容随检测结果变化，用 DataTemplate + x:Bind 反而要多写一套 ViewModel。 -->
+                            <StackPanel x:Name="RdpProbeRows" Spacing="6" />
+
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <ProgressRing x:Name="RdpProbeProgress" Width="16" Height="16"
+                                              IsActive="False" Visibility="Collapsed" />
+                                <TextBlock x:Name="RdpProbeSummaryText" VerticalAlignment="Center"
+                                           TextWrapping="Wrap" Text="尚未检测。" />
+                            </StackPanel>
+
+                            <TextBlock x:Name="RdpProbeDetailText"
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.65"
+                                       IsTextSelectionEnabled="True" />
+
+                            <!-- 操作反馈（复制诊断、检测完成等）留在这里，别只往运行日志页写 -->
+                            <TextBlock x:Name="RdpProbeActionText"
+                                       Visibility="Collapsed"
+                                       TextWrapping="Wrap" FontSize="12"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
-            </Border>
 
-            <!-- 关于 -->
-            <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
-                <StackPanel Spacing="12">
-                    <TextBlock Text="关于" FontWeight="SemiBold" />
+                <!-- ==================== 分类 5：更新 ==================== -->
+                <StackPanel x:Name="Section_updates" Tag="updates" Spacing="12" Visibility="Collapsed">
 
-                    <!-- 首次启动引导的手动重看入口。一次性动作、不是持续状态，
-                         按约定用按钮而不是 ToggleSwitch；不写配置、不需要二次确认。 -->
-                    <StackPanel Spacing="4">
-                        <Button Content="重新观看开始引导" Click="OnRestartOnboarding" />
-                        <TextBlock Text="按首次启动的顺序重新播放一遍引导，不改变任何配置。"
-                                   TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
-                    </StackPanel>
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="版本与更新" FontWeight="SemiBold" />
 
-                    <TextBlock Text="Yomori —— 让每日清体力变得更省心。"
-                               TextWrapping="Wrap" Opacity="0.8" />
-                    <TextBlock Text="本程序不提供任何游戏内自动化逻辑，只负责把已有脚本按预设顺序稳定地跑完。"
-                               TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <HyperlinkButton Content="联系作者" NavigateUri="https://space.bilibili.com/627260829" />
-                        <HyperlinkButton Content="GitHub" NavigateUri="https://github.com/AITNR/Yomori" />
-                        <!-- 用户群。链接来自群管理后台的「加入群聊」二维码，群号可能随换群变化，
-                             所以按钮上只写「QQ 群」，不写死群号。 -->
-                        <HyperlinkButton Content="QQ 群" NavigateUri="https://qm.qq.com/q/cCBxO7xCXm" />
-                        <Button Content="☕ 赞赏支持" Click="OnSponsor" />
-                    </StackPanel>
+                            <!-- 版本号从程序集信息版本里取（CI 传 -p:Version=），
+                                 不是写死的字面量 —— 见 SettingsPage.xaml.cs 的 RefreshVersionText -->
+                            <TextBlock x:Name="VersionText"
+                                       FontSize="12" Opacity="0.75" TextWrapping="Wrap"
+                                       IsTextSelectionEnabled="True" />
+                            <TextBlock x:Name="VersionDetailText"
+                                       FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
 
-                    <!-- 第三方组件与许可证。不是装饰：包里带着 FreeRDP / WinPR / OpenSSL
-                         （均为 Apache-2.0），该许可证要求分发时让拿到程序的人能查到用了什么、
-                         什么许可。清单与打包脚本共用 third_party/components.json。 -->
-                    <HyperlinkButton x:Name="OpenSourceNoticesButton"
-                                     Content="开源许可（使用的第三方组件）"
-                                     Click="OnOpenThirdPartyNotices"
-                                     Padding="0"
-                                     HorizontalAlignment="Left" />
+                            <!-- 启动时的更新行为 + 下载代理。
+                                 两个下拉都不绑 SelectedValue（由代码在 RefreshUpdateOptions 里摆好）——
+                                 这一页已经踩过两次「SelectedValue 先于 ItemsSource 求值 → 永远空白」。 -->
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <ComboBox x:Name="UpdateCheckModeBox"
+                                          Header="启动时检查更新" MinWidth="186"
+                                          ItemsSource="{x:Bind VM.UpdateCheckModeItems, Mode=OneWay}"
+                                          DisplayMemberPath="Value" SelectedValuePath="Key"
+                                          SelectionChanged="OnUpdateCheckModeChanged">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="每次启动在后台查一次。选「有更新时自动下载」会在下载完后问你要不要现在安装。" />
+                                    </ToolTipService.ToolTip>
+                                </ComboBox>
 
-                    <!-- 本程序自己的许可。与上面那项区分开：那一项是 FreeRDP 等第三方组件的
-                         声明，这一项才是本程序的许可 —— 两者混在一起时，用户会以为 GPL 只覆盖
-                         别人那部分。 -->
-                    <TextBlock Text="以 GPL-3.0 发布，全文与源码见上方链接。"
-                               TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                                <ComboBox x:Name="UpdateProxyModeBox"
+                                          Header="下载代理" MinWidth="150"
+                                          ItemsSource="{x:Bind VM.UpdateProxyModeItems, Mode=OneWay}"
+                                          DisplayMemberPath="Value" SelectedValuePath="Key"
+                                          SelectionChanged="OnUpdateProxyModeChanged">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="检查更新与下载安装包都走这里。系统代理配错时选「不使用代理」。" />
+                                    </ToolTipService.ToolTip>
+                                </ComboBox>
+                            </StackPanel>
 
-                    <!-- 版本号 + 检查更新。版本号从程序集信息版本里取（CI 传 -p:Version=），
-                         不是写死的字面量 —— 见 SettingsPage.xaml.cs 的 RefreshVersionText -->
-                    <TextBlock x:Name="VersionText"
-                               FontSize="12" Opacity="0.75" TextWrapping="Wrap"
-                               IsTextSelectionEnabled="True" />
-                    <TextBlock x:Name="VersionDetailText"
-                               FontSize="12" Opacity="0.55" TextWrapping="Wrap" />
+                            <!-- 自定义代理地址：留空 = 直连；需要认证时把「用户名:密码@」写在主机前面。
+                                 密码不会跟着地址落盘（见 UpdateProxySecretStore），所以框里只回显用户名。 -->
+                            <StackPanel Spacing="4">
+                                <TextBox x:Name="UpdateProxyUrlBox"
+                                         Header="自定义代理地址"
+                                         PlaceholderText="http://127.0.0.1:7890"
+                                         Visibility="Collapsed"
+                                         LostFocus="OnUpdateProxyUrlLostFocus" />
+                                <TextBlock x:Name="UpdateProxyUrlHint"
+                                           TextWrapping="Wrap" FontSize="12" Opacity="0.6"
+                                           Visibility="Collapsed" />
+                            </StackPanel>
 
-                    <!-- 启动时的更新行为 + 下载代理。
-                         两个下拉都不绑 SelectedValue（由代码在 RefreshUpdateOptions 里摆好）——
-                         这一页已经踩过两次「SelectedValue 先于 ItemsSource 求值 → 永远空白」。 -->
-                    <StackPanel Orientation="Horizontal" Spacing="12">
-                        <ComboBox x:Name="UpdateCheckModeBox"
-                                  Header="启动时检查更新" MinWidth="186"
-                                  ItemsSource="{x:Bind VM.UpdateCheckModeItems, Mode=OneWay}"
-                                  DisplayMemberPath="Value" SelectedValuePath="Key"
-                                  SelectionChanged="OnUpdateCheckModeChanged">
-                            <ToolTipService.ToolTip>
-                                <ToolTip Content="每次启动在后台查一次。选「有更新时自动下载」会在下载完后问你要不要现在安装。" />
-                            </ToolTipService.ToolTip>
-                        </ComboBox>
+                            <Grid ColumnSpacing="8" RowSpacing="8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
 
-                        <ComboBox x:Name="UpdateProxyModeBox"
-                                  Header="下载代理" MinWidth="150"
-                                  ItemsSource="{x:Bind VM.UpdateProxyModeItems, Mode=OneWay}"
-                                  DisplayMemberPath="Value" SelectedValuePath="Key"
-                                  SelectionChanged="OnUpdateProxyModeChanged">
-                            <ToolTipService.ToolTip>
-                                <ToolTip Content="检查更新与下载安装包都走这里。系统代理配错时选「不使用代理」。" />
-                            </ToolTipService.ToolTip>
-                        </ComboBox>
-                    </StackPanel>
+                                <ComboBox x:Name="UpdateChannelBox" Grid.Column="0"
+                                          Header="更新渠道" MinWidth="132"
+                                          ItemsSource="{x:Bind VM.UpdateChannelItems, Mode=OneWay}"
+                                          DisplayMemberPath="Value" SelectedValuePath="Key"
+                                          SelectionChanged="OnUpdateChannelChanged">
+                                    <ToolTipService.ToolTip>
+                                        <ToolTip Content="正式版 = 手动发布的 vX.Y.Z；测试版 = 每次提交自动构建的滚动版。" />
+                                    </ToolTipService.ToolTip>
+                                </ComboBox>
 
-                    <!-- 自定义代理地址：留空 = 直连；需要认证时把「用户名:密码@」写在主机前面。
-                         密码不会跟着地址落盘（见 UpdateProxySecretStore），所以框里只回显用户名。 -->
-                    <StackPanel Spacing="4">
-                        <TextBox x:Name="UpdateProxyUrlBox"
-                                 Header="自定义代理地址"
-                                 PlaceholderText="http://127.0.0.1:7890"
-                                 Visibility="Collapsed"
-                                 LostFocus="OnUpdateProxyUrlLostFocus" />
-                        <TextBlock x:Name="UpdateProxyUrlHint"
-                                   TextWrapping="Wrap" FontSize="12" Opacity="0.6"
-                                   Visibility="Collapsed" />
-                    </StackPanel>
+                                <Button x:Name="CheckUpdateButton" Grid.Column="1"
+                                        Content="检查更新" Click="OnCheckUpdate"
+                                        VerticalAlignment="Bottom" />
 
-                    <Grid ColumnSpacing="8" RowSpacing="8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
+                                <ProgressRing x:Name="UpdateProgress" Grid.Column="2"
+                                              IsActive="False" Visibility="Collapsed"
+                                              Width="20" Height="20" VerticalAlignment="Bottom"
+                                              Margin="0,0,0,6" />
+                            </Grid>
 
-                        <ComboBox x:Name="UpdateChannelBox" Grid.Column="0"
-                                  Header="更新渠道" MinWidth="132"
-                                  ItemsSource="{x:Bind VM.UpdateChannelItems, Mode=OneWay}"
-                                  DisplayMemberPath="Value" SelectedValuePath="Key"
-                                  SelectionChanged="OnUpdateChannelChanged">
-                            <ToolTipService.ToolTip>
-                                <ToolTip Content="正式版 = 手动发布的 vX.Y.Z；测试版 = 每次提交自动构建的滚动版。" />
-                            </ToolTipService.ToolTip>
-                        </ComboBox>
+                            <!-- 检查结果 / 提示：默认收起，界面上不占位置 -->
+                            <InfoBar x:Name="UpdateResultBar"
+                                     IsOpen="False"
+                                     IsClosable="False">
+                                <InfoBar.Content>
+                                    <TextBlock x:Name="UpdateResultText" TextWrapping="Wrap" />
+                                </InfoBar.Content>
+                                <InfoBar.ActionButton>
+                                    <Button x:Name="UpdateDownloadButton"
+                                            Content="前往下载" Click="OnOpenUpdatePage"
+                                            Visibility="Collapsed" />
+                                </InfoBar.ActionButton>
+                            </InfoBar>
 
-                        <Button x:Name="CheckUpdateButton" Grid.Column="1"
-                                Content="检查更新" Click="OnCheckUpdate"
-                                VerticalAlignment="Bottom" />
-
-                        <ProgressRing x:Name="UpdateProgress" Grid.Column="2"
-                                      IsActive="False" Visibility="Collapsed"
-                                      Width="20" Height="20" VerticalAlignment="Bottom"
-                                      Margin="0,0,0,6" />
-                    </Grid>
-
-                    <!-- 检查结果 / 提示：默认收起，界面上不占位置 -->
-                    <InfoBar x:Name="UpdateResultBar"
-                             IsOpen="False"
-                             IsClosable="False">
-                        <InfoBar.Content>
-                            <TextBlock x:Name="UpdateResultText" TextWrapping="Wrap" />
-                        </InfoBar.Content>
-                        <InfoBar.ActionButton>
-                            <Button x:Name="UpdateDownloadButton"
-                                    Content="前往下载" Click="OnOpenUpdatePage"
-                                    Visibility="Collapsed" />
-                        </InfoBar.ActionButton>
-                    </InfoBar>
-
-                    <TextBlock Text="只读一次 GitHub 发布信息，不下载、不改文件。装新版请点「前往下载」。"
-                               TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                            <TextBlock Text="只读一次 GitHub 发布信息，不下载、不改文件。装新版请点「前往下载」。"
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                        </StackPanel>
+                    </Border>
                 </StackPanel>
-            </Border>
-        </StackPanel>
-    </ScrollViewer>
+
+                <!-- ==================== 分类 6：数据与日志 ==================== -->
+                <StackPanel x:Name="Section_data" Tag="data" Spacing="12" Visibility="Collapsed">
+
+                    <!-- 配置文件 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="配置文件" FontWeight="SemiBold" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="导出配置" Click="OnExport" />
+                                <Button Content="导入配置" Click="OnImport" />
+                            </StackPanel>
+                            <TextBlock Text="导入只会覆盖任务列表；自动关机、开机自启动、截图开关等本机设置保持不变。"
+                                       FontSize="12" Opacity="0.6" TextWrapping="Wrap" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 外部脚本日志：每个通道每天一个文件，超过份数自动清理 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="外部脚本日志" FontWeight="SemiBold" />
+                            <TextBlock Text="脚本自身输出的日志，按通道分目录、每天一份。目标会话写在 %ProgramData%\Yomori\agent\external_logs，本地写在程序目录 external_logs。"
+                                       TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
+                            <TextBlock Text="只归档 INFO 及以上，TRACE/DEBUG 不入文件（体积约减四分之三）。需要完整明细时设 YOMORI_EXTERNAL_LOG_VERBOSE=1。"
+                                       TextWrapping="Wrap" Opacity="0.7" FontSize="12" />
+
+                            <Grid ColumnSpacing="12">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock Grid.Column="0" Text="最多保留（份）：" VerticalAlignment="Center" />
+                                <NumberBox x:Name="ExternalLogKeepBox" Grid.Column="1"
+                                           Minimum="1" Maximum="365"
+                                           SpinButtonPlacementMode="Compact"
+                                           ValueChanged="OnExternalLogKeepChanged" />
+                            </Grid>
+
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="查看占用" Click="OnExternalLogUsage" />
+                                <Button Content="清理超出的" Click="OnExternalLogPrune" />
+                                <Button Content="打开日志目录" Click="OnOpenExternalLogFolder" />
+                            </StackPanel>
+
+                            <TextBlock x:Name="ExternalLogInfoText"
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.65" />
+
+                            <!-- 操作反馈必须留在本页。
+                                 原来「查看占用」「清理超出的」只往「运行日志」页追加一行，
+                                 用户站在设置页看不到任何变化，会当成按钮坏了。
+                                 这段文字专门显示上一次操作的结果（含时间戳，重复点也能看出刷新了）。 -->
+                            <TextBlock x:Name="ExternalLogActionText"
+                                       Visibility="Collapsed"
+                                       TextWrapping="Wrap" FontSize="12"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
+                            <!-- 明细列表：点「查看占用」才展开，默认收起免得占版面。
+                                 行由 SettingsPage.xaml.cs 直接塞进 StackPanel，不用 DataTemplate + x:Bind。 -->
+                            <StackPanel x:Name="ExternalLogUsagePanel" Spacing="6" Visibility="Collapsed">
+                                <TextBlock x:Name="ExternalLogUsageTitle" FontSize="12" FontWeight="SemiBold" />
+                                <ScrollViewer MaxHeight="220"
+                                              VerticalScrollBarVisibility="Auto"
+                                              HorizontalScrollBarVisibility="Disabled">
+                                    <StackPanel x:Name="ExternalLogUsageLines" Spacing="2" />
+                                </ScrollViewer>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- 目录 -->
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="目录" FontWeight="SemiBold" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Content="打开配置目录" Click="OnOpenConfigFolder" />
+                                <Button Content="打开日志目录" Click="OnOpenLogFolder" />
+                                <Button Content="打开统计目录" Click="OnOpenStatsFolder" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <!-- ==================== 分类 7：开发者 ==================== -->
+                <StackPanel x:Name="Section_developer" Tag="developer" Spacing="12" Visibility="Collapsed">
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="开发者" FontWeight="SemiBold" />
+
+                            <!-- ⚠️ OneWay + Toggled 里落盘，**不能**写成 TwoWay：
+                                 TwoWay 下 x:Bind 会自己把值写回 Config，"用户拨动"和"绑定回写"
+                                 哪个先到没有保证，处理函数里那句"值没变就当程序性赋值"就会被
+                                 概率性地跳过 —— 表现是偶尔不落盘 / 重复提示。
+                                 OneWay 时 Config 只由 OnDeveloperModeToggled 写，顺序确定。 -->
+                            <ToggleSwitch x:Name="DeveloperModeSwitch"
+                                          Header="开发者模式"
+                                          IsOn="{x:Bind VM.Config.DeveloperMode, Mode=OneWay}"
+                                          Toggled="OnDeveloperModeToggled" />
+
+                            <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.6"
+                                       Text="开启后运行日志页显示 [embed] 诊断行。关闭只影响页面显示，日志文件始终完整保留。" />
+
+                            <!-- GitHub 访问令牌：从「远程桌面解锁」区挪到这里（2026-10-26）——
+                                 它只影响访问 GitHub 接口的配额，跟某个功能是一对一关系，不是 RDP 专属，
+                                 放在开发者工具区才不会让人以为"不解锁 RDP 就不用管它"。
+                                 令牌只进 Windows 凭据管理器，不进 config.json：
+                                 匿名接口每小时 60 次，配令牌后 5000 次 —— 这是绕过限流的正路。 -->
+                            <StackPanel Spacing="6">
+                                <TextBlock Text="GitHub 访问令牌（可选）" FontSize="13" FontWeight="SemiBold" />
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <PasswordBox x:Name="GitHubTokenBox"
+                                                 Width="320"
+                                                 PlaceholderText="ghp_… 或 github_pat_…"
+                                                 PasswordRevealMode="Hidden" />
+                                    <Button x:Name="GitHubTokenSaveButton" Content="保存并验证" Click="OnSaveGitHubToken" />
+                                    <Button x:Name="GitHubTokenClearButton" Content="清除" Click="OnClearGitHubToken" />
+                                </StackPanel>
+                                <TextBlock x:Name="GitHubTokenState" FontSize="12" Opacity="0.7" TextWrapping="Wrap" />
+                                <TextBlock TextWrapping="Wrap" FontSize="12" Opacity="0.55"
+                                           Text="提高 GitHub 接口配额（60 → 5000 次/小时）。检查更新（含每次启动时的自动检查）与远程桌面解锁都会带上它；只需公开仓库只读权限，令牌存凭据管理器，界面只显示首尾各 4 位。" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <!-- ==================== 分类 8：关于 ==================== -->
+                <StackPanel x:Name="Section_about" Tag="about" Spacing="12" Visibility="Collapsed">
+                    <Border Padding="16" Style="{StaticResource YomoriCardStyle}">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="关于" FontWeight="SemiBold" />
+
+                            <!-- 首次启动引导的手动重看入口。一次性动作、不是持续状态，
+                                 按约定用按钮而不是 ToggleSwitch；不写配置、不需要二次确认。 -->
+                            <StackPanel Spacing="4">
+                                <Button Content="重新观看开始引导" Click="OnRestartOnboarding" />
+                                <TextBlock Text="按首次启动的顺序重新播放一遍引导，不改变任何配置。"
+                                           TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                            </StackPanel>
+
+                            <TextBlock Text="Yomori —— 让每日清体力变得更省心。"
+                                       TextWrapping="Wrap" Opacity="0.8" />
+                            <TextBlock Text="本程序不提供任何游戏内自动化逻辑，只负责把已有脚本按预设顺序稳定地跑完。"
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <HyperlinkButton Content="联系作者" NavigateUri="https://space.bilibili.com/627260829" />
+                                <HyperlinkButton Content="GitHub" NavigateUri="https://github.com/AITNR/Yomori" />
+                                <!-- 用户群。链接来自群管理后台的「加入群聊」二维码，群号可能随换群变化，
+                                     所以按钮上只写「QQ 群」，不写死群号。 -->
+                                <HyperlinkButton Content="QQ 群" NavigateUri="https://qm.qq.com/q/cCBxO7xCXm" />
+                                <Button Content="☕ 赞赏支持" Click="OnSponsor" />
+                            </StackPanel>
+
+                            <!-- 第三方组件与许可证。不是装饰：包里带着 FreeRDP / WinPR / OpenSSL
+                                 （均为 Apache-2.0），该许可证要求分发时让拿到程序的人能查到用了什么、
+                                 什么许可。清单与打包脚本共用 third_party/components.json。 -->
+                            <HyperlinkButton x:Name="OpenSourceNoticesButton"
+                                             Content="开源许可（使用的第三方组件）"
+                                             Click="OnOpenThirdPartyNotices"
+                                             Padding="0"
+                                             HorizontalAlignment="Left" />
+
+                            <!-- 本程序自己的许可。与上面那项区分开：那一项是 FreeRDP 等第三方组件的
+                                 声明，这一项才是本程序的许可 —— 两者混在一起时，用户会以为 GPL 只覆盖
+                                 别人那部分。 -->
+                            <TextBlock Text="以 GPL-3.0 发布，全文与源码见上方链接。"
+                                       TextWrapping="Wrap" FontSize="12" Opacity="0.6" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
 </Page>

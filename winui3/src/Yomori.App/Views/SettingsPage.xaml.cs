@@ -67,6 +67,158 @@ public sealed partial class SettingsPage : Page
     /// <summary>预检结果只在本页首次加载时刷一次（改主题会让 Loaded 重来）。</summary>
     private bool _readinessRefreshed;
 
+    // ---------------- 分类导航（2026-11-14 重构） ----------------
+
+    /// <summary>分类键。与 XAML 里 Section_&lt;key&gt; 面板、导航项 Tag 一一对应。</summary>
+    private static readonly string[] SectionKeys =
+    {
+        "general", "connection", "notifications", "environment",
+        "updates", "data", "developer", "about",
+    };
+
+    /// <summary>当前显示的分类。主题切换会重建内容树、Loaded 再来一次，靠它把分类补回去。</summary>
+    private string _currentSection = SectionKeys[0];
+
+    /// <summary>InitializeComponent 期间 ListView 的初始化 SelectionChanged 不算用户操作。</summary>
+    private bool _sectionsReady;
+
+    /// <summary>ShowSection 同步导航选中态时，挡住 SelectionChanged 回灌造成递归。</summary>
+    private bool _syncingSection;
+
+    /// <summary>
+    /// 用户点左侧分类：只切 Visibility，不重建任何集合。
+    /// 动态 Clear() 再 Add 会撞上树进入期的 stowed exception。
+    /// </summary>
+    private void OnSectionNavSelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (!_sectionsReady || _syncingSection || _unloaded)
+        {
+            return;
+        }
+
+        if (e.AddedItems.Count > 0
+            && e.AddedItems[0] is ListViewItem item
+            && item.Tag is string key)
+        {
+            ShowSection(key);
+        }
+    }
+
+    /// <summary>切到指定分类：显示对应面板、更新页眉、同步导航选中态、滚动回顶部。</summary>
+    private void ShowSection(string key, bool resetScroll = true)
+    {
+        if (Array.IndexOf(SectionKeys, key) < 0 || _unloaded)
+        {
+            return;
+        }
+
+        _currentSection = key;
+
+        // 一律用 FindName 取控件：主题切换会重建内容树，生成字段可能指向失效元素。
+        _syncingSection = true;
+        try
+        {
+            foreach (var k in SectionKeys)
+            {
+                if (FindName("Section_" + k) is FrameworkElement panel)
+                {
+                    panel.Visibility = k == key ? Visibility.Visible : Visibility.Collapsed;
+                }
+            }
+
+            if (FindName("SectionTitle") is TextBlock title)
+            {
+                title.Text = SectionTitleOf(key);
+            }
+
+            if (FindName("SectionSubtitle") is TextBlock subtitle)
+            {
+                subtitle.Text = SectionSubtitleOf(key);
+            }
+
+            if (FindName("SectionNav") is ListView nav)
+            {
+                foreach (var navItem in nav.Items)
+                {
+                    if (navItem is ListViewItem li && li.Tag is string tag)
+                    {
+                        li.IsSelected = tag == key;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _syncingSection = false;
+        }
+
+        if (resetScroll && FindName("SettingsScroll") is ScrollViewer scroll)
+        {
+            scroll.ChangeView(null, 0, null, true);
+        }
+    }
+
+    /// <summary>
+    /// 引导等外部定位：把目标控件所在的分类展开，并强制同步布局。
+    /// RdpUnlockCard 在「环境检查」分类里，若分类折叠着，TransformToVisual 量不到
+    /// 正确坐标（元素高宽为 0），高亮框会套歪。见 MainWindow.ScrollOnboardingTargetToTop。
+    /// </summary>
+    internal void EnsureSectionOfTargetVisible(string targetName)
+    {
+        if (_unloaded || FindName(targetName) is not FrameworkElement target)
+        {
+            return;
+        }
+
+        DependencyObject? node = target;
+        while (node is not null)
+        {
+            if (node is FrameworkElement fe
+                && fe.Tag is string key
+                && Array.IndexOf(SectionKeys, key) >= 0)
+            {
+                ShowSection(key, resetScroll: false);
+                // Visibility 改变只是标记布局失效，这里强制跑完一趟，
+                // 后面紧接着的 TransformToVisual 才能量到展开后的尺寸。
+                if (FindName("SettingsScroll") is ScrollViewer scroll)
+                {
+                    scroll.InvalidateMeasure();
+                    scroll.UpdateLayout();
+                }
+
+                return;
+            }
+
+            node = VisualTreeHelper.GetParent(node);
+        }
+    }
+
+    private static string SectionTitleOf(string key) => key switch
+    {
+        "general" => "常规",
+        "connection" => "连接与显示",
+        "notifications" => "通知",
+        "environment" => "环境检查",
+        "updates" => "更新",
+        "data" => "数据与日志",
+        "developer" => "开发者",
+        "about" => "关于",
+        _ => "全局设置",
+    };
+
+    private static string SectionSubtitleOf(string key) => key switch
+    {
+        "general" => "程序启动、收尾与界面相关的常用设置。",
+        "connection" => "远程桌面的连接方式、画面解码与会话行为；改动大多在下次连接生效。",
+        "notifications" => "任务与通道跑完时，本机主控端弹出的通知。",
+        "environment" => "连接前的通道预检，以及本机多账户远程桌面（RDP）的只读检测与解锁。",
+        "updates" => "版本信息、更新渠道、启动检查方式与下载代理。",
+        "data" => "配置文件的导入导出、外部脚本日志归档与常用目录。",
+        "developer" => "诊断开关与 GitHub 访问令牌。",
+        "about" => "关于 Yomori、首次启动引导与开源许可。",
+        _ => string.Empty,
+    };
+
     /// <summary>
     /// 「重新观看开始引导」：一次性重播，不写配置、不改首次启动标记。
     /// 放在设置页是为了让跳过引导的用户有回头路。
@@ -146,6 +298,10 @@ public sealed partial class SettingsPage : Page
 
         RefreshVersionText();
         RefreshExternalLogSection();
+
+        // 分类导航初始化完毕，此后 SelectionChanged 才算用户操作。
+        // XAML 里第一项带 IsSelected="True"，构造期间那次回调要挡掉。
+        _sectionsReady = true;
     }
 
     public MainViewModel VM => App.ViewModel;
@@ -1197,6 +1353,9 @@ public sealed partial class SettingsPage : Page
     {
         if (_rdpAutoDetectDone)
         {
+            // 改主题会让根元素 RequestedTheme 变化、内容树重建，Loaded 再来一次。
+            // 这时把当前分类补回去，否则用户正在看的分类会莫名跳回「常规」。
+            ShowSection(_currentSection, resetScroll: false);
             return;
         }
 

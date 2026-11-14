@@ -252,6 +252,14 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // 设置页按分类折叠内容：引导第 5 步定位 RdpUnlockCard 时，先把它所在的
+        // 「环境检查」分类展开，否则 TransformToVisual 量不到折叠元素的坐标，
+        // 高亮框会套歪（见 SettingsPage.EnsureSectionOfTargetVisible）。
+        if (page is SettingsPage settingsPage)
+        {
+            settingsPage.EnsureSectionOfTargetVisible(targetName);
+        }
+
         var target = page.FindName(targetName) as FrameworkElement;
         var scroll = page.FindName(OnboardingPlan.SettingsScrollName) as ScrollViewer;
         if (target is null || scroll is null)
