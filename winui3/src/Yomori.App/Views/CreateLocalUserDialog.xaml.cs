@@ -18,16 +18,23 @@ namespace Yomori.Views;
 /// </remarks>
 public sealed partial class CreateLocalUserDialog : ContentDialog
 {
-    public CreateLocalUserDialog()
+    /// <param name="canAutoSaveCredential">
+    /// 当前是否有「本机通道」可以接收凭据。为 <c>false</c>（没选中通道 / 目标是远程主机）时
+    /// 隐藏那个勾选开关 —— 凭据是按「主机 + 账户」存的，没有目标主机就无处可存。
+    /// </param>
+    public CreateLocalUserDialog(bool canAutoSaveCredential)
     {
         InitializeComponent();
         PrimaryButtonClick += OnPrimaryButtonClick;
+
+        AutoSaveToggle.Visibility = canAutoSaveCredential ? Visibility.Visible : Visibility.Collapsed;
+        AutoSaveNote.Visibility = AutoSaveToggle.Visibility;
     }
 
     /// <summary>
     /// 校验通过后的取值；对话框被取消 / 校验未通过时保持 <c>null</c>。
     /// </summary>
-    public (string Name, string Password, bool MakeAdmin)? Request { get; private set; }
+    public (string Name, string Password, bool MakeAdmin, bool AutoSaveCredential)? Request { get; private set; }
 
     private void OnPrimaryButtonClick(ContentDialog sender, ContentDialogButtonClickEventArgs args)
     {
@@ -64,7 +71,8 @@ public sealed partial class CreateLocalUserDialog : ContentDialog
         }
 
         ErrorText.Visibility = Visibility.Collapsed;
-        Request = (bare, PasswordInput.Password, AdminToggle.IsOn);
+        Request = (bare, PasswordInput.Password, AdminToggle.IsOn,
+            AutoSaveToggle.Visibility == Visibility.Visible && AutoSaveToggle.IsOn);
     }
 
     /// <summary>留住对话框并把原因写在输入框下面。</summary>

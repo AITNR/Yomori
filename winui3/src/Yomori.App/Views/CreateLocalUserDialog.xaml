@@ -45,8 +45,16 @@
             <Run Text="不勾选：只加入「远程桌面用户」组，账户能远程登录但没有管理员权限。" />
         </TextBlock>
 
+        <ToggleSwitch x:Name="AutoSaveToggle"
+                      Header="建完直接存成当前通道的凭据"
+                      IsOn="True" />
+
+        <TextBlock x:Name="AutoSaveNote"
+                   TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                   Text="勾选：账户建好就写进 Windows 凭据管理器（按「主机 + 账户」一条），并把账户填进当前通道 —— 密码只在这里填一次。取消勾选：只建账户，之后在通道里点「保存凭据」时再填一次。" />
+
         <TextBlock TextWrapping="Wrap" Opacity="0.6" FontSize="12"
-                   Text="账户建好后密码默认按「设置 → 通道账户密码永不过期」的开关决定是否置「密码永不过期」；创建时会自动加入 Users 组。密码只用于创建账户，进入凭据管理器仍需在通道里点一次「保存凭据」。" />
+                   Text="账户的「密码永不过期」跟随设置页「通道账户密码永不过期」的开关；创建时自动加入 Users 组。密码只进凭据管理器，不写进 config.json。" />
 
         <TextBlock x:Name="ErrorText"
                    Visibility="Collapsed"

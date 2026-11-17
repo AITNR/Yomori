@@ -1,6 +1,9 @@
 // -*- coding: utf-8 -*-
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
+using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
@@ -65,6 +68,9 @@ public sealed partial class ChannelsPage : Page
         VM.RefreshChannelReadiness();
         SyncChannelChrome();
 
+        // 目标账户下拉的数据源：只读扫描本机账户（放后台，回来后自己切回 UI 线程）
+        ReloadLocalUsers();
+
         if (VM.ActiveEmbedClient is not null)
         {
             ApplyEmbedClientState();
@@ -109,6 +115,8 @@ public sealed partial class ChannelsPage : Page
         {
             case nameof(MainViewModel.SelectedChannel):
                 SyncChannelChrome();
+                // 换了通道 = 换了主机：本机账户列表要不要给，得按新通道重算一遍
+                FilterChannelUserSuggestions(ChannelUserBox.Text);
                 // 只有真正换选中通道才播；Channels / ActiveSession 那些 1Hz 刷新别反复闪
                 PlayChannelEditorEntrance();
                 break;
@@ -203,6 +211,9 @@ public sealed partial class ChannelsPage : Page
         ChannelEditorHint.Text = selected is null
             ? "未选择通道"
             : $"正在编辑：{selected.DisplayName}";
+
+        // 账户状态提示与凭据状态绑在一起（保存凭据后要立刻从「未保存」变成「已保存」）
+        RefreshChannelUserHint();
     }
 
     /// <summary>自检模式：折叠本页除画面卡以外的全部内容，让画面直接进视口。</summary>
@@ -234,8 +245,8 @@ public sealed partial class ChannelsPage : Page
     /// <para>通道要的账户有三个隐形要求：能远程登录、有管理员权限、密码不能几十天后过期。
     /// 让用户去「Windows 设置 → 账户」里建完再回来补这三件事，等于每次都要记一遍 ——
     /// 所以「建账户 + 加组 + 密码策略」在这里一次做完（见 <see cref="LocalUserAccountService.Create"/>）。</para>
-    /// <para>建完之后若已选中某条通道，顺手提供「填入当前通道」。<b>密码不进凭据管理器</b>：
-    /// 那是「保存凭据」的职责，这里悄悄写一条会让"凭据从哪来"变得没法追溯。</para>
+    /// <para>密码在对话框里刚输过一次，所以默认顺手写成该通道的凭据（对话框里有勾选开关）——
+    /// 不让用户为了同一条密码在通道里再敲一遍。取消勾选时退回老路：只填账户，凭据自己保存。</para>
     /// </remarks>
     private async void OnAddLocalUser(object sender, RoutedEventArgs e)
     {
@@ -246,7 +257,11 @@ public sealed partial class ChannelsPage : Page
                 return;   // 没有窗口就没有输入框（自检 / 无人值守）
             }
 
-            var dialog = new CreateLocalUserDialog { XamlRoot = App.MainWindow.Content.XamlRoot };
+            // 凭据按「主机 + 账户」存：没有本机通道就无处可存，此时把那个勾选开关藏起来
+            var channel = VM.SelectedChannel;
+            var canAutoSave = channel is not null && RdpTargets.IsLocal(channel.Host);
+
+            var dialog = new CreateLocalUserDialog(canAutoSave) { XamlRoot = App.MainWindow.Content.XamlRoot };
             var result = await DialogHelper.ShowAsync(dialog);
 
             // 校验全部在对话框里做，走到这里 Request 一定已通过校验；取消时它是 null
@@ -265,16 +280,40 @@ public sealed partial class ChannelsPage : Page
 
             VM.AppendLog($"[会话通道] 新建本机用户「{request.Value.Name}」：{created.Message}（{created.Detail}）");
 
-            var channel = VM.SelectedChannel;
+            // 建成了就先刷新选择器，让新账户马上可选（哪怕用户这次不打算配通道）
+            if (created.Ok)
+            {
+                ReloadLocalUsers();
+            }
+
+            var autoSaved = false;
+            if (created.Ok && canAutoSave && request.Value.AutoSaveCredential && channel is not null)
+            {
+                channel.User = created.AccountName;
+                VM.PersistChannelEdits();
+                VM.SaveChannelCredential(request.Value.Password);
+
+                // SaveChannelCredential 自己会弹失败框；这里只负责核实"是不是真的存进去了"
+                autoSaved = RdpCredentialStore.Exists(channel.Host, created.AccountName);
+                VM.AppendLog(autoSaved
+                    ? $"[会话通道] 已把「{created.AccountName}」填进通道「{channel.DisplayName}」并保存凭据。"
+                    : $"[会话通道] 已把「{created.AccountName}」填进通道「{channel.DisplayName}」，"
+                      + "但凭据没能保存，需要在通道里手动保存一次。");
+            }
+
+            var message = autoSaved
+                ? $"{created.Message}{Environment.NewLine}已填进通道「{channel!.DisplayName}」并保存好凭据，可以直接用了。"
+                : created.Message;
+
             var answer = await DialogHelper.ShowMessageAsync(
                 created.Ok ? "已创建本机用户" : "未能创建本机用户",
                 created.Ok
-                    ? $"{created.Message}{Environment.NewLine}{Environment.NewLine}{created.Detail}"
-                    : created.Message,
+                    ? $"{message}{Environment.NewLine}{Environment.NewLine}{created.Detail}"
+                    : message,
                 "知道了",
-                created.Ok && channel is not null ? "填入当前通道" : null);
+                created.Ok && channel is not null && !autoSaved ? "填入当前通道" : null);
 
-            if (!created.Ok || answer != ContentDialogResult.Primary || channel is null)
+            if (!created.Ok || autoSaved || answer != ContentDialogResult.Primary || channel is null)
             {
                 return;
             }
@@ -295,6 +334,147 @@ public sealed partial class ChannelsPage : Page
             AppPaths.WriteStartupError(ex);
             VM.AppendLog($"[会话通道] 新建本机用户时出错：{ex.GetType().Name}：{ex.Message}");
         }
+    }
+
+    // ---------------- 目标账户选择器 ----------------
+
+    /// <summary>扫描到的本机可用账户（已启用、非系统内置、非纯服务身份）。</summary>
+    private List<LocalUserEntry> _localUsers = new();
+
+    /// <summary>扫描到的**全部**本机账户。只用于解释"为什么某个账户不在下拉里"，不进下拉。</summary>
+    private List<LocalUserEntry> _allLocalUsers = new();
+
+    /// <summary>上一轮扫描的一句话概况，供提示行与运行日志使用。</summary>
+    private string _localUserSummary = "尚未扫描本机账户。";
+
+    /// <summary>重新扫描本机账户（只读：不建、不删、不改密码、不改组）。</summary>
+    private void ReloadLocalUsers() => _ = LoadLocalUsersAsync();
+
+    private async Task LoadLocalUsersAsync()
+    {
+        try
+        {
+            // 十几次 netapi32 调用，放后台；回来必须显式切回 UI 线程再碰控件与绑定
+            var scan = await Task.Run(() => LocalUserDirectory.Scan(Environment.MachineName));
+
+            var enqueued = DispatcherQueue.TryEnqueue(() => ApplyLocalUserScan(scan));
+            _ = enqueued;
+        }
+        catch (Exception ex)
+        {
+            AppPaths.WriteStartupError(ex);
+            VM.AppendLog($"[会话通道] 扫描本机账户出错：{ex.GetType().Name}：{ex.Message}");
+        }
+    }
+
+    private void ApplyLocalUserScan(LocalUserScan scan)
+    {
+        // 扫描是异步的：回来时页面可能已经被导航走了，别再往控件上写字
+        if (!ChannelUserBox.IsLoaded)
+        {
+            return;
+        }
+
+        _localUsers = scan.Usable.ToList();
+        _allLocalUsers = scan.All.ToList();
+        _localUserSummary = scan.Error.Length > 0 ? scan.Error : scan.Summary;
+
+        FilterChannelUserSuggestions(ChannelUserBox.Text);
+        RefreshChannelUserHint();
+        VM.AppendLog($"[会话通道] 本机账户扫描：{_localUserSummary}");
+    }
+
+    /// <summary>
+    /// 按当前输入过滤下拉项。
+    /// 目标主机不是本机时不给本机账户 —— 那些账户在对方机器上并不存在，列出来只会让人选错。
+    /// </summary>
+    private void FilterChannelUserSuggestions(string? text)
+    {
+        var channel = VM.SelectedChannel;
+        if (channel is null || !RdpTargets.IsLocal(channel.Host))
+        {
+            ChannelUserBox.ItemsSource = null;
+            return;
+        }
+
+        var keyword = (text ?? string.Empty).Trim();
+        ChannelUserBox.ItemsSource = keyword.Length == 0
+            ? _localUsers
+            : _localUsers.Where(u => u.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    private void OnChannelUserTextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+    {
+        // 选中建议项时别再按新文本过滤一次 —— 那会把列表缩成只剩它自己
+        if (args.Reason != AutoSuggestionBoxTextChangeReason.SuggestionChosen)
+        {
+            FilterChannelUserSuggestions(sender.Text);
+        }
+
+        RefreshChannelUserHint();
+    }
+
+    private void OnChannelUserSuggestionChosen(AutoSuggestBox sender, AutoSuggestBoxSuggestionChosenEventArgs args)
+        => RefreshChannelUserHint();
+
+    private void OnRefreshLocalUsers(object sender, RoutedEventArgs e) => ReloadLocalUsers();
+
+    /// <summary>
+    /// 把"这个账户在本机到底什么状态"讲清楚：启用与否、是不是管理员、能否远程登录、密码策略，
+    /// 以及还差哪一步（填密码 / 保存凭据）。这些信息全部来自只读扫描，不猜。
+    /// </summary>
+    private void RefreshChannelUserHint()
+    {
+        var channel = VM.SelectedChannel;
+        if (channel is null)
+        {
+            ChannelUserHint.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        ChannelUserHint.Visibility = Visibility.Visible;
+
+        if (!RdpTargets.IsLocal(channel.Host))
+        {
+            ChannelUserHint.Text =
+                $"目标主机不是本机，本机账户列表对它不适用 —— 请按对方计算机上的账户填写。（{_localUserSummary}）";
+            return;
+        }
+
+        var name = (channel.User ?? string.Empty).Trim();
+        if (name.Length == 0)
+        {
+            ChannelUserHint.Text = $"从下拉里选一个本机账户，或直接输入。{_localUserSummary}";
+            return;
+        }
+
+        if (_allLocalUsers.Count == 0)
+        {
+            ChannelUserHint.Text = "正在扫描本机账户…";
+            return;
+        }
+
+        // 在**全量**里找：账户可能因为"已禁用 / 系统内置 / 纯服务身份"没进下拉，
+        // 这时要能说清是哪一种，而不是含糊地来一句"名字可能打错了"。
+        var entry = _allLocalUsers.FirstOrDefault(
+            u => string.Equals(u.Name, name, StringComparison.OrdinalIgnoreCase));
+
+        if (entry is null)
+        {
+            ChannelUserHint.Text =
+                $"本机没有名为「{name}」的账户 —— 可能是名字打错，或它来自域而不是本机账户。"
+                + _localUserSummary;
+            return;
+        }
+
+        if (!entry.Usable)
+        {
+            ChannelUserHint.Text = $"「{entry.Name}」不在可选列表里　{entry.Detail}　{entry.Note}";
+            return;
+        }
+
+        var note = entry.Note.Length > 0 ? $"　{entry.Note}" : string.Empty;
+        ChannelUserHint.Text = $"{entry.Detail}{note}　凭据：{VM.ChannelCredentialText}";
     }
 
     // ---------------- 通道增删改 ----------------
@@ -331,6 +511,9 @@ public sealed partial class ChannelsPage : Page
     {
         VM.PersistChannelEdits();
         SyncChannelChrome();
+
+        // 主机在「本机 ↔ 远程」之间切换时，账户下拉的来源要跟着变（远程主机上没有本机账户）
+        FilterChannelUserSuggestions(ChannelUserBox.Text);
     }
 
     /// <summary>把该通道的主机填回本机环回。</summary>
