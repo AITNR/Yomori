@@ -20,7 +20,8 @@ namespace Yomori.Services;
 /// 组名和成员名都可能带空格与中文，还得处理"命令成功但成员没加上"这种情形。
 /// 直接用 netapi32：加/删成员都以 SID 传参，回读也按 SID 比，绕开所有本地化问题。</para>
 /// <para>策略（2026-10-26 增量计划书）：本机被控账户**一律设为管理员**，目标组恒为
-/// Administrators；不创建用户；不把 <c>DOMAIN\user</c> 截成 <c>user</c>；
+/// Administrators；本链路自身不创建用户（建账户是「通道管理 → 新建用户」的显式入口，
+/// 见 <see cref="LocalUserAccountService"/>）；不把 <c>DOMAIN\user</c> 截成 <c>user</c>；
 /// 管理员组不可用就失败，不"降级"去加 Remote Desktop Users；
 /// 不执行「移除原组 → 加入管理员组」的搬迁链路（只追加，不删任何组关系）。</para>
 /// </remarks>
@@ -283,13 +284,14 @@ public static class LocalGroupMembershipService
         var accountSid = ResolveAccountSid(plan.AccountName);
         if (accountSid is null)
         {
-            // 不创建用户：用户得自己在「设置 → 账户」里建
+            // 授权链路本身不建账户 —— 建账户是「通道管理 → 新建用户」那个显式入口的事
             return new RdpGrantPrecheck
             {
                 Plan = plan,
                 GroupName = adminGroupName!,
-                Failure = $"本机没有账户「{plan.AccountName}」。Yomori 不创建 Windows 用户，"
-                          + "请先在「设置 → 账户 → 其他用户」里创建。",
+                Failure = $"本机没有账户「{plan.AccountName}」。"
+                          + "可以在「通道管理」页点「新建用户」建一个，"
+                          + "或用 Windows 设置的「账户 → 其他用户」添加。",
             };
         }
 
@@ -330,7 +332,8 @@ public static class LocalGroupMembershipService
         if (accountSid is null)
         {
             return RdpGrantResult.Failed(
-                $"本机已经找不到账户「{plan.AccountName}」（可能在确认后被删除）。Yomori 不创建 Windows 用户。");
+                $"本机已经找不到账户「{plan.AccountName}」（可能在确认后被删除）。"
+                + "要重建的话用「通道管理」页的「新建用户」。");
         }
 
         if (confirmedAccountSid is { Length: > 0 }

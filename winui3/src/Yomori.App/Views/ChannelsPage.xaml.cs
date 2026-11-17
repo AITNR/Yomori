@@ -225,6 +225,78 @@ public sealed partial class ChannelsPage : Page
         EmbedCard.Visibility = Visibility.Visible;
     }
 
+    // ---------------- 新建本机用户 ----------------
+
+    /// <summary>
+    /// 在本机创建一个 Windows 本地账户，供通道当目标账户用。
+    /// </summary>
+    /// <remarks>
+    /// <para>通道要的账户有三个隐形要求：能远程登录、有管理员权限、密码不能几十天后过期。
+    /// 让用户去「Windows 设置 → 账户」里建完再回来补这三件事，等于每次都要记一遍 ——
+    /// 所以「建账户 + 加组 + 密码策略」在这里一次做完（见 <see cref="LocalUserAccountService.Create"/>）。</para>
+    /// <para>建完之后若已选中某条通道，顺手提供「填入当前通道」。<b>密码不进凭据管理器</b>：
+    /// 那是「保存凭据」的职责，这里悄悄写一条会让"凭据从哪来"变得没法追溯。</para>
+    /// </remarks>
+    private async void OnAddLocalUser(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            if (App.MainWindow?.Content?.XamlRoot is null)
+            {
+                return;   // 没有窗口就没有输入框（自检 / 无人值守）
+            }
+
+            var dialog = new CreateLocalUserDialog { XamlRoot = App.MainWindow.Content.XamlRoot };
+            var result = await DialogHelper.ShowAsync(dialog);
+
+            // 校验全部在对话框里做，走到这里 Request 一定已通过校验；取消时它是 null
+            var request = dialog.Request;
+            if (result != ContentDialogResult.Primary || request is null)
+            {
+                return;
+            }
+
+            var created = LocalUserAccountService.Create(
+                request.Value.Name,
+                request.Value.Password,
+                "由 Yomori 创建",
+                request.Value.MakeAdmin,
+                VM.Config.Rdp.ChannelPasswordNeverExpires);
+
+            VM.AppendLog($"[会话通道] 新建本机用户「{request.Value.Name}」：{created.Message}（{created.Detail}）");
+
+            var channel = VM.SelectedChannel;
+            var answer = await DialogHelper.ShowMessageAsync(
+                created.Ok ? "已创建本机用户" : "未能创建本机用户",
+                created.Ok
+                    ? $"{created.Message}{Environment.NewLine}{Environment.NewLine}{created.Detail}"
+                    : created.Message,
+                "知道了",
+                created.Ok && channel is not null ? "填入当前通道" : null);
+
+            if (!created.Ok || answer != ContentDialogResult.Primary || channel is null)
+            {
+                return;
+            }
+
+            channel.User = created.AccountName;
+            VM.PersistChannelEdits();
+            VM.RefreshChannelReadiness();
+            SyncChannelChrome();
+
+            // 填完账户还差凭据：把焦点放到密码框，别让用户自己去找下一步
+            ChannelPasswordInput.Focus(FocusState.Programmatic);
+            VM.AppendLog($"[会话通道] 已把账户「{created.AccountName}」填进通道「{channel.DisplayName}」，"
+                         + "下一步是「保存凭据」。");
+        }
+        catch (Exception ex)
+        {
+            // async void 里漏出去的异常会直接掀掉进程 —— 就地收口并落盘
+            AppPaths.WriteStartupError(ex);
+            VM.AppendLog($"[会话通道] 新建本机用户时出错：{ex.GetType().Name}：{ex.Message}");
+        }
+    }
+
     // ---------------- 通道增删改 ----------------
 
     private void OnAddChannel(object sender, RoutedEventArgs e)
