@@ -28,6 +28,9 @@ public sealed class LocalUserCreateResult
     /// <summary>它本来就在那个组里（并发场景，本轮不算新增）。</summary>
     public bool AlreadyMember { get; init; }
 
+    /// <summary>本轮是否真的把它从登录界面隐藏了（只影响交互式登录界面的磁贴列表）。</summary>
+    public bool HiddenApplied { get; init; }
+
     /// <summary>Win32 / NERR 错误码；0 表示账户创建这一步成功，-1 表示在托管侧就被拦下了。</summary>
     public int Code { get; init; }
 
@@ -258,8 +261,13 @@ public static class LocalUserAccountService
     /// false = 加入 Remote Desktop Users（否则账户建出来也登不进远程桌面）。
     /// </param>
     /// <param name="neverExpires">是否置 UF_DONT_EXPIRE_PASSWD（跟随通道密码策略开关）。</param>
+    /// <param name="hiddenFromLogon">
+    /// 是否把这个账户从 Windows 登录界面隐藏（<see cref="LocalUserVisibility"/>）。
+    /// 只影响交互式登录界面的磁贴列表，远程桌面照样能用凭据登录。
+    /// </param>
     public static LocalUserCreateResult Create(
-        string? name, string? password, string comment, bool makeAdmin, bool neverExpires)
+        string? name, string? password, string comment, bool makeAdmin, bool neverExpires,
+        bool hiddenFromLogon = false)
     {
         var nameCheck = ValidateName(name, Environment.MachineName);
         if (!nameCheck.Ok)
@@ -324,9 +332,16 @@ public static class LocalUserAccountService
             return Failure(bare, code, $"创建账户失败：{DescribeCode(code)}{field}");
         }
 
-        // ---- 账户已经建成。后面每一步都必须如实回报，不能因为"账户建好了"就把组关系的
-        //      失败也算成功 —— 用户拿一个非管理员、也不在远程桌面组里的账户去建通道，
-        //      会在连接阶段报一个看起来毫不相干的错。 ----
+        // ---- 账户已经建成。后面每一步都必须如实回报，不能因为"账户建好了"就把组关系 /
+        //      登录界面可见性的失败也算成功 —— 用户拿一个非管理员、也不在远程桌面组里的账户
+        //      去建通道，会在连接阶段报一个看起来毫不相干的错。 ----
+
+        // 隐藏放在加组之前：它只动注册表，与组关系无关，先做完能让后面几条提前返回都带上结论
+        var hidden = hiddenFromLogon
+            ? LocalUserVisibility.SetHidden(bare, true)
+            : (Ok: true, Detail: "未勾选隐藏，登录界面照常显示该账户。");
+
+        var hiddenNote = $";登录界面：{(hidden.Ok ? "已按选择处理" : $"隐藏失败：{hidden.Detail}")}";
 
         var sid = LocalGroupMembershipService.ResolveAccountSid(bare);
         if (sid is null)
@@ -335,8 +350,10 @@ public static class LocalUserAccountService
             {
                 Ok = true,
                 AccountName = bare,
+                HiddenApplied = hidden.Ok && hiddenFromLogon,
                 Message = $"已创建账户「{bare}」，但解析不到它的 SID，未能加入任何组。",
-                Detail = "NetUserAdd 成功；SID 解析失败。请到「计算机管理 → 本地用户和组」确认账户状态。",
+                Detail = $"NetUserAdd 成功；SID 解析失败。请到「计算机管理 → 本地用户和组」确认账户状态。"
+                         + hiddenNote,
                 Code = NerrSuccess,
             };
         }
@@ -350,8 +367,9 @@ public static class LocalUserAccountService
                 Ok = true,
                 AccountName = bare,
                 AccountSid = sid,
+                HiddenApplied = hidden.Ok && hiddenFromLogon,
                 Message = $"已创建账户「{bare}」，但本机找不到{(makeAdmin ? "管理员组" : "远程桌面用户组")}，未能加组。",
-                Detail = $"NetUserAdd 成功；SID={sid}；目标组 SID={groupSid} 在本机不存在。",
+                Detail = $"NetUserAdd 成功；SID={sid}；目标组 SID={groupSid} 在本机不存在。{hiddenNote}",
                 Code = NerrSuccess,
             };
         }
@@ -363,7 +381,8 @@ public static class LocalUserAccountService
             + $"（{(neverExpires ? "密码永不过期" : "密码按系统期限")}）；"
             + $"目标组「{groupName}」（{groupSid}）："
             + (memberOk ? (memberCode == 1378 ? "本来就在组内" : "本轮已加入") : $"加入失败：{memberError}（{memberCode}）")
-            + ";默认组 Users 由 NetUserAdd 自动加入。";
+            + ";默认组 Users 由 NetUserAdd 自动加入。"
+            + hiddenNote;
 
         if (!memberOk)
         {
@@ -372,6 +391,7 @@ public static class LocalUserAccountService
                 Ok = true,
                 AccountName = bare,
                 AccountSid = sid,
+                HiddenApplied = hidden.Ok && hiddenFromLogon,
                 GroupName = groupName,
                 Message = $"已创建账户「{bare}」，但加入「{groupName}」失败：{memberError}",
                 Detail = detail,
@@ -387,6 +407,7 @@ public static class LocalUserAccountService
             GroupName = groupName,
             GroupAdded = memberCode != 1378,
             AlreadyMember = memberCode == 1378,
+            HiddenApplied = hidden.Ok && hiddenFromLogon,
             Message = makeAdmin
                 ? $"已创建账户「{bare}」，并设为本机管理员。"
                 : $"已创建账户「{bare}」，已加入「{groupName}」（本机管理员未勾选）。",

@@ -45,6 +45,13 @@
             <Run Text="不勾选：只加入「远程桌面用户」组，账户能远程登录但没有管理员权限。" />
         </TextBlock>
 
+        <ToggleSwitch x:Name="HideToggle"
+                      Header="在 Windows 登录界面隐藏这个账户"
+                      IsOn="False" />
+
+        <TextBlock TextWrapping="Wrap" Opacity="0.7" FontSize="12"
+                   Text="隐藏后，登录界面的账户磁贴与「切换用户」列表里都看不到它 —— 远程桌面照样能用它登录，只是坐在机器前的人看不到这个入口。写入 Winlogon\SpecialAccounts\UserList 并读回核对；不隐藏就完全不动注册表。" />
+
         <ToggleSwitch x:Name="AutoSaveToggle"
                       Header="建完直接存成当前通道的凭据"
                       IsOn="True" />

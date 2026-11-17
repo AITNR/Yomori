@@ -43,6 +43,12 @@ public sealed class LocalUserEntry
     /// <summary>是不是主控端当前登录的账户（拿它建通道会和当前会话抢）。</summary>
     public bool IsCurrentUser { get; init; }
 
+    /// <summary>
+    /// 是否被从**交互式登录界面**隐藏（<c>Winlogon\SpecialAccounts\UserList</c> 里为 0）。
+    /// 只影响欢迎屏幕的账户磁贴与「切换用户」列表，不影响远程桌面与凭据登录。
+    /// </summary>
+    public bool HiddenFromLogon { get; init; }
+
     /// <summary>登录过（<c>usri3_last_logon</c> 非 0）。</summary>
     public bool HasLoggedOn => LastLogon is not null;
 
@@ -91,6 +97,12 @@ public sealed class LocalUserEntry
             parts.Add(PasswordNeverExpires
                 ? "密码永不过期"
                 : PasswordAgeDays >= 0 ? $"密码 {PasswordAgeDays} 天前设置" : "密码期限不详");
+
+            if (HiddenFromLogon)
+            {
+                parts.Add("登录界面已隐藏");
+            }
+
             parts.Add(LastLogon is { } at
                 ? $"最近登录 {at.LocalDateTime:MM-dd HH:mm}"
                 : "从未登录");
@@ -272,12 +284,14 @@ public static class LocalUserDirectory
 
         var admins = GroupMemberSids(RdpEditions.AdministratorsSid);
         var rdpUsers = GroupMemberSids(RdpEditions.RemoteDesktopUsersSid);
+        // 登录界面可见性：整张 UserList 一次读全，别逐账户开注册表
+        var userList = LocalUserVisibility.ReadUserList();
         var currentUser = Environment.UserName;
 
         var all = new List<LocalUserEntry>(names.Count);
         foreach (var (name, enumFlags) in names)
         {
-            all.Add(ReadEntry(name, enumFlags, admins, rdpUsers, currentUser));
+            all.Add(ReadEntry(name, enumFlags, admins, rdpUsers, userList, currentUser));
         }
 
         all.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
@@ -364,14 +378,16 @@ public static class LocalUserDirectory
 
         return ReadEntry(
             text, 0, GroupMemberSids(RdpEditions.AdministratorsSid),
-            GroupMemberSids(RdpEditions.RemoteDesktopUsersSid), Environment.UserName);
+            GroupMemberSids(RdpEditions.RemoteDesktopUsersSid),
+            LocalUserVisibility.ReadUserList(), Environment.UserName);
     }
 
     /// <summary>把账户名解析成 SID 字符串（失败返回 null）。给「凭据归属」这类判断用。</summary>
     public static string? ResolveSid(string? name) => LocalGroupMembershipService.ResolveAccountSid(name);
 
     private static LocalUserEntry ReadEntry(
-        string name, uint enumFlags, HashSet<string> admins, HashSet<string> rdpUsers, string currentUser)
+        string name, uint enumFlags, HashSet<string> admins, HashSet<string> rdpUsers,
+        IReadOnlyDictionary<string, int> userList, string currentUser)
     {
         var info = ReadInfo(name);
         var flags = info.Ok ? info.Flags : enumFlags;
@@ -394,6 +410,7 @@ public static class LocalUserDirectory
                 ? DateTimeOffset.FromUnixTimeSeconds(info.LastLogonSeconds).ToLocalTime()
                 : null,
             IsCurrentUser = string.Equals(name, currentUser, StringComparison.OrdinalIgnoreCase),
+            HiddenFromLogon = LocalUserVisibility.IsHidden(userList, name),
         };
     }
 

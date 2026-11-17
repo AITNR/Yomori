@@ -290,7 +290,7 @@ public static class LocalGroupMembershipService
                 Plan = plan,
                 GroupName = adminGroupName!,
                 Failure = $"本机没有账户「{plan.AccountName}」。"
-                          + "可以在「通道管理」页点「新建用户」建一个，"
+                          + "可以在「通道管理」页点「新建」→「还没有，先建账户」建一个，"
                           + "或用 Windows 设置的「账户 → 其他用户」添加。",
             };
         }
@@ -333,7 +333,7 @@ public static class LocalGroupMembershipService
         {
             return RdpGrantResult.Failed(
                 $"本机已经找不到账户「{plan.AccountName}」（可能在确认后被删除）。"
-                + "要重建的话用「通道管理」页的「新建用户」。");
+                + "要重建的话用「通道管理」页的「新建」→「还没有，先建账户」。");
         }
 
         if (confirmedAccountSid is { Length: > 0 }

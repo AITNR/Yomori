@@ -3650,7 +3650,7 @@ public sealed class MainViewModel : ObservableObject
         var channel = _selectedChannel;
         if (channel is null)
         {
-            ChannelReadinessText = "还没有通道 —— 点「新建通道」加一条。";
+            ChannelReadinessText = "还没有通道 —— 点「新建」加一条。";
             ChannelSessionSummary = "－";
             ChannelAgentStatusText = "－";
             ChannelCredentialText = "－";

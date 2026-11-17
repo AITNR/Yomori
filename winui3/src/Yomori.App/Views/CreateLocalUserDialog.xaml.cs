@@ -34,7 +34,8 @@ public sealed partial class CreateLocalUserDialog : ContentDialog
     /// <summary>
     /// 校验通过后的取值；对话框被取消 / 校验未通过时保持 <c>null</c>。
     /// </summary>
-    public (string Name, string Password, bool MakeAdmin, bool AutoSaveCredential)? Request { get; private set; }
+    public (string Name, string Password, bool MakeAdmin, bool AutoSaveCredential, bool HideFromLogon)?
+        Request { get; private set; }
 
     private void OnPrimaryButtonClick(ContentDialog sender, ContentDialogButtonClickEventArgs args)
     {
@@ -72,7 +73,8 @@ public sealed partial class CreateLocalUserDialog : ContentDialog
 
         ErrorText.Visibility = Visibility.Collapsed;
         Request = (bare, PasswordInput.Password, AdminToggle.IsOn,
-            AutoSaveToggle.Visibility == Visibility.Visible && AutoSaveToggle.IsOn);
+            AutoSaveToggle.Visibility == Visibility.Visible && AutoSaveToggle.IsOn,
+            HideToggle.IsOn);
     }
 
     /// <summary>留住对话框并把原因写在输入框下面。</summary>

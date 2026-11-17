@@ -65,7 +65,9 @@ public static class OnboardingPlan
     public const string TargetQuickLogs = "QuickLogsButton";
     public const string TargetQuickChannels = "QuickChannelsButton";
     public const string TargetRdpUnlockCard = "RdpUnlockCard";
-    public const string TargetAddChannel = "AddChannelButton";
+
+    /// <summary>「新建」按钮：建通道与建账户共用同一个入口（点击后先问有没有现成账户）。</summary>
+    public const string TargetAddChannel = "AddButton";
 
     /// <summary>设置页里用于把 RDP 卡片滚进视口的 ScrollViewer（不参与聚焦，只参与定位时序）。</summary>
     public const string SettingsScrollName = "SettingsScroll";
@@ -107,8 +109,9 @@ public static class OnboardingPlan
                 scrollToTop: true),
 
             new OnboardingStep(6, ChannelMgmtTag, TargetAddChannel,
-                "新建通道",
-                "在这里添加通道。创建前需要两个前提：电脑已经解锁 RDP，并且已经添加了 Windows 用户账户。",
+                "新建",
+                "在这里新建通道。创建前需要两个前提：电脑已经解锁 RDP，并且已经添加了 Windows 用户账户 —— "
+                + "点这个按钮时它会先问你有没有现成账户，没有就当场建一个（可顺手设管理员、在登录界面隐藏、存凭据）。",
                 null),
 
             new OnboardingStep(7, ChannelMgmtTag, null,
