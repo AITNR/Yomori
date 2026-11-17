@@ -588,12 +588,6 @@ public sealed partial class ChannelsPage : Page
         SyncChannelChrome();
     }
 
-    private void OnDuplicateChannel(object sender, RoutedEventArgs e)
-    {
-        VM.DuplicateChannelCommand.Execute(VM.SelectedChannel);
-        SyncChannelChrome();
-    }
-
     private void OnRemoveChannel(object sender, RoutedEventArgs e)
     {
         VM.RemoveChannelCommand.Execute(VM.SelectedChannel);

@@ -39,27 +39,21 @@
                        Style="{StaticResource SubtitleTextBlockStyle}"
                        Margin="0,0,0,8" />
 
-            <!-- 左列只有 264 宽，三个按钮按「一行满宽 + 一行两列」摆：
-                 新建是主入口（点它先问"有没有现成账户"，再决定建通道还是建账户），所以给它整行。 -->
-            <Grid Grid.Row="1" RowSpacing="6" ColumnSpacing="6" Margin="0,0,0,8">
+            <!-- 左列 264 宽：新建 / 删除 一行两列足够（「复制」按钮已按用户要求移除，2026-11-17）。 -->
+            <Grid Grid.Row="1" ColumnSpacing="6" Margin="0,0,0,8">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="Auto" />
-                    <RowDefinition Height="Auto" />
-                </Grid.RowDefinitions>
 
                 <!-- x:Name 供首次启动引导第 6 步挖洞定位（OnboardingPlan.TargetAddChannel），改名要同步。 -->
-                <Button Grid.Row="0" Grid.Column="0" Grid.ColumnSpan="2"
+                <Button Grid.Column="0"
                         x:Name="AddButton" Content="新建" Click="OnCreate"
                         HorizontalAlignment="Stretch"
                         ToolTipService.ToolTip="新建通道，或先建一个 Windows 本地账户：点开会先问本机有没有现成账户" />
 
-                <Button Grid.Row="1" Grid.Column="0" Content="复制" Click="OnDuplicateChannel"
-                        ToolTipService.ToolTip="按当前选中的通道复制一条（凭据需要重新保存）" />
-                <Button Grid.Row="1" Grid.Column="1" Content="删除" Click="OnRemoveChannel" />
+                <Button Grid.Column="1" Content="删除" Click="OnRemoveChannel"
+                        HorizontalAlignment="Stretch" />
             </Grid>
 
             <Border Grid.Row="2"

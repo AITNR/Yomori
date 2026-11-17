@@ -1141,7 +1141,7 @@ public sealed class MainViewModel : ObservableObject
 
     /// <summary>
     /// 立即落盘（会写运行日志）。留给"确实需要当场写完"的位置：
-    /// 开始执行、导入配置、通道增删复制、设置页里那些拨了就该立刻生效的开关。
+    /// 开始执行、导入配置、通道增删、设置页里那些拨了就该立刻生效的开关。
     /// </summary>
     public void SaveConfig()
     {
@@ -3502,7 +3502,6 @@ public sealed class MainViewModel : ObservableObject
     private readonly Dictionary<string, string> _channelGrantTexts = new(StringComparer.OrdinalIgnoreCase);
 
     private RelayCommand? _addChannelCommand;
-    private RelayCommand? _duplicateChannelCommand;
     private AsyncRelayCommand? _removeChannelCommand;
     private RelayCommand? _refreshChannelCommand;
     private RelayCommand? _clearChannelCredentialCommand;
@@ -3703,8 +3702,6 @@ public sealed class MainViewModel : ObservableObject
 
     public ICommand AddChannelCommand => _addChannelCommand ??= new RelayCommand(AddChannel);
 
-    public ICommand DuplicateChannelCommand => _duplicateChannelCommand ??= new RelayCommand(DuplicateChannel);
-
     /// <summary>
     /// 删除通道。<c>CommandParameter</c> 是 <see cref="RdpChannel"/>，不传则删选中的那条。
     /// 里面有任务时会先弹框问归属（计划书 D5），所以是异步命令。
@@ -3748,27 +3745,6 @@ public sealed class MainViewModel : ObservableObject
         ReloadChannels();
         SelectedChannel = Channels.FirstOrDefault(c => c.Id == channel.Id);
         AppendLog($"[会话通道] 新建通道「{channel.DisplayName}」（{channel.Host} / 待填账户）");
-    }
-
-    private void DuplicateChannel(object? parameter)
-    {
-        var source = parameter as RdpChannel ?? _selectedChannel;
-        if (source is null)
-        {
-            return;
-        }
-
-        var copy = source.Clone();
-        copy.Id = RdpChannel.NewId();
-        copy.Name = $"{source.DisplayName} 副本";
-        // 副本默认清掉凭据标记：同名账户换个主机就用不上了，让用户自己重存一次更稳
-        copy.CredentialSaved = false;
-
-        Config.Rdp.Channels.Add(copy);
-        SaveConfig();
-        ReloadChannels();
-        SelectedChannel = Channels.FirstOrDefault(c => c.Id == copy.Id);
-        AppendLog($"[会话通道] 复制出通道「{copy.DisplayName}」，记得补账户与凭据。");
     }
 
     private async Task RemoveChannelAsync(object? parameter)
@@ -3967,7 +3943,7 @@ public sealed class MainViewModel : ObservableObject
         RefreshChannelReadiness();
 
         // 保存账户 = 明确提交动作：本机通道顺手完成组授权（计划书 §8）。
-        // 字段失焦 / 导入配置 / 复制通道都走不到这里，那些路径不修改系统权限。
+        // 字段失焦 / 导入配置都走不到这里，那些路径不修改系统权限。
         StartAccountAuthorization(channel);
 
         // 同上：保存凭据意味着这个账户正式添加进 Yomori，顺手补一次密码永不过期标志位。
