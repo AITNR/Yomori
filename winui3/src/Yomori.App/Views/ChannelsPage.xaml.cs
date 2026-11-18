@@ -116,7 +116,7 @@ public sealed partial class ChannelsPage : Page
             case nameof(MainViewModel.SelectedChannel):
                 SyncChannelChrome();
                 // 换了通道 = 换了主机：本机账户列表要不要给，得按新通道重算一遍
-                FilterChannelUserSuggestions(ChannelUserBox.Text);
+                ApplyLocalUserItems();
                 // 只有真正换选中通道才播；Channels / ActiveSession 那些 1Hz 刷新别反复闪
                 PlayChannelEditorEntrance();
                 break;
@@ -450,6 +450,9 @@ public sealed partial class ChannelsPage : Page
     /// <summary>上一轮扫描的一句话概况，供提示行与运行日志使用。</summary>
     private string _localUserSummary = "尚未扫描本机账户。";
 
+    /// <summary>正在按模型回填下拉选中项：此时 SelectionChanged 不算用户操作。</summary>
+    private bool _syncingUserBox;
+
     /// <summary>重新扫描本机账户（只读：不建、不删、不改密码、不改组）。</summary>
     private void ReloadLocalUsers() => _ = LoadLocalUsersAsync();
 
@@ -482,43 +485,91 @@ public sealed partial class ChannelsPage : Page
         _allLocalUsers = scan.All.ToList();
         _localUserSummary = scan.Error.Length > 0 ? scan.Error : scan.Summary;
 
-        FilterChannelUserSuggestions(ChannelUserBox.Text);
+        ApplyLocalUserItems();
         RefreshChannelUserHint();
         VM.AppendLog($"[会话通道] 本机账户扫描：{_localUserSummary}");
     }
 
     /// <summary>
-    /// 按当前输入过滤下拉项。
-    /// 目标主机不是本机时不给本机账户 —— 那些账户在对方机器上并不存在，列出来只会让人选错。
+    /// 把扫描结果灌进下拉，并按主机类型切换"下拉 / 输入框"。
     /// </summary>
-    private void FilterChannelUserSuggestions(string? text)
+    /// <remarks>
+    /// 本机通道**只能从下拉里选**：手打账户名要同时记住它启没启用、是不是管理员、在不在远程桌面组，
+    /// 填错唯一的表现是连接阶段报一个看起来毫不相干的错。
+    /// 远程主机例外 —— 本机账户列表对对方机器毫无意义，而远程通道又必须能填账户，所以那里留一个输入框。
+    /// </remarks>
+    private void ApplyLocalUserItems()
     {
         var channel = VM.SelectedChannel;
-        if (channel is null || !RdpTargets.IsLocal(channel.Host))
+        var local = channel is not null && RdpTargets.IsLocal(channel.Host);
+
+        ChannelUserBox.Visibility = local ? Visibility.Visible : Visibility.Collapsed;
+        ChannelUserTextBox.Visibility = local ? Visibility.Collapsed : Visibility.Visible;
+
+        if (!local)
         {
             ChannelUserBox.ItemsSource = null;
             return;
         }
 
-        var keyword = (text ?? string.Empty).Trim();
-        ChannelUserBox.ItemsSource = keyword.Length == 0
-            ? _localUsers
-            : _localUsers.Where(u => u.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
+        // 整体替换 ItemsSource 会清掉选中项，所以换完立刻按模型回填
+        ChannelUserBox.ItemsSource = _localUsers;
+        SyncChannelUserBox();
     }
 
-    private void OnChannelUserTextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
+    /// <summary>按当前通道的账户回填下拉选中项（模型 → 控件方向）。</summary>
+    private void SyncChannelUserBox()
     {
-        // 选中建议项时别再按新文本过滤一次 —— 那会把列表缩成只剩它自己
-        if (args.Reason != AutoSuggestionBoxTextChangeReason.SuggestionChosen)
+        var channel = VM.SelectedChannel;
+        if (channel is null || !RdpTargets.IsLocal(channel.Host))
         {
-            FilterChannelUserSuggestions(sender.Text);
+            return;
         }
 
-        RefreshChannelUserHint();
+        var name = (channel.User ?? string.Empty).Trim();
+        var match = _localUsers.FirstOrDefault(
+            u => string.Equals(u.Name, name, StringComparison.OrdinalIgnoreCase));
+
+        // 值不在可用列表里（远程账户残留 / 账户已被禁用）时 match 为 null：
+        // 这里**故意不清空 channel.User**，也不硬塞一个假选项 —— 原值保留，由提示行说明，
+        // 等用户自己从下拉里选了新的再覆盖。清空会静默丢掉用户填过的东西。
+        if (ReferenceEquals(ChannelUserBox.SelectedItem, match))
+        {
+            return;
+        }
+
+        _syncingUserBox = true;
+        try
+        {
+            ChannelUserBox.SelectedItem = match;
+        }
+        finally
+        {
+            _syncingUserBox = false;
+        }
     }
 
-    private void OnChannelUserSuggestionChosen(AutoSuggestBox sender, AutoSuggestBoxSuggestionChosenEventArgs args)
-        => RefreshChannelUserHint();
+    /// <summary>用户在下拉里选了账户：写回通道并落盘。</summary>
+    private void OnChannelUserSelected(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncingUserBox || ChannelUserBox.SelectedItem is not LocalUserEntry entry)
+        {
+            return;
+        }
+
+        var channel = VM.SelectedChannel;
+        if (channel is null
+            || string.Equals(channel.User, entry.Name, StringComparison.Ordinal))
+        {
+            RefreshChannelUserHint();
+            return;
+        }
+
+        channel.User = entry.Name;
+        VM.PersistChannelEdits();
+        VM.RefreshChannelReadiness();
+        SyncChannelChrome();
+    }
 
     private void OnRefreshLocalUsers(object sender, RoutedEventArgs e) => ReloadLocalUsers();
 
@@ -540,14 +591,7 @@ public sealed partial class ChannelsPage : Page
         if (!RdpTargets.IsLocal(channel.Host))
         {
             ChannelUserHint.Text =
-                $"目标主机不是本机，本机账户列表对它不适用 —— 请按对方计算机上的账户填写。（{_localUserSummary}）";
-            return;
-        }
-
-        var name = (channel.User ?? string.Empty).Trim();
-        if (name.Length == 0)
-        {
-            ChannelUserHint.Text = $"从下拉里选一个本机账户，或直接输入。{_localUserSummary}";
+                $"目标主机不是本机：账户要按对方计算机上的实际情况填（本机账户列表帮不上忙）。（{_localUserSummary}）";
             return;
         }
 
@@ -557,22 +601,24 @@ public sealed partial class ChannelsPage : Page
             return;
         }
 
+        var name = (channel.User ?? string.Empty).Trim();
+        if (name.Length == 0)
+        {
+            ChannelUserHint.Text = $"还没选账户：从下拉里选一个。{_localUserSummary}";
+            return;
+        }
+
         // 在**全量**里找：账户可能因为"已禁用 / 系统内置 / 纯服务身份"没进下拉，
         // 这时要能说清是哪一种，而不是含糊地来一句"名字可能打错了"。
         var entry = _allLocalUsers.FirstOrDefault(
             u => string.Equals(u.Name, name, StringComparison.OrdinalIgnoreCase));
 
-        if (entry is null)
+        if (entry is null || !entry.Usable)
         {
-            ChannelUserHint.Text =
-                $"本机没有名为「{name}」的账户 —— 可能是名字打错，或它来自域而不是本机账户。"
-                + _localUserSummary;
-            return;
-        }
-
-        if (!entry.Usable)
-        {
-            ChannelUserHint.Text = $"「{entry.Name}」不在可选列表里　{entry.Detail}　{entry.Note}";
+            var why = entry is null
+                ? "本机没有这个账户（可能是域账户，或名字打错了）"
+                : $"它不在可选列表里：{entry.Detail}";
+            ChannelUserHint.Text = $"当前通道填的是「{name}」，但{why}。原值已保留 —— 从下拉里选一个会覆盖它。";
             return;
         }
 
@@ -610,7 +656,7 @@ public sealed partial class ChannelsPage : Page
         SyncChannelChrome();
 
         // 主机在「本机 ↔ 远程」之间切换时，账户下拉的来源要跟着变（远程主机上没有本机账户）
-        FilterChannelUserSuggestions(ChannelUserBox.Text);
+        ApplyLocalUserItems();
     }
 
     /// <summary>把该通道的主机填回本机环回。</summary>

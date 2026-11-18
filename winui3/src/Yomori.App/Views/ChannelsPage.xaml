@@ -132,35 +132,41 @@
                                     ToolTipService.ToolTip="填回 127.0.0.1，切本机另一个账户" />
                         </Grid>
 
-                        <!-- 目标账户：本机通道从扫描出来的账户里选（也可直接输入，远程主机 / 域账户要靠手填）。
-                             扫描只读、不改任何账户；已禁用与系统内置账户不进这个列表（见 LocalUserDirectory）。 -->
+                        <!-- 目标账户：本机通道**只许下拉选择**（扫描结果里选，不能手打 —— 打错只会在连接阶段
+                             报一个看起来毫不相干的错）。目标主机不是本机时换成输入框：本机账户列表对远程机器
+                             没有意义，而远程通道又必须能填账户。 -->
                         <Grid ColumnSpacing="8">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*" />
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
 
-                            <AutoSuggestBox Grid.Column="0"
-                                            x:Name="ChannelUserBox"
-                                            Header="目标账户"
-                                            PlaceholderText="选一个本机账户，或直接输入（远程主机 / 域账户）"
-                                            TextMemberPath="Name"
-                                            UpdateTextOnSelect="True"
-                                            Text="{x:Bind VM.SelectedChannel.User, Mode=TwoWay}"
-                                            TextChanged="OnChannelUserTextChanged"
-                                            SuggestionChosen="OnChannelUserSuggestionChosen"
-                                            LostFocus="OnChannelFieldLostFocus">
-                                <!-- 下拉项两行：账户名 + 它在本机的真实状态，省得选完才发现是禁用的／不是管理员 -->
-                                <AutoSuggestBox.ItemTemplate>
+                            <ComboBox Grid.Column="0"
+                                      x:Name="ChannelUserBox"
+                                      Header="目标账户"
+                                      PlaceholderText="从下拉里选一个本机账户"
+                                      HorizontalAlignment="Stretch"
+                                      SelectedValuePath="Name"
+                                      SelectionChanged="OnChannelUserSelected">
+                                <!-- 选中项与下拉项用同一个模板：收起时也能看到这个账户的真实状态 -->
+                                <ComboBox.ItemTemplate>
                                     <DataTemplate x:DataType="services:LocalUserEntry">
-                                        <StackPanel Padding="0,4" Spacing="2">
+                                        <StackPanel Padding="0,2" Spacing="2">
                                             <TextBlock Text="{x:Bind Name}" />
                                             <TextBlock Text="{x:Bind Detail}" FontSize="11" Opacity="0.65"
                                                        TextTrimming="CharacterEllipsis" />
                                         </StackPanel>
                                     </DataTemplate>
-                                </AutoSuggestBox.ItemTemplate>
-                            </AutoSuggestBox>
+                                </ComboBox.ItemTemplate>
+                            </ComboBox>
+
+                            <TextBox Grid.Column="0"
+                                     x:Name="ChannelUserTextBox"
+                                     Header="目标账户（远程主机）"
+                                     Visibility="Collapsed"
+                                     PlaceholderText="对方计算机上的账户名，例如 Player2 或 机器名\Player2"
+                                     Text="{x:Bind VM.SelectedChannel.User, Mode=TwoWay}"
+                                     LostFocus="OnChannelFieldLostFocus" />
 
                             <Button Grid.Column="1" Content="刷新账户" VerticalAlignment="Bottom"
                                     Click="OnRefreshLocalUsers"
