@@ -15,6 +15,16 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
+        <!-- ===== 云母主题的着色层 =====
+             铺满整窗、不参与命中测试，压在系统画的 Mica 之上、所有内容之下。
+             不透明度由设置里的「背景不透明度」控制（100 = 完全盖住云母，0 = 完全透出云母）；
+             选「纯色」时它整块收起，改由 RootGrid 自己画底色。
+             必须是 RootGrid 的第一个子元素 —— 否则会盖住标题栏与导航区。 -->
+        <Border x:Name="BackdropTint"
+                Grid.Row="0" Grid.RowSpan="2"
+                IsHitTestVisible="False"
+                Visibility="Collapsed" />
+
         <!-- ===== 自定义标题栏 ===== -->
         <Grid x:Name="AppTitleBar" Height="44" Canvas.ZIndex="1">
             <Grid.ColumnDefinitions>

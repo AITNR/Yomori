@@ -40,6 +40,10 @@ public partial class App : Application
         NotificationService.Initialize(MainWindow.DispatcherQueue);
         ViewModel.Initialize();
 
+        // 配置读完之后才能拿到真正的「窗口背景」取值，所以背景在这里落一次
+        // （MainWindow 构造时配置还是空的，那里只订阅了明暗变化）。
+        MainWindow.ApplyBackdrop();
+
         // 单实例：用户又双击了一次 exe 时，第二个进程会把信号打到这条命名事件上。
         // 窗口若收在状态栏里，这里负责把它叫回前台（否则用户会以为程序没反应，再点几次）。
         SingleInstance.StartListener(MainWindow.DispatcherQueue, () => MainWindow?.RestoreFromTray());

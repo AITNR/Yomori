@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Media.Animation;
 using Windows.UI;
 using Yomori.Helpers;
@@ -381,6 +382,12 @@ public sealed partial class SettingsPage : Page
             }
 
             ThemeBox.SelectedIndex = found;
+
+            BackdropBox.SelectedIndex = IndexOfItem(
+                WindowBackdrops.Items, WindowBackdrops.Normalize(VM.Config.Backdrop));
+            BackdropOpacitySlider.Value = WindowBackdrops.NormalizeOpacity(VM.Config.BackdropOpacity);
+            UpdateBackdropUi();
+
             UpdateChannelBox.SelectedIndex = IndexOfUpdateChannel(VM.Config.UpdateChannel);
             CloseActionBox.SelectedIndex = IndexOfCloseAction(VM.Config.Window.CloseAction);
 
@@ -418,6 +425,88 @@ public sealed partial class SettingsPage : Page
         }
 
         VM.Config.ShutdownDelaySeconds = (int)Math.Round(double.IsNaN(args.NewValue) ? 60 : args.NewValue);
+    }
+
+    /// <summary>
+    /// 切换窗口背景（云母 / 亚克力 / 纯色）。离散选择，改完立刻落盘。
+    /// </summary>
+    private void OnBackdropChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_syncing || BackdropBox.SelectedItem is not KeyValuePair<string, string> item)
+        {
+            return;
+        }
+
+        // 值没变 = 程序性重设（见 OnThemeChanged 的同款说明），别当成用户操作
+        if (WindowBackdrops.Normalize(VM.Config.Backdrop) == item.Key)
+        {
+            UpdateBackdropUi();
+            return;
+        }
+
+        VM.Config.Backdrop = item.Key;
+        ApplyBackdropAndPersist();
+    }
+
+    /// <summary>离散选择模式：改完立刻落盘（跟主题、关闭行为这些一致）。</summary>
+    private void ApplyBackdropAndPersist()
+    {
+        App.MainWindow?.ApplyBackdrop();
+        VM.SaveConfig();
+        UpdateBackdropUi();
+    }
+
+    /// <summary>拖动「背景不透明度」。滑块是连续值，这里只在整数变化时落一次。</summary>
+    private void OnBackdropOpacityChanged(object sender, RangeBaseValueChangedEventArgs e)
+    {
+        if (_syncing)
+        {
+            return;
+        }
+
+        var value = (int)Math.Round(e.NewValue);
+        if (WindowBackdrops.NormalizeOpacity(VM.Config.BackdropOpacity) == value)
+        {
+            return;
+        }
+
+        VM.Config.BackdropOpacity = value;
+
+        // ⚠️ 这里**不写盘**：拖动时这个处理器每帧都会进来，每帧同步写一次 config.json
+        // 会把界面卡出闪烁。配置的自动保存（600ms 去抖）会接手落盘。
+        App.MainWindow?.ApplyBackdrop();
+        UpdateBackdropUi();
+    }
+
+    /// <summary>把"这个模式下滑块有没有用、当前是多少"讲清楚。纯色模式下不透明度不生效，滑块禁用但不清零。</summary>
+    private void UpdateBackdropUi()
+    {
+        var kind = WindowBackdrops.Normalize(VM.Config.Backdrop);
+        var usesBackdrop = WindowBackdrops.UsesBackdrop(kind);
+        var acrylic = WindowBackdrops.IsAcrylic(kind);
+        var supported = acrylic ? Yomori.MainWindow.IsAcrylicSupported : Yomori.MainWindow.IsMicaSupported;
+        var opacity = WindowBackdrops.NormalizeOpacity(VM.Config.BackdropOpacity);
+
+        // 滑块对云母和亚克力都有效，只有纯色下不生效
+        BackdropOpacitySlider.IsEnabled = usesBackdrop;
+
+        BackdropOpacityText.Text = usesBackdrop
+            ? opacity <= 0
+                ? $"{opacity}%（完全透出{(acrylic ? "桌面模糊" : "云母")}）"
+                : opacity >= 100
+                    ? $"{opacity}%（完全盖住，观感等同纯色）"
+                    : $"{opacity}%"
+            : $"{opacity}%（纯色模式下不生效）";
+
+        BackdropHintText.Text = !supported
+            ? $"这台机器画不了{(acrylic ? "亚克力" : "云母")}（需要 Windows 11 22H2 及以上）："
+              + "选了会自动退回纯色，运行日志里会记一条。"
+            : acrylic
+                ? "亚克力会把窗口后面的桌面真模糊掉，效果最明显；拖动不透明度可以调它压多厚。"
+                  + "明暗跟着上面的「主题」走。"
+                : "云母只取壁纸的色调、不显示壁纸本身，深色主题下系统会把它压到接近 #202020 —— "
+                  + "在深色桌面上几乎看不出变化，这是 Mica 的设计。想要看得出「玻璃感」请选亚克力。"
+                  + "明暗跟着上面的「主题」走；不透明度调的是背景之上那层着色：100% 等于纯色，0% 完全透出。";
     }
 
     /// <summary>

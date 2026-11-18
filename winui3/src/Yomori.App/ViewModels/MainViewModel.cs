@@ -649,6 +649,9 @@ public sealed class MainViewModel : ObservableObject
 
     public IReadOnlyList<KeyValuePair<string, string>> ThemeItems => AppConfig.ThemeItems;
 
+    /// <summary>窗口背景下拉的取值（亚克力 / 云母 / 云母 Alt / 纯色，顺序即下拉顺序）。</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> BackdropItems => WindowBackdrops.Items;
+
     /// <summary>「设置 → 关于」里更新渠道下拉框的选项（正式版 / 测试版）。</summary>
     public IReadOnlyList<KeyValuePair<string, string>> UpdateChannelItems => UpdateChannels.Items;
 

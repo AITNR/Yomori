@@ -18,6 +18,15 @@
     <SolidColorBrush x:Key="YomoriDangerBrush" Color="{StaticResource YomoriDanger}" />
     <SolidColorBrush x:Key="YomoriDangerDeepBrush" Color="{StaticResource YomoriDangerDeep}" />
 
+    <!-- ===== 云母主题：让 Mica 真的看得见 =====
+         NavigationView 的内容区与左侧 pane 各自带一层底板，不改的话 Mica 只在窗口边缘几像素露出，
+         表现为"选了云母跟纯色一样"。这里把这两层改成透明，底色改由 MainWindow 统一提供：
+           · 云母模式 → RootGrid 透明 + BackdropTint 半透明着色层（不透明度可调）
+           · 纯色模式 → RootGrid 直接画主题底色
+         改这两行之前先想清楚：删掉它们，云母会退回"只在边角可见"。 -->
+    <SolidColorBrush x:Key="NavigationViewContentBackground" Color="Transparent" />
+    <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="Transparent" />
+
     <!-- 停止 / 紧急停止：高对比危险操作按钮 -->
     <Style x:Key="DangerButtonStyle" TargetType="Button" BasedOn="{StaticResource DefaultButtonStyle}">
         <Setter Property="Foreground" Value="White" />

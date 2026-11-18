@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.UI;
+using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
@@ -16,6 +17,7 @@ using Microsoft.UI.Xaml.Media.Animation;
 using Microsoft.UI.Xaml.Media.Imaging;
 using Windows.Foundation;
 using Windows.Graphics;
+using Windows.UI;
 using Yomori.Helpers;
 using Yomori.Models;
 using Yomori.Services;
@@ -94,7 +96,9 @@ public sealed partial class MainWindow : Window
         Title = "Yomori";
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(AppTitleBar);
-        SystemBackdrop = new MicaBackdrop();
+        // 背景（云母 / 纯色）与不透明度统一由 ApplyBackdrop 决定 —— 配置在 ViewModel.Initialize 里才读到，
+        // 所以启动时会再调一次（App.OnLaunched）。这里只订阅"明暗变了要重算着色层颜色"。
+        RootGrid.ActualThemeChanged += (_, _) => ApplyBackdrop();
 
         // 记忆上次窗口大小：先把上次记下的位置/尺寸恢复到当前显示器工作区内，
         // 之后再监听变化持续记录（恢复过程本身不触发写盘，注册顺序即是这个意思）。
@@ -216,6 +220,116 @@ public sealed partial class MainWindow : Window
             DispatcherQueue.TryEnqueue(
                 Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
                 () => NavigateTo(ChannelMgmtTag));
+        }
+    }
+
+    // ---------------- 窗口背景（云母 / 纯色） ----------------
+
+    /// <summary>
+    /// 上一次真正落到窗口上的背景（<c>模式|是否启用</c>）。用它挡住"拖不透明度也重建
+    /// SystemBackdrop"——那会让 DWM 每帧拆装一次背景，窗口一直闪。
+    /// </summary>
+    private string _appliedBackdropKey = string.Empty;
+
+    /// <summary>着色层画刷（复用，只改 Color，不换实例）。</summary>
+    private SolidColorBrush? _tintBrush;
+
+    /// <summary>纯色模式的底板画刷（复用，只改 Color，不换实例）。</summary>
+    private SolidColorBrush? _solidBrush;
+
+    /// <summary>
+    /// 当前系统是否支持云母。<c>MicaController</c> 要 Windows 11 22H2 起才有；
+    /// Win10 与某些无合成环境返回 false。
+    /// </summary>
+    public static bool IsMicaSupported => MicaController.IsSupported();
+
+    /// <summary>当前系统是否支持亚克力（真模糊）。同样要 Windows 11 22H2 起。</summary>
+    public static bool IsAcrylicSupported => DesktopAcrylicController.IsSupported();
+
+    /// <summary>
+    /// 把「窗口背景」设置落到窗口上：云母 / 纯色，以及云母之上那层着色层的不透明度。
+    /// </summary>
+    /// <remarks>
+    /// <para>三层各管一段，别混：①系统画的 Mica；②本方法设的着色层 <c>BackdropTint</c>；
+    /// ③内容自己的画刷（卡片、列表 —— 不受这里影响）。所以「背景不透明度」调的是②，
+    /// 不是整窗透明度。</para>
+    /// <para>切云母时必须把 <c>NavigationView</c> 与 <c>RootGrid</c> 自己的底色清掉 ——
+    /// 它们默认自带一层不透明底，不清就整块盖住 Mica，表现出来是"选了云母没反应"。</para>
+    /// <para>明暗变了要重算着色层颜色，所以 <c>RootGrid.ActualThemeChanged</c> 也走这里。</para>
+    /// </remarks>
+    public void ApplyBackdrop()
+    {
+        var config = App.ViewModel?.Config;
+        if (config is null)
+        {
+            return;
+        }
+
+        var kind = WindowBackdrops.Normalize(config.Backdrop);
+        var opacity = WindowBackdrops.NormalizeOpacity(config.BackdropOpacity);
+        var acrylic = WindowBackdrops.IsAcrylic(kind);
+        var wantsBackdrop = WindowBackdrops.UsesBackdrop(kind);
+        var supported = acrylic ? IsAcrylicSupported : IsMicaSupported;
+        var useBackdrop = wantsBackdrop && supported;
+
+        var dark = RootGrid.ActualTheme == ElementTheme.Dark;
+        var (r, g, b) = WindowBackdrops.TintColor(dark);
+
+        // ---- 只有"模式"变了才碰 SystemBackdrop ----
+        // 重建 SystemBackdrop 等于让 DWM 把背景拆掉再装一次；拖不透明度时若每帧都这么干，
+        // 表现出来就是窗口一直闪。不透明度只影响着色层的颜色，与背景对象本身无关。
+        var key = useBackdrop ? kind + "|on" : kind + "|off";
+        if (!string.Equals(_appliedBackdropKey, key, StringComparison.Ordinal))
+        {
+            _appliedBackdropKey = key;
+
+            if (useBackdrop)
+            {
+                // 亚克力：把窗口后面的桌面真模糊掉，深色主题下也看得出来
+                // 云母：只取壁纸色调、不显示壁纸，深色下会被系统压到接近 #202020（效果天然很淡）
+                SystemBackdrop = acrylic
+                    ? new DesktopAcrylicBackdrop()
+                    : new MicaBackdrop
+                    {
+                        Kind = WindowBackdrops.IsAlt(kind) ? MicaKind.BaseAlt : MicaKind.Base,
+                    };
+
+                // 外壳不许有自己的底色，否则背景只在边角几像素露出来
+                RootGrid.Background = null;
+                NavView.Background = new SolidColorBrush(Colors.Transparent);
+                BackdropTint.Visibility = Visibility.Visible;
+            }
+            else
+            {
+                // 纯色，或者这台机器根本画不了所选背景：自己画底色，着色层收起
+                SystemBackdrop = null;
+                BackdropTint.Background = null;
+                BackdropTint.Visibility = Visibility.Collapsed;
+
+                if (wantsBackdrop)
+                {
+                    App.ViewModel?.AppendLog(acrylic
+                        ? "[界面] 当前系统不支持亚克力（需要 Windows 11 22H2 及以上），已退回纯色背景。"
+                        : "[界面] 当前系统不支持云母（需要 Windows 11 22H2 及以上），已退回纯色背景。");
+                }
+            }
+        }
+
+        // ---- 每帧只更新颜色 ----
+        var alpha = WindowBackdrops.ToAlphaByte(opacity);
+
+        if (useBackdrop)
+        {
+            _tintBrush ??= new SolidColorBrush();
+            _tintBrush.Color = Color.FromArgb(alpha, r, g, b);
+            BackdropTint.Background = _tintBrush;
+        }
+        else
+        {
+            _solidBrush ??= new SolidColorBrush();
+            _solidBrush.Color = Color.FromArgb(byte.MaxValue, r, g, b);
+            RootGrid.Background = _solidBrush;
+            NavView.Background = _solidBrush;
         }
     }
 

@@ -154,6 +154,33 @@
                                        TextWrapping="Wrap"
                                        Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
 
+                            <!-- 窗口背景：云母（Win11 默认观感）/ 纯色。明暗不单独给开关 ——
+                                 Mica 的明暗由窗口 RequestedTheme 决定，独立设置只会造出
+                                 "深色云母 + 浅色界面"这种明显不对的组合。 -->
+                            <ComboBox x:Name="BackdropBox"
+                                      Header="窗口背景"
+                                      MinWidth="220"
+                                      ItemsSource="{x:Bind VM.BackdropItems, Mode=OneWay}"
+                                      DisplayMemberPath="Value"
+                                      SelectedValuePath="Key"
+                                      SelectionChanged="OnBackdropChanged" />
+
+                            <StackPanel Spacing="2">
+                                <TextBlock Text="背景不透明度" FontSize="12" Opacity="0.8" />
+                                <Slider x:Name="BackdropOpacitySlider"
+                                        Minimum="0" Maximum="100"
+                                        StepFrequency="1"
+                                        TickFrequency="10"
+                                        TickPlacement="Outside"
+                                        ValueChanged="OnBackdropOpacityChanged" />
+                                <TextBlock x:Name="BackdropOpacityText" FontSize="12" Opacity="0.7" />
+                            </StackPanel>
+
+                            <TextBlock x:Name="BackdropHintText"
+                                       TextWrapping="Wrap"
+                                       FontSize="12"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+
                             <!-- 关闭按钮行为：与 window.close_action 一一对应。
                                  放在这里是为了让"记住我的选择"有回头路 —— 只在弹窗里记、没有地方改，
                                  用户勾了之后就永远改不回来了。 -->

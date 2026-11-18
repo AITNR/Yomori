@@ -26,6 +26,8 @@ public sealed class AppConfig : ObservableObject
 
     private static readonly HashSet<string> LegacyThemes = new() { "yukino", "campus", "fresh", "fantasy" };
 
+    private string _backdrop = WindowBackdrops.Mica;
+    private int _backdropOpacity = WindowBackdrops.DefaultOpacity;
     private bool _shutdownAfterDone;
     private int _shutdownDelaySeconds = 60;
     private bool _autoExitAfterDone;
@@ -54,6 +56,28 @@ public sealed class AppConfig : ObservableObject
 
     [JsonPropertyName("theme")]
     public string Theme { get; set; } = "system";
+
+    /// <summary>
+    /// 窗口背景：云母（Mica）还是纯色，取值见 <see cref="WindowBackdrops"/>。
+    /// 默认云母 —— 这是 Windows 11 的默认观感；老配置里没有这个键时 <see cref="Sanitize"/> 会补上默认值。
+    /// </summary>
+    [JsonPropertyName("backdrop")]
+    public string Backdrop
+    {
+        get => _backdrop;
+        set => SetProperty(ref _backdrop, WindowBackdrops.Normalize(value));
+    }
+
+    /// <summary>
+    /// 云母之上那层"背景"的不透明度（0–100）。100 = 完全盖住云母（等同纯色），0 = 完全透出云母。
+    /// 只影响窗口背景这一层，不影响卡片与页面内容。
+    /// </summary>
+    [JsonPropertyName("backdrop_opacity")]
+    public int BackdropOpacity
+    {
+        get => _backdropOpacity;
+        set => SetProperty(ref _backdropOpacity, WindowBackdrops.NormalizeOpacity(value));
+    }
 
     [JsonPropertyName("shutdown_after_done")]
     public bool ShutdownAfterDone
@@ -277,6 +301,11 @@ public sealed class AppConfig : ObservableObject
         }
 
         Theme = allowed || LegacyThemes.Contains(theme) ? theme : "system";
+
+        // 背景：认不出的取值回落到云母（本功能的默认值），不透明度夹到 0–100
+        Backdrop = WindowBackdrops.Normalize(Backdrop);
+        BackdropOpacity = WindowBackdrops.NormalizeOpacity(BackdropOpacity);
+
         ShutdownDelaySeconds = Math.Max(0, ShutdownDelaySeconds);
         // 只做去空白：路径失效（盘符拔了、文件被删）由首页自己回退到图库随机，
         // 不能在这里清空 —— 临时拔一次 U 盘就把用户的选择抹掉太粗暴。
