@@ -11,6 +11,8 @@ public partial class App : Application
 
     /// <summary>全局共享视图模型，必须在 UI 线程上创建（内部会捕获 DispatcherQueue）。</summary>
     public static ViewModels.MainViewModel ViewModel { get; private set; } = null!;
+    /// <summary>主控进程内的本机 MCP 服务，复用当前内嵌 RDP 连接。</summary>
+    private YomoriMcpServer? _mcpServer;
 
     public App()
     {
@@ -65,6 +67,9 @@ public partial class App : Application
             Services.CrashLog.WriteNote(
                 "系统通知注册失败：" + Environment.NewLine + NotificationService.DisabledDetail);
         }
+        _mcpServer = new YomoriMcpServer(ViewModel, MainWindow.DispatcherQueue, ViewModel.AppendLog);
+        _mcpServer.Start();
+        MainWindow.Closed += (_, _) => _mcpServer?.Dispose();
     }
 
     /// <summary>

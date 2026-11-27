@@ -190,6 +190,13 @@ YCN_API void ycn_rdp_set_session_decode_paused(int session, int paused);
 /* 输入注入。flags = FreeRDP PTR_FLAGS_*（C# 侧定义同名常量） */
 YCN_API int ycn_rdp_send_mouse(int session, uint32_t flags, uint16_t x, uint16_t y);
 
+/* Tracked mouse API: accepts MOVE(0x0800), left down(0x9000), drag MOVE(0x1800), left up(0x1000).
+ * ticket identifies queue admission; poll receipt for actual FreeRDP dispatch.
+ * Non-release requests expire after 2s. outcome: 0 pending, 1 dispatched, 2 failed/expired.
+ * Dispatch success is not proof of remote application processing. Old DLLs lack these exports. */
+YCN_API int ycn_rdp_send_mouse_tracked(int session, uint32_t flags, uint16_t x, uint16_t y, uint64_t* ticket);
+YCN_API int ycn_rdp_mouse_receipt(int session, uint64_t ticket, int* outcome);
+
 /* 键盘注入。scancode 为 RDP 扫描码（VSC），extended 为扩展键位 */
 YCN_API int ycn_rdp_send_key(int session, int down, int extended, uint16_t scancode);
 

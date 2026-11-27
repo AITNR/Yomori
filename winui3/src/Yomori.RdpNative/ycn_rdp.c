@@ -103,6 +103,8 @@ typedef struct
 	uint32_t flags;
 	uint16_t x;
 	uint16_t y;
+	uint64_t receipt_id; /* 0 for legacy/UI events */
+	ULONGLONG expires_at; /* release events must not expire */
 } YcnMouseReq;
 
 typedef struct
@@ -113,6 +115,10 @@ typedef struct
 } YcnKeyReq;
 
 #define YCN_INPUT_QUEUE_CAP 64
+
+typedef struct { uint64_t id; int outcome; } YcnMouseReceipt;
+/* Process-wide IDs prevent a reconnect from aliasing an old receipt. g_lock protected. */
+static uint64_t g_mouse_receipt_next = 0;
 
 typedef struct
 {
@@ -155,6 +161,7 @@ typedef struct
 	YcnMouseReq mouse_q[YCN_INPUT_QUEUE_CAP];
 	int mouse_head;
 	int mouse_tail;
+	YcnMouseReceipt mouse_receipts[YCN_INPUT_QUEUE_CAP];
 	YcnKeyReq key_q[YCN_INPUT_QUEUE_CAP];
 	int key_head;
 	int key_tail;
@@ -3150,10 +3157,18 @@ static DWORD WINAPI event_loop(LPVOID arg)
 				}
 				if (have_m)
 				{
-					BOOL sent = freerdp_input_send_mouse_event(instance->context->input, m.flags, m.x, m.y);
-					WLog_DBG(TAG, "input drain: mouse sent=%d flags=0x%04X", sent, m.flags);
-					if (!sent)
-						WLog_WARN(TAG, "input drain: mouse NOT sent (回调未注册或队列状态异常)");
+					BOOL sent = FALSE;
+					if (!m.receipt_id || !m.expires_at || GetTickCount64() < m.expires_at)
+						sent = freerdp_input_send_mouse_event(instance->context->input, m.flags, m.x, m.y);
+					if (m.receipt_id)
+					{
+						EnterCriticalSection(&g_lock);
+						YcnMouseReceipt* receipt = &s->mouse_receipts[m.receipt_id % YCN_INPUT_QUEUE_CAP];
+						if (receipt->id == m.receipt_id) receipt->outcome = sent ? 1 : 2;
+						LeaveCriticalSection(&g_lock);
+						WLog_INFO(TAG, "mouse receipt: id=%llu sent=%d flags=0x%04X", (unsigned long long)m.receipt_id, sent, m.flags);
+					}
+					if (!sent) WLog_WARN(TAG, "input drain: mouse NOT sent or expired");
 				}
 				if (have_k)
 				{
@@ -3766,7 +3781,7 @@ YCN_API int ycn_rdp_send_mouse(int session, uint32_t flags, uint16_t x, uint16_t
 			uint32_t tailFlags = s->mouse_q[tail].flags;
 			/* 仅当新旧 flags 完全相同且是移动类（含 MOVE 位、非按下）时覆盖队尾。
 			 * 拖拽 MOVE(0x1800) 也合并（RDP 语义允许丢中间点）；滚轮/按下/释放不动 */
-			if (tailFlags == flags && (flags & 0x0800u) != 0 && (flags & 0x8000u) == 0)
+			if (!s->mouse_q[tail].receipt_id && tailFlags == flags && (flags & 0x0800u) != 0 && (flags & 0x8000u) == 0)
 			{
 				s->mouse_q[tail].x = x;
 				s->mouse_q[tail].y = y;
@@ -3777,11 +3792,49 @@ YCN_API int ycn_rdp_send_mouse(int session, uint32_t flags, uint16_t x, uint16_t
 		s->mouse_q[s->mouse_head].flags = flags;
 		s->mouse_q[s->mouse_head].x = x;
 		s->mouse_q[s->mouse_head].y = y;
+		s->mouse_q[s->mouse_head].receipt_id = 0;
+		s->mouse_q[s->mouse_head].expires_at = 0;
 		s->mouse_head = next;
 		rc = YCN_OK;
 	}
 	LeaveCriticalSection(&g_lock);
 	return rc;
+}
+
+/* Additive ABI: queue admission is distinct from FreeRDP dispatch. Never call from a callback. */
+YCN_API int ycn_rdp_send_mouse_tracked(int session, uint32_t flags, uint16_t x, uint16_t y, uint64_t* ticket)
+{
+	if (!ticket || (flags != 0x0800u && flags != 0x9000u && flags != 0x1800u && flags != 0x1000u)) return YCN_ERR_INVALID_ARG;
+	*ticket = 0;
+	EnterCriticalSection(&g_lock);
+	YcnSession* s = find_session(session);
+	if (!s || s->state != YCN_STATE_RUNNING) { LeaveCriticalSection(&g_lock); return YCN_ERR_NOT_CONNECTED; }
+	int next = (s->mouse_head + 1) % YCN_INPUT_QUEUE_CAP;
+	if (next == s->mouse_tail || g_mouse_receipt_next == UINT64_MAX) { LeaveCriticalSection(&g_lock); return YCN_ERR_NOT_CONNECTED; }
+	uint64_t id = ++g_mouse_receipt_next;
+	YcnMouseReq* request = &s->mouse_q[s->mouse_head];
+	request->flags = flags; request->x = x; request->y = y; request->receipt_id = id;
+	request->expires_at = flags == 0x1000u ? 0 : GetTickCount64() + 2000;
+	s->mouse_receipts[id % YCN_INPUT_QUEUE_CAP].id = id;
+	s->mouse_receipts[id % YCN_INPUT_QUEUE_CAP].outcome = 0;
+	s->mouse_head = next; *ticket = id;
+	LeaveCriticalSection(&g_lock);
+	return YCN_OK;
+}
+
+/* outcome: 0 pending, 1 FreeRDP accepted dispatch, 2 failed/expired. Not a game acknowledgement. */
+YCN_API int ycn_rdp_mouse_receipt(int session, uint64_t ticket, int* outcome)
+{
+	if (!ticket || !outcome) return YCN_ERR_INVALID_ARG;
+	*outcome = 0;
+	EnterCriticalSection(&g_lock);
+	YcnSession* s = find_session(session);
+	if (!s) { LeaveCriticalSection(&g_lock); return YCN_ERR_SESSION_NOT_FOUND; }
+	YcnMouseReceipt* receipt = &s->mouse_receipts[ticket % YCN_INPUT_QUEUE_CAP];
+	if (receipt->id != ticket) { LeaveCriticalSection(&g_lock); return YCN_ERR_INVALID_ARG; }
+	*outcome = receipt->outcome;
+	LeaveCriticalSection(&g_lock);
+	return YCN_OK;
 }
 
 YCN_API int ycn_rdp_send_key(int session, int down, int extended, uint16_t scancode)

@@ -7,6 +7,7 @@ namespace Yomori.Models;
 public static class WaitModes
 {
     public const string DirectProcess = "direct_process";
+    public const string ExitCode = "exit_code";
     public const string ProcessName = "process_name";
     public const string FireAndContinue = "fire_and_continue";
     public const string WindowTitle = "window_title";
@@ -15,6 +16,7 @@ public static class WaitModes
     public static readonly IReadOnlyList<KeyValuePair<string, string>> Items = new List<KeyValuePair<string, string>>
     {
         new(DirectProcess, "等待直接启动进程"),
+        new(ExitCode, "按直接进程退出码判断（0 为成功）"),
         new(ProcessName, "等待指定进程名"),
         new(FireAndContinue, "启动后不等待"),
         new(WindowTitle, "等待窗口标题出现后消失"),
@@ -22,7 +24,7 @@ public static class WaitModes
     };
 
     public static string Normalize(string? value) =>
-        value is DirectProcess or ProcessName or FireAndContinue or WindowTitle or CmdlineKeyword
+        value is DirectProcess or ExitCode or ProcessName or FireAndContinue or WindowTitle or CmdlineKeyword
             ? value
             : DirectProcess;
 
