@@ -1167,7 +1167,8 @@ public sealed class ScriptRunner
             Log($"启动参数：{task.Args.Trim()}");
         }
 
-        var monitorSpec = BuildMonitorSpec(task);
+        var checkExitCode = task.WaitMode == WaitModes.ExitCode;
+        var monitorSpec = checkExitCode ? new MonitorSpec() : BuildMonitorSpec(task);
         if (task.WaitMode == WaitModes.FireAndContinue)
         {
             Log("等待模式：启动后不等待；此任务启动成功后会立即进入后续任务。");
@@ -1247,7 +1248,7 @@ public sealed class ScriptRunner
         }
 
         var stopwatch = Stopwatch.StartNew();
-        if (!ConfirmLaunchSuccess(task, process, name, stopwatch, monitorSpec))
+        if (!checkExitCode && !ConfirmLaunchSuccess(task, process, name, stopwatch, monitorSpec))
         {
             // 停止请求把启动确认 / 接力确认打断了 —— 进程很可能还活着（是我们主动放弃等待，
             // 不是它退出了），所以既不解除登记、也不记"启动失败或提前退出"这条异常：
@@ -1390,6 +1391,12 @@ public sealed class ScriptRunner
             }
             else if (exitCode is not null)
             {
+                if (checkExitCode && exitCode != 0)
+                {
+                    var status = $"异常结束，退出码：{exitCode}";
+                    MarkTaskError($"任务「{name}」{status}", name);
+                    return FinishWithLog(status, abnormal: true);
+                }
                 return FinishWithLog($"正常结束，退出码：{exitCode}");
             }
 

@@ -673,6 +673,34 @@ namespace Yomori.Services
         public bool SendMouse(uint flags, ushort x, ushort y)
             => RdpNativeInterop.ycn_rdp_send_mouse(_session, flags, x, y) == 0;
 
+        /// <summary>Await FreeRDP dispatch, not remote application processing. No legacy fallback.</summary>
+        public async System.Threading.Tasks.Task<bool> SendMouseDispatchedAsync(uint flags, ushort x, ushort y)
+        {
+            var session = _session;
+            if (session <= 0) return false;
+            try
+            {
+                if (RdpNativeInterop.ycn_rdp_send_mouse_tracked(session, flags, x, y, out var ticket) != 0)
+                    return false;
+                var deadline = Environment.TickCount64 + 2500;
+                while (Environment.TickCount64 < deadline)
+                {
+                    if (RdpNativeInterop.ycn_rdp_mouse_receipt(session, ticket, out var outcome) != 0)
+                        return false;
+                    if (outcome != 0) return outcome == 1;
+                    await System.Threading.Tasks.Task.Delay(10).ConfigureAwait(false);
+                }
+                // A timed-out release must still be attempted on the original connection.
+                if (flags == YcnPointerFlags.Button1)
+                    RdpNativeInterop.ycn_rdp_send_mouse(session, flags, x, y);
+                return false;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                throw new NotSupportedException("Native DLL lacks tracked mouse dispatch; update the matching runtime.");
+            }
+        }
+
         /// <summary>注入键盘事件（VSC 扫描码；扩展键如方向键/Right Ctrl 传 extended=true）。</summary>
         public bool SendKey(bool down, bool extended, ushort scancode) => SendKeyRc(down, extended, scancode) == 0;
 

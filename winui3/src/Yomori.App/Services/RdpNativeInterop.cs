@@ -128,6 +128,8 @@ namespace Yomori.Services
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_set_decode_paused(int paused);
         [DllImport(Lib, CallingConvention = CC)] internal static extern void ycn_rdp_set_session_decode_paused(int session, int paused);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_mouse(int session, uint flags, ushort x, ushort y);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_mouse_tracked(int session, uint flags, ushort x, ushort y, out ulong ticket);
+        [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_mouse_receipt(int session, ulong ticket, out int outcome);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_key(int session, int down, int extended, ushort scancode);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_send_keyboard_sync(int session, uint flags);
         [DllImport(Lib, CallingConvention = CC)] internal static extern int ycn_rdp_set_muted(int session, int muted);
